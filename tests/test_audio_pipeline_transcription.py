@@ -1,3 +1,4 @@
+# tests/test_audio_pipeline_transcription.py
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -8,14 +9,14 @@ from universal_video_ai.downloader.download_result import DownloadResult
 from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.audio.audio_result import AudioResult
 from universal_video_ai.audio.pipeline import AudioPipeline, AudioPipelineConfig, AudioPipelineResult
+from universal_video_ai.speech.service import SpeechService
 
 
 @dataclass
-class DummyTranscriber:
-    """Simple dummy transcriber for tests."""
+class DummyBackend:
+    """Simple dummy speech backend implementing transcribe()."""
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
-        # Return deterministic transcript for assertions
         return f"TRANSCRIPT for {audio_path.name} lang={language}"
 
 
@@ -58,9 +59,11 @@ def test_pipeline_transcription_success(tmp_path: Path, monkeypatch):
     from universal_video_ai.audio.extractor import AudioExtractor
     monkeypatch.setattr(AudioExtractor, "extract", staticmethod(fake_extract))
 
-    transcriber = DummyTranscriber()
+    backend = DummyBackend()
+    service = SpeechService(backend=backend)
+
     pipeline = AudioPipeline(config=AudioPipelineConfig(run_transcription=True, transcription_language="en"),
-                             extractor=AudioExtractor(), transcriber=transcriber)
+                             extractor=AudioExtractor(), speech_service=service)
 
     dr = make_download_result(tmp_path)
     result = pipeline.process(dr, output_dir=tmp_path)
@@ -72,7 +75,7 @@ def test_pipeline_transcription_success(tmp_path: Path, monkeypatch):
     assert "lang=en" in result.transcript
 
 
-def test_pipeline_transcription_no_transcriber_raises(tmp_path: Path, monkeypatch):
+def test_pipeline_transcription_no_service_raises(tmp_path: Path, monkeypatch):
     # mock extractor again
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"\x00" * 1024)

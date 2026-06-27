@@ -1,9 +1,10 @@
+# src/universal_video_ai/audio/pipeline.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional
 
 from universal_video_ai.downloader.download_result import DownloadResult
 from .audio_result import AudioResult
@@ -11,21 +12,10 @@ from .demucs import DemucsOutput
 from .extractor import AudioExtractor
 from . import DEMUCS_AVAILABLE
 
+# Import the SpeechService type to depend on the service instead of a raw transcriber
+from universal_video_ai.speech.service import SpeechService  # type: ignore
+
 _module_logger = logging.getLogger(__name__)
-
-
-class _DemucsLike(Protocol):
-    """Protocol representing the Demucs processor interface we depend on."""
-
-    def separate(self, audio_path: Path, output_dir: Optional[Path] = None) -> DemucsOutput:
-        ...
-
-
-class _TranscriberLike(Protocol):
-    """Protocol representing a transcription backend."""
-
-    def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
-        ...
 
 
 @dataclass(frozen=True)
@@ -36,7 +26,7 @@ class AudioPipelineConfig:
         run_demucs: whether to run Demucs separation after extraction.
         demucs_output_dir: optional base directory for demucs outputs. If None, Demucs decides defaults.
         run_transcription: whether to run speech transcription after extraction.
-        transcription_language: optional language code to pass to the transcriber.
+        transcription_language: optional language code to pass to the transcriber via SpeechService.
     """
     run_demucs: bool = False
     demucs_output_dir: Optional[Path] = None
@@ -55,31 +45,31 @@ class AudioPipelineResult:
 class AudioPipeline:
     """Orchestrator that extracts audio from a downloaded video and optionally separates stems and transcribes.
 
-    Design notes:
-    - Keeps responsibilities small: orchestrate existing components, do not replace them.
-    - Uses dependency injection for testability (pass extractor, demucs_processor, transcriber).
+    Responsibilities:
+    - Compose AudioExtractor, SpeechService, optional Demucs processor.
+    - Use DI for backends to keep import-time light.
     """
 
     def __init__(
         self,
         config: Optional[AudioPipelineConfig] = None,
         extractor: Optional[AudioExtractor] = None,
-        demucs_processor: Optional[_DemucsLike] = None,
-        transcriber: Optional[_TranscriberLike] = None,
+        demucs_processor: Optional[object] = None,
+        speech_service: Optional[SpeechService] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.config = config or AudioPipelineConfig()
         self.extractor = extractor or AudioExtractor()
         self.demucs_processor = demucs_processor
-        self.transcriber = transcriber
+        self.speech_service = speech_service
         self.logger = logger or _module_logger
 
         self.logger.debug(
-            "AudioPipeline initialized run_demucs=%s demucs_processor=%s run_transcription=%s transcriber=%s",
+            "AudioPipeline initialized run_demucs=%s demucs_processor=%s run_transcription=%s speech_service=%s",
             self.config.run_demucs,
             type(self.demucs_processor).__name__ if self.demucs_processor is not None else None,
             self.config.run_transcription,
-            type(self.transcriber).__name__ if self.transcriber is not None else None,
+            type(self.speech_service).__name__ if self.speech_service is not None else None,
         )
 
     def process(self, download_result: DownloadResult, output_dir: Optional[Path] = None) -> AudioPipelineResult:
@@ -89,7 +79,7 @@ class AudioPipeline:
         1. Validate download result.
         2. Extract audio using provided AudioExtractor.
         3. Optionally run Demucs if configured and available.
-        4. Optionally run transcription if configured and transcriber injected.
+        4. Optionally run transcription via SpeechService if configured.
 
         :param download_result: DownloadResult from the downloader.
         :param output_dir: optional directory to place extracted audio (overrides extractor defaults).
@@ -119,16 +109,16 @@ class AudioPipeline:
             demucs_output = self.demucs_processor.separate(audio_result.audio_path, output_dir=self.config.demucs_output_dir)
             self.logger.debug("AudioPipeline: demucs produced %s", demucs_output)
 
-        # Optionally run transcription
+        # Optionally run transcription via SpeechService
         if self.config.run_transcription:
-            if self.transcriber is None:
+            if self.speech_service is None:
                 raise RuntimeError(
-                    "Transcription requested (run_transcription=True) but no transcriber was injected. "
-                    "Provide a transcriber via DI (e.g., a WhisperTranscriber instance) to avoid importing heavy dependencies at module import time."
+                    "Transcription requested (run_transcription=True) but no SpeechService was injected. "
+                    "Provide a SpeechService via DI (e.g., SpeechService(backend=...))."
                 )
             self.logger.info("AudioPipeline: running transcription for %s (lang=%s)",
                              audio_result.audio_path, self.config.transcription_language)
-            transcript = self.transcriber.transcribe(audio_result.audio_path, language=self.config.transcription_language)
+            transcript = self.speech_service.transcribe(audio_result.audio_path, language=self.config.transcription_language)
             self.logger.debug("AudioPipeline: transcription length=%s", len(transcript) if transcript is not None else 0)
 
         return AudioPipelineResult(audio_result=audio_result, demucs_output=demucs_output, transcript=transcript)
