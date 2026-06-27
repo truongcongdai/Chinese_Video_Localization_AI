@@ -5,30 +5,40 @@ from pathlib import Path
 from typing import Protocol, Optional
 import logging
 
-# Import the local whisper wrapper; it lazy-loads heavy deps inside methods.
+# WhisperTranscriber is a local wrapper that lazy-loads heavy deps inside its methods.
+# We import it here only to provide a concrete adapter; this import is safe because
+# WhisperTranscriber itself does not import heavy libs at module import time.
 from .whisper import WhisperTranscriber, WhisperConfig  # type: ignore
 
-logger = logging.getLogger(__name__)
+__all__ = ["SpeechBackend", "WhisperBackend"]
+
+_logger = logging.getLogger(__name__)
 
 
 class SpeechBackend(Protocol):
-    """Protocol that speech backends should implement."""
+    """Protocol for speech backends used by the SpeechService."""
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
+        """Return transcript text for the given audio file."""
         ...
 
 
 class WhisperBackend:
-    """Adapter that exposes a SpeechBackend API backed by the WhisperTranscriber.
+    """Adapter exposing SpeechBackend API backed by `WhisperTranscriber`.
 
-    This adapter keeps the WhisperTranscriber usage behind the backend so callers
-    only depend on the SpeechBackend protocol.
+    This adapter isolates the Whisper-specific wrapper behind a backend interface
+    so callers depend on SpeechBackend only.
     """
 
     def __init__(self, config: Optional[WhisperConfig] = None, logger: Optional[logging.Logger] = None) -> None:
-        self.logger = logger or logger or logging.getLogger(__name__)
+        """
+        :param config: configuration passed to the underlying WhisperTranscriber.
+        :param logger: optional logger; if omitted a module logger is used.
+        """
+        self.logger = logger or _logger
         self._transcriber = WhisperTranscriber(config=config, logger=self.logger)
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
-        self.logger.debug("WhisperBackend: transcribe %s lang=%s", audio_path, language)
+        """Delegate transcription to the underlying WhisperTranscriber."""
+        self.logger.debug("WhisperBackend.transcribe: audio=%s language=%s", audio_path, language)
         return self._transcriber.transcribe(audio_path, language=language)

@@ -4,31 +4,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import logging
+from dataclasses import dataclass
 
 from .backend import SpeechBackend  # type: ignore
 
-logger = logging.getLogger(__name__)
+__all__ = ["SpeechService"]
+
+_logger = logging.getLogger(__name__)
 
 
+@dataclass
 class SpeechService:
     """Service layer for speech operations.
 
-    The service delegates to an injected SpeechBackend. It intentionally does not
-    construct backends itself (DI-first) to avoid heavy import-time side effects.
+    Responsibilities:
+    - Expose a small, testable API to perform speech tasks.
+    - Delegate to an injected SpeechBackend (DI).
     """
 
-    def __init__(self, backend: Optional[SpeechBackend] = None, logger: Optional[logging.Logger] = None) -> None:
-        self.backend = backend
-        self.logger = logger or logger or logging.getLogger(__name__)
+    backend: Optional[SpeechBackend] = None
+    logger: Optional[logging.Logger] = None
+
+    def __post_init__(self) -> None:
+        if self.logger is None:
+            self.logger = _logger
         self.logger.debug("SpeechService initialized backend=%s", type(self.backend).__name__ if self.backend is not None else None)
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
-        """Transcribe audio using the configured backend.
+        """Transcribe `audio_path` using the configured backend.
 
-        Raises:
-            RuntimeError: if no backend is configured.
+        :raises RuntimeError: if no backend is configured.
         """
         if self.backend is None:
-            raise RuntimeError("No SpeechBackend configured for SpeechService")
-        self.logger.info("SpeechService: transcribing %s (lang=%s)", audio_path, language)
+            raise RuntimeError("No SpeechBackend configured in SpeechService")
+        self.logger.info("SpeechService.transcribe: audio=%s language=%s", audio_path, language)
         return self.backend.transcribe(audio_path, language=language)

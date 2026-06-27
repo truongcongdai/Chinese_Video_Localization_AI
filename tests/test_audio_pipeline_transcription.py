@@ -14,10 +14,8 @@ from universal_video_ai.speech.service import SpeechService
 
 @dataclass
 class DummyBackend:
-    """Simple dummy speech backend implementing transcribe()."""
-
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
-        return f"TRANSCRIPT for {audio_path.name} lang={language}"
+        return f"TRANSCRIPT:{audio_path.name}:{language}"
 
 
 def make_download_result(tmp_path: Path) -> DownloadResult:
@@ -40,7 +38,6 @@ def make_download_result(tmp_path: Path) -> DownloadResult:
 
 
 def test_pipeline_transcription_success(tmp_path: Path, monkeypatch):
-    # Arrange: mock extractor.extract to return a predictable AudioResult
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"\x00" * 1024)
 
@@ -61,7 +58,6 @@ def test_pipeline_transcription_success(tmp_path: Path, monkeypatch):
 
     backend = DummyBackend()
     service = SpeechService(backend=backend)
-
     pipeline = AudioPipeline(config=AudioPipelineConfig(run_transcription=True, transcription_language="en"),
                              extractor=AudioExtractor(), speech_service=service)
 
@@ -72,11 +68,10 @@ def test_pipeline_transcription_success(tmp_path: Path, monkeypatch):
     assert result.audio_result.audio_path == audio_path
     assert result.transcript is not None
     assert "TRANSCRIPT" in result.transcript
-    assert "lang=en" in result.transcript
+    assert "lang=en" in result.transcript or ":en" in result.transcript
 
 
 def test_pipeline_transcription_no_service_raises(tmp_path: Path, monkeypatch):
-    # mock extractor again
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"\x00" * 1024)
 
