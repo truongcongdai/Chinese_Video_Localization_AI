@@ -8,24 +8,15 @@ from universal_video_ai.downloader.download_result import DownloadResult
 from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.audio.audio_result import AudioResult
 from universal_video_ai.audio.pipeline import AudioPipeline, AudioPipelineConfig, AudioPipelineResult
-from universal_video_ai.audio.demucs import DemucsOutput
 
 
 @dataclass
-class DummyDemucs:
-    """Simple dummy demucs processor for tests."""
+class DummyTranscriber:
+    """Simple dummy transcriber for tests."""
 
-    def separate(self, audio_path: Path, output_dir: Optional[Path] = None) -> DemucsOutput:
-        base = output_dir or audio_path.parent / "demucs_output"
-        base.mkdir(parents=True, exist_ok=True)
-        # create fake stem files
-        vocals = base / "vocals.wav"
-        drums = base / "drums.wav"
-        bass = base / "bass.wav"
-        other = base / "other.wav"
-        for p in (vocals, drums, bass, other):
-            p.write_bytes(b"dummy")
-        return DemucsOutput(vocals=vocals, drums=drums, bass=bass, other=other)
+    def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
+        # Return deterministic transcript for assertions
+        return f"TRANSCRIPT for {audio_path.name} lang={language}"
 
 
 def make_download_result(tmp_path: Path) -> DownloadResult:
@@ -47,15 +38,13 @@ def make_download_result(tmp_path: Path) -> DownloadResult:
     )
 
 
-def test_pipeline_extract_only(tmp_path: Path, monkeypatch):
+def test_pipeline_transcription_success(tmp_path: Path, monkeypatch):
     # Arrange: mock extractor.extract to return a predictable AudioResult
-    from universal_video_ai.audio.audio_result import AudioResult as AR
-
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"\x00" * 1024)
 
     def fake_extract(video_path, output_dir=None):
-        return AR(
+        return AudioResult(
             success=True,
             audio_path=audio_path,
             duration=1.0,
@@ -69,24 +58,27 @@ def test_pipeline_extract_only(tmp_path: Path, monkeypatch):
     from universal_video_ai.audio.extractor import AudioExtractor
     monkeypatch.setattr(AudioExtractor, "extract", staticmethod(fake_extract))
 
-    pipeline = AudioPipeline(config=AudioPipelineConfig(run_demucs=False), extractor=AudioExtractor())
+    transcriber = DummyTranscriber()
+    pipeline = AudioPipeline(config=AudioPipelineConfig(run_transcription=True, transcription_language="en"),
+                             extractor=AudioExtractor(), transcriber=transcriber)
 
     dr = make_download_result(tmp_path)
     result = pipeline.process(dr, output_dir=tmp_path)
 
     assert isinstance(result, AudioPipelineResult)
     assert result.audio_result.audio_path == audio_path
-    assert result.demucs_output is None
+    assert result.transcript is not None
+    assert "TRANSCRIPT" in result.transcript
+    assert "lang=en" in result.transcript
 
 
-def test_pipeline_with_demucs(tmp_path: Path, monkeypatch):
-    # Arrange: fake extractor + inject dummy Demucs
-    from universal_video_ai.audio.audio_result import AudioResult as AR
+def test_pipeline_transcription_no_transcriber_raises(tmp_path: Path, monkeypatch):
+    # mock extractor again
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"\x00" * 1024)
 
     def fake_extract(video_path, output_dir=None):
-        return AR(
+        return AudioResult(
             success=True,
             audio_path=audio_path,
             duration=1.0,
@@ -100,29 +92,8 @@ def test_pipeline_with_demucs(tmp_path: Path, monkeypatch):
     from universal_video_ai.audio.extractor import AudioExtractor
     monkeypatch.setattr(AudioExtractor, "extract", staticmethod(fake_extract))
 
-    demucs = DummyDemucs()
-    pipeline = AudioPipeline(config=AudioPipelineConfig(run_demucs=True, demucs_output_dir=tmp_path / "demucs_out"),
-                             extractor=AudioExtractor(), demucs_processor=demucs)
+    pipeline = AudioPipeline(config=AudioPipelineConfig(run_transcription=True), extractor=AudioExtractor())
 
     dr = make_download_result(tmp_path)
-    result = pipeline.process(dr, output_dir=tmp_path)
-
-    assert result.audio_result.audio_path == audio_path
-    assert result.demucs_output is not None
-    assert result.demucs_output.vocals.exists()
-    assert result.demucs_output.drums.exists()
-    assert result.demucs_output.bass.exists()
-    assert result.demucs_output.other.exists()
-
-
-def test_pipeline_fails_on_unsuccessful_download(tmp_path: Path):
-    dr = DownloadResult(
-        success=False,
-        platform=Platform.GENERIC,
-        original_url="http://x",
-        final_url="http://x",
-        video_path=tmp_path / "no.mp4",
-    )
-    pipeline = AudioPipeline()
-    with pytest.raises(ValueError):
-        pipeline.process(dr)
+    with pytest.raises(RuntimeError):
+        pipeline.process(dr, output_dir=tmp_path)
