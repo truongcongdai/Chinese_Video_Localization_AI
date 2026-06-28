@@ -1,0 +1,8 @@
+yt-dlp>=2025.06.30
+python-dotenv>=1.0.1
+demucs
+torch
+torchvision
+torchaudio
+openai-whisper
+edge-tts

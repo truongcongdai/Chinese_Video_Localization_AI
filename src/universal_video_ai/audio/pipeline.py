@@ -10,7 +10,7 @@ from universal_video_ai.downloader.download_result import DownloadResult
 from .audio_result import AudioResult
 from .demucs import DemucsOutput
 from .extractor import AudioExtractor
-from . import DEMUCS_AVAILABLE
+from .demucs import DEMUCS_AVAILABLE
 
 # depend on service layer (DI)
 from universal_video_ai.speech.service import SpeechService  # type: ignore

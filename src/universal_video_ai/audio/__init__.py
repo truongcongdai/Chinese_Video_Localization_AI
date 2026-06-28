@@ -1,52 +1,26 @@
+# src/universal_video_ai/audio/__init__.py
 """
-Public API for the audio package.
+Public API for the audio subsystem.
 
-This module intentionally keeps imports minimal and import-safe:
-- Exposes primary lightweight symbols eagerly.
-- Attempts to import Demucs symbols and sets DEMUCS_AVAILABLE accordingly.
+Exposes extraction, separation, and a factory for easy pipeline creation.
 """
 
 from __future__ import annotations
 
-from typing import Optional
-
-import importlib
-import logging
-
-# Import lightweight, safe modules (these should not pull heavy external deps).
 from .audio_result import AudioResult
-from .extractor import AudioExtractor
-from .ffprobe import FFprobeResult
-
-logger = logging.getLogger(__name__)
-
-# Demucs symbols: attempt to import but do not fail the package import if unavailable.
-DEMUCS_AVAILABLE: bool = False
-DemucsProcessor: Optional[type] = None
-DemucsConfig: Optional[type] = None
-DemucsOutput: Optional[type] = None
-
-try:
-    # local import; wrap to avoid raising ImportError on systems without demucs or heavy deps
-    from .demucs import DemucsProcessor as _DemucsProcessor  # type: ignore
-    from .demucs import DemucsConfig as _DemucsConfig  # type: ignore
-    from .demucs import DemucsOutput as _DemucsOutput  # type: ignore
-
-    DemucsProcessor = _DemucsProcessor  # rebind to public names
-    DemucsConfig = _DemucsConfig
-    DemucsOutput = _DemucsOutput
-    DEMUCS_AVAILABLE = True
-except Exception as exc:  # broad by intent: catch ImportError and other runtime issues
-    logger.debug(
-        "Demucs symbols not available from %s (%s). Set DEMUCS_AVAILABLE=False",
-        __name__ + ".demucs",
-        exc,
-    )
+from .extractor import AudioExtractor, AudioConfig
+from .pipeline import AudioPipeline, AudioPipelineConfig, AudioPipelineResult
+from .factory import create_audio_pipeline
+from .demucs import DemucsProcessor, DemucsConfig, DemucsOutput, DEMUCS_AVAILABLE
 
 __all__ = [
-    "AudioExtractor",
     "AudioResult",
-    "FFprobeResult",
+    "AudioExtractor",
+    "AudioConfig",
+    "AudioPipeline",
+    "AudioPipelineConfig",
+    "AudioPipelineResult",
+    "create_audio_pipeline",
     "DemucsProcessor",
     "DemucsConfig",
     "DemucsOutput",
