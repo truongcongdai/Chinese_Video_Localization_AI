@@ -112,7 +112,6 @@ def test_add_credits(tmp_path: Path):
     credits = manager.get_user_credits(user_id=123)
     assert pytest.approx(credits.credits, 0.001) == 8.0  # 3 default + 5 added
 
-# --- append to tests/test_database.py ---
 
 def test_set_user_credits(tmp_path: Path):
     """Test set_user_credits admin API sets exact balance."""
@@ -125,11 +124,11 @@ def test_set_user_credits(tmp_path: Path):
     assert pytest.approx(credits.credits, 0.001) == 3.0
 
     # Set to 10
-    manager.set_user_credits(user_id=42, amount=10.0)
+    manager.set_user_credits(user_id=42, new_balance=10.0)
     credits2 = manager.get_user_credits(user_id=42)
     assert pytest.approx(credits2.credits, 0.001) == 10.0
 
     # Set to 0.5
-    manager.set_user_credits(user_id=42, amount=0.5)
+    manager.set_user_credits(user_id=42, new_balance=0.5)
     credits3 = manager.get_user_credits(user_id=42)
     assert pytest.approx(credits3.credits, 0.001) == 0.5

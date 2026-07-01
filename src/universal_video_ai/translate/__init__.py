@@ -2,7 +2,7 @@
 """
 Public API for the translate subsystem.
 
-Exposes the service layer and exceptions.
+Exposes the service layer, backend layer, and exceptions.
 """
 
 from __future__ import annotations
@@ -28,4 +28,10 @@ __all__ = [
     "TranslateServiceError",
     "TranslationBackendUnavailable",
     "TranslationFailed",
+    # Backend exports (for backward compatibility and testing)
+    "Translator",
+    "TranslatorConfig",
+    "TranslatorFactory",
+    "NoOpTranslator",
+    "TranslationError",
 ]

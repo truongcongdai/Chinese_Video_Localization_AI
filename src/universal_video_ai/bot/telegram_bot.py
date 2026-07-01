@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import logging
+import time
 from typing import Callable, Dict, List, Optional, Set
 
 from universal_video_ai.config import TEMP_DIR
@@ -96,6 +97,9 @@ class TelegramBot:
     validator: UrlValidator | None = None
     logger: Optional[logging.Logger] = None
     _job_to_chat: Dict[str, int] = field(default_factory=dict)
+    _rate_limit_cache: Dict[int, tuple[int, float]] = field(default_factory=dict)  # chat_id -> (count, reset_time)
+    _rate_limit_max_per_minute: int = 10
+    _language: Dict[int, str] = field(default_factory=dict)  # chat_id -> "en" or "vi"
 
     def __post_init__(self) -> None:
         # Normalize types and set defaults
@@ -110,12 +114,14 @@ class TelegramBot:
         self.adapter.register_command("download", self._handle_download)
         self.adapter.register_command("localize", self._handle_localize)
         self.adapter.register_command("credits", self._handle_credits)
+        self.adapter.register_command("language", self._handle_language)  # NEW
+        self.adapter.register_command("stats", self._handle_stats)  # NEW
 
         # Admin commands
         self.adapter.register_command("addcredits", self._handle_addcredits)
         self.adapter.register_command("setcredits", self._handle_setcredits)
 
-        self.logger.debug("TelegramBot initialized; handlers registered for start/status/download/localize/credits/addcredits/setcredits")
+        self.logger.debug("TelegramBot initialized; handlers registered for start/status/download/localize/credits/language/stats/addcredits/setcredits")
 
     # ---- Admin helpers ----
     def _is_admin(self, chat_id: int) -> bool:
@@ -123,40 +129,109 @@ class TelegramBot:
             return False
         return chat_id in self.admin_chat_ids
 
+    # ---- Localization strings ----
+    _strings = {
+        "en": {
+            "start": "🎬 Universal Video AI Bot\nCommands:\n/download <url> - download video only\n/localize <url> - full pipeline (transcribe → translate → TTS → render) [cost: 1 credit]\n/credits - show your credit balance\n/status - show bot status\n/language en|vi - set language\n",
+            "status_running": "Bot is running ✓\n",
+            "status_localization": "Localization: {}\n",
+            "enabled": "✓ Enabled",
+            "disabled": "✗ Disabled",
+            "usage": "Usage: /download <video_url>",
+            "invalid_url": "❌ Invalid URL: {}",
+            "download_start": "⏳ Starting download: {}",
+            "download_success": "✓ Download completed!\n📽️ {}\nPlatform: {}\nFile: {}",
+            "download_failed": "❌ Download failed: {}",
+            "localize_start": "⏳ Starting localization: {}",
+            "localize_unavailable": "❌ Localization service not available",
+            "credits_insufficient": "❌ Insufficient credits!",
+            "credits_show": "💰 Your Credit Balance\n\nBalance: {:.2f} credits\nTotal Used: {:.2f} credits\nCreated: {}",
+            "credits_user": "💰 User {} Credit Balance\n\nBalance: {:.2f} credits\nTotal Used: {:.2f} credits",
+            "language_set": "✓ Language set to {}",
+            "language_invalid": "❌ Language not supported. Use: en, vi",
+            "stats_title": "📊 User Statistics\n",
+            "stats_jobs": "Jobs processed: {}",
+            "stats_credits": "Total credits spent: {:.2f}",
+        },
+        "vi": {
+            "start": "🎬 Bot Định Dạng Video AI\nLệnh:\n/download <url> - tải video\n/localize <url> - toàn bộ quy trình (ghi âm → dịch → TTS → render) [chi phí: 1 credit]\n/credits - xem số dư credit\n/status - trạng thái bot\n/language en|vi - đặt ngôn ngữ\n",
+            "status_running": "Bot đang chạy ✓\n",
+            "status_localization": "Định dạng: {}\n",
+            "enabled": "✓ Bật",
+            "disabled": "✗ Tắt",
+            "usage": "Cách dùng: /download <url_video>",
+            "invalid_url": "❌ URL không hợp lệ: {}",
+            "download_start": "⏳ Đang tải: {}",
+            "download_success": "✓ Tải xong!\n📽️ {}\nNền tảng: {}\nFile: {}",
+            "download_failed": "❌ Tải thất bại: {}",
+            "localize_start": "⏳ Đang định dạng: {}",
+            "localize_unavailable": "❌ Dịch vụ định dạng không khả dụng",
+            "credits_insufficient": "❌ Không đủ credit!",
+            "credits_show": "💰 Số Dư Credit\n\nSố dư: {:.2f} credits\nTổng dùng: {:.2f} credits\nTạo lúc: {}",
+            "credits_user": "💰 Số Dư Credit Người Dùng {}\n\nSố dư: {:.2f} credits\nTổng dùng: {:.2f} credits",
+            "language_set": "✓ Ngôn ngữ đặt thành {}",
+            "language_invalid": "❌ Ngôn ngữ không hỗ trợ. Dùng: en, vi",
+            "stats_title": "📊 Thống Kê Người Dùng\n",
+            "stats_jobs": "Công việc xử lý: {}",
+            "stats_credits": "Tổng credit dùng: {:.2f}",
+        }
+    }
+
+    def _get_string(self, chat_id: int, key: str, *args) -> str:
+        """Get localized string."""
+        lang = self._language.get(chat_id, "en")
+        template = self._strings.get(lang, {}).get(key, "")
+        try:
+            return template.format(*args) if args else template
+        except (IndexError, KeyError):
+            return template
+
+    def _check_rate_limit(self, chat_id: int) -> bool:
+        """Check and enforce rate limiting (10 commands per minute)."""
+        now = time.time()
+        if chat_id in self._rate_limit_cache:
+            count, reset_time = self._rate_limit_cache[chat_id]
+            if now < reset_time:
+                if count >= self._rate_limit_max_per_minute:
+                    self.logger.warning("Rate limit exceeded for chat=%s", chat_id)
+                    return False
+                self._rate_limit_cache[chat_id] = (count + 1, reset_time)
+            else:
+                self._rate_limit_cache[chat_id] = (1, now + 60.0)
+        else:
+            self._rate_limit_cache[chat_id] = (1, now + 60.0)
+        return True
+
     # ---- Handlers ----
     def _handle_start(self, chat_id: int, args: List[str]) -> None:
-        """
-        Handle /start command.
-        """
-        text = (
-            "🎬 Universal Video AI Bot\n"
-            "Commands:\n"
-            "/download <url> - download video only\n"
-            "/localize <url> - full pipeline (transcribe → translate → TTS → render) [cost: 1 credit]\n"
-            "/credits - show your credit balance\n"
-            "/status - show bot status\n"
-        )
+        """Handle /start command."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
+        text = self._get_string(chat_id, "start")
         self.adapter.send_message(chat_id, text)
         self.logger.info("Handled /start for chat=%s", chat_id)
 
     def _handle_status(self, chat_id: int, args: List[str]) -> None:
-        """
-        Handle /status command.
-        """
+        """Handle /status command."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
         localization_available = self.localization_service is not None
-        text = (
-            "Bot is running ✓\n"
-            f"Localization: {'✓ Enabled' if localization_available else '✗ Disabled'}\n"
-        )
+        status_text = self._get_string(chat_id, "status_localization",
+                                       self._get_string(chat_id, "enabled" if localization_available else "disabled"))
+        text = self._get_string(chat_id, "status_running") + status_text
         self.adapter.send_message(chat_id, text)
         self.logger.info("Handled /status for chat=%s", chat_id)
 
     def _handle_download(self, chat_id: int, args: List[str]) -> None:
-        """
-        Handle /download <url> command.
-        """
+        """Handle /download <url> command."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
+
         if not args:
-            self.adapter.send_message(chat_id, "Usage: /download <video_url>")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "usage"))
             self.logger.debug("Download called with no args by chat=%s", chat_id)
             return
 
@@ -168,42 +243,42 @@ class TelegramBot:
             self.validator.validate_or_raise(url)
         except Exception as exc:
             self.logger.warning("Invalid URL provided by chat=%s: %s", chat_id, exc)
-            self.adapter.send_message(chat_id, f"❌ Invalid URL: {exc}")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "invalid_url", exc))
             return
 
         # Acknowledge start
-        self.adapter.send_message(chat_id, f"⏳ Starting download: {url}")
+        self.adapter.send_message(chat_id, self._get_string(chat_id, "download_start", url))
         self.logger.info("Starting download for chat=%s url=%s", chat_id, url)
 
         try:
             result: DownloadResult = self.download_service.download(url=url, output_dir=self.output_dir)
         except Exception as exc:
             self.logger.exception("Download failed for url=%s", url)
-            self.adapter.send_message(chat_id, f"❌ Download failed: {exc}")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "download_failed", exc))
             return
 
         # Send final status
         if getattr(result, "success", False):
-            msg = f"✓ Download completed!\n📽️ {result.title or 'untitled'}\nPlatform: {result.platform}\nFile: {result.video_path}"
+            msg = self._get_string(chat_id, "download_success", result.title or 'untitled', result.platform, result.video_path)
             self.adapter.send_message(chat_id, msg)
             self.logger.info("Download succeeded for chat=%s url=%s", chat_id, url)
         else:
-            self.adapter.send_message(chat_id, f"❌ Download failed for URL: {url}")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "download_failed", url))
             self.logger.info("Download reported failure for chat=%s url=%s", chat_id, url)
 
     def _handle_localize(self, chat_id: int, args: List[str]) -> None:
-        """
-        Handle /localize <url> command.
+        """Handle /localize <url> command."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
 
-        Costs: 1 credit per localization job (checked and deducted via DatabaseManager).
-        """
         if self.localization_service is None:
-            self.adapter.send_message(chat_id, "❌ Localization service not available")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "localize_unavailable"))
             self.logger.warning("Localize requested but no LocalizationService injected, chat=%s", chat_id)
             return
 
         if not args:
-            self.adapter.send_message(chat_id, "Usage: /localize <video_url>")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "usage"))
             self.logger.debug("Localize called with no args by chat=%s", chat_id)
             return
 
@@ -215,17 +290,15 @@ class TelegramBot:
             self.validator.validate_or_raise(url)
         except Exception as exc:
             self.logger.warning("Invalid URL provided by chat=%s: %s", chat_id, exc)
-            self.adapter.send_message(chat_id, f"❌ Invalid URL: {exc}")
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "invalid_url", exc))
             return
 
         # Check credits
         if self.database_manager:
             user_credit = self.database_manager.get_user_credits(chat_id)
             if user_credit.credits < 1.0:
-                self.adapter.send_message(
-                    chat_id,
-                    f"❌ Insufficient credits!\nCurrent balance: {user_credit.credits:.1f}\nRequired: 1.0\nContact admin for credits."
-                )
+                msg = f"❌ Insufficient credits!\nCurrent balance: {user_credit.credits:.1f}\nRequired: 1.0\nContact admin for credits."
+                self.adapter.send_message(chat_id, msg)
                 self.logger.warning("User %s attempted localization with insufficient credits", chat_id)
                 return
 
@@ -274,6 +347,10 @@ class TelegramBot:
 
     def _handle_credits(self, chat_id: int, args: List[str]) -> None:
         """Handle /credits command to show balance."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
+
         if not self.database_manager:
             self.adapter.send_message(chat_id, "Credit system not available")
             return
@@ -307,6 +384,39 @@ class TelegramBot:
         )
         self.adapter.send_message(chat_id, text)
         self.logger.info("Showed credits for user %s: %.1f", chat_id, user_credit.credits)
+
+    def _handle_language(self, chat_id: int, args: List[str]) -> None:
+        """Handle /language en|vi command."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
+
+        if not args:
+            current = self._language.get(chat_id, "en")
+            self.adapter.send_message(chat_id, f"Current language: {current}")
+            return
+        lang = args[0].lower()
+        if lang not in ["en", "vi"]:
+            self.adapter.send_message(chat_id, self._get_string(chat_id, "language_invalid"))
+            return
+        self._language[chat_id] = lang
+        self.adapter.send_message(chat_id, self._get_string(chat_id, "language_set", lang))
+        self.logger.info("Language set to %s for chat=%s", lang, chat_id)
+
+    def _handle_stats(self, chat_id: int, args: List[str]) -> None:
+        """Handle /stats command (user statistics)."""
+        if not self._check_rate_limit(chat_id):
+            self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
+            return
+
+        if not self.database_manager:
+            self.adapter.send_message(chat_id, "Database not available")
+            return
+        uc = self.database_manager.get_user_credits(chat_id)
+        msg = self._get_string(chat_id, "stats_title")
+        msg += self._get_string(chat_id, "stats_credits", uc.total_used)
+        self.adapter.send_message(chat_id, msg)
+        self.logger.info("Stats requested by chat=%s", chat_id)
 
     # ---- Admin handlers ----
     def _handle_addcredits(self, chat_id: int, args: List[str]) -> None:
@@ -361,9 +471,7 @@ class TelegramBot:
 
     # ---- Lifecycle ----
     def start(self) -> None:
-        """
-        Start adapter polling / event loop.
-        """
+        """Start adapter polling / event loop."""
         self.logger.info("Starting TelegramBot adapter")
         self.adapter.start()
 

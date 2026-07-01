@@ -1,3 +1,4 @@
+
 # src/universal_video_ai/database/manager.py
 from __future__ import annotations
 
@@ -75,7 +76,7 @@ class DatabaseManager:
         self._migrations: Dict[int, Callable[[], None]] = {
             1: self._migrate_1_create_downloads,
             2: self._migrate_2_create_users,
-            # future migrations: add here as {3: self._migrate_3_xyz, ...}
+            3: self._migrate_3_create_audit_log,  # NEW
         }
 
     # ---------------------------
@@ -220,6 +221,68 @@ class DatabaseManager:
         self._conn.commit()
         self.logger.debug("Migration 2: users table ensured")
 
+    def _migrate_3_create_audit_log(self) -> None:
+        """
+        Migration v3: add audit_log table for credit transaction tracking.
+        Idempotent via CREATE TABLE IF NOT EXISTS.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                old_value REAL,
+                new_value REAL,
+                reason TEXT,
+                admin_id INTEGER,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+        self.logger.debug("Migration 3: audit_log table ensured")
+
+    # ---------------------------
+    # Audit Logging (new feature)
+    # ---------------------------
+    def log_audit(
+        self,
+        user_id: int,
+        action: str,
+        old_value: Optional[float] = None,
+        new_value: Optional[float] = None,
+        reason: Optional[str] = None,
+        admin_id: Optional[int] = None,
+    ) -> None:
+        """Log a credit transaction to audit table."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO audit_log (user_id, action, old_value, new_value, reason, admin_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, action, old_value, new_value, reason, admin_id, self._now()),
+            )
+            self._conn.commit()
+            self.logger.info(
+                "Audit: user=%s action=%s old=%s new=%s reason=%s admin=%s",
+                user_id, action, old_value, new_value, reason, admin_id,
+            )
+
+    def get_audit_log(self, user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieve audit log for a user."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT * FROM audit_log WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            )
+            rows = cur.fetchall()
+            return [dict(row) for row in rows]
+
     # ---------------------------
     # Downloads API (existing)
     # ---------------------------
@@ -359,105 +422,60 @@ class DatabaseManager:
             return self._row_to_user_credit(row)
 
     def deduct_credits(self, user_id: int, amount: float) -> bool:
+        """Deduct credits; returns True if successful, False if insufficient."""
         with self._lock:
-            cur = self._conn.cursor()
-            cur.execute("SELECT credits FROM users WHERE user_id = ?", (user_id,))
-            row = cur.fetchone()
-
-            if row is None:
-                # create default user record first
-                created = self._now()
-                cur.execute(
-                    """
-                    INSERT INTO users (user_id, credits, total_used, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (user_id, 3.0, 0.0, created, created),
-                )
-                self._conn.commit()
-                cur.execute("SELECT credits FROM users WHERE user_id = ?", (user_id,))
-                row = cur.fetchone()
-
-            current = float(row["credits"])
-            if current < amount:
-                self.logger.debug("User %s has insufficient credits: %.2f < %.2f", user_id, current, amount)
+            uc = self.get_user_credits(user_id)
+            if uc.credits < amount:
+                self.logger.warning("Insufficient credits: user=%s has %s, need %s", user_id, uc.credits, amount)
                 return False
-
-            new_credits = current - amount
-            updated = self._now()
+            new_balance = uc.credits - amount
+            updatedAt = self._now()
+            cur = self._conn.cursor()
             cur.execute(
-                """
-                UPDATE users
-                SET credits = ?, total_used = total_used + ?, updated_at = ?
-                WHERE user_id = ?
-                """,
-                (new_credits, amount, updated, user_id),
+                "UPDATE users SET credits = ?, updated_at = ?, total_used = total_used + ? WHERE user_id = ?",
+                (new_balance, updatedAt, amount, user_id),
             )
             self._conn.commit()
-            self.logger.info("Deducted %.2f credits from user %s (new balance: %.2f)", amount, user_id, new_credits)
+            self.logger.info("Deducted %.2f credits from user=%s, new_balance=%.2f", amount, user_id, new_balance)
+            # NEW: Audit log
+            self.log_audit(user_id, "deduct", old_value=uc.credits, new_value=new_balance, reason="Localization job")
             return True
 
-    def add_credits(self, user_id: int, amount: float) -> None:
+    def add_credits(self, user_id: int, amount: float) -> float:
+        """Add credits to user account; returns new balance."""
         with self._lock:
+            uc = self.get_user_credits(user_id)
+            new_balance = uc.credits + amount
+            updatedAt = self._now()
             cur = self._conn.cursor()
-            cur.execute("SELECT credits FROM users WHERE user_id = ?", (user_id,))
-            row = cur.fetchone()
-
-            if row is None:
-                created = self._now()
-                cur.execute(
-                    """
-                    INSERT INTO users (user_id, credits, total_used, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (user_id, amount, 0.0, created, created),
-                )
-            else:
-                current = float(row["credits"])
-                new_credits = current + amount
-                updated = self._now()
-                cur.execute(
-                    """
-                    UPDATE users
-                    SET credits = ?, updated_at = ?
-                    WHERE user_id = ?
-                    """,
-                    (new_credits, updated, user_id),
-                )
-
+            cur.execute(
+                "UPDATE users SET credits = ?, updated_at = ? WHERE user_id = ?",
+                (new_balance, updatedAt, user_id),
+            )
             self._conn.commit()
-            self.logger.info("Added %.2f credits to user %s", amount, user_id)
+            self.logger.info("Added %.2f credits to user=%s, new_balance=%.2f", amount, user_id, new_balance)
+            # NEW: Audit log
+            self.log_audit(user_id, "add", old_value=uc.credits, new_value=new_balance)
+            return new_balance
 
-    def set_user_credits(self, user_id: int, amount: float) -> None:
-        """
-        Set user's credits to exact amount (create user if necessary).
-        This is an admin-level operation: it overwrites the `credits` value but
-        does not modify `total_used` (so usage history is not retroactively changed).
-        """
+    def set_user_credits(self, user_id: int, new_balance: float, reason: Optional[str] = None,
+                         admin_id: Optional[int] = None) -> float:
+        """Set user balance to exact amount (admin operation)."""
         with self._lock:
+            uc = self.get_user_credits(user_id)
+            old_balance = uc.credits
+            updatedAt = self._now()
             cur = self._conn.cursor()
-            cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-            if cur.fetchone() is None:
-                now = self._now()
-                cur.execute(
-                    """
-                    INSERT INTO users (user_id, credits, total_used, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (user_id, float(amount), 0.0, now, now),
-                )
-            else:
-                now = self._now()
-                cur.execute(
-                    """
-                    UPDATE users
-                    SET credits = ?, updated_at = ?
-                    WHERE user_id = ?
-                    """,
-                    (float(amount), now, user_id),
-                )
+            cur.execute(
+                "UPDATE users SET credits = ?, updated_at = ? WHERE user_id = ?",
+                (new_balance, updatedAt, user_id),
+            )
             self._conn.commit()
-            self.logger.info("Set credits for user %s to %.2f", user_id, amount)
+            self.logger.info("Set user=%s balance from %.2f to %.2f", user_id, old_balance, new_balance)
+            # NEW: Audit log with admin tracking
+            self.log_audit(user_id, "set", old_value=old_balance, new_value=new_balance,
+                          reason=reason or "Admin adjustment", admin_id=admin_id)
+            return new_balance
 
     def _row_to_user_credit(self, row: sqlite3.Row) -> UserCredit:
         return UserCredit(
@@ -467,14 +485,3 @@ class DatabaseManager:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
-
-    # ---------------------------
-    # Cleanup
-    # ---------------------------
-    def close(self) -> None:
-        try:
-            with self._lock:
-                self._conn.close()
-                self.logger.debug("Closed database connection to %s", self.db_path)
-        except Exception:
-            self.logger.exception("Error closing database connection")
