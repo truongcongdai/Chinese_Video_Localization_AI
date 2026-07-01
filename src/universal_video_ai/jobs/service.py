@@ -5,7 +5,7 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, UTC
 from threading import Thread
 import json
 
@@ -72,9 +72,9 @@ class JobService:
             result_path=result_path or job.result_path,
             error=error or job.error,
             created_at=job.created_at,
-            started_at=job.started_at or (datetime.utcnow() if status == JobStatus.RUNNING else None),
+            started_at=job.started_at or (datetime.now(UTC) if status == JobStatus.RUNNING else None),
             completed_at=job.completed_at or (
-                datetime.utcnow() if status in (JobStatus.COMPLETED, JobStatus.FAILED) else None),
+                datetime.now(UTC) if status in (JobStatus.COMPLETED, JobStatus.FAILED) else None),
             duration_seconds=job.duration_seconds,
         )
 
@@ -135,7 +135,7 @@ class JobService:
 
         data = {
             "jobs": [job.to_dict() for job in self.jobs.values()],
-            "exported_at": datetime.utcnow().isoformat(),
+            "exported_at": datetime.now(UTC).isoformat(),
         }
 
         with open(output_path, "w", encoding="utf-8") as f:

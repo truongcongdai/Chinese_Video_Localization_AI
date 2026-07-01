@@ -14,6 +14,13 @@ from .exceptions import (
     TTSBackendUnavailable,
     SynthesisError,
 )
+from .tts import (
+    TTS,
+    TTSConfig,
+    TTSFactory,
+    NoOpTTS,
+    EdgeTTS,
+)
 
 __all__ = [
     "TTSService",

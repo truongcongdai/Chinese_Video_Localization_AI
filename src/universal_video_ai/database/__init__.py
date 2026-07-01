@@ -1,11 +1,4 @@
 # src/universal_video_ai/database/__init__.py
-"""
-Database helpers for Universal Video AI.
+from .manager import DatabaseManager, DownloadRecord, UserCredit
 
-Exports:
-- DatabaseManager
-- DownloadRecord
-"""
-from .manager import DatabaseManager, DownloadRecord
-
-__all__ = ["DatabaseManager", "DownloadRecord"]
+__all__ = ["DatabaseManager", "DownloadRecord", "UserCredit"]

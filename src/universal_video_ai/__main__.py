@@ -88,6 +88,11 @@ Examples:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render final video with audio and subtitles (requires --tts or --mix-audio)",
+    )
 
     args = parser.parse_args()
 
