@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from universal_video_ai.cache import RedisCache
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
@@ -15,3 +16,5 @@ for directory in (
     directory.mkdir(parents=True, exist_ok=True)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+cache = RedisCache(url=REDIS_URL, fallback=True)

@@ -6,3 +6,4 @@ torchvision
 torchaudio
 openai-whisper
 edge-tts
+redis>=5.0.0

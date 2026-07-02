@@ -6,7 +6,7 @@ from typing import Optional
 import logging
 from dataclasses import dataclass
 
-from .backend import TTS  # type: ignore
+from .tts import TTS  # type: ignore
 from .exceptions import TTSBackendUnavailable, SynthesisError  # type: ignore
 
 __all__ = ["TTSService"]
