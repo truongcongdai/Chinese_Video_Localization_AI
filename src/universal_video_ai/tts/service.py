@@ -6,7 +6,7 @@ from typing import Optional
 import logging
 from dataclasses import dataclass
 
-from .backend import TTSBackend  # type: ignore
+from .backend import TTS  # type: ignore
 from .exceptions import TTSBackendUnavailable, SynthesisError  # type: ignore
 
 __all__ = ["TTSService"]
@@ -16,9 +16,10 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class TTSService:
-    """Service layer for text-to-speech operations."""
+    """Service layer for TTS operations."""
 
-    backend: Optional[TTSBackend] = None
+    backend: Optional[TTS] = None
+    cache: Optional[object] = None  # RedisCache
     logger: Optional[logging.Logger] = None
 
     def __post_init__(self) -> None:
@@ -26,27 +27,43 @@ class TTSService:
             self.logger = _logger
         self.logger.debug("TTSService initialized backend=%s", type(self.backend).__name__ if self.backend else None)
 
-    def synthesize(self, text: str, output_path: Path, language: str = "en") -> Path:
+    def synthesize(
+            self,
+            text: str,
+            language: str = "vi",
+            voice: Optional[str] = None,
+            output_path: Optional[Path] = None,
+    ) -> Path:
         """
-        Synthesize text to speech.
+        Synthesize text to speech with caching.
 
-        :param text: text to synthesize
-        :param output_path: where to save audio
-        :param language: language code (default "en")
         :raises TTSBackendUnavailable: if no backend is configured.
         :raises SynthesisError: if synthesis fails.
-        :return: output_path
         """
         if self.backend is None:
             self.logger.error("TTSService.synthesize: no backend configured")
-            raise TTSBackendUnavailable("No TTSBackend configured")
+            raise TTSBackendUnavailable("No TTS backend configured")
 
-        output_path = Path(output_path).resolve()
-        self.logger.info("TTSService.synthesize: language=%s output=%s", language, output_path)
+        # Check cache first
+        if self.cache:
+            cache_key = self.cache.make_key("tts", language, voice or "default", text[:50])
+            cached_path_str = self.cache.get(cache_key)
+            if cached_path_str and Path(cached_path_str).exists():
+                self.logger.debug("TTS cache HIT for %s voice=%s", language, voice)
+                return Path(cached_path_str)
+
+        self.logger.info("TTSService.synthesize: language=%s voice=%s", language, voice)
         try:
-            return self.backend.synthesize(text, output_path, language=language)
+            result = self.backend.synthesize(text, language=language, voice=voice, output_path=output_path)
+
+            # Cache result
+            if self.cache:
+                cache_key = self.cache.make_key("tts", language, voice or "default", text[:50])
+                self.cache.set(cache_key, str(result), ttl_seconds=86400 * 7)
+
+            return result
         except SynthesisError:
             raise
         except Exception as exc:
             self.logger.exception("Unexpected error in TTSService: %s", exc)
-            raise SynthesisError("Speech synthesis failed", cause=exc) from exc
+            raise SynthesisError("Synthesis failed", cause=exc) from exc
