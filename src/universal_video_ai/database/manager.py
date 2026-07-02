@@ -37,12 +37,14 @@ class DownloadRecord:
 
 @dataclass
 class UserCredit:
-    """Represents a user's credit balance."""
+    """Represents a user's credit balance and subscription tier."""
     user_id: int  # e.g. Telegram chat id
     credits: float
     total_used: float
     created_at: float
     updated_at: float
+    subscription_tier: str = "free"  # free, pro, enterprise
+    tier_reset_at: Optional[float] = None  # When monthly reset happens
 
 
 class DatabaseManager:
@@ -76,7 +78,8 @@ class DatabaseManager:
         self._migrations: Dict[int, Callable[[], None]] = {
             1: self._migrate_1_create_downloads,
             2: self._migrate_2_create_users,
-            3: self._migrate_3_create_audit_log,  # NEW
+            3: self._migrate_3_create_audit_log,
+            4: self._migrate_4_add_subscription,  # NEW
         }
 
     # ---------------------------
@@ -243,6 +246,25 @@ class DatabaseManager:
         )
         self._conn.commit()
         self.logger.debug("Migration 3: audit_log table ensured")
+
+    def _migrate_4_add_subscription(self) -> None:
+        """
+        Migration v4: add subscription tier columns to users table.
+        Idempotent via ALTER TABLE IF NOT EXISTS.
+        """
+        cur = self._conn.cursor()
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN subscription_tier TEXT DEFAULT 'free'")
+        except sqlite3.OperationalError:
+            # Column already exists
+            pass
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN tier_reset_at REAL")
+        except sqlite3.OperationalError:
+            # Column already exists
+            pass
+        self._conn.commit()
+        self.logger.debug("Migration 4: subscription columns added to users table")
 
     # ---------------------------
     # Audit Logging (new feature)
@@ -477,11 +499,53 @@ class DatabaseManager:
                           reason=reason or "Admin adjustment", admin_id=admin_id)
             return new_balance
 
+    def set_subscription_tier(self, user_id: int, tier: str) -> None:
+        """Set user subscription tier (free, pro, enterprise)."""
+        if tier not in ["free", "pro", "enterprise"]:
+            raise ValueError(f"Invalid subscription tier: {tier}")
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE users SET subscription_tier = ?, updated_at = ? WHERE user_id = ?",
+                (tier, self._now(), user_id),
+            )
+            self._conn.commit()
+            self.logger.info("Set subscription tier for user=%s to %s", user_id, tier)
+            self.log_audit(user_id, "tier_change", reason=f"Changed to {tier}")
+
+    def get_monthly_credit_limit(self, user_id: int) -> float:
+        """Get monthly credit limit based on subscription tier."""
+        uc = self.get_user_credits(user_id)
+        tier_limits = {
+            "free": 3.0,
+            "pro": 100.0,
+            "enterprise": 999999.0,
+        }
+        return tier_limits.get(uc.subscription_tier, 3.0)
+
+    def reset_monthly_credits(self, user_id: int) -> None:
+        """Reset credits to monthly limit (admin operation)."""
+        limit = self.get_monthly_credit_limit(user_id)
+        self.set_user_credits(user_id, limit, reason="Monthly reset")
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE users SET tier_reset_at = ? WHERE user_id = ?",
+                (self._now(), user_id),
+            )
+            self._conn.commit()
+        self.logger.info("Monthly credits reset for user=%s to %.2f", user_id, limit)
+
     def _row_to_user_credit(self, row: sqlite3.Row) -> UserCredit:
+        """Convert sqlite3.Row to UserCredit dataclass."""
+        row_dict = dict(row)
         return UserCredit(
-            user_id=int(row["user_id"]),
-            credits=float(row["credits"]),
-            total_used=float(row["total_used"]),
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
+            user_id=int(row_dict["user_id"]),
+            credits=float(row_dict["credits"]),
+            total_used=float(row_dict["total_used"]),
+            created_at=float(row_dict["created_at"]),
+            updated_at=float(row_dict["updated_at"]),
+            subscription_tier=row_dict.get("subscription_tier", "free") or "free",
+            tier_reset_at=row_dict.get("tier_reset_at"),
         )
