@@ -9,18 +9,19 @@ import logging
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
 
-# Add src to path
+# Ensure package import works when running as script in Docker context
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.universal_video_ai.config import setup_logger, TEMP_DIR
+from src.universal_video_ai.config import TEMP_DIR
 from src.universal_video_ai.downloader.service import DownloadService
 from src.universal_video_ai.downloader.validator import UrlValidator
 from src.universal_video_ai.database import DatabaseManager
 from src.universal_video_ai.bot.telegram_bot import TelegramBot, MockAdapter
 from src.universal_video_ai.bot.server import start_health_check_server
+from src.universal_video_ai.logger import setup_logger
 
+# Initialize logger for this runner
 logger = setup_logger("bot_runner")
 
 
@@ -36,7 +37,8 @@ def main() -> None:
     logger.info("Database initialized at %s", args.db)
 
     # Setup services
-    downloader = DownloadService(logger=logger)
+    # DownloadService does not accept logger in constructor; instantiate without kwargs
+    downloader = DownloadService()
     validator = UrlValidator()
 
     # Setup bot with mock adapter (for testing)
@@ -54,12 +56,15 @@ def main() -> None:
     )
 
     # Start health check server
-    health_server = start_health_check_server(host="127.0.0.1", port=8000)
+    health_server = start_health_check_server(host="0.0.0.0", port=8000)
 
     # Graceful shutdown
     def signal_handler(sig, frame):
         logger.info("Shutdown signal received (%s)", sig)
-        bot.stop()
+        try:
+            bot.stop()
+        except Exception:
+            logger.exception("Error stopping bot")
         health_server.stop()
         sys.exit(0)
 
@@ -77,6 +82,10 @@ def main() -> None:
     # Start bot (blocks)
     try:
         bot.start()
+        # Keep the main thread alive since MockAdapter doesn't block
+        while True:
+            import time
+            time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt")
         bot.stop()

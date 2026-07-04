@@ -16,11 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source
 COPY . .
 
-# Install package
+# Install package (requires setup.py or pyproject.toml present)
 RUN pip install -e .
 
-# Health check
+# Health check pointing to the bot health server on port 8000
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=40s \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f http://localhost:8000/health || exit 1
 
-CMD ["python", "-m", "universal_video_ai"]
+# Default command: run the local bot runner (long-running)
+CMD ["python", "scripts/run_bot.py", "--db", "/app/database.sqlite3"]

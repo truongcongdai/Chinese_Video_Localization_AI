@@ -1,10 +1,10 @@
-version: '3.9'
 
 services:
   app:
     build: .
     container_name: video-ai-app
     restart: always
+    command: python scripts/run_bot.py --db /app/database.sqlite3
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS}
@@ -16,10 +16,10 @@ services:
       - LOG_LEVEL=INFO
       - REDIS_URL=redis://redis:6379/0
     volumes:
-      - ./database.sqlite3:/app/database.sqlite3
+      - db-data:/app/data
       - ./temp:/app/temp
       - ./output:/app/output
-      - ./logs:/app/logs
+      - ./logs:/app/log
     ports:
       - "8000:8000"  # Health check server
       - "5000:5000"  # Admin API (optional)
@@ -44,7 +44,7 @@ services:
     volumes:
       - redis-data:/data
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -55,4 +55,5 @@ services:
         max-file: "2"
 
 volumes:
+  db-data:
   redis-data:
