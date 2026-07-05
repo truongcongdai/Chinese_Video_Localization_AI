@@ -5,9 +5,9 @@ services:
     container_name: video-ai-app
     restart: always
     command: python scripts/run_bot.py --db /app/database.sqlite3
+    env_file:
+      - .env
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS}
       - DATABASE_PATH=/app/database.sqlite3
       - TEMP_DIR=/app/temp
       - OUTPUT_DIR=/app/output

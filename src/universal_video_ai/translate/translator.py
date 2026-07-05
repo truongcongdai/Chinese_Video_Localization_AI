@@ -150,4 +150,37 @@ class TranslatorFactory:
 
             return _GoogleTranslator(cfg, log)
 
+        if provider == "deepl":
+            try:
+                # Try to import deepl lazily
+                import deepl  # type: ignore
+            except Exception as exc:
+                raise ValueError(
+                    "DeepL provider requested but deepl is not available. Install deepl or choose another provider."
+                ) from exc
+
+            if not cfg.api_key:
+                raise ValueError("DeepL provider requires api_key in TranslatorConfig")
+
+            class _DeepLTranslator:
+                def __init__(self, cfg: TranslatorConfig, logger: logging.Logger) -> None:
+                    self.cfg = cfg
+                    self.logger = logger
+                    self.client = deepl.Translator(cfg.api_key)
+
+                def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
+                    dest = dest_lang or self.cfg.dest_lang or "en-US"
+                    src = src_lang or self.cfg.src_lang or None
+                    try:
+                        result = self.client.translate_text(
+                            text,
+                            source_lang=src,
+                            target_lang=dest,
+                        )
+                        return result.text
+                    except Exception as exc:  # pragma: no cover - depends on external lib
+                        raise TranslationError(f"DeepL translation failed: {exc}") from exc
+
+            return _DeepLTranslator(cfg, log)
+
         raise ValueError(f"Unknown translation provider: {cfg.provider!r}")

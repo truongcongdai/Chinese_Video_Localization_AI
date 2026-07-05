@@ -1,8 +1,20 @@
 Metadata-Version: 2.4
-Name: universal-video-ai
+Name: universal_video_ai
 Version: 0.1.0
-Summary: Universal AI Video Localization
-Author: Dai Truong
-Requires-Python: >=3.11
+Summary: Chinese Video Localization AI
+Requires-Python: >=3.10
 Requires-Dist: yt-dlp>=2025.06.30
 Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: demucs
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: torchaudio
+Requires-Dist: openai-whisper
+Requires-Dist: edge-tts
+Requires-Dist: redis>=5.0.0
+Requires-Dist: Flask>=3.0.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: python-telegram-bot>=21.0
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

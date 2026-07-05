@@ -39,13 +39,17 @@ class TTSConfig:
     Configuration for TTS engine.
 
     Attributes:
-        provider: 'noop' or 'edge' (default 'noop')
+        provider: 'noop', 'edge', 'azure', or 'google' (default 'noop')
         voice: voice identifier for provider (Edge TTS example: "en-US-JennyNeural")
         output_format: output file extension/format (e.g., 'mp3', 'wav')
+        api_key: API key for cloud providers (Azure, Google)
+        region: Region for cloud providers (Azure only, default 'eastus')
     """
     provider: str = "noop"
     voice: str = "en-US-JennyNeural"
     output_format: str = "mp3"
+    api_key: Optional[str] = None
+    region: Optional[str] = None
 
 
 class NoOpTTS:
@@ -157,5 +161,79 @@ class TTSFactory:
             return NoOpTTS(config=cfg, logger=logger)
         if provider == "edge":
             return EdgeTTS(config=cfg, logger=logger)
+        
+        # Azure TTS
+        if provider == "azure":
+            try:
+                import azure.cognitiveservices.speech as speechsdk  # type: ignore
+            except Exception as exc:
+                raise ValueError(
+                    "Azure provider requested but azure-cognitiveservices-speech is not available. "
+                    "Install azure-cognitiveservices-speech or choose another provider."
+                ) from exc
+            
+            if not cfg.api_key:
+                raise ValueError("Azure provider requires api_key in TTSConfig")
+            
+            class _AzureTTS:
+                def __init__(self, cfg: TTSConfig, logger: logging.Logger) -> None:
+                    self.cfg = cfg
+                    self.logger = logger
+                    self.speech_config = speechsdk.SpeechConfig(
+                        subscription=cfg.api_key,
+                        region=cfg.region or "eastus"
+                    )
+                    self.speech_config.speech_synthesis_voice_name = cfg.voice or "en-US-JennyNeural"
+                    self.speech_config.set_speech_synthesis_output_format(
+                        speechsdk.SpeechSynthesisOutputFormat.Audio16Khz128KBitRateMonoMp3
+                    )
+                
+                def synthesize(self, text: str, output_path: Path) -> Path:
+                    output_path = output_path.resolve()
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    synthesizer = speechsdk.SpeechSynthesizer(
+                        speech_config=self.speech_config,
+                        audio_config=speechsdk.audio.AudioOutputConfig(str(output_path))
+                    )
+                    
+                    self.logger.info("Azure TTS synthesizing to %s", output_path)
+                    result = synthesizer.speak_text_async(text).get()
+                    
+                    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                        self.logger.info("Azure TTS synthesis complete: %s", output_path)
+                        return output_path
+                    else:
+                        raise RuntimeError(f"Azure TTS failed: {result.reason}")
+            
+            return _AzureTTS(cfg, logger)
+        
+        # Google TTS
+        if provider == "google":
+            try:
+                from gtts import gTTS  # type: ignore
+            except Exception as exc:
+                raise ValueError(
+                    "Google provider requested but gTTS is not available. "
+                    "Install gTTS or choose another provider."
+                ) from exc
+            
+            class _GoogleTTS:
+                def __init__(self, cfg: TTSConfig, logger: logging.Logger) -> None:
+                    self.cfg = cfg
+                    self.logger = logger
+                
+                def synthesize(self, text: str, output_path: Path) -> Path:
+                    output_path = output_path.resolve()
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    self.logger.info("Google TTS synthesizing to %s", output_path)
+                    tts = gTTS(text=text, lang=self.cfg.voice[:2] if self.cfg.voice else "en")
+                    tts.save(str(output_path))
+                    
+                    self.logger.info("Google TTS synthesis complete: %s", output_path)
+                    return output_path
+            
+            return _GoogleTTS(cfg, logger)
 
         raise ValueError(f"Unknown TTS provider: {cfg.provider!r}")

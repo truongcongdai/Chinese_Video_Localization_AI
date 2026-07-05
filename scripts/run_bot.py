@@ -18,6 +18,7 @@ from src.universal_video_ai.downloader.service import DownloadService
 from src.universal_video_ai.downloader.validator import UrlValidator
 from src.universal_video_ai.database import DatabaseManager
 from src.universal_video_ai.bot.telegram_bot import TelegramBot, MockAdapter
+from src.universal_video_ai.bot.real_telegram_adapter import RealTelegramAdapter
 from src.universal_video_ai.bot.server import start_health_check_server
 from src.universal_video_ai.logger import setup_logger
 
@@ -29,6 +30,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Telegram bot locally")
     parser.add_argument("--admin", type=int, nargs="+", default=[], help="Admin chat IDs")
     parser.add_argument("--db", type=Path, default=TEMP_DIR / "database.sqlite3", help="Database path")
+    parser.add_argument("--mock", action="store_true", help="Use mock adapter for testing")
     args = parser.parse_args()
 
     # Setup database
@@ -41,8 +43,17 @@ def main() -> None:
     downloader = DownloadService()
     validator = UrlValidator()
 
-    # Setup bot with mock adapter (for testing)
-    adapter = MockAdapter()
+    # Setup bot adapter (real or mock)
+    if args.mock:
+        adapter = MockAdapter()
+        logger.info("Using MockAdapter for testing")
+    else:
+        try:
+            adapter = RealTelegramAdapter(logger=logger)
+            logger.info("Using RealTelegramAdapter")
+        except ValueError as exc:
+            logger.warning("Failed to initialize RealTelegramAdapter: %s. Falling back to MockAdapter", exc)
+            adapter = MockAdapter()
 
     admin_ids = set(args.admin) if args.admin else set()
     bot = TelegramBot(

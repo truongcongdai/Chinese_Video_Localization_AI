@@ -5,13 +5,14 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from threading import Thread
 import json
 
 from .models import Job, JobStatus, JobConfig
+from .queue import JobQueue, JobPriority
 
-__all__ = ["JobService"]
+__all__ = ["JobService", "JobQueue"]
 
 _logger = logging.getLogger(__name__)
 
@@ -23,12 +24,26 @@ class JobService:
     - Track job status and progress
     - Provide job history
     - Run jobs in background threads (simple, no celery)
+    - Optional queue-based processing with priority support
     """
 
-    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        use_queue: bool = False,
+        max_workers: int = 4,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
         self.jobs: Dict[str, Job] = {}  # job_id -> Job
         self.logger = logger or _logger
-        self.logger.debug("JobService initialized")
+        self.use_queue = use_queue
+        
+        # Initialize queue if enabled
+        self.queue: Optional[JobQueue] = None
+        if use_queue:
+            self.queue = JobQueue(max_workers=max_workers, logger=self.logger)
+            self.queue.start()
+        
+        self.logger.debug("JobService initialized use_queue=%s max_workers=%d", use_queue, max_workers)
 
     def create_job(self, config: JobConfig) -> Job:
         """Create a new job record."""
@@ -72,9 +87,9 @@ class JobService:
             result_path=result_path or job.result_path,
             error=error or job.error,
             created_at=job.created_at,
-            started_at=job.started_at or (datetime.now(UTC) if status == JobStatus.RUNNING else None),
+            started_at=job.started_at or (datetime.now(timezone.utc) if status == JobStatus.RUNNING else None),
             completed_at=job.completed_at or (
-                datetime.now(UTC) if status in (JobStatus.COMPLETED, JobStatus.FAILED) else None),
+                datetime.now(timezone.utc) if status in (JobStatus.COMPLETED, JobStatus.FAILED) else None),
             duration_seconds=job.duration_seconds,
         )
 
@@ -87,18 +102,43 @@ class JobService:
                           progress * 100 if progress else 0)
         return updated_job
 
-    def run_job_async(self, job_id: str, callback) -> Thread:
+    def run_job_async(self, job_id: str, callback, priority: JobPriority = JobPriority.NORMAL) -> Optional[Thread]:
         """
-        Run a job in a background thread.
+        Run a job in a background thread or queue.
 
         :param job_id: ID of the job to run
-        :param callback: async function that accepts job_id and returns result/error
-        :return: Thread (started)
+        :param callback: function that accepts job_id and returns result/error
+        :param priority: Job priority (only used if queue enabled)
+        :return: Thread if not using queue, None if using queue
         """
         job = self.jobs.get(job_id)
         if job is None:
             raise ValueError(f"Job {job_id} not found")
 
+        # Use queue if enabled
+        if self.use_queue and self.queue:
+            self.logger.info("JobService: enqueuing job %s with priority %s", job_id, priority.name)
+            
+            def _queue_callback(jid: str) -> None:
+                """Callback wrapper for queue processing."""
+                try:
+                    self.update_job(jid, status=JobStatus.RUNNING)
+                    result = callback(jid)
+                    self.update_job(
+                        jid,
+                        status=JobStatus.COMPLETED,
+                        progress=1.0,
+                        message="Completed successfully",
+                        result_path=result if isinstance(result, Path) else None,
+                    )
+                except Exception as exc:
+                    self.logger.exception("JobService: job %s failed: %s", jid, exc)
+                    self.update_job(jid, status=JobStatus.FAILED, error=str(exc))
+            
+            self.queue.enqueue(job_id, _queue_callback, priority)
+            return None
+
+        # Use simple thread if queue not enabled
         def _worker():
             try:
                 self.logger.info("JobService: starting job %s", job_id)
@@ -113,7 +153,7 @@ class JobService:
                     status=JobStatus.COMPLETED,
                     progress=1.0,
                     message="Completed successfully",
-                    result_path=result,
+                    result_path=result if isinstance(result, Path) else None,
                 )
                 self.logger.info("JobService: completed job %s", job_id)
             except Exception as exc:
@@ -135,7 +175,7 @@ class JobService:
 
         data = {
             "jobs": [job.to_dict() for job in self.jobs.values()],
-            "exported_at": datetime.now(UTC).isoformat(),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
         }
 
         with open(output_path, "w", encoding="utf-8") as f:
@@ -155,3 +195,15 @@ class JobService:
             self.jobs[job.job_id] = job
 
         self.logger.info("JobService: imported %d jobs from %s", len(data.get("jobs", [])), input_path)
+
+    def shutdown(self) -> None:
+        """Shutdown queue if enabled."""
+        if self.queue:
+            self.queue.stop()
+            self.logger.info("JobService: queue shutdown complete")
+
+    def get_queue_stats(self) -> Optional[dict]:
+        """Get queue statistics if queue enabled."""
+        if self.queue:
+            return self.queue.get_stats()
+        return None

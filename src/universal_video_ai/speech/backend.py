@@ -10,7 +10,7 @@ import logging
 # WhisperTranscriber itself does not import heavy libs at module import time.
 from .whisper import WhisperTranscriber, WhisperConfig  # type: ignore
 
-__all__ = ["SpeechBackend", "WhisperBackend"]
+__all__ = ["SpeechBackend", "WhisperBackend", "NoOpSpeechBackend"]
 
 _logger = logging.getLogger(__name__)
 
@@ -42,3 +42,19 @@ class WhisperBackend:
         """Delegate transcription to the underlying WhisperTranscriber."""
         self.logger.debug("WhisperBackend.transcribe: audio=%s language=%s", audio_path, language)
         return self._transcriber.transcribe(audio_path, language=language)
+
+
+class NoOpSpeechBackend:
+    """No-op speech backend for development and testing.
+
+    Returns placeholder transcript without actual transcription.
+    """
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        self.logger = logger or _logger
+        self.logger.debug("NoOpSpeechBackend initialized")
+
+    def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
+        """Return placeholder transcript."""
+        self.logger.debug("NoOpSpeechBackend.transcribe: audio=%s language=%s", audio_path, language)
+        return "Dummy transcript from NoOpSpeechBackend"

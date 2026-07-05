@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import json
 
 __all__ = ["JobStatus", "Job", "JobConfig"]
@@ -78,7 +78,7 @@ class Job:
     message: str = ""
     result_path: Optional[Path] = None
     error: Optional[str] = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     duration_seconds: float = 0.0
