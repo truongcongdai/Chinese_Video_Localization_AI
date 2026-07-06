@@ -29,8 +29,8 @@ def main():
 
     app = create_app(db_manager, metrics, admin_token=args.token)
 
-    print(f"✓ Admin API running on http://127.0.0.1:{args.port}")
-    print(f"✓ Auth token: {args.token}")
+    print(f"Admin API running on http://127.0.0.1:{args.port}")
+    print(f"Auth token: {args.token}")
     app.run(host="127.0.0.1", port=args.port, debug=False)
 
 
