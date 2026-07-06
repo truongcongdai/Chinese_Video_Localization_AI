@@ -46,8 +46,7 @@ def main() -> None:
     
     # Setup localization service
     localization_service = LocalizationService(
-        download_service=downloader,
-        output_dir=TEMP_DIR / "output",
+        downloader=downloader,
         logger=logger
     )
 
