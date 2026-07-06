@@ -5,6 +5,7 @@ from typing import Optional
 import pytest
 
 from universal_video_ai.speech.service import SpeechService
+from universal_video_ai.speech.exceptions import SpeechBackendUnavailable
 
 
 @dataclass
@@ -26,5 +27,5 @@ def test_speech_service_no_backend_raises(tmp_path: Path):
     audio = tmp_path / "a.wav"
     audio.write_bytes(b"\x00")
     svc = SpeechService(backend=None)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(SpeechBackendUnavailable):
         svc.transcribe(audio)

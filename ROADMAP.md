@@ -18,7 +18,7 @@ Audio
 
 
 
-TODO
+DONE
 
 
 
@@ -30,7 +30,7 @@ Whisper
 
 
 
-TODO
+DONE
 
 
 
@@ -42,7 +42,7 @@ Translate
 
 
 
-TODO
+DONE
 
 
 
@@ -54,7 +54,7 @@ TTS
 
 
 
-TODO
+DONE
 
 
 
@@ -66,7 +66,7 @@ Render
 
 
 
-TODO
+DONE
 
 
 
@@ -78,7 +78,7 @@ Telegram
 
 
 
-TODO
+DONE
 
 
 
