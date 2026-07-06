@@ -21,6 +21,7 @@ from src.universal_video_ai.bot.telegram_bot import TelegramBot, MockAdapter
 from src.universal_video_ai.bot.real_telegram_adapter import RealTelegramAdapter
 from src.universal_video_ai.bot.server import start_health_check_server
 from src.universal_video_ai.logger import setup_logger
+from src.universal_video_ai.orchestrator.service import LocalizationService
 
 # Initialize logger for this runner
 logger = setup_logger("bot_runner")
@@ -42,6 +43,13 @@ def main() -> None:
     # DownloadService does not accept logger in constructor; instantiate without kwargs
     downloader = DownloadService()
     validator = UrlValidator()
+    
+    # Setup localization service
+    localization_service = LocalizationService(
+        download_service=downloader,
+        output_dir=TEMP_DIR / "output",
+        logger=logger
+    )
 
     # Setup bot adapter (real or mock)
     if args.mock:
@@ -59,6 +67,7 @@ def main() -> None:
     bot = TelegramBot(
         adapter=adapter,
         download_service=downloader,
+        localization_service=localization_service,
         database_manager=db_manager,
         admin_chat_ids=admin_ids,
         output_dir=TEMP_DIR / "output",
