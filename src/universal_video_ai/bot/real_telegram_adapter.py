@@ -43,15 +43,18 @@ class RealTelegramAdapter:
         if self._application:
             import asyncio
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
+                # If loop is already running, create a task
+                asyncio.create_task(self._application.bot.send_message(chat_id=chat_id, text=text))
             except RuntimeError:
+                # No running loop, create one
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-            
-            async def _send():
-                await self._application.bot.send_message(chat_id=chat_id, text=text)
-            
-            loop.run_until_complete(_send())
+                
+                async def _send():
+                    await self._application.bot.send_message(chat_id=chat_id, text=text)
+                
+                loop.run_until_complete(_send())
         else:
             self.logger.warning("Cannot send message: application not initialized")
 
