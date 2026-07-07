@@ -116,6 +116,7 @@ class TelegramBot:
         self.adapter.register_command("credits", self._handle_credits)
         self.adapter.register_command("language", self._handle_language)  # NEW
         self.adapter.register_command("stats", self._handle_stats)  # NEW
+        self.adapter.register_command("myid", self._handle_myid)  # NEW
 
         # Admin commands
         self.adapter.register_command("addcredits", self._handle_addcredits)
@@ -126,8 +127,11 @@ class TelegramBot:
     # ---- Admin helpers ----
     def _is_admin(self, chat_id: int) -> bool:
         if not self.admin_chat_ids:
+            self.logger.warning("Admin check failed: no admin_chat_ids configured")
             return False
-        return chat_id in self.admin_chat_ids
+        is_admin = chat_id in self.admin_chat_ids
+        self.logger.debug("Admin check: chat_id=%s is_admin=%s admin_ids=%s", chat_id, is_admin, self.admin_chat_ids)
+        return is_admin
 
     # ---- Localization strings ----
     _strings = {
@@ -417,6 +421,11 @@ class TelegramBot:
         msg += self._get_string(chat_id, "stats_credits", uc.total_used)
         self.adapter.send_message(chat_id, msg)
         self.logger.info("Stats requested by chat=%s", chat_id)
+
+    def _handle_myid(self, chat_id: int, args: List[str]) -> None:
+        """Handle /myid command to show user's chat ID."""
+        self.adapter.send_message(chat_id, f"Your chat ID: {chat_id}")
+        self.logger.info("My ID requested by chat=%s", chat_id)
 
     # ---- Admin handlers ----
     def _handle_addcredits(self, chat_id: int, args: List[str]) -> None:

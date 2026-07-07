@@ -4,7 +4,7 @@ services:
     build: .
     container_name: video-ai-app
     restart: always
-    command: python scripts/run_bot.py --db /app/database.sqlite3
+    command: python scripts/run_bot.py --db /app/database.sqlite3 --admin 7164535840
     env_file:
       - .env
     environment:
