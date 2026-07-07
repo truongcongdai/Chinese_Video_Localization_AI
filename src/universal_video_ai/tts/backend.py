@@ -26,9 +26,11 @@ class EdgeTTSBackend:
 
     def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or _logger
-        self._tts = EdgeTTS()
+        from .tts import TTSConfig
+        config = TTSConfig(provider="edge", voice="vi-VN-HoaiMyNeural")
+        self._tts = EdgeTTS(config=config)
 
-    def synthesize(self, text: str, output_path: Path, language: str = "en") -> Path:
+    def synthesize(self, text: str, output_path: Path, language: str = "vi") -> Path:
         """Delegate to EdgeTTS and convert exceptions to SynthesisError."""
         try:
             self.logger.debug("EdgeTTSBackend.synthesize: language=%s output=%s text_len=%d",

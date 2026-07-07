@@ -25,7 +25,9 @@ class TranslatorBackend:
 
     def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or _logger
-        self._translator = Translator()
+        from .translator import TranslatorConfig, TranslatorFactory
+        config = TranslatorConfig(provider="google")
+        self._translator = TranslatorFactory.create(config, logger)
 
     def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Delegate to Translator and convert exceptions to TranslationFailed."""

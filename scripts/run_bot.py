@@ -21,7 +21,7 @@ from src.universal_video_ai.bot.telegram_bot import TelegramBot, MockAdapter
 from src.universal_video_ai.bot.real_telegram_adapter import RealTelegramAdapter
 from src.universal_video_ai.bot.server import start_health_check_server
 from src.universal_video_ai.logger import setup_logger
-from src.universal_video_ai.orchestrator.service import LocalizationService, LocalizationConfig
+from src.universal_video_ai.orchestrator.factory import create_localization_service
 
 # Initialize logger for this runner
 logger = setup_logger("bot_runner")
@@ -40,22 +40,19 @@ def main() -> None:
     logger.info("Database initialized at %s", args.db)
 
     # Setup services
-    # DownloadService does not accept logger in constructor; instantiate without kwargs
     downloader = DownloadService()
     validator = UrlValidator()
-    
-    # Setup localization service with full pipeline enabled
-    localization_config = LocalizationConfig(
+
+    # Setup localization service with full pipeline enabled using factory
+    localization_service = create_localization_service(
         run_transcription=True,
         transcription_language="zh",
         run_translation=True,
         target_language="vi",
         run_tts=True,
-        render_video=True
-    )
-    localization_service = LocalizationService(
-        downloader=downloader,
-        config=localization_config,
+        generate_subtitles=True,
+        mix_audio=True,
+        render_video=True,
         logger=logger
     )
 

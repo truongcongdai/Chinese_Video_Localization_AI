@@ -1,4 +1,4 @@
-yt-dlp>=2025.06.30
+yt-dlp>=2024.1.1
 python-dotenv>=1.0.1
 demucs
 torch
@@ -10,3 +10,4 @@ redis>=5.0.0
 Flask>=3.0.0
 requests>=2.31.0
 python-telegram-bot>=21.0
+googletrans>=4.0.0
