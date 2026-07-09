@@ -99,18 +99,21 @@ class LocalizationService:
             self.config.render_video,
         )
 
-    async def localize(self, url: str, output_dir: Path) -> LocalizationResult:
+    async def localize(self, url: str, output_dir: Path, target_language: Optional[str] = None) -> LocalizationResult:
         """Execute full video localization workflow.
 
         :param url: video URL to download.
         :param output_dir: directory where to save all artifacts.
+        :param target_language: optional override for target language (overrides config).
         :raises ValueError: if download fails or processing fails.
         :return: LocalizationResult
         """
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info("LocalizationService.localize: url=%s output_dir=%s", url, output_dir)
+        # Use provided target_language or fall back to config
+        effective_target_lang = target_language or self.config.target_language
+        self.logger.info("LocalizationService.localize: url=%s output_dir=%s target_language=%s", url, output_dir, effective_target_lang)
 
         # Step 1: Download video
         self.logger.info("LocalizationService: downloading video")
@@ -141,12 +144,12 @@ class LocalizationService:
             if self.translate_service is None:
                 self.logger.warning("Translation requested but no TranslateService injected; skipping")
             else:
-                self.logger.info("LocalizationService: translating to %s", self.config.target_language)
+                self.logger.info("LocalizationService: translating to %s", effective_target_lang)
                 try:
                     translated_text = await self.translate_service.translate(
                         audio_result.transcript,
                         source_lang=self.config.transcription_language or "en",
-                        target_lang=self.config.target_language or "en",
+                        target_lang=effective_target_lang or "en",
                     )
                     self.logger.info("LocalizationService: translation complete (length=%d)", len(translated_text))
                 except Exception as exc:
@@ -164,7 +167,7 @@ class LocalizationService:
                     self.tts_service.synthesize(
                         translated_text,
                         output_path=tts_audio_path,
-                        language=self.config.target_language or "en",
+                        language=effective_target_lang or "en",
                     )
                     self.logger.info("LocalizationService: TTS complete: %s", tts_audio_path)
                 except Exception as exc:

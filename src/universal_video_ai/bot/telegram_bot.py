@@ -136,7 +136,7 @@ class TelegramBot:
     # ---- Localization strings ----
     _strings = {
         "en": {
-            "start": "🎬 Universal Video AI Bot\nCommands:\n/download <url> - download video only\n/localize <url> - full pipeline (transcribe → translate → TTS → render) [cost: 1 credit]\n/credits - show your credit balance\n/status - show bot status\n/language en|vi - set language\n",
+            "start": "🎬 Universal Video AI Bot\nCommands:\n/download <url> - download video only\n/localize <url> [lang] - full pipeline (transcribe → translate → TTS → render) [cost: 1 credit]\n  lang: en (English) or vi (Vietnamese)\n  Example: /localize https://example.com/video en\n/credits - show your credit balance\n/status - show bot status\n/language en|vi - set default language\n",
             "status_running": "Bot is running ✓\n",
             "status_localization": "Localization: {}\n",
             "enabled": "✓ Enabled",
@@ -158,7 +158,7 @@ class TelegramBot:
             "stats_credits": "Total credits spent: {:.2f}",
         },
         "vi": {
-            "start": "🎬 Bot Định Dạng Video AI\nLệnh:\n/download <url> - tải video\n/localize <url> - toàn bộ quy trình (ghi âm → dịch → TTS → render) [chi phí: 1 credit]\n/credits - xem số dư credit\n/status - trạng thái bot\n/language en|vi - đặt ngôn ngữ\n",
+            "start": "🎬 Bot Định Dạng Video AI\nLệnh:\n/download <url> - tải video\n/localize <url> [lang] - toàn bộ quy trình (ghi âm → dịch → TTS → render) [chi phí: 1 credit]\n  lang: en (Tiếng Anh) hoặc vi (Tiếng Việt)\n  Ví dụ: /localize https://example.com/video vi\n/credits - xem số dư credit\n/status - trạng thái bot\n/language en|vi - đặt ngôn ngữ mặc định\n",
             "status_running": "Bot đang chạy ✓\n",
             "status_localization": "Định dạng: {}\n",
             "enabled": "✓ Bật",
@@ -271,7 +271,13 @@ class TelegramBot:
             self.logger.info("Download reported failure for chat=%s url=%s", chat_id, url)
 
     async def _handle_localize(self, chat_id: int, args: List[str]) -> None:
-        """Handle /localize <url> command."""
+        """Handle /localize <url> [lang] command.
+        
+        Usage:
+        - /localize <url> - use language set by /language command
+        - /localize <url> en - force English translation
+        - /localize <url> vi - force Vietnamese translation
+        """
         if not self._check_rate_limit(chat_id):
             self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
             return
@@ -287,7 +293,21 @@ class TelegramBot:
             return
 
         url = args[0].strip()
-        self.logger.debug("Localize requested by chat=%s for url=%s", chat_id, url)
+        
+        # Parse optional language parameter
+        target_lang = None
+        if len(args) > 1:
+            lang_arg = args[1].lower()
+            if lang_arg in ["en", "vi"]:
+                target_lang = lang_arg
+            else:
+                self.adapter.send_message(chat_id, self._get_string(chat_id, "language_invalid"))
+                return
+        else:
+            # Use language set by /language command, default to "en"
+            target_lang = self._language.get(chat_id, "en")
+        
+        self.logger.debug("Localize requested by chat=%s for url=%s lang=%s", chat_id, url, target_lang)
 
         # Validate URL
         try:
@@ -317,17 +337,19 @@ class TelegramBot:
             self.adapter.send_message(chat_id, f"🪙 1 credit deducted. Remaining: {new_balance.credits:.1f}")
 
         # Acknowledge start
+        lang_name = "English" if target_lang == "en" else "Vietnamese"
         self.adapter.send_message(
             chat_id,
-            f"⏳ Localizing video (transcribe → translate → TTS → render):\n{url}\n\nThis may take several minutes..."
+            f"⏳ Localizing video to {lang_name} (transcribe → translate → TTS → render):\n{url}\n\nThis may take several minutes..."
         )
-        self.logger.info("Starting localization for chat=%s url=%s", chat_id, url)
+        self.logger.info("Starting localization for chat=%s url=%s lang=%s", chat_id, url, target_lang)
 
         try:
             output_dir = Path(self.output_dir) / f"localize_{chat_id}"
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            result = await self.localization_service.localize(url, output_dir)
+            # Pass target_language to localize method
+            result = await self.localization_service.localize(url, output_dir, target_language=target_lang)
 
             # Send final status
             if result.final_video_path and result.final_video_path.exists():
