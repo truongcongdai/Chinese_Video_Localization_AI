@@ -80,7 +80,7 @@ class RealTelegramAdapter:
         handler = self._handlers.get(command)
         if handler:
             try:
-                handler(chat_id, args)
+                await handler(chat_id, args)
             except Exception as exc:
                 self.logger.exception("Error handling command %s: %s", command, exc)
                 await update.message.reply_text(f"Error: {exc}")

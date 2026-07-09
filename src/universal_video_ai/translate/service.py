@@ -27,7 +27,7 @@ class TranslateService:
         self.logger.debug("TranslateService initialized backend=%s",
                           type(self.backend).__name__ if self.backend else None)
 
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """
         Translate text with caching.
 
@@ -48,7 +48,7 @@ class TranslateService:
 
         self.logger.info("TranslateService.translate: source=%s target=%s", source_lang, target_lang)
         try:
-            result = self.backend.translate(text, source_lang, target_lang)
+            result = await self.backend.translate(text, source_lang, target_lang)
 
             # Cache result
             if self.cache:

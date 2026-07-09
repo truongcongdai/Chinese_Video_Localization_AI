@@ -99,7 +99,7 @@ class LocalizationService:
             self.config.render_video,
         )
 
-    def localize(self, url: str, output_dir: Path) -> LocalizationResult:
+    async def localize(self, url: str, output_dir: Path) -> LocalizationResult:
         """Execute full video localization workflow.
 
         :param url: video URL to download.
@@ -143,7 +143,7 @@ class LocalizationService:
             else:
                 self.logger.info("LocalizationService: translating to %s", self.config.target_language)
                 try:
-                    translated_text = self.translate_service.translate(
+                    translated_text = await self.translate_service.translate(
                         audio_result.transcript,
                         source_lang=self.config.transcription_language or "en",
                         target_lang=self.config.target_language or "en",

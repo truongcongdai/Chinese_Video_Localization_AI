@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 import logging
+import asyncio
 from pathlib import Path
 
 from universal_video_ai.logger import logger
@@ -17,7 +18,7 @@ from universal_video_ai.downloader.platform_detector import PlatformDetector
 from universal_video_ai.orchestrator.factory import create_localization_service
 
 
-def main() -> None:
+async def main() -> None:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Universal Video AI - end-to-end video localization",
@@ -138,7 +139,7 @@ Examples:
     # Execute localization
     try:
         logger.info("Starting localization workflow...")
-        result = service.localize(args.url, output_dir=args.output)
+        result = await service.localize(args.url, output_dir=args.output)
 
         logger.info("=" * 60)
         logger.info("LOCALIZATION COMPLETE")
@@ -180,4 +181,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

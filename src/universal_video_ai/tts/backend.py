@@ -16,7 +16,7 @@ _logger = logging.getLogger(__name__)
 class TTSBackend(Protocol):
     """Protocol for TTS backends."""
 
-    def synthesize(self, text: str, output_path: Path, language: str = "en") -> Path:
+    def synthesize(self, text: str, output_path: Path) -> Path:
         """Synthesize speech to audio file."""
         ...
 
@@ -27,15 +27,16 @@ class EdgeTTSBackend:
     def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or _logger
         from .tts import TTSConfig
-        config = TTSConfig(provider="edge", voice="vi-VN-HoaiMyNeural")
+        config = TTSConfig(provider="edge", voice="en-US-JennyNeural")
         self._tts = EdgeTTS(config=config)
 
-    def synthesize(self, text: str, output_path: Path, language: str = "vi") -> Path:
+    def synthesize(self, text: str, output_path: Path) -> Path:
         """Delegate to EdgeTTS and convert exceptions to SynthesisError."""
         try:
-            self.logger.debug("EdgeTTSBackend.synthesize: language=%s output=%s text_len=%d",
-                            language, output_path, len(text))
-            return self._tts.synthesize(text, output_path, language=language)
+            self.logger.debug("EdgeTTSBackend.synthesize: output=%s text_len=%d",
+                            output_path, len(text))
+            # EdgeTTS uses voice configuration, not language parameter
+            return self._tts.synthesize(text, output_path)
         except SynthesisError:
             raise
         except Exception as exc:

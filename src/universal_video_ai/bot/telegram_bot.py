@@ -270,7 +270,7 @@ class TelegramBot:
             self.adapter.send_message(chat_id, self._get_string(chat_id, "download_failed", url))
             self.logger.info("Download reported failure for chat=%s url=%s", chat_id, url)
 
-    def _handle_localize(self, chat_id: int, args: List[str]) -> None:
+    async def _handle_localize(self, chat_id: int, args: List[str]) -> None:
         """Handle /localize <url> command."""
         if not self._check_rate_limit(chat_id):
             self.adapter.send_message(chat_id, "⚠️ Too many requests. Please wait a moment.")
@@ -327,7 +327,7 @@ class TelegramBot:
             output_dir = Path(self.output_dir) / f"localize_{chat_id}"
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            result = self.localization_service.localize(url, output_dir)
+            result = await self.localization_service.localize(url, output_dir)
 
             # Send final status
             if result.final_video_path and result.final_video_path.exists():

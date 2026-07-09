@@ -44,7 +44,7 @@ class Translator(Protocol):
     Implementations must provide `translate`.
     """
 
-    def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
+    async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
         """
         Translate `text` from src_lang to dest_lang.
 
@@ -69,7 +69,7 @@ class NoOpTranslator:
         self.logger = logger or _logger
         self.logger.debug("NoOpTranslator initialized with config=%s", self.config)
 
-    def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
+    async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
         """
         Return the input text unchanged.
 
@@ -139,11 +139,17 @@ class TranslatorFactory:
                     self.logger = logger
                     self.client = GoogleTrans()
 
-                def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
+                async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
                     dest = dest_lang or self.cfg.dest_lang or "en"
                     src = src_lang or self.cfg.src_lang or None
                     try:
-                        res = self.client.translate(text, src=src, dest=dest)
+                        result = self.client.translate(text, src=src, dest=dest)
+                        # Handle both sync and async versions of googletrans
+                        import asyncio
+                        if asyncio.iscoroutine(result):
+                            res = await result
+                        else:
+                            res = result
                         return getattr(res, "text", str(res))
                     except Exception as exc:  # pragma: no cover - depends on external lib
                         raise TranslationError(f"Google translation failed: {exc}") from exc
@@ -168,7 +174,7 @@ class TranslatorFactory:
                     self.logger = logger
                     self.client = deepl.Translator(cfg.api_key)
 
-                def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
+                async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
                     dest = dest_lang or self.cfg.dest_lang or "en-US"
                     src = src_lang or self.cfg.src_lang or None
                     try:

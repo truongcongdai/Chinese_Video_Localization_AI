@@ -15,7 +15,7 @@ _logger = logging.getLogger(__name__)
 class TranslateBackend(Protocol):
     """Protocol for translation backends."""
 
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translate text from source to target language."""
         ...
 
@@ -29,12 +29,13 @@ class TranslatorBackend:
         config = TranslatorConfig(provider="google")
         self._translator = TranslatorFactory.create(config, logger)
 
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Delegate to Translator and convert exceptions to TranslationFailed."""
         try:
             self.logger.debug("TranslatorBackend.translate: source=%s target=%s text_len=%d",
                             source_lang, target_lang, len(text))
-            return self._translator.translate(text, source_lang, target_lang)
+            result = await self._translator.translate(text, source_lang, target_lang)
+            return result
         except TranslationFailed:
             raise
         except Exception as exc:

@@ -54,7 +54,7 @@ class TTSService:
 
         self.logger.info("TTSService.synthesize: language=%s voice=%s", language, voice)
         try:
-            result = self.backend.synthesize(text, language=language, voice=voice, output_path=output_path)
+            result = self.backend.synthesize(text, output_path=output_path)
 
             # Cache result
             if self.cache:

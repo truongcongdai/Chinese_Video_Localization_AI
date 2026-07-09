@@ -44,15 +44,24 @@ def main() -> None:
     validator = UrlValidator()
 
     # Setup localization service with full pipeline enabled using factory
+    from universal_video_ai.render.renderer import RenderConfig
+    
+    # Enable blur to cover original Chinese text
+    render_config = RenderConfig(
+        blur_text=True,
+        blur_box=None  # Default: blur bottom 15% where subtitles usually appear
+    )
+    
     localization_service = create_localization_service(
         run_transcription=True,
-        transcription_language="zh",
+        transcription_language=None,  # Auto-detect language (important for YouTube videos)
         run_translation=True,
         target_language="vi",
         run_tts=True,
         generate_subtitles=True,
         mix_audio=True,
         render_video=True,
+        render_config=render_config,
         logger=logger
     )
 

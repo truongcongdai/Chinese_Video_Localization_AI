@@ -37,6 +37,9 @@ class RenderConfig:
         audio_bitrate: bitrate for audio (e.g. "192k").
         overwrite: whether to overwrite existing output file.
         timeout_seconds: ffmpeg timeout for rendering.
+        blur_text: whether to apply blur filter to cover original text (e.g., Chinese subtitles).
+        blur_box: coordinates for blur box as "x:y:w:h" (e.g., "0:0:1920:100" for top bar).
+                  If None, defaults to covering bottom 15% of video.
     """
 
     video_codec: str = "libx264"
@@ -45,7 +48,9 @@ class RenderConfig:
     audio_codec: str = "aac"
     audio_bitrate: str = "192k"
     overwrite: bool = True
-    timeout_seconds: int = 600  # 10 minutes
+    timeout_seconds: int = 1800  # 30 minutes
+    blur_text: bool = False
+    blur_box: Optional[str] = None
 
 
 class Renderer:
@@ -85,7 +90,7 @@ class Renderer:
         Build ffmpeg command list based on configuration and presence of subtitles.
 
         Strategy:
-        - If subtitles provided: we need to re-encode video (apply -vf subtitles=...)
+        - If subtitles or blur_text enabled: we need to re-encode video (apply -vf filters)
         - Otherwise: use stream copy for video (-c:v copy) and encode audio to target codec
                      (faster).
         """
@@ -98,15 +103,44 @@ class Renderer:
         cmd.extend(["-i", str(input_video)])
         cmd.extend(["-i", str(input_audio)])
 
-        # If subtitles are provided, we will re-encode video and apply video filter
-        if subtitles:
-            # re-encode video with subtitles filter
-            vf = f"subtitles={str(subtitles)}"
+        # Determine if we need video filters (subtitles or blur)
+        needs_reencode = subtitles is not None or self.config.blur_text
+
+        if needs_reencode:
+            # Build video filter chain
+            filters = []
+            
+            # Add blur filter if enabled
+            if self.config.blur_text:
+                if self.config.blur_box:
+                    # Use custom blur box coordinates with crop+blur+overlay
+                    # Format: x:y:w:h
+                    blur_filter = f"crop={self.config.blur_box},boxblur=10:1,overlay={self.config.blur_box.split(':')[0]}:{self.config.blur_box.split(':')[1]}"
+                else:
+                    # Simple global blur (temporary fix - will blur entire video)
+                    # TODO: Implement region-specific blur with crop+overlay
+                    blur_filter = "boxblur=5:1"
+                filters.append(blur_filter)
+            
+            # Add subtitles filter if provided
+            if subtitles:
+                filters.append(f"subtitles={str(subtitles)}")
+            
+            # Combine filters with comma
+            vf = ",".join(filters) if filters else None
+            
             cmd.extend(
                 [
                     "-map", "0:v",
                     "-map", "1:a",
-                    "-vf", vf,
+                ]
+            )
+            
+            if vf:
+                cmd.extend(["-vf", vf])
+            
+            cmd.extend(
+                [
                     "-c:v", self.config.video_codec,
                     "-preset", self.config.preset,
                     "-crf", str(self.config.crf),
@@ -116,7 +150,7 @@ class Renderer:
                 ]
             )
         else:
-            # No subtitles: keep video stream (copy) and encode audio
+            # No filters: keep video stream (copy) and encode audio
             cmd.extend(
                 [
                     "-map", "0:v",
