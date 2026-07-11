@@ -1,12 +1,14 @@
 # src/universal_video_ai/translate/service.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
+import asyncio
 import logging
 from dataclasses import dataclass
 
 from .backend import TranslateBackend  # type: ignore
 from .exceptions import TranslationBackendUnavailable, TranslationFailed  # type: ignore
+from universal_video_ai.segment import TranscriptSegment
 
 __all__ = ["TranslateService"]
 
@@ -61,3 +63,45 @@ class TranslateService:
         except Exception as exc:
             self.logger.exception("Unexpected error in TranslateService: %s", exc)
             raise TranslationFailed("Translation failed", cause=exc) from exc
+
+    async def translate_segments(
+        self, segments: List[TranscriptSegment], source_lang: str, target_lang: str
+    ) -> List[TranscriptSegment]:
+        """
+        Translate a list of timed segments sentence-by-sentence, preserving
+        each segment's original start/end timestamps.
+
+        This keeps the localized video's dialogue aligned with the original:
+        instead of translating the whole transcript as one blob (losing the
+        mapping between "what was said at 0-3s" and "what should be said at
+        0-3s in the target language"), each sentence is translated
+        independently and keeps its source timing. TTS and subtitle
+        generation should consume the result of this method rather than a
+        flat translated string.
+
+        Segments are translated concurrently (each still goes through the
+        same per-text cache as `translate()`), then re-assembled in order.
+
+        :raises TranslationBackendUnavailable: if no backend is configured.
+        :raises TranslationFailed: if any segment's translation fails.
+        """
+        if self.backend is None:
+            self.logger.error("TranslateService.translate_segments: no backend configured")
+            raise TranslationBackendUnavailable("No TranslateBackend configured")
+
+        if not segments:
+            return []
+
+        self.logger.info(
+            "TranslateService.translate_segments: %d segments source=%s target=%s",
+            len(segments), source_lang, target_lang,
+        )
+
+        translated_texts = await asyncio.gather(
+            *(self.translate(seg.text, source_lang, target_lang) for seg in segments)
+        )
+
+        return [
+            TranscriptSegment(start=seg.start, end=seg.end, text=translated_text)
+            for seg, translated_text in zip(segments, translated_texts)
+        ]

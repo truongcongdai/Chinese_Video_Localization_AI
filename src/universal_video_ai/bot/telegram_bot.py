@@ -36,6 +36,9 @@ class TelegramAdapter:
     def send_message(self, chat_id: int, text: str) -> None:
         ...
 
+    def send_video(self, chat_id: int, video_path: Path, caption: Optional[str] = None) -> None:
+        ...
+
     def start(self) -> None:
         ...
 
@@ -55,6 +58,7 @@ class MockAdapter:
     def __init__(self) -> None:
         self._handlers: Dict[str, Callable[[int, List[str]], None]] = {}
         self.sent_messages: List[tuple[int, str]] = []
+        self.sent_videos: List[tuple] = []
         self._running = False
 
     def register_command(self, command: str, handler: Callable[[int, List[str]], None]) -> None:
@@ -62,6 +66,9 @@ class MockAdapter:
 
     def send_message(self, chat_id: int, text: str) -> None:
         self.sent_messages.append((chat_id, text))
+
+    def send_video(self, chat_id: int, video_path: Path, caption: Optional[str] = None) -> None:
+        self.sent_videos.append((chat_id, video_path, caption))
 
     def start(self) -> None:
         self._running = True
@@ -358,10 +365,36 @@ class TelegramBot:
                     f"📽️ Final video: {result.final_video_path.name}\n"
                     f"Transcript: {len(result.audio_pipeline_result.transcript) if result.audio_pipeline_result.transcript else 0} chars\n"
                     f"Translation: {'✓' if result.translated_text else '✗'}\n"
-                    f"Subtitles: {'✓' if result.subtitle_segments else '✗'}\n"
-                    f"File: {result.final_video_path}"
+                    f"Subtitles: {'✓' if result.subtitle_segments else '✗'}"
                 )
                 self.adapter.send_message(chat_id, msg)
+
+                # Send the actual video file to the chat — users can't browse
+                # the server's output folder, so a text path alone is
+                # useless to them. Telegram's Bot API rejects uploads over
+                # 50MB, so fall back to a clear message (with the path, for
+                # admins/self-hosters who DO have server access) instead of
+                # a failed/silent send.
+                video_size_mb = result.final_video_path.stat().st_size / (1024 * 1024)
+                if video_size_mb <= 50:
+                    try:
+                        self.adapter.send_video(
+                            chat_id,
+                            result.final_video_path,
+                            caption=f"✓ {result.final_video_path.name}",
+                        )
+                    except Exception as exc:
+                        self.logger.exception("Failed to send video to chat=%s: %s", chat_id, exc)
+                        self.adapter.send_message(
+                            chat_id, f"⚠️ Video ready but failed to send via Telegram: {exc}"
+                        )
+                else:
+                    self.adapter.send_message(
+                        chat_id,
+                        f"⚠️ Video is {video_size_mb:.0f}MB, over Telegram's 50MB bot upload limit — "
+                        f"can't send it directly here. File: {result.final_video_path}"
+                    )
+
                 self.logger.info("Localization succeeded for chat=%s url=%s", chat_id, url)
             else:
                 self.adapter.send_message(chat_id, "❌ Localization completed but no final video generated")

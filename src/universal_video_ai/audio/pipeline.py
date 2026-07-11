@@ -4,9 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from universal_video_ai.downloader.download_result import DownloadResult
+from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
 from .audio_result import AudioResult
 from .demucs import DemucsOutput
 from .extractor import AudioExtractor
@@ -33,6 +34,13 @@ class AudioPipelineResult:
     audio_result: AudioResult
     demucs_output: Optional[DemucsOutput] = None
     transcript: Optional[str] = None
+    # Per-sentence transcript with real start/end timestamps (seconds), when
+    # the configured SpeechBackend supports it (e.g. Whisper). Downstream
+    # stages (translation, TTS, subtitles, on-screen text cover) should
+    # prefer this over `transcript` so the localized video stays aligned
+    # with the original video's timing. May contain a single segment with
+    # `end == UNKNOWN_TIMING` if the backend only provided flat text.
+    segments: Optional[List[TranscriptSegment]] = None
 
 
 class AudioPipeline:
@@ -77,6 +85,7 @@ class AudioPipeline:
 
         demucs_output: Optional[DemucsOutput] = None
         transcript: Optional[str] = None
+        segments: Optional[List[TranscriptSegment]] = None
 
         # Demucs step (optional)
         if self.config.run_demucs:
@@ -88,13 +97,31 @@ class AudioPipeline:
             demucs_output = self.demucs_processor.separate(audio_result.audio_path, output_dir=self.config.demucs_output_dir)
             self.logger.debug("AudioPipeline: demucs_output=%s", demucs_output)
 
-        # Transcription step (optional) via SpeechService
+        # Transcription step (optional) via SpeechService.
+        # We always request per-sentence segments (transcribe_segments); the
+        # service transparently falls back to a single unknown-timing segment
+        # if the backend doesn't support real segment-level timestamps. This
+        # keeps `transcript` (flat text, used by legacy callers) and
+        # `segments` (timed, used by the localization pipeline) in sync and
+        # avoids calling the backend twice.
         if self.config.run_transcription:
             if self.speech_service is None:
                 raise RuntimeError("Transcription requested but no SpeechService was injected")
             self.logger.info("AudioPipeline: running transcription for %s (lang=%s)",
                              audio_result.audio_path, self.config.transcription_language)
-            transcript = self.speech_service.transcribe(audio_result.audio_path, language=self.config.transcription_language)
-            self.logger.debug("AudioPipeline: transcript length=%d", len(transcript) if transcript else 0)
+            segments = self.speech_service.transcribe_segments(
+                audio_result.audio_path, language=self.config.transcription_language
+            )
+            transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip()) or None
+            self.logger.debug(
+                "AudioPipeline: transcript length=%d segments=%d",
+                len(transcript) if transcript else 0,
+                len(segments) if segments else 0,
+            )
 
-        return AudioPipelineResult(audio_result=audio_result, demucs_output=demucs_output, transcript=transcript)
+        return AudioPipelineResult(
+            audio_result=audio_result,
+            demucs_output=demucs_output,
+            transcript=transcript,
+            segments=segments,
+        )

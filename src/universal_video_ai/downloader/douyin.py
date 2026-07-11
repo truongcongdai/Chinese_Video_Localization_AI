@@ -121,6 +121,20 @@ class DouyinDownloader(BaseDownloader):
                         url_list = addr_data.get('url_list', [])
                         if url_list and isinstance(url_list, list) and len(url_list) > 0:
                             video_url = url_list[0]
+                            # Douyin's own returned URL is the WATERMARKED
+                            # stream — it's the same video served from a
+                            # "/playwm/" path ("wm" = watermark). Swapping
+                            # that for "/play/" fetches the identical video
+                            # from Douyin's own CDN with no logo/@handle
+                            # burned into the pixels at all. This is the
+                            # standard, well-documented way every Douyin
+                            # "no watermark" downloader works — it isn't
+                            # re-encoding or cropping anything, just
+                            # requesting the clean stream Douyin already
+                            # serves for in-app playback.
+                            if 'playwm' in video_url:
+                                video_url = video_url.replace('playwm', 'play')
+                                logger.info("🧼 Rewrote play URL to the non-watermarked stream")
                             logger.info(f"🎥 Found video URL in {field_name}: {video_url[:100]}...")
                             break
 

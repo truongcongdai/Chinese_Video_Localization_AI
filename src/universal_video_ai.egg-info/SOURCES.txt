@@ -5,6 +5,7 @@ src/universal_video_ai/__main__.py
 src/universal_video_ai/config.py
 src/universal_video_ai/exceptions.py
 src/universal_video_ai/logger.py
+src/universal_video_ai/segment.py
 src/universal_video_ai.egg-info/PKG-INFO
 src/universal_video_ai.egg-info/SOURCES.txt
 src/universal_video_ai.egg-info/dependency_links.txt
@@ -56,6 +57,7 @@ src/universal_video_ai/downloader/ytdlp_downloader.py
 src/universal_video_ai/jobs/__init__.py
 src/universal_video_ai/jobs/batch.py
 src/universal_video_ai/jobs/models.py
+src/universal_video_ai/jobs/queue.py
 src/universal_video_ai/jobs/service.py
 src/universal_video_ai/mixer/__init__.py
 src/universal_video_ai/mixer/service.py
@@ -69,6 +71,7 @@ src/universal_video_ai/orchestrator/service.py
 src/universal_video_ai/render/__init__.py
 src/universal_video_ai/render/quality.py
 src/universal_video_ai/render/renderer.py
+src/universal_video_ai/render/text_detector.py
 src/universal_video_ai/speech/__init__.py
 src/universal_video_ai/speech/backend.py
 src/universal_video_ai/speech/exceptions.py
@@ -98,6 +101,7 @@ tests/test_cache.py
 tests/test_cookie_manager.py
 tests/test_database.py
 tests/test_demucs.py
+tests/test_job_queue.py
 tests/test_jobs_service.py
 tests/test_mixer_service.py
 tests/test_model_manager.py
@@ -107,13 +111,17 @@ tests/test_orchestrator_service.py
 tests/test_redis_cache.py
 tests/test_renderer.py
 tests/test_retry.py
+tests/test_segment_alignment.py
 tests/test_service.py
 tests/test_speech_service.py
+tests/test_speech_service_cache.py
 tests/test_telegram_bot.py
 tests/test_timeline_service.py
 tests/test_translate.py
+tests/test_translate_backends.py
 tests/test_translate_service.py
 tests/test_tts.py
+tests/test_tts_backends.py
 tests/test_tts_service.py
 tests/test_validator.py
 tests/test_webhook.py

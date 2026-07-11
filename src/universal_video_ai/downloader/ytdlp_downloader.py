@@ -46,7 +46,24 @@ class YTDLPDownloader(BaseDownloader):
 
             "outtmpl": output_template,
 
-            "format": "bv*+ba/b",
+            # TikTok/Douyin expose the SAME video as multiple format IDs:
+            # a "download_addr" / "watermark" stream (the one their app
+            # stamps with the logo + @username + account name when you use
+            # its own "save video" feature) and a "play_addr"-style direct
+            # stream (h264_*/bytevc1_* format ids) used for in-app playback,
+            # which has NO watermark burned into the pixels at all. Plain
+            # "bv*+ba/b" doesn't distinguish between them and can pick the
+            # watermarked one, so we explicitly exclude any format whose id
+            # contains "watermark" or "download_addr", preferring the clean
+            # stream. If a given video genuinely has no clean format
+            # available, the final "/bv*+ba/b" fallback still downloads
+            # something rather than failing outright.
+            "format": (
+                "bestvideo[format_id!*=watermark][format_id!*=download_addr]"
+                "+bestaudio[format_id!*=watermark][format_id!*=download_addr]"
+                "/best[format_id!*=watermark][format_id!*=download_addr]"
+                "/bv*+ba/b"
+            ),
 
             "merge_output_format": "mp4",
 

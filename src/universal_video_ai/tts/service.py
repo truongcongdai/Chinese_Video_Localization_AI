@@ -54,7 +54,13 @@ class TTSService:
 
         self.logger.info("TTSService.synthesize: language=%s voice=%s", language, voice)
         try:
-            result = self.backend.synthesize(text, output_path=output_path)
+            # NOTE: language/voice must be forwarded to the backend — the
+            # backend is what actually picks which TTS voice to speak with.
+            # Previously these were computed for logging/caching only and
+            # silently dropped here, so every synthesis request used
+            # whatever voice the backend happened to default to regardless
+            # of the requested target language.
+            result = self.backend.synthesize(text, output_path=output_path, language=language, voice=voice)
 
             # Cache result
             if self.cache:

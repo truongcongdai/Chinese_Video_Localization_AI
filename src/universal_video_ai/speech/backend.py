@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, Optional
+from typing import List, Protocol, Optional
 import logging
 
 # WhisperTranscriber is a local wrapper that lazy-loads heavy deps inside its methods.
 # We import it here only to provide a concrete adapter; this import is safe because
 # WhisperTranscriber itself does not import heavy libs at module import time.
 from .whisper import WhisperTranscriber, WhisperConfig  # type: ignore
+from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
 
 __all__ = ["SpeechBackend", "WhisperBackend", "NoOpSpeechBackend"]
 
@@ -20,6 +21,15 @@ class SpeechBackend(Protocol):
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
         """Return transcript text for the given audio file."""
+        ...
+
+    def transcribe_segments(self, audio_path: Path, language: Optional[str] = None) -> List[TranscriptSegment]:
+        """Return timed transcript segments (start/end/text) for the given audio file.
+
+        This is optional for backends: SpeechService falls back to wrapping
+        `transcribe()`'s flat text in a single unknown-timing segment when a
+        backend doesn't implement this method.
+        """
         ...
 
 
@@ -43,6 +53,11 @@ class WhisperBackend:
         self.logger.debug("WhisperBackend.transcribe: audio=%s language=%s", audio_path, language)
         return self._transcriber.transcribe(audio_path, language=language)
 
+    def transcribe_segments(self, audio_path: Path, language: Optional[str] = None) -> List[TranscriptSegment]:
+        """Delegate timed transcription to the underlying WhisperTranscriber."""
+        self.logger.debug("WhisperBackend.transcribe_segments: audio=%s language=%s", audio_path, language)
+        return self._transcriber.transcribe_segments(audio_path, language=language)
+
 
 class NoOpSpeechBackend:
     """No-op speech backend for development and testing.
@@ -58,3 +73,8 @@ class NoOpSpeechBackend:
         """Return placeholder transcript."""
         self.logger.debug("NoOpSpeechBackend.transcribe: audio=%s language=%s", audio_path, language)
         return "Dummy transcript from NoOpSpeechBackend"
+
+    def transcribe_segments(self, audio_path: Path, language: Optional[str] = None) -> List[TranscriptSegment]:
+        """Return a single placeholder segment with unknown timing."""
+        self.logger.debug("NoOpSpeechBackend.transcribe_segments: audio=%s language=%s", audio_path, language)
+        return [TranscriptSegment(start=0.0, end=UNKNOWN_TIMING, text="Dummy transcript from NoOpSpeechBackend")]

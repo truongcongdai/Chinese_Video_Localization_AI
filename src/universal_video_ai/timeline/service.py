@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import logging
 from typing import Optional, List
 
+from universal_video_ai.segment import TranscriptSegment
+
 __all__ = ["TimelineService", "TimelineConfig", "TimelineSegment"]
 
 _logger = logging.getLogger(__name__)
@@ -77,6 +79,56 @@ class TimelineService:
             self.logger.debug("TimelineService: segment %d [%.2f - %.2f] %s", idx, start, end, sentence[:50])
 
         return segments
+
+    def from_segments(self, segments: List[TranscriptSegment], audio_duration: Optional[float] = None) -> List[TimelineSegment]:
+        """
+        Build subtitle segments directly from real ASR/translation timestamps,
+        instead of guessing timing by evenly splitting a flat transcript.
+
+        Use this (rather than `align_transcript`) whenever `TranscriptSegment`
+        objects with real timing are available (e.g. from
+        `SpeechService.transcribe_segments` or
+        `TranslateService.translate_segments`) — this is what keeps subtitles,
+        the dubbed voice, and the on-screen text cover all lined up with the
+        moment the original speaker actually said each sentence.
+
+        Segments whose timing is unknown (`TranscriptSegment.has_timing` is
+        False, e.g. a legacy backend that only returned flat text) are
+        distributed evenly across `audio_duration` as a best-effort fallback,
+        mirroring `align_transcript`'s behavior.
+
+        :param segments: timed transcript/translated segments
+        :param audio_duration: total audio duration, used only as a fallback
+            for segments without real timing
+        :return: list of TimelineSegment
+        """
+        if not segments:
+            return []
+
+        timed = [s for s in segments if s.has_timing]
+        untimed = [s for s in segments if not s.has_timing]
+
+        result: List[TimelineSegment] = [
+            TimelineSegment(start_time=s.start, end_time=s.end, text=s.text) for s in timed
+        ]
+
+        if untimed:
+            self.logger.warning(
+                "TimelineService.from_segments: %d segment(s) had no real timing; "
+                "falling back to even-split for those",
+                len(untimed),
+            )
+            duration = audio_duration or 0.0
+            per = duration / len(untimed) if untimed and duration else 0.0
+            base = max((s.end_time for s in result), default=0.0)
+            for idx, s in enumerate(untimed):
+                start = base + idx * per
+                end = base + (idx + 1) * per
+                result.append(TimelineSegment(start_time=start, end_time=end, text=s.text))
+
+        result.sort(key=lambda seg: seg.start_time)
+        self.logger.info("TimelineService.from_segments: built %d subtitle segments from real timestamps", len(result))
+        return result
 
     def generate_srt(self, segments: List[TimelineSegment]) -> str:
         """Generate SRT subtitle file content."""

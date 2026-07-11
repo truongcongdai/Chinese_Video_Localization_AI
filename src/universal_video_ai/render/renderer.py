@@ -7,11 +7,11 @@ import logging
 import shutil
 import subprocess
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from universal_video_ai.config import TEMP_DIR
 
-__all__ = ["Renderer", "RenderConfig"]
+__all__ = ["Renderer", "RenderConfig", "TextOverlay"]
 
 _logger = logging.getLogger(__name__)
 
@@ -21,6 +21,94 @@ def _check_ffmpeg_available() -> bool:
     Check whether ffmpeg binary is available in PATH.
     """
     return shutil.which("ffmpeg") is not None
+
+
+def _escape_drawtext(text: str) -> str:
+    """
+    Escape a string for safe use inside an ffmpeg `drawtext` filter argument.
+
+    ffmpeg's filter-graph mini-language treats `\\`, `:`, `'`, `%`, `,`, `[`
+    and `]` specially, so any of these appearing in translated subtitle text
+    (which is untrusted, human-written content) must be escaped or the
+    filter_complex string will fail to parse or silently truncate the text.
+    """
+    text = text.replace("\\", "\\\\")
+    text = text.replace(":", "\\:")
+    text = text.replace("%", "\\%")
+    text = text.replace(",", "\\,")
+    text = text.replace("[", "\\[")
+    text = text.replace("]", "\\]")
+    # Single quotes are awkward to escape inside ffmpeg's own quoting; swap
+    # for a visually-equivalent right single quote instead of risking a
+    # broken filter graph.
+    text = text.replace("'", "\u2019")
+    text = text.replace("\n", " ")
+    return text
+
+
+def _escape_filter_path(path: str) -> str:
+    """
+    Escape a filesystem path for safe use as an ffmpeg filter option value
+    (e.g. `subtitles=<this>`), per ffmpeg's own filtergraph escaping rules.
+
+    The `subtitles` filter parses its argument as `filename[:opt=val...]`,
+    so a raw colon in the path (Windows drive letters like `C:\\...`, or
+    just a folder containing a colon) gets misread as the start of an
+    option list instead of part of the filename — this is what produces
+    "Unable to parse option value" errors, or in some builds, a filter that
+    silently misbehaves instead of failing cleanly. Backslashes need
+    escaping first (so the colon-escaping backslash itself isn't
+    misinterpreted), then colons, then the whole thing is wrapped in single
+    quotes as ffmpeg's docs recommend for values containing special chars.
+    """
+    escaped = path.replace("\\", "\\\\").replace(":", "\\:")
+    return f"'{escaped}'"
+
+
+@dataclass(frozen=True)
+class TextOverlay:
+    """
+    A translated-subtitle overlay that replaces burned-in on-screen text for
+    one sentence, shown only during that sentence's time window.
+
+    Combine `render.text_detector.TextRegion` (where the original text is)
+    with the matching translated `TimelineSegment` (what to show instead,
+    and when) to build these.
+
+    Attributes:
+        start: seconds, when this overlay should appear (matches the
+               original sentence's on-screen appearance).
+        end: seconds, when this overlay should disappear.
+        x, y, width, height: pixel region of the original video to cover.
+        text: translated text to draw in place of the covered region.
+        box_color: ffmpeg color used to cover the original text (default
+               white, since burned-in subtitles are usually on a plain
+               background bar; override per-video if needed).
+        font_color: color of the translated text.
+        font_path: optional path to a Unicode-capable .ttf/.otf font. This
+               MUST support the target language's characters (e.g. Vietnamese
+               diacritics); ffmpeg's default font may not. If omitted,
+               ffmpeg's fontconfig default is used, which may render
+               diacritics/CJK incorrectly.
+    """
+
+    start: float
+    end: float
+    x: int
+    y: int
+    width: int
+    height: int
+    text: str
+    box_color: str = "white"
+    font_color: str = "black"
+    font_path: Optional[str] = None
+    font_size: Optional[int] = None
+    """Explicit font size in px. If None, falls back to a size derived from
+    `height` (height * 0.6). Callers building many overlays for the same
+    video (e.g. the orchestrator) should set the SAME explicit font_size on
+    every overlay so the translated text renders at one consistent size
+    throughout the video, instead of fluctuating with each detected box's
+    height."""
 
 
 @dataclass(frozen=True)
@@ -38,8 +126,14 @@ class RenderConfig:
         overwrite: whether to overwrite existing output file.
         timeout_seconds: ffmpeg timeout for rendering.
         blur_text: whether to apply blur filter to cover original text (e.g., Chinese subtitles).
+                   This is a coarse legacy option; prefer passing `text_overlays`
+                   to `render()` for accurate, per-sentence, timestamp-aware covering.
         blur_box: coordinates for blur box as "x:y:w:h" (e.g., "0:0:1920:100" for top bar).
-                  If None, defaults to covering bottom 15% of video.
+                  If None, defaults to blurring the whole frame (see `render()` docs).
+        default_overlay_font_path: fallback font used for `TextOverlay`s that
+                  don't specify their own `font_path`. Should point to a
+                  Unicode-capable TTF (e.g. NotoSans, DejaVuSans) so
+                  Vietnamese/other diacritics render correctly.
     """
 
     video_codec: str = "libx264"
@@ -51,11 +145,22 @@ class RenderConfig:
     timeout_seconds: int = 1800  # 30 minutes
     blur_text: bool = False
     blur_box: Optional[str] = None
+    default_overlay_font_path: Optional[str] = None
+    # Static region to permanently blur for the ENTIRE video, regardless of
+    # blur_text/text_overlays — intended for a platform watermark (e.g. the
+    # TikTok/Douyin logo + @username + reup title baked into the corner of
+    # a downloaded source video), which is not a translatable subtitle and
+    # shouldn't be treated like one. Expressed as (x0, y0, x1, y1) FRACTIONS
+    # (0.0-1.0) of the frame so it works across differently-sized source
+    # videos. Example: (0.80, 0.72, 1.0, 1.0) covers the bottom-right ~20%
+    # width x ~28% height corner.
+    watermark_box_fractional: Optional[Tuple[float, float, float, float]] = None
 
 
 class Renderer:
     """
-    Combine video and audio into a final video file and optionally burn subtitles.
+    Combine video and audio into a final video file and optionally burn subtitles
+    and/or timestamp-accurate text-cover overlays.
 
     Responsibilities:
     - Validate inputs (existence, file)
@@ -85,12 +190,145 @@ class Renderer:
         filename = f"{video_path.stem}.final.mp4"
         return out_dir / filename
 
-    def _build_command(self, input_video: Path, input_audio: Path, output: Path, subtitles: Optional[Path] = None) -> List[str]:
+    def _build_text_overlay_filters(
+        self, overlays: List[TextOverlay], frame_w: Optional[int] = None
+    ) -> List[str]:
         """
-        Build ffmpeg command list based on configuration and presence of subtitles.
+        Build one `drawbox` (cover the original text) + one `drawtext` (draw
+        the translated text) filter pair per overlay, each gated to only be
+        active during that sentence's `[start, end)` window via ffmpeg's
+        `enable='between(t,start,end)'` expression. This is what makes the
+        cover box and translated caption appear/disappear in sync with the
+        original on-screen text instead of covering the whole video.
+
+        The translated sentence is very often wider than the ORIGINAL
+        on-screen text's OCR-detected box (e.g. Vietnamese needs more
+        horizontal space per "word" than Chinese characters do), so sizing
+        the box/font purely from the detected box's height — ignoring how
+        long the translated string actually is — let long sentences spill
+        text outside the white cover box or off the edge of the frame.
+        Below, both the font size and the box width adapt to the text
+        length: first try to fit at a height-based font size by widening
+        the box (kept centered on the original detected box and clamped to
+        the frame); only if that would make the box unreasonably wide do we
+        shrink the font instead.
+        """
+        filters: List[str] = []
+        # Average glyph width as a fraction of font size for a typical bold
+        # sans-serif font (incl. Vietnamese diacritics/wide glyphs) — a
+        # deliberately conservative estimate so text more often fits with
+        # room to spare than overflows.
+        avg_char_width_ratio = 0.58
+        box_padding_x = 20  # px of breathing room inside the box, each side
+        min_font_size = 14
+        max_font_size = 64
+
+        for overlay in overlays:
+            enable_expr = f"between(t\\,{overlay.start:.3f}\\,{overlay.end:.3f})"
+
+            font_path = overlay.font_path or self.config.default_overlay_font_path
+            font_clause = f"fontfile='{font_path}':" if font_path else ""
+
+            text_len = max(1, len(overlay.text))
+            font_size = (
+                overlay.font_size
+                if overlay.font_size is not None
+                else max(min_font_size, int(overlay.height * 0.6))
+            )
+            font_size = min(font_size, max_font_size)
+
+            box_cx = overlay.x + overlay.width / 2.0
+            # Don't let the cover box balloon past ~92% of the frame width
+            # even for very long sentences — beyond that we shrink the font
+            # instead so it still reads as a caption, not a banner.
+            max_box_width = int(frame_w * 0.92) if frame_w else overlay.width * 4
+
+            est_text_width = text_len * font_size * avg_char_width_ratio
+            avail_width = overlay.width - 2 * box_padding_x
+
+            if est_text_width > avail_width:
+                needed_box_width = int(est_text_width + 2 * box_padding_x)
+                box_width = min(needed_box_width, max_box_width)
+                avail_at_box = box_width - 2 * box_padding_x
+                est_text_width_at_box = text_len * font_size * avg_char_width_ratio
+                if est_text_width_at_box > avail_at_box > 0:
+                    # Even the widened (capped) box isn't enough — shrink
+                    # the font until the estimated text width fits.
+                    font_size = max(
+                        min_font_size,
+                        int(avail_at_box / (text_len * avg_char_width_ratio)),
+                    )
+            else:
+                box_width = overlay.width
+
+            box_x = int(box_cx - box_width / 2.0)
+            if frame_w:
+                box_x = max(0, min(box_x, frame_w - box_width))
+
+            filters.append(
+                f"drawbox=x={box_x}:y={overlay.y}:w={box_width}:h={overlay.height}"
+                f":color={overlay.box_color}@1.0:t=fill:enable='{enable_expr}'"
+            )
+
+            # Center the translated text both horizontally and vertically
+            # inside the (possibly widened) cover box. `text_w`/`text_h` are
+            # ffmpeg drawtext's built-in expressions for the rendered text's
+            # own pixel size, so this stays centered regardless of length.
+            filters.append(
+                "drawtext="
+                f"{font_clause}"
+                f"text='{_escape_drawtext(overlay.text)}':"
+                f"x={box_x}+({box_width}-text_w)/2:"
+                f"y={overlay.y}+({overlay.height}-text_h)/2:"
+                f"fontsize={font_size}:fontcolor={overlay.font_color}:"
+                f"enable='{enable_expr}'"
+            )
+        return filters
+
+    def _get_video_dimensions(self, video_path: Path) -> Optional[Tuple[int, int]]:
+        """Return (width, height) of the video via ffprobe, or None if unavailable."""
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0", str(video_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
+                return None
+            w_str, h_str = result.stdout.strip().split("x")
+            return int(w_str), int(h_str)
+        except Exception as exc:
+            self.logger.warning("Could not determine video dimensions: %s", exc)
+            return None
+
+    @staticmethod
+    def _region_blur_filter(x: int, y: int, w: int, h: int) -> str:
+        """Build an ffmpeg filter that blurs only the pixel region
+        (x, y, w, h) for the whole video, leaving everything else sharp.
+
+        IMPORTANT: ffmpeg's `crop` filter takes `w:h:x:y` (width, height,
+        x, y) — NOT `x:y:w:h`. Passing our x/y/w/h straight through in the
+        wrong order silently crops (and then blurs/overlays) the wrong
+        region of the frame.
+        """
+        return f"crop={w}:{h}:{x}:{y},boxblur=10:1,overlay={x}:{y}"
+
+    def _build_command(
+        self,
+        input_video: Path,
+        input_audio: Path,
+        output: Path,
+        subtitles: Optional[Path] = None,
+        text_overlays: Optional[List[TextOverlay]] = None,
+    ) -> List[str]:
+        """
+        Build ffmpeg command list based on configuration and presence of subtitles
+        and/or text overlays.
 
         Strategy:
-        - If subtitles or blur_text enabled: we need to re-encode video (apply -vf filters)
+        - If subtitles, text_overlays, or blur_text enabled: we need to re-encode
+          video (apply -vf filters)
         - Otherwise: use stream copy for video (-c:v copy) and encode audio to target codec
                      (faster).
         """
@@ -103,42 +341,129 @@ class Renderer:
         cmd.extend(["-i", str(input_video)])
         cmd.extend(["-i", str(input_audio)])
 
-        # Determine if we need video filters (subtitles or blur)
-        needs_reencode = subtitles is not None or self.config.blur_text
+        text_overlays = text_overlays or []
+
+        # Determine if we need video filters (subtitles, overlays, or blur)
+        needs_reencode = (
+            subtitles is not None
+            or self.config.blur_text
+            or bool(text_overlays)
+            or self.config.watermark_box_fractional is not None
+        )
+
+        if text_overlays and not self.config.default_overlay_font_path and not any(
+            o.font_path for o in text_overlays
+        ):
+            self.logger.warning(
+                "Rendering %d text_overlay(s) with no font_path/default_overlay_font_path set. "
+                "FFmpeg's default fontconfig font may not render Vietnamese diacritics (or other "
+                "non-ASCII target-language text) correctly. Set RenderConfig.default_overlay_font_path "
+                "to a Unicode-capable .ttf (e.g. NotoSans-Regular.ttf, DejaVuSans.ttf).",
+                len(text_overlays),
+            )
 
         if needs_reencode:
             # Build video filter chain
             filters = []
-            
-            # Add blur filter if enabled
-            if self.config.blur_text:
-                if self.config.blur_box:
-                    # Use custom blur box coordinates with crop+blur+overlay
-                    # Format: x:y:w:h
-                    blur_filter = f"crop={self.config.blur_box},boxblur=10:1,overlay={self.config.blur_box.split(':')[0]}:{self.config.blur_box.split(':')[1]}"
+
+            frame_w: Optional[int] = None
+            frame_h: Optional[int] = None
+            if self.config.watermark_box_fractional is not None or text_overlays:
+                dims = self._get_video_dimensions(input_video)
+                if dims is not None:
+                    frame_w, frame_h = dims
+
+            # Permanently blur a platform watermark (logo/@username/reup
+            # title), independent of blur_text/text_overlays — it's not a
+            # translatable subtitle, it's baked into every single frame, so
+            # it's covered for the whole video rather than per-sentence.
+            if self.config.watermark_box_fractional is not None:
+                if frame_w is None or frame_h is None:
+                    self.logger.warning(
+                        "watermark_box_fractional is set but video dimensions could not be "
+                        "determined; skipping watermark cover for this render."
+                    )
                 else:
-                    # Simple global blur (temporary fix - will blur entire video)
-                    # TODO: Implement region-specific blur with crop+overlay
-                    blur_filter = "boxblur=5:1"
-                filters.append(blur_filter)
-            
-            # Add subtitles filter if provided
+                    fx0, fy0, fx1, fy1 = self.config.watermark_box_fractional
+                    wx, wy = int(fx0 * frame_w), int(fy0 * frame_h)
+                    ww = max(2, int((fx1 - fx0) * frame_w))
+                    wh = max(2, int((fy1 - fy0) * frame_h))
+                    filters.append(self._region_blur_filter(wx, wy, ww, wh))
+
+            # Add blur filter only as a LAST-RESORT fallback for covering
+            # burned-in text — and only when we have no better option.
+            #
+            # Precedence, from best to worst:
+            #   1. text_overlays (OCR-detected box + translated caption) —
+            #      precise, per-sentence, keeps the rest of the frame sharp.
+            #   2. blur_text WITH an explicit blur_box — blurs only that
+            #      region, not the whole frame.
+            #   3. blur_text with NO blur_box — used to fall back to
+            #      `boxblur` over the ENTIRE frame ("temporary fix" per the
+            #      old TODO). This made the whole video look blurry/hard to
+            #      watch even though only a small subtitle strip needed
+            #      covering, so it is intentionally disabled below rather
+            #      than applied.
+            #
+            # If text_overlays were successfully detected, we skip blur_text
+            # entirely — covering the same region twice (blur + white box)
+            # is redundant and blur_text's whole-frame fallback would
+            # actively make the video worse.
+            if self.config.blur_text and not text_overlays:
+                if self.config.blur_box:
+                    # blur_box is documented/entered as "x:y:w:h"; convert to
+                    # the crop filter's actual w:h:x:y order (see
+                    # _region_blur_filter docstring).
+                    try:
+                        bx, by, bw, bh = (int(v) for v in self.config.blur_box.split(":"))
+                        filters.append(self._region_blur_filter(bx, by, bw, bh))
+                    except ValueError:
+                        self.logger.error(
+                            "Malformed blur_box=%r (expected 'x:y:w:h' integers); skipping.",
+                            self.config.blur_box,
+                        )
+                else:
+                    # No region given: do NOT blur the entire frame anymore.
+                    # A full-frame blur is a much worse user experience than
+                    # simply not covering the text, so we skip it and log
+                    # loudly instead of silently degrading every video.
+                    self.logger.warning(
+                        "blur_text=True but no blur_box was set and no text_overlays were "
+                        "available — skipping blur entirely instead of blurring the whole "
+                        "frame. Set RenderConfig.blur_box to a specific 'x:y:w:h' region, "
+                        "or (preferred) enable LocalizationConfig.enable_text_cover so the "
+                        "on-screen text region is detected automatically via OCR."
+                    )
+
+            # Add per-sentence text-cover + translated-text overlays, each
+            # only active during its own [start, end) window.
+            filters.extend(self._build_text_overlay_filters(text_overlays, frame_w=frame_w))
+
+            # Add subtitles filter if provided. The `subtitles=` filter option
+            # value is itself parsed as filename[:key=value...], so a raw path
+            # containing a colon (a Windows drive letter, or just a folder
+            # name with a colon in it) gets misparsed as a bogus filter
+            # option and ffmpeg fails with "Unable to parse option value" —
+            # or, on some inputs, stalls/gets stuck applying that filter
+            # instead of failing cleanly. Escaping `\` and `:` and wrapping
+            # in single quotes (ffmpeg's documented approach for filter
+            # option values with special characters) avoids this entirely.
             if subtitles:
-                filters.append(f"subtitles={str(subtitles)}")
-            
+                filters.append(f"subtitles={_escape_filter_path(str(subtitles))}")
+
             # Combine filters with comma
             vf = ",".join(filters) if filters else None
-            
+
             cmd.extend(
                 [
                     "-map", "0:v",
                     "-map", "1:a",
                 ]
             )
-            
+
             if vf:
                 cmd.extend(["-vf", vf])
-            
+
             cmd.extend(
                 [
                     "-c:v", self.config.video_codec,
@@ -170,6 +495,7 @@ class Renderer:
         audio_path: Path,
         subtitles: Optional[Path] = None,
         output_path: Optional[Path] = None,
+        text_overlays: Optional[List[TextOverlay]] = None,
     ) -> Path:
         """
         Render the final video.
@@ -178,6 +504,11 @@ class Renderer:
         :param audio_path: Path to audio file (e.g., TTS result).
         :param subtitles: Optional path to subtitles file (SRT). If provided, subtitles will be burned in.
         :param output_path: Optional target output path. If None, use default location.
+        :param text_overlays: Optional list of TextOverlay — per-sentence boxes
+            that cover the original on-screen (burned-in) text and draw the
+            translated text in its place, each shown only during its own
+            time window. Build these from `render.text_detector.OnScreenTextDetector`
+            output combined with translated `TimelineSegment`s.
         :raises FileNotFoundError: when inputs missing or not files
         :raises RuntimeError: when ffmpeg fails or output not created
         :return: Path to rendered video
@@ -201,18 +532,20 @@ class Renderer:
         output = output.resolve()
 
         # Construct ffmpeg command
-        cmd = self._build_command(video_path, audio_path, output, subtitles)
+        cmd = self._build_command(video_path, audio_path, output, subtitles, text_overlays)
 
-        self.logger.info("Rendering output %s from video=%s audio=%s subtitles=%s", output, video_path, audio_path, subtitles)
+        self.logger.info(
+            "Rendering output %s from video=%s audio=%s subtitles=%s text_overlays=%d",
+            output, video_path, audio_path, subtitles, len(text_overlays or []),
+        )
         self.logger.debug("FFmpeg command: %s", " ".join(cmd))
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=self.config.timeout_seconds)
+            returncode, stderr_text = self._run_ffmpeg_with_progress(cmd, self.config.timeout_seconds)
 
-            if result.returncode != 0:
-                err = result.stderr or result.stdout or "unknown error"
-                self.logger.error("FFmpeg returned non-zero exit code: %s", err)
-                raise RuntimeError(f"FFmpeg failed: {err}")
+            if returncode != 0:
+                self.logger.error("FFmpeg returned non-zero exit code: %s", stderr_text)
+                raise RuntimeError(f"FFmpeg failed: {stderr_text}")
 
             if not output.exists():
                 self.logger.error("FFmpeg completed but output file not created: %s", output)
@@ -231,3 +564,62 @@ class Renderer:
         except Exception as exc:
             self.logger.exception("Unexpected error during rendering: %s", exc)
             raise RuntimeError(f"Rendering failed: {exc}") from exc
+
+    def _run_ffmpeg_with_progress(self, cmd: List[str], timeout_seconds: int, heartbeat_seconds: float = 15.0) -> "tuple[int, str]":
+        """
+        Run an ffmpeg command while streaming its stderr instead of buffering
+        it silently until exit. A full re-encode (needed whenever subtitles
+        or text-cover overlays are burned in) can legitimately take many
+        minutes; blocking with no output in the meantime is exactly what
+        makes the process *look* hung even when it's still working. This
+        logs ffmpeg's own progress line (it reports `frame=`/`time=` on
+        stderr) at most once every `heartbeat_seconds`, so long renders stay
+        visibly alive, and still enforces `timeout_seconds` by killing the
+        process if it runs over.
+
+        :return: (returncode, full stderr text) — stderr text is used for
+            error reporting on failure, matching the previous behavior.
+        """
+        import threading
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        stderr_lines: List[str] = []
+        last_heartbeat = time.monotonic()
+        last_progress_line = ""
+        lock = threading.Lock()
+
+        def _reader() -> None:
+            nonlocal last_heartbeat, last_progress_line
+            assert process.stderr is not None
+            for line in process.stderr:
+                with lock:
+                    stderr_lines.append(line)
+                    stripped = line.strip()
+                    if stripped:
+                        last_progress_line = stripped
+                    now = time.monotonic()
+                    if now - last_heartbeat >= heartbeat_seconds:
+                        last_heartbeat = now
+                        self.logger.info("FFmpeg still running... %s", last_progress_line)
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+
+        reader_thread.join(timeout=5.0)
+        with lock:
+            stderr_text = "".join(stderr_lines) or "unknown error"
+        return returncode, stderr_text

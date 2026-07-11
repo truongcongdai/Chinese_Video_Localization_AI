@@ -45,13 +45,30 @@ def main() -> None:
 
     # Setup localization service with full pipeline enabled using factory
     from universal_video_ai.render.renderer import RenderConfig
-    
-    # Enable blur to cover original Chinese text
+
+    # Cover the original burned-in Chinese subtitles with a precise,
+    # per-sentence white box (detected via OCR) instead of blurring the
+    # whole frame. blur_text is OFF — it was only ever a coarse fallback,
+    # and blurring the entire video (not just the subtitle strip) made it
+    # hard to watch. The white box + translated text is turned on below via
+    # `enable_text_cover=True`.
     render_config = RenderConfig(
-        blur_text=True,
-        blur_box=None  # Default: blur bottom 15% where subtitles usually appear
+        blur_text=False,
+        blur_box=None,
+        # DejaVu Sans (installed via Dockerfile) renders Vietnamese
+        # diacritics correctly; ffmpeg's fontconfig default often doesn't.
+        default_overlay_font_path="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        # No watermark_box_fractional anymore: the downloader now fetches
+        # Douyin/TikTok's own non-watermarked stream directly (see
+        # downloader/douyin.py and downloader/ytdlp_downloader.py), so
+        # there's no logo left in the pixels to cover. Permanently blurring
+        # a corner that's already clean just made the video look worse for
+        # no reason. If a specific source still slips through with a
+        # watermark, set this back to e.g. (0.80, 0.72, 1.0, 1.0) as a
+        # per-deployment fallback.
+        watermark_box_fractional=None,
     )
-    
+
     localization_service = create_localization_service(
         run_transcription=True,
         transcription_language=None,  # Auto-detect language (important for YouTube videos)
@@ -62,6 +79,11 @@ def main() -> None:
         mix_audio=True,
         render_video=True,
         render_config=render_config,
+        # Detect the burned-in Chinese subtitle region via OCR (easyocr) for
+        # each sentence and cover it with a white box + centered translated
+        # text, instead of relying on the old whole-frame blur.
+        enable_text_cover=True,
+        ocr_languages=("ch_sim", "en"),
         logger=logger
     )
 

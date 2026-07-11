@@ -2,24 +2,59 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
 from typing import Optional, List
 import subprocess
 import shutil
 
-__all__ = ["MixerService", "MixerConfig", "AudioMix"]
+__all__ = ["MixerService", "MixerConfig", "AudioMix", "TimedAudioClip"]
 
 _logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class AudioMix:
-    """Specification for mixing audio streams."""
+    """Specification for mixing audio streams.
+
+    `mix_level` is the volume weight given to `primary_audio` (the ORIGINAL,
+    untranslated audio); `secondary_audio` (the dubbed/TTS track) gets
+    `1 - mix_level`.
+
+    For a localized/dubbed video, the translated voice is the thing viewers
+    actually need to understand, so it should be the DOMINANT track — the
+    original audio should be ducked low (kept only for ambient sound/music
+    under the dub), not the other way around. The previous default of 0.7
+    gave the ORIGINAL language 70% and the dub only 30%, which is why the
+    dubbed voice was nearly inaudible under the original dialogue. 0.18
+    keeps a bit of the original's ambience/music audible without competing
+    with the dub for intelligibility.
+    """
 
     primary_audio: Path  # original audio
     secondary_audio: Optional[Path] = None  # TTS/translation
-    mix_level: float = 0.7  # volume of primary (0-1), secondary gets 1-mix_level
+    mix_level: float = 0.18  # volume of primary/original (0-1); secondary/dub gets 1-mix_level
+
+
+@dataclass(frozen=True)
+class TimedAudioClip:
+    """A single dubbed-sentence audio clip anchored to the original video's timeline.
+
+    Attributes:
+        start: when this clip should start playing, in seconds, relative to
+               the original video (i.e. the same timestamp the source
+               sentence started at).
+        end: when this clip's slot ends, in seconds. Used only to know how
+             much room is available before the next sentence; the clip will
+             be time-stretched/compressed to fit `end - start` if its actual
+             rendered duration differs.
+        audio_path: path to the synthesized (TTS) audio file for this clip.
+    """
+
+    start: float
+    end: float
+    audio_path: Path
 
 
 @dataclass
@@ -80,7 +115,13 @@ class MixerService:
             "-i", str(mix_spec.primary_audio),
             "-i", str(mix_spec.secondary_audio),
             "-filter_complex",
-            f"[0:a]volume={mix_spec.mix_level}[a0];[1:a]volume={1 - mix_spec.mix_level}[a1];[a0][a1]amix=inputs=2:duration=first[out]",
+            # `volume=` on each input already sets the exact primary/secondary
+            # balance we want (they sum to 1.0), so we disable amix's default
+            # `normalize` behavior (which would otherwise divide both inputs
+            # by the input count again and quietly halve overall loudness,
+            # on top of the balance we already applied).
+            f"[0:a]volume={mix_spec.mix_level}[a0];[1:a]volume={1 - mix_spec.mix_level}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:normalize=0[out]",
             "-map", "[out]",
             "-ar", str(self.config.sample_rate),
             "-y",
@@ -101,3 +142,170 @@ class MixerService:
         except Exception as exc:
             self.logger.exception("Unexpected error during mix: %s", exc)
             raise RuntimeError(f"Audio mix failed: {exc}") from exc
+
+    def _probe_duration(self, audio_path: Path) -> float:
+        """Return duration in seconds of `audio_path` via ffprobe, or 0.0 if unknown."""
+        if shutil.which("ffprobe") is None:
+            self.logger.warning("ffprobe not available; cannot measure clip duration for %s", audio_path)
+            return 0.0
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(audio_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            if result.returncode != 0:
+                self.logger.warning("ffprobe failed for %s: %s", audio_path, result.stderr)
+                return 0.0
+            data = json.loads(result.stdout or "{}")
+            return float(data.get("format", {}).get("duration", 0.0))
+        except Exception as exc:
+            self.logger.warning("ffprobe duration probe failed for %s: %s", audio_path, exc)
+            return 0.0
+
+    @staticmethod
+    def _atempo_chain(factor: float) -> List[str]:
+        """
+        Build a chain of ffmpeg `atempo` filter args so an arbitrary speed
+        factor can be applied, since a single `atempo` only accepts [0.5, 2.0].
+
+        :param factor: desired speed multiplier (>1 = faster/shorter, <1 = slower/longer)
+        :return: list like ["atempo=1.5"] or ["atempo=2.0", "atempo=1.2"] for extreme factors
+        """
+        factor = max(0.25, min(4.0, factor))  # clamp to a sane audible range
+        parts: List[str] = []
+        remaining = factor
+        while remaining > 2.0:
+            parts.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5:
+            parts.append("atempo=0.5")
+            remaining /= 0.5
+        parts.append(f"atempo={remaining:.4f}")
+        return parts
+
+    def build_dubbed_track(
+        self,
+        clips: List[TimedAudioClip],
+        total_duration: float,
+        output_path: Path,
+    ) -> Path:
+        """
+        Assemble many per-sentence TTS clips into a single continuous audio
+        track, placing each clip at its original sentence's start time so the
+        dubbed voice stays aligned with the source video's timing.
+
+        Each clip is time-stretched/compressed (via ffmpeg `atempo`) to fit
+        the `end - start` slot of its source sentence when the synthesized
+        speech doesn't naturally match that duration. Gaps between sentences
+        are left silent.
+
+        :param clips: timed clips, ideally ordered by start time (order is not required)
+        :param total_duration: length in seconds of the resulting track (matches
+            the original video/audio duration)
+        :param output_path: where to write the assembled track
+        :raises RuntimeError: if ffmpeg is unavailable or fails
+        :return: output_path
+        """
+        output_path = Path(output_path).resolve()
+
+        if not self._ffmpeg_available:
+            self.logger.error("FFmpeg not available; cannot build dubbed track")
+            raise RuntimeError("FFmpeg not available in PATH")
+
+        if not clips:
+            self.logger.warning("build_dubbed_track: no clips provided; producing silent track")
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"anullsrc=r={self.config.sample_rate}:cl=stereo",
+                "-t", str(max(0.01, total_duration)),
+                "-y", str(output_path),
+            ]
+            self._run_ffmpeg(cmd, "build_dubbed_track (silent)")
+            return output_path
+
+        self.logger.info(
+            "MixerService.build_dubbed_track: assembling %d clips into %.2fs track -> %s",
+            len(clips), total_duration, output_path,
+        )
+
+        inputs: List[str] = []
+        filter_parts: List[str] = []
+        mixed_labels: List[str] = []
+
+        for idx, clip in enumerate(clips):
+            slot_duration = max(0.0, clip.end - clip.start)
+            actual_duration = self._probe_duration(clip.audio_path)
+
+            inputs.extend(["-i", str(clip.audio_path)])
+
+            stage_label = f"[{idx}:a]"
+            if slot_duration > 0.05 and actual_duration > 0.05:
+                factor = actual_duration / slot_duration
+                # Only bother stretching if the mismatch is meaningfully audible.
+                if abs(factor - 1.0) > 0.03:
+                    atempo_filters = self._atempo_chain(factor)
+                    chain = ",".join(atempo_filters)
+                    out_label = f"[t{idx}]"
+                    filter_parts.append(f"{stage_label}{chain}{out_label}")
+                    stage_label = out_label
+
+            delay_ms = max(0, int(round(clip.start * 1000)))
+            delayed_label = f"[d{idx}]"
+            filter_parts.append(f"{stage_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
+            mixed_labels.append(delayed_label)
+
+        mix_inputs = "".join(mixed_labels)
+        n = len(mixed_labels)
+        # IMPORTANT: previously this used amix's default `normalize=1`
+        # (divide the sum by input count) and then multiplied the result
+        # back by `n` to compensate, on the assumption that only ~1 of the
+        # `n` clips is ever audible at a given instant (since each clip is
+        # placed at its own non-overlapping sentence slot). That assumption
+        # breaks whenever two clips' audio actually overlaps in time — e.g.
+        # a clip that got `atempo`-stretched and runs slightly past its
+        # slot into the next clip's start. When that happens, amix's
+        # normalized sum of 2+ *real* signals gets multiplied by `n`
+        # (routinely 100+), producing a massive, escalating volume spike —
+        # exactly the "volume suddenly jumps" symptom, worse in
+        # dialogue-dense sections where overlaps are more likely.
+        #
+        # Fix: use `normalize=0` so amix just sums the streams as-is with
+        # no automatic division. When only one clip is active this yields
+        # its original (correct) volume with no multiplier needed. When
+        # clips do overlap, the sum can only grow by the (small) number of
+        # truly-overlapping clips, not by `n` — and `alimiter` below catches
+        # any resulting peaks so overlaps can't clip/distort the output.
+        filter_parts.append(
+            f"{mix_inputs}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0[summed]"
+        )
+        filter_parts.append("[summed]alimiter=limit=0.95:attack=5:release=50[mixed]")
+
+        filter_complex = ";".join(filter_parts)
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[mixed]",
+            "-t", str(max(0.01, total_duration)),
+            "-ar", str(self.config.sample_rate),
+            "-y", str(output_path),
+        ]
+
+        self._run_ffmpeg(cmd, "build_dubbed_track")
+        return output_path
+
+    def _run_ffmpeg(self, cmd: List[str], op_name: str) -> None:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=1800)
+            if result.returncode != 0:
+                stderr = result.stderr or result.stdout or "unknown error"
+                self.logger.error("FFmpeg %s failed: %s", op_name, stderr)
+                raise RuntimeError(f"FFmpeg {op_name} failed: {stderr}")
+            self.logger.info("MixerService.%s: success", op_name)
+        except subprocess.TimeoutExpired:
+            self.logger.error("FFmpeg %s timed out", op_name)
+            raise RuntimeError(f"FFmpeg {op_name} timed out")

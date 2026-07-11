@@ -58,6 +58,38 @@ class RealTelegramAdapter:
         else:
             self.logger.warning("Cannot send message: application not initialized")
 
+    def send_video(self, chat_id: int, video_path, caption: Optional[str] = None) -> None:
+        """Send a video file to a chat."""
+        if not self._application:
+            self.logger.warning("Cannot send video: application not initialized")
+            return
+
+        import asyncio
+
+        async def _send():
+            with open(video_path, "rb") as f:
+                await self._application.bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    caption=caption,
+                    # A large local video can take a while to upload;
+                    # Telegram's own network read timeout for big uploads
+                    # is generous, but the default httpx client timeout
+                    # here is not — raise it so the send doesn't fail
+                    # partway through on slower connections.
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(_send())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_send())
+
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming Telegram command."""
         if not update.message or not update.message.text:
@@ -135,3 +167,4 @@ class RealTelegramAdapter:
         
         self._running = False
         self.logger.info("Telegram bot stopped")
+

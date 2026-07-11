@@ -3,8 +3,13 @@
 Render module.
 
 Exports:
-- Renderer, RenderConfig
+- Renderer, RenderConfig, TextOverlay
+- OnScreenTextDetector, TextRegion (optional OCR-based text-cover detection)
 """
-from .renderer import Renderer, RenderConfig
+from .renderer import Renderer, RenderConfig, TextOverlay
+from .text_detector import OnScreenTextDetector, TextRegion, OCR_AVAILABLE
 
-__all__ = ["Renderer", "RenderConfig"]
+__all__ = [
+    "Renderer", "RenderConfig", "TextOverlay",
+    "OnScreenTextDetector", "TextRegion", "OCR_AVAILABLE",
+]
