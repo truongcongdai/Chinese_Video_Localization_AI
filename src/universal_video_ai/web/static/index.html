@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Localization AI</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1f232c;
+    --border: #2a2f3a;
+    --text: #e7e9ee;
+    --text-dim: #9aa1ae;
+    --accent: #5b8cff;
+    --accent-2: #3f6bd8;
+    --ok: #3ecf8e;
+    --err: #ff6b6b;
+    --warn: #f5b74e;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 32px 20px 80px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  header h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  header .sub { color: var(--text-dim); font-size: 13px; }
+  #userbar { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--text-dim); }
+  button { cursor: pointer; font-family: inherit; }
+  .btn {
+    background: var(--accent); color: white; border: none; border-radius: 8px;
+    padding: 10px 18px; font-size: 14px; font-weight: 600; transition: background .15s;
+  }
+  .btn:hover { background: var(--accent-2); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  .btn.secondary:hover { background: #262b35; }
+  .btn.small { padding: 6px 12px; font-size: 13px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 20px;
+  }
+  input, select, textarea {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 10px 12px; font-size: 14px; font-family: inherit;
+  }
+  label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 6px; }
+  .field { margin-bottom: 14px; }
+  .row { display: flex; gap: 14px; }
+  .row > * { flex: 1; }
+  #auth-view { max-width: 380px; margin: 80px auto 0; }
+  #auth-view h2 { text-align: center; margin-bottom: 4px; }
+  #auth-view p.sub { text-align: center; color: var(--text-dim); font-size: 13px; margin-top: 0; margin-bottom: 24px; }
+  #auth-error { color: var(--err); font-size: 13px; min-height: 18px; margin-top: 8px; }
+  .hidden { display: none !important; }
+  .job {
+    display: flex; align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--border);
+  }
+  .job:last-child { border-bottom: none; }
+  .job .job-info { flex: 1; min-width: 0; }
+  .job .job-url { font-size: 14px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .job .job-meta { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+  .badge {
+    font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase;
+    letter-spacing: .03em;
+  }
+  .badge.queued { background: #3a3f4c; color: var(--text-dim); }
+  .badge.running { background: #2b3a5c; color: var(--accent); }
+  .badge.done { background: #17352a; color: var(--ok); }
+  .badge.error { background: #3a2323; color: var(--err); }
+  .job-actions { display: flex; gap: 8px; }
+  #empty-history { color: var(--text-dim); font-size: 14px; padding: 20px 0; text-align: center; }
+
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+    align-items: center; justify-content: center; z-index: 50; padding: 20px;
+  }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    max-width: 640px; width: 100%; max-height: 88vh; overflow-y: auto; padding: 22px; }
+  .modal h3 { margin-top: 0; }
+  .modal video { width: 100%; border-radius: 8px; background: #000; }
+  .modal-close { float: right; background: none; border: none; color: var(--text-dim); font-size: 20px; }
+  .chip-row { display: flex; gap: 10px; margin-bottom: 14px; }
+  .chip {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 13px;
+    background: var(--panel-2); color: var(--text-dim); cursor: pointer;
+  }
+  .chip.active { border-color: var(--accent); color: var(--accent); background: #16233f; }
+  .publish-result { font-size: 13px; padding: 8px 10px; border-radius: 6px; margin-top: 6px; }
+  .publish-result.ok { background: #17352a; color: var(--ok); }
+  .publish-result.fail { background: #3a2323; color: var(--err); }
+
+  .credits-badge {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+    padding: 4px 12px; font-size: 13px; font-weight: 700; color: var(--warn);
+  }
+
+  .connect-card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+    margin-bottom: 12px; background: var(--panel-2);
+  }
+  .connect-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .connect-name { font-weight: 700; font-size: 14px; }
+  .connect-sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+  .connect-note { font-size: 12px; color: var(--warn); margin-top: 6px; line-height: 1.5; }
+  .connect-qr-box { margin-top: 10px; display: flex; align-items: center; gap: 12px; }
+  .connect-qr-box img { border-radius: 8px; background: white; padding: 6px; }
+  .pill { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 700; }
+  .pill.on { background: #17352a; color: var(--ok); }
+  .pill.off { background: #3a3f4c; color: var(--text-dim); }
+
+  /* admin */
+  #admin-view { max-width: 1000px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; margin-bottom: 8px; }
+  .stat-box { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .stat-box .num { font-size: 22px; font-weight: 800; }
+  .stat-box .label { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  table.admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.admin-table th, table.admin-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.admin-table th { color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  .credit-adjust { display: flex; gap: 6px; align-items: center; }
+  .credit-adjust input { width: 70px; padding: 6px 8px; }
+</style>
+</head>
+<body>
+
+<div id="auth-view" class="wrap hidden">
+  <h2 id="auth-title">Đăng nhập</h2>
+  <p class="sub" id="auth-sub">Video Localization AI</p>
+  <div class="card">
+    <div class="field"><label>Tên đăng nhập</label><input id="auth-username"></div>
+    <div class="field"><label>Mật khẩu</label><input id="auth-password" type="password"></div>
+    <button class="btn" id="auth-submit" style="width:100%">Đăng nhập</button>
+    <div id="auth-error"></div>
+  </div>
+</div>
+
+<div id="app-view" class="wrap hidden">
+  <header>
+    <div>
+      <h1>Video Localization AI</h1>
+      <div class="sub">Dịch &amp; lồng tiếng video, xem trước, tải xuống, đăng lên mạng xã hội</div>
+    </div>
+    <div id="userbar">
+      <span id="userbar-credits" class="credits-badge" title="Credit còn lại"></span>
+      <span id="userbar-name"></span>
+      <button class="btn secondary small hidden" id="admin-btn">Quản trị</button>
+      <button class="btn secondary small" id="logout-btn">Đăng xuất</button>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <div class="field" style="flex: 3">
+        <label>Đường link video (TikTok / Douyin / v.v.)</label>
+        <input id="url-input" placeholder="https://v.douyin.com/....">
+      </div>
+      <div class="field" style="flex: 1">
+        <label>Ngôn ngữ đích</label>
+        <select id="lang-select">
+          <option value="vi">Tiếng Việt</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+    </div>
+    <button class="btn" id="submit-btn">Bắt đầu xử lý</button>
+    <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Lịch sử</h3>
+    <div id="job-list"></div>
+    <div id="empty-history" class="hidden">Chưa có video nào. Dán link ở trên để bắt đầu.</div>
+  </div>
+</div>
+
+<div id="preview-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="preview-close">×</button>
+    <h3>Xem trước</h3>
+    <video id="preview-video" controls></video>
+    <div style="margin-top: 14px; display:flex; gap:10px;">
+      <a class="btn" id="preview-download">Tải xuống</a>
+      <button class="btn secondary" id="preview-publish-btn">Đăng lên mạng xã hội</button>
+    </div>
+  </div>
+</div>
+
+<div id="publish-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="publish-close">×</button>
+    <h3>Đăng lên mạng xã hội</h3>
+
+    <div id="connect-cards"></div>
+
+    <div class="chip-row">
+      <div class="chip" data-platform="tiktok">TikTok</div>
+      <div class="chip" data-platform="facebook">Facebook</div>
+      <div class="chip" data-platform="youtube">YouTube</div>
+    </div>
+    <div class="field"><label>Tiêu đề</label><input id="publish-title"></div>
+    <div class="field"><label>Mô tả</label><textarea id="publish-desc" rows="3"></textarea></div>
+    <div class="field"><label>Hashtag (cách nhau bằng dấu cách)</label><input id="publish-hashtags" placeholder="#anime #shortdrama"></div>
+    <button class="btn" id="publish-submit">Đăng ngay</button>
+    <div id="publish-results"></div>
+  </div>
+</div>
+
+<div id="admin-view" class="wrap hidden">
+  <header>
+    <div>
+      <h1>Quản trị</h1>
+      <div class="sub">Người dùng, credit, và thống kê hệ thống</div>
+    </div>
+    <button class="btn secondary small" id="admin-back-btn">← Quay lại</button>
+  </header>
+
+  <div class="card">
+    <h3 style="margin-top:0">Tổng quan</h3>
+    <div class="stat-grid" id="admin-stats"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Tạo tài khoản mới</h3>
+    <div class="row">
+      <div class="field"><label>Tên đăng nhập</label><input id="new-user-username"></div>
+      <div class="field"><label>Mật khẩu</label><input id="new-user-password" type="password"></div>
+      <div class="field" style="flex:.5"><label>Credit ban đầu</label><input id="new-user-credits" type="number" value="10"></div>
+    </div>
+    <button class="btn" id="new-user-submit">Tạo tài khoản</button>
+    <div id="new-user-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Người dùng</h3>
+    <table class="admin-table" id="admin-users-table">
+      <thead><tr><th>Tên đăng nhập</th><th>Vai trò</th><th>Credit</th><th>Điều chỉnh</th></tr></thead>
+      <tbody id="admin-users-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+let currentJobId = null;
+let selectedPlatforms = new Set();
+let pollTimer = null;
+let pollTimer2 = null;
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.detail || `HTTP ${resp.status}`);
+  }
+  return resp.status === 204 ? null : resp.json();
+}
+
+// ---------------- auth ----------------
+async function initAuth() {
+  const { needs_registration } = await api("/api/bootstrap");
+  $("#auth-title").textContent = needs_registration ? "Tạo tài khoản admin" : "Đăng nhập";
+  $("#auth-submit").textContent = needs_registration ? "Tạo tài khoản" : "Đăng nhập";
+  $("#auth-submit").onclick = () => needs_registration ? doRegister() : doLogin();
+
+  try {
+    const me = await api("/api/me");
+    showApp(me);
+  } catch {
+    $("#auth-view").classList.remove("hidden");
+  }
+}
+
+async function doLogin() {
+  $("#auth-error").textContent = "";
+  try {
+    await api("/api/login", { method: "POST", body: JSON.stringify({
+      username: $("#auth-username").value, password: $("#auth-password").value,
+    })});
+    const me = await api("/api/me");
+    showApp(me);
+  } catch (e) { $("#auth-error").textContent = e.message; }
+}
+
+async function doRegister() {
+  $("#auth-error").textContent = "";
+  try {
+    await api("/api/register", { method: "POST", body: JSON.stringify({
+      username: $("#auth-username").value, password: $("#auth-password").value,
+    })});
+    const me = await api("/api/me");
+    showApp(me);
+  } catch (e) { $("#auth-error").textContent = e.message; }
+}
+
+function showApp(me) {
+  $("#auth-view").classList.add("hidden");
+  $("#app-view").classList.remove("hidden");
+  $("#userbar-name").textContent = me.username;
+  $("#userbar-credits").textContent = `💳 ${me.credits}`;
+  $("#admin-btn").classList.toggle("hidden", !me.is_admin);
+  refreshJobs();
+  pollTimer = setInterval(refreshJobs, 4000);
+  pollTimer2 = setInterval(refreshMe, 10000);
+}
+
+async function refreshMe() {
+  try {
+    const me = await api("/api/me");
+    $("#userbar-credits").textContent = `💳 ${me.credits}`;
+  } catch (e) { /* session likely expired; next job/history poll will surface it */ }
+}
+
+window.addEventListener("message", (ev) => {
+  if (ev.data === "social-connected") {
+    loadConnections();
+  }
+});
+
+$("#logout-btn").onclick = async () => {
+  await api("/api/logout", { method: "POST" });
+  clearInterval(pollTimer);
+  location.reload();
+};
+
+// ---------------- jobs ----------------
+$("#submit-btn").onclick = async () => {
+  $("#submit-error").textContent = "";
+  const url = $("#url-input").value.trim();
+  if (!url) { $("#submit-error").textContent = "Nhập đường link video"; return; }
+  $("#submit-btn").disabled = true;
+  try {
+    await api("/api/jobs", { method: "POST", body: JSON.stringify({
+      url, target_language: $("#lang-select").value,
+    })});
+    $("#url-input").value = "";
+    refreshJobs();
+    refreshMe();
+  } catch (e) { $("#submit-error").textContent = e.message; }
+  finally { $("#submit-btn").disabled = false; }
+};
+
+const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", done: "Xong", error: "Lỗi" };
+
+async function refreshJobs() {
+  const jobs = await api("/api/jobs");
+  const list = $("#job-list");
+  list.innerHTML = "";
+  $("#empty-history").classList.toggle("hidden", jobs.length > 0);
+  for (const job of jobs) {
+    const el = document.createElement("div");
+    el.className = "job";
+    const created = new Date(job.created_at * 1000).toLocaleString("vi-VN");
+    el.innerHTML = `
+      <div class="job-info">
+        <div class="job-url">${job.title || job.source_url}</div>
+        <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${job.progress_note || ""}</div>
+      </div>
+      <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
+      <div class="job-actions">
+        ${job.has_video ? `
+          <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
+          <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
+        ` : ""}
+      </div>
+    `;
+    list.appendChild(el);
+  }
+  list.querySelectorAll("[data-preview]").forEach(btn => {
+    btn.onclick = () => openPreview(btn.dataset.preview);
+  });
+  list.querySelectorAll("[data-publish]").forEach(btn => {
+    btn.onclick = () => openPublish(btn.dataset.publish);
+  });
+}
+
+// ---------------- preview + publish ----------------
+function openPreview(jobId) {
+  currentJobId = jobId;
+  $("#preview-video").src = `/api/jobs/${jobId}/video`;
+  $("#preview-download").href = `/api/jobs/${jobId}/video?download=true`;
+  $("#preview-modal").classList.remove("hidden");
+}
+$("#preview-close").onclick = () => {
+  $("#preview-modal").classList.add("hidden");
+  $("#preview-video").pause();
+  $("#preview-video").src = "";
+};
+
+$("#preview-publish-btn").onclick = () => {
+  $("#preview-modal").classList.add("hidden");
+  openPublish(currentJobId);
+};
+
+function openPublish(jobId) {
+  currentJobId = jobId;
+  $("#publish-results").innerHTML = "";
+  $("#publish-modal").classList.remove("hidden");
+  loadConnections();
+}
+$("#publish-close").onclick = () => $("#publish-modal").classList.add("hidden");
+
+document.querySelectorAll(".chip").forEach(chip => {
+  chip.onclick = () => {
+    const p = chip.dataset.platform;
+    if (selectedPlatforms.has(p)) { selectedPlatforms.delete(p); chip.classList.remove("active"); }
+    else { selectedPlatforms.add(p); chip.classList.add("active"); }
+  };
+});
+
+const PLATFORM_LABEL = { tiktok: "TikTok", facebook: "Facebook Page", youtube: "YouTube" };
+
+async function loadConnections() {
+  const box = $("#connect-cards");
+  box.innerHTML = `<div style="color:var(--text-dim);font-size:13px">Đang tải trạng thái kết nối…</div>`;
+  let conns;
+  try { conns = await api("/api/social/connections"); }
+  catch (e) { box.innerHTML = ""; return; }
+
+  box.innerHTML = Object.entries(conns).map(([platform, info]) => `
+    <div class="connect-card" data-card="${platform}">
+      <div class="connect-head">
+        <div>
+          <span class="connect-name">${PLATFORM_LABEL[platform]}</span>
+          <span class="pill ${info.connected ? "on" : "off"}">${info.connected ? "Đã kết nối" : "Chưa kết nối"}</span>
+        </div>
+        ${info.connected
+          ? `<button class="btn secondary small" data-disconnect="${platform}">Ngắt kết nối</button>`
+          : `<button class="btn secondary small" data-connect="${platform}" ${info.configured ? "" : "disabled"}>Kết nối</button>`}
+      </div>
+      ${info.connected ? `<div class="connect-sub">Đăng dưới tên: ${info.account_name || "(không rõ tên)"}</div>` : ""}
+      ${!info.configured ? `<div class="connect-note">${info.not_configured_message}</div>` : ""}
+      <div class="connect-qr-box hidden" id="qr-${platform}"></div>
+    </div>
+  `).join("");
+
+  box.querySelectorAll("[data-connect]").forEach(btn => {
+    btn.onclick = () => startConnect(btn.dataset.connect);
+  });
+  box.querySelectorAll("[data-disconnect]").forEach(btn => {
+    btn.onclick = async () => {
+      await fetch(`/api/social/connections/${btn.dataset.disconnect}`, { method: "DELETE" });
+      loadConnections();
+    };
+  });
+}
+
+async function startConnect(platform) {
+  let data;
+  try { data = await api(`/api/social/connect/${platform}`); }
+  catch (e) { alert(e.message); return; }
+
+  window.open(data.authorize_url, "connect_" + platform, "width=520,height=680");
+
+  const qrBox = $(`#qr-${platform}`);
+  qrBox.classList.remove("hidden");
+  qrBox.innerHTML = `
+    <img src="${data.qr_code_url}" width="140" height="140" alt="QR đăng nhập ${platform}">
+    <div style="font-size:12px;color:var(--text-dim);max-width:260px">
+      Cửa sổ đăng nhập ${PLATFORM_LABEL[platform]} đã mở. Nếu bạn đang dùng máy tính nhưng đã
+      đăng nhập ${PLATFORM_LABEL[platform]} trên điện thoại, quét mã QR này bằng điện thoại để
+      xác nhận nhanh hơn — không cần gõ lại mật khẩu trên máy tính.
+    </div>`;
+}
+
+$("#publish-submit").onclick = async () => {
+  if (selectedPlatforms.size === 0) { alert("Chọn ít nhất 1 nền tảng"); return; }
+  const hashtags = $("#publish-hashtags").value.split(/\s+/).filter(Boolean);
+  $("#publish-results").innerHTML = "Đang đăng...";
+  try {
+    const { results } = await api(`/api/jobs/${currentJobId}/publish`, {
+      method: "POST", body: JSON.stringify({
+        platforms: [...selectedPlatforms],
+        title: $("#publish-title").value,
+        description: $("#publish-desc").value,
+        hashtags,
+      }),
+    });
+    $("#publish-results").innerHTML = results.map(r =>
+      `<div class="publish-result ${r.success ? "ok" : "fail"}"><b>${r.platform}:</b> ${r.message}</div>`
+    ).join("");
+  } catch (e) {
+    $("#publish-results").innerHTML = `<div class="publish-result fail">${e.message}</div>`;
+  }
+};
+
+// ---------------- admin ----------------
+$("#admin-btn").onclick = () => {
+  $("#app-view").classList.add("hidden");
+  $("#admin-view").classList.remove("hidden");
+  loadAdmin();
+};
+$("#admin-back-btn").onclick = () => {
+  $("#admin-view").classList.add("hidden");
+  $("#app-view").classList.remove("hidden");
+};
+
+async function loadAdmin() {
+  const [stats, users] = await Promise.all([api("/api/admin/stats"), api("/api/admin/users")]);
+
+  $("#admin-stats").innerHTML = `
+    <div class="stat-box"><div class="num">${stats.total_users}</div><div class="label">Người dùng</div></div>
+    <div class="stat-box"><div class="num">${stats.total_jobs}</div><div class="label">Tổng số video</div></div>
+    <div class="stat-box"><div class="num">${stats.jobs_last_7d}</div><div class="label">Video (7 ngày qua)</div></div>
+    <div class="stat-box"><div class="num">${stats.jobs_by_status.done || 0}</div><div class="label">Hoàn tất</div></div>
+    <div class="stat-box"><div class="num">${stats.jobs_by_status.error || 0}</div><div class="label">Lỗi</div></div>
+    <div class="stat-box"><div class="num">${Object.values(stats.publishes_by_platform).reduce((a,b)=>a+b,0)}</div><div class="label">Đã đăng lên MXH</div></div>
+  `;
+
+  const body = $("#admin-users-body");
+  body.innerHTML = users.map(u => `
+    <tr>
+      <td>${u.username}</td>
+      <td>${u.is_admin ? "Admin" : "User"}</td>
+      <td>${u.credits}</td>
+      <td>
+        <div class="credit-adjust">
+          <input type="number" id="credit-input-${u.id}" placeholder="+/-">
+          <button class="btn secondary small" data-adjust="${u.id}">Áp dụng</button>
+        </div>
+      </td>
+    </tr>
+  `).join("");
+
+  body.querySelectorAll("[data-adjust]").forEach(btn => {
+    btn.onclick = async () => {
+      const uid = btn.dataset.adjust;
+      const val = parseInt($(`#credit-input-${uid}`).value, 10);
+      if (Number.isNaN(val)) return;
+      await api(`/api/admin/users/${uid}/credits`, { method: "POST", body: JSON.stringify({ delta: val }) });
+      loadAdmin();
+    };
+  });
+}
+
+$("#new-user-submit").onclick = async () => {
+  $("#new-user-error").textContent = "";
+  try {
+    await api("/api/admin/users", { method: "POST", body: JSON.stringify({
+      username: $("#new-user-username").value.trim(),
+      password: $("#new-user-password").value,
+      credits: parseInt($("#new-user-credits").value, 10) || 0,
+    })});
+    $("#new-user-username").value = "";
+    $("#new-user-password").value = "";
+    loadAdmin();
+  } catch (e) { $("#new-user-error").textContent = e.message; }
+};
+
+initAuth();
+</script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+# Cấu hình Blur Box cho Video Localization
+# File này định nghĩa các vùng cần blur (che text gốc) theo timestamps
+
+# Video metadata
+video_info:
+  width: 1920
+  height: 1080
+  fps: 30
+
+# Danh sách các vùng text cần blur theo timestamps
+# Format: start_time, end_time (seconds), x, y, width, height (pixels)
+blur_regions:
+  # Segment 1: 0-3s - "你好世界" (Hello World)
+  # Video gốc 0-3s: Text "你好世界" tại vị trí (100, 800, 400, 50)
+  # Bản final 0-3s: Che text gốc bằng ô trắng, chèn subtitle dịch
+  # Voice EN 0-3s: Đọc "Hello World"
+  # Voice VI 0-3s: Đọc "Xin chào thế giới"
+  - start_time: 0.0
+    end_time: 3.0
+    x: 100
+    y: 800
+    width: 400
+    height: 50
+    original_text: "你好世界"
+    translated_text_en: "Hello World"
+    translated_text_vi: "Xin chào thế giới"
+  
+  # Segment 2: 3-6s - "这是一个测试" (This is a test)
+  # Video gốc 3-6s: Text "这是一个测试" tại vị trí (100, 800, 500, 50)
+  # Bản final 3-6s: Che text gốc bằng ô trắng, chèn subtitle dịch
+  # Voice EN 3-6s: Đọc "This is a test"
+  # Voice VI 3-6s: Đọc "Đây là một bài kiểm tra"
+  - start_time: 3.0
+    end_time: 6.0
+    x: 100
+    y: 800
+    width: 500
+    height: 50
+    original_text: "这是一个测试"
+    translated_text_en: "This is a test"
+    translated_text_vi: "Đây là một bài kiểm tra"
+  
+  # Segment 3: 6-9s - "视频本地化示例" (Video localization example)
+  # Video gốc 6-9s: Text "视频本地化示例" tại vị trí (100, 800, 600, 50)
+  # Bản final 6-9s: Che text gốc bằng ô trắng, chèn subtitle dịch
+  # Voice EN 6-9s: Đọc "Video localization example"
+  # Voice VI 6-9s: Đọc "Ví dụ bản địa hóa video"
+  - start_time: 6.0
+    end_time: 9.0
+    x: 100
+    y: 800
+    width: 600
+    height: 50
+    original_text: "视频本地化示例"
+    translated_text_en: "Video localization example"
+    translated_text_vi: "Ví dụ bản địa hóa video"
+
+# Cấu hình blur
+blur_settings:
+  blur_strength: 10  # Độ mạnh của blur (1-20)
+  blur_type: "boxblur"  # Loại blur: boxblur, gblur
+  overlay_color: "white"  # Màu nền: white, black, transparent
