@@ -98,6 +98,39 @@
     padding: 4px 12px; font-size: 13px; font-weight: 700; color: var(--warn);
   }
 
+  /* auth tabs + social login */
+  .auth-tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+  .auth-tab {
+    flex: 1; text-align: center; padding: 9px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border);
+  }
+  .auth-tab.active { background: #16233f; color: var(--accent); border-color: var(--accent); }
+  .social-row { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+  .btn.social {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border); width: 100%;
+  }
+  .btn.social:hover { background: #262b35; }
+  .btn.social:disabled { opacity: .4; cursor: not-allowed; }
+  .auth-divider { display: flex; align-items: center; gap: 10px; margin: 16px 0; color: var(--text-dim); font-size: 12px; }
+  .auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+  /* logo overlay panel */
+  .corner-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .corner-opt {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 12px; text-align: center;
+    background: var(--panel-2); color: var(--text-dim); cursor: pointer;
+  }
+  .corner-opt.active { border-color: var(--accent); color: var(--accent); background: #16233f; }
+  #logo-preview-box { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  #logo-preview-box img { width: 48px; height: 48px; object-fit: contain; background: #fff; border-radius: 6px; padding: 4px; }
+
+  /* history search/filter/delete */
+  .history-toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+  .history-toolbar input[type="date"] { flex: none; width: 150px; }
+  .job-actions .btn.danger { background: transparent; color: var(--err); border: 1px solid #4a2b2b; }
+  .job-actions .btn.danger:hover { background: #2a1717; }
+
   .connect-card {
     border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
     margin-bottom: 12px; background: var(--panel-2);
@@ -131,10 +164,27 @@
   <h2 id="auth-title">Đăng nhập</h2>
   <p class="sub" id="auth-sub">Video Localization AI</p>
   <div class="card">
-    <div class="field"><label>Tên đăng nhập</label><input id="auth-username"></div>
-    <div class="field"><label>Mật khẩu</label><input id="auth-password" type="password"></div>
-    <button class="btn" id="auth-submit" style="width:100%">Đăng nhập</button>
-    <div id="auth-error"></div>
+    <!-- Real <form> so pressing Enter in either field submits it (as a
+         login), instead of only working via mouse click on a button. -->
+    <form id="auth-form">
+      <div class="field">
+        <label id="auth-identifier-label">Tên đăng nhập / Email / Số điện thoại</label>
+        <input id="auth-identifier" autocomplete="username">
+      </div>
+      <div class="field"><label>Mật khẩu</label><input id="auth-password" type="password" autocomplete="current-password"></div>
+      <div class="row" style="gap:10px">
+        <button class="btn" type="submit" id="auth-login-btn" style="flex:1">Đăng nhập</button>
+        <button class="btn secondary" type="button" id="auth-register-btn" style="flex:1">Đăng ký</button>
+      </div>
+      <div id="auth-error"></div>
+    </form>
+
+    <div class="auth-divider">hoặc</div>
+    <div class="social-row" id="social-login-row">
+      <button class="btn social" data-provider="google">🔵 Đăng nhập với Google</button>
+      <button class="btn social" data-provider="github">⚫ Đăng nhập với GitHub</button>
+      <button class="btn social" data-provider="facebook">🔷 Đăng nhập với Facebook</button>
+    </div>
   </div>
 </div>
 
@@ -153,25 +203,186 @@
   </header>
 
   <div class="card">
-    <div class="row">
+    <div class="field">
+      <label>
+        <input type="checkbox" id="batch-mode-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Chế độ xử lý hàng loạt (nhiều video cùng lúc)
+      </label>
+    </div>
+    <div id="single-url-panel" class="row">
       <div class="field" style="flex: 3">
         <label>Đường link video (TikTok / Douyin / v.v.)</label>
         <input id="url-input" placeholder="https://v.douyin.com/....">
       </div>
       <div class="field" style="flex: 1">
+        <label>Ngôn ngữ gốc</label>
+        <select id="source-lang-select"></select>
+      </div>
+      <div class="field" style="flex: 1">
         <label>Ngôn ngữ đích</label>
-        <select id="lang-select">
-          <option value="vi">Tiếng Việt</option>
-          <option value="en">English</option>
-        </select>
+        <select id="lang-select"></select>
       </div>
     </div>
+    <div id="batch-url-panel" class="hidden">
+      <div class="field">
+        <label>Danh sách đường link (mỗi dòng 1 link)</label>
+        <textarea id="batch-urls-input" rows="6" placeholder="https://v.douyin.com/....&#10;https://v.douyin.com/....&#10;https://v.douyin.com/...."></textarea>
+      </div>
+      <div class="row">
+        <div class="field" style="flex: 1">
+          <label>Ngôn ngữ gốc</label>
+          <select id="batch-source-lang-select"></select>
+        </div>
+        <div class="field" style="flex: 1">
+          <label>Ngôn ngữ đích</label>
+          <select id="batch-lang-select"></select>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:8px">
+        💡 Tất cả video sẽ được xử lý với cùng một cấu hình. Credits sẽ được trừ cho tất cả video cùng lúc.
+      </div>
+    </div>
+
+    <div class="field">
+      <label>
+        <input type="checkbox" id="logo-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Chèn logo riêng vào video
+      </label>
+    </div>
+    <div id="logo-panel" class="hidden" style="margin-bottom: 14px;">
+      <div class="row">
+        <div class="field">
+          <label>Ảnh logo (PNG/JPG/WEBP)</label>
+          <input type="file" id="logo-file-input" accept=".png,.jpg,.jpeg,.webp">
+          <div id="logo-preview-box" class="hidden"><img id="logo-preview-img"><span id="logo-upload-status" style="font-size:12px;color:var(--text-dim)"></span></div>
+        </div>
+        <div class="field" style="flex:.6">
+          <label>Kích thước (px)</label>
+          <input type="number" id="logo-size-input" value="120" min="20" max="600">
+        </div>
+      </div>
+      <div class="field">
+        <label>Vị trí</label>
+        <div class="corner-grid">
+          <div class="corner-opt active" data-corner="top_left">↖ Góc trên trái</div>
+          <div class="corner-opt" data-corner="top_right">↗ Góc trên phải</div>
+          <div class="corner-opt" data-corner="bottom_left">↙ Góc dưới trái</div>
+          <div class="corner-opt" data-corner="bottom_right">↘ Góc dưới phải</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>
+        <input type="checkbox" id="anticopyright-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Bật chống quét bản quyền (tránh Content ID)
+      </label>
+    </div>
+    <div id="anticopyright-panel" class="hidden" style="margin-bottom: 14px;">
+      <div class="row">
+        <div class="field">
+          <label>Khung đen (left:right:top:bottom px)</label>
+          <input type="text" id="letterbox-input" placeholder="100:100:0:0" value="100:100:0:0">
+        </div>
+        <div class="field">
+          <label>Zoom (1.0 = không zoom)</label>
+          <input type="number" id="zoom-input" value="1.05" min="1.0" max="1.3" step="0.01">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>
+            <input type="checkbox" id="flip-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+            Lật ngang (mirror)
+          </label>
+        </div>
+        <div class="field">
+          <label>Tốc độ (1.0 = bình thường)</label>
+          <input type="number" id="speed-input" value="1.02" min="0.95" max="1.05" step="0.01">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Độ sáng (-1.0 đến 1.0)</label>
+          <input type="number" id="brightness-input" value="0.05" min="-1.0" max="1.0" step="0.05">
+        </div>
+        <div class="field">
+          <label>Độ tương phản (0 đến 2)</label>
+          <input type="number" id="contrast-input" value="1.05" min="0" max="2" step="0.05">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Độ bão hòa (0 đến 2)</label>
+          <input type="number" id="saturation-input" value="1.05" min="0" max="2" step="0.05">
+        </div>
+        <div class="field">
+          <label>Nhiễu (0 đến 100)</label>
+          <input type="number" id="noise-input" value="5" min="0" max="100" step="1">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Xoay (độ, 0 đến 5)</label>
+          <input type="number" id="rotation-input" value="0.5" min="0" max="5" step="0.1">
+        </div>
+        <div class="field">
+          <label>Crop (left:right:top:bottom px)</label>
+          <input type="text" id="crop-input" placeholder="10:10:10:10">
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>
+        <input type="checkbox" id="platform-opt-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Tối ưu cho nền tảng cụ thể (TikTok, YouTube, v.v.)
+      </label>
+    </div>
+    <div id="platform-opt-panel" class="hidden" style="margin-bottom: 14px;">
+      <div class="field">
+        <label>Nền tảng đích</label>
+        <select id="target-platform-select">
+          <option value="none">Không (giữ nguyên)</option>
+          <option value="tiktok">TikTok (9:16, 1080x1920)</option>
+          <option value="youtube_shorts">YouTube Shorts (9:16, 1080x1920)</option>
+          <option value="youtube_long">YouTube Long (16:9, 1920x1080)</option>
+          <option value="facebook">Facebook (1:1, 1080x1080)</option>
+          <option value="instagram">Instagram (1:1, 1080x1080)</option>
+        </select>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Tỷ lệ khung hình</label>
+          <select id="target-aspect-ratio-select">
+            <option value="auto">Tự động (giữ nguyên)</option>
+            <option value="9:16">9:16 (Dọc - TikTok/Shorts)</option>
+            <option value="16:9">16:9 (Ngang - YouTube thường)</option>
+            <option value="1:1">1:1 (Vuông - Facebook/Instagram)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Độ phân giải tùy chỉnh (rộng x cao)</label>
+          <input type="text" id="target-resolution-input" placeholder="1080,1920" title="Để trống để dùng mặc định">
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:8px">
+        💡 Chọn nền tảng để tự động tối ưu tỷ lệ khung hình và độ phân giải. Video dài (YouTube Long) cũng được hỗ trợ, không chỉ short video.
+      </div>
+    </div>
+
     <button class="btn" id="submit-btn">Bắt đầu xử lý</button>
     <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
 
   <div class="card">
     <h3 style="margin-top:0">Lịch sử</h3>
+    <div class="history-toolbar">
+      <input id="history-search" placeholder="Tìm theo tên hoặc link...">
+      <input type="date" id="history-date-from" title="Từ ngày">
+      <input type="date" id="history-date-to" title="Đến ngày">
+      <button class="btn secondary small" id="history-clear-btn">Xoá lọc</button>
+    </div>
     <div id="job-list"></div>
     <div id="empty-history" class="hidden">Chưa có video nào. Dán link ở trên để bắt đầu.</div>
   </div>
@@ -263,11 +474,34 @@ async function api(path, opts = {}) {
 }
 
 // ---------------- auth ----------------
+let needsRegistrationGlobal = false;
+
 async function initAuth() {
-  const { needs_registration } = await api("/api/bootstrap");
-  $("#auth-title").textContent = needs_registration ? "Tạo tài khoản admin" : "Đăng nhập";
-  $("#auth-submit").textContent = needs_registration ? "Tạo tài khoản" : "Đăng nhập";
-  $("#auth-submit").onclick = () => needs_registration ? doRegister() : doLogin();
+  const boot = await api("/api/bootstrap");
+  needsRegistrationGlobal = boot.needs_registration;
+
+  if (needsRegistrationGlobal) {
+    // First-ever account on this server: nothing to log into yet, so only
+    // "Đăng ký" makes sense — hide the "Đăng nhập" button entirely instead
+    // of leaving a button that can only ever fail.
+    $("#auth-title").textContent = "Tạo tài khoản admin";
+    $("#auth-sub").textContent = "Tài khoản đầu tiên sẽ là quản trị viên hệ thống";
+    $("#auth-login-btn").classList.add("hidden");
+    $("#auth-register-btn").style.flex = "1 1 100%";
+  }
+
+  // Buttons always stay clickable — this way clicking one always DOES
+  // something. If the admin hasn't added that provider's Client ID/Secret
+  // to .env yet, the click still goes through to the server, which
+  // replies with a clear "here's what to configure" message shown right
+  // under the form (instead of silently disabling the button, which just
+  // looked broken/unresponsive with no explanation).
+  document.querySelectorAll("#social-login-row [data-provider]").forEach(btn => {
+    const provider = btn.dataset.provider;
+    const configured = !!(boot.identity_providers && boot.identity_providers[provider]);
+    if (!configured) btn.title = "Chưa cấu hình — bấm để xem cần thêm gì vào .env";
+    btn.onclick = () => startIdentityLogin(provider);
+  });
 
   try {
     const me = await api("/api/me");
@@ -275,13 +509,29 @@ async function initAuth() {
   } catch {
     $("#auth-view").classList.remove("hidden");
   }
+
+  // Surface an error from a failed "Sign in with ..." redirect, if any.
+  const params = new URLSearchParams(location.search);
+  if (params.get("login_error")) {
+    $("#auth-error").textContent = "Đăng nhập thất bại: " + params.get("login_error");
+    history.replaceState(null, "", location.pathname);
+  }
 }
+
+// Pressing Enter in either field submits the <form>, which defaults to the
+// "Đăng nhập" action (the submit button) — same as clicking it. "Đăng ký"
+// is a separate, non-submit button so it never fires from Enter by accident.
+$("#auth-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  doLogin();
+});
+$("#auth-register-btn").addEventListener("click", () => doRegister());
 
 async function doLogin() {
   $("#auth-error").textContent = "";
   try {
     await api("/api/login", { method: "POST", body: JSON.stringify({
-      username: $("#auth-username").value, password: $("#auth-password").value,
+      identifier: $("#auth-identifier").value.trim(), password: $("#auth-password").value,
     })});
     const me = await api("/api/me");
     showApp(me);
@@ -292,10 +542,17 @@ async function doRegister() {
   $("#auth-error").textContent = "";
   try {
     await api("/api/register", { method: "POST", body: JSON.stringify({
-      username: $("#auth-username").value, password: $("#auth-password").value,
+      identifier: $("#auth-identifier").value.trim(), password: $("#auth-password").value,
     })});
     const me = await api("/api/me");
     showApp(me);
+  } catch (e) { $("#auth-error").textContent = e.message; }
+}
+
+async function startIdentityLogin(provider) {
+  try {
+    const { authorize_url } = await api(`/api/identity/login/${provider}`);
+    location.href = authorize_url; // full-page redirect — this IS the login action, not a popup
   } catch (e) { $("#auth-error").textContent = e.message; }
 }
 
@@ -305,6 +562,7 @@ function showApp(me) {
   $("#userbar-name").textContent = me.username;
   $("#userbar-credits").textContent = `💳 ${me.credits}`;
   $("#admin-btn").classList.toggle("hidden", !me.is_admin);
+  loadLanguages();
   refreshJobs();
   pollTimer = setInterval(refreshJobs, 4000);
   pollTimer2 = setInterval(refreshMe, 10000);
@@ -329,17 +587,183 @@ $("#logout-btn").onclick = async () => {
   location.reload();
 };
 
+// ---------------- languages ----------------
+async function loadLanguages() {
+  try {
+    const { targets, sources } = await api("/api/languages");
+    const targetOptions = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
+    const sourceOptions = sources.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
+
+    $("#lang-select").innerHTML = targetOptions;
+    $("#lang-select").value = "vi";
+    $("#source-lang-select").innerHTML = sourceOptions;
+    $("#source-lang-select").value = "auto";
+
+    // Populate batch selects too
+    $("#batch-lang-select").innerHTML = targetOptions;
+    $("#batch-lang-select").value = "vi";
+    $("#batch-source-lang-select").innerHTML = sourceOptions;
+    $("#batch-source-lang-select").value = "auto";
+  } catch (e) { /* keep whatever was already in the selects if this fails */ }
+}
+
+// ---------------- logo overlay ----------------
+let uploadedLogoId = null;
+
+$("#logo-enable-checkbox").onchange = (ev) => {
+  $("#logo-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+// ---------------- anti-copyright ----------------
+$("#anticopyright-enable-checkbox").onchange = (ev) => {
+  $("#anticopyright-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+// ---------------- platform optimization ----------------
+$("#platform-opt-enable-checkbox").onchange = (ev) => {
+  $("#platform-opt-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+// Auto-update aspect ratio when platform is selected
+$("#target-platform-select").onchange = (ev) => {
+  const platform = ev.target.value;
+  const aspectSelect = $("#target-aspect-ratio-select");
+  const platformToAspect = {
+    "tiktok": "9:16",
+    "youtube_shorts": "9:16",
+    "youtube_long": "16:9",
+    "facebook": "1:1",
+    "instagram": "1:1",
+  };
+  if (platformToAspect[platform]) {
+    aspectSelect.value = platformToAspect[platform];
+  }
+};
+
+// ---------------- batch processing ----------------
+$("#batch-mode-checkbox").onchange = (ev) => {
+  const isBatch = ev.target.checked;
+  $("#single-url-panel").classList.toggle("hidden", isBatch);
+  $("#batch-url-panel").classList.toggle("hidden", !isBatch);
+  // Sync language selects
+  if (isBatch) {
+    $("#batch-source-lang-select").value = $("#source-lang-select").value;
+    $("#batch-lang-select").value = $("#lang-select").value;
+  }
+};
+
+document.querySelectorAll(".corner-opt").forEach(el => {
+  el.onclick = () => {
+    document.querySelectorAll(".corner-opt").forEach(o => o.classList.remove("active"));
+    el.classList.add("active");
+  };
+});
+
+$("#logo-file-input").onchange = async (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  $("#logo-upload-status").textContent = "Đang tải lên...";
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const resp = await fetch("/api/upload-logo", { method: "POST", body: form });
+    if (!resp.ok) throw new Error((await resp.json()).detail || "Tải logo thất bại");
+    const data = await resp.json();
+    uploadedLogoId = data.logo_path;
+    $("#logo-preview-box").classList.remove("hidden");
+    $("#logo-preview-img").src = data.preview_url;
+    $("#logo-upload-status").textContent = "Đã tải lên ✓";
+  } catch (e) {
+    $("#logo-upload-status").textContent = e.message;
+    uploadedLogoId = null;
+  }
+};
+
 // ---------------- jobs ----------------
 $("#submit-btn").onclick = async () => {
   $("#submit-error").textContent = "";
-  const url = $("#url-input").value.trim();
-  if (!url) { $("#submit-error").textContent = "Nhập đường link video"; return; }
+  const isBatch = $("#batch-mode-checkbox").checked;
+
+  if (isBatch) {
+    // Batch mode
+    const urlsText = $("#batch-urls-input").value.trim();
+    const urls = urlsText.split("\n").map(u => u.trim()).filter(u => u);
+    if (urls.length === 0) { $("#submit-error").textContent = "Nhập ít nhất 1 đường link"; return; }
+  } else {
+    // Single mode
+    const url = $("#url-input").value.trim();
+    if (!url) { $("#submit-error").textContent = "Nhập đường link video"; return; }
+  }
+
+  const logoEnabled = $("#logo-enable-checkbox").checked;
+  if (logoEnabled && !uploadedLogoId) {
+    $("#submit-error").textContent = "Chọn ảnh logo trước (hoặc bỏ tick 'Chèn logo')";
+    return;
+  }
+
+  const activeCorner = document.querySelector(".corner-opt.active");
+  const antiCopyrightEnabled = $("#anticopyright-enable-checkbox").checked;
+  const platformOptEnabled = $("#platform-opt-enable-checkbox").checked;
+
+  // Use appropriate language selects based on mode
+  const langSelect = isBatch ? $("#batch-lang-select") : $("#lang-select");
+  const sourceLangSelect = isBatch ? $("#batch-source-lang-select") : $("#source-lang-select");
+
   $("#submit-btn").disabled = true;
   try {
-    await api("/api/jobs", { method: "POST", body: JSON.stringify({
-      url, target_language: $("#lang-select").value,
-    })});
-    $("#url-input").value = "";
+    if (isBatch) {
+      const urlsText = $("#batch-urls-input").value.trim();
+      const urls = urlsText.split("\n").map(u => u.trim()).filter(u => u);
+      const result = await api("/api/jobs/batch", { method: "POST", body: JSON.stringify({
+        urls,
+        target_language: langSelect.value,
+        source_language: sourceLangSelect.value,
+        logo_path: logoEnabled ? uploadedLogoId : null,
+        logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
+        logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
+        enable_anti_copyright: antiCopyrightEnabled,
+        letterbox: antiCopyrightEnabled ? $("#letterbox-input").value : null,
+        zoom_factor: antiCopyrightEnabled ? parseFloat($("#zoom-input").value) || 1.0 : 1.0,
+        flip_horizontal: antiCopyrightEnabled ? $("#flip-checkbox").checked : false,
+        speed_factor: antiCopyrightEnabled ? parseFloat($("#speed-input").value) || 1.0 : 1.0,
+        brightness: antiCopyrightEnabled ? parseFloat($("#brightness-input").value) || 0.0 : 0.0,
+        contrast: antiCopyrightEnabled ? parseFloat($("#contrast-input").value) || 1.0 : 1.0,
+        saturation: antiCopyrightEnabled ? parseFloat($("#saturation-input").value) || 1.0 : 1.0,
+        noise_amount: antiCopyrightEnabled ? parseInt($("#noise-input").value, 10) || 0 : 0,
+        rotation_degrees: antiCopyrightEnabled ? parseFloat($("#rotation-input").value) || 0.0 : 0.0,
+        crop: antiCopyrightEnabled ? $("#crop-input").value || null : null,
+        target_platform: platformOptEnabled ? $("#target-platform-select").value : "none",
+        target_aspect_ratio: platformOptEnabled ? $("#target-aspect-ratio-select").value : "auto",
+        target_resolution: platformOptEnabled ? $("#target-resolution-input").value || null : null,
+      })});
+      $("#batch-urls-input").value = "";
+      alert(`Đã tạo ${result.total} job thành công!`);
+    } else {
+      const url = $("#url-input").value.trim();
+      await api("/api/jobs", { method: "POST", body: JSON.stringify({
+        url,
+        target_language: langSelect.value,
+        source_language: sourceLangSelect.value,
+        logo_path: logoEnabled ? uploadedLogoId : null,
+        logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
+        logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
+        enable_anti_copyright: antiCopyrightEnabled,
+        letterbox: antiCopyrightEnabled ? $("#letterbox-input").value : null,
+        zoom_factor: antiCopyrightEnabled ? parseFloat($("#zoom-input").value) || 1.0 : 1.0,
+        flip_horizontal: antiCopyrightEnabled ? $("#flip-checkbox").checked : false,
+        speed_factor: antiCopyrightEnabled ? parseFloat($("#speed-input").value) || 1.0 : 1.0,
+        brightness: antiCopyrightEnabled ? parseFloat($("#brightness-input").value) || 0.0 : 0.0,
+        contrast: antiCopyrightEnabled ? parseFloat($("#contrast-input").value) || 1.0 : 1.0,
+        saturation: antiCopyrightEnabled ? parseFloat($("#saturation-input").value) || 1.0 : 1.0,
+        noise_amount: antiCopyrightEnabled ? parseInt($("#noise-input").value, 10) || 0 : 0,
+        rotation_degrees: antiCopyrightEnabled ? parseFloat($("#rotation-input").value) || 0.0 : 0.0,
+        crop: antiCopyrightEnabled ? $("#crop-input").value || null : null,
+        target_platform: platformOptEnabled ? $("#target-platform-select").value : "none",
+        target_aspect_ratio: platformOptEnabled ? $("#target-aspect-ratio-select").value : "auto",
+        target_resolution: platformOptEnabled ? $("#target-resolution-input").value || null : null,
+      })});
+      $("#url-input").value = "";
+    }
     refreshJobs();
     refreshMe();
   } catch (e) { $("#submit-error").textContent = e.message; }
@@ -348,8 +772,23 @@ $("#submit-btn").onclick = async () => {
 
 const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", done: "Xong", error: "Lỗi" };
 
+function _dateToUnix(dateStr, endOfDay) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + (endOfDay ? "T23:59:59" : "T00:00:00"));
+  return d.getTime() / 1000;
+}
+
 async function refreshJobs() {
-  const jobs = await api("/api/jobs");
+  const q = $("#history-search").value.trim();
+  const dateFrom = _dateToUnix($("#history-date-from").value, false);
+  const dateTo = _dateToUnix($("#history-date-to").value, true);
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (dateFrom) params.set("date_from", dateFrom);
+  if (dateTo) params.set("date_to", dateTo);
+  const qs = params.toString();
+
+  const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
   const list = $("#job-list");
   list.innerHTML = "";
   $("#empty-history").classList.toggle("hidden", jobs.length > 0);
@@ -368,6 +807,7 @@ async function refreshJobs() {
           <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
           <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
         ` : ""}
+        <button class="btn danger small" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
       </div>
     `;
     list.appendChild(el);
@@ -378,7 +818,28 @@ async function refreshJobs() {
   list.querySelectorAll("[data-publish]").forEach(btn => {
     btn.onclick = () => openPublish(btn.dataset.publish);
   });
+  list.querySelectorAll("[data-delete]").forEach(btn => {
+    btn.onclick = async () => {
+      if (!confirm("Xoá mục này khỏi lịch sử? Không thể hoàn tác.")) return;
+      try { await api(`/api/jobs/${btn.dataset.delete}`, { method: "DELETE" }); refreshJobs(); }
+      catch (e) { alert(e.message); }
+    };
+  });
 }
+
+let _historySearchDebounce = null;
+$("#history-search").addEventListener("input", () => {
+  clearTimeout(_historySearchDebounce);
+  _historySearchDebounce = setTimeout(refreshJobs, 300);
+});
+$("#history-date-from").onchange = refreshJobs;
+$("#history-date-to").onchange = refreshJobs;
+$("#history-clear-btn").onclick = () => {
+  $("#history-search").value = "";
+  $("#history-date-from").value = "";
+  $("#history-date-to").value = "";
+  refreshJobs();
+};
 
 // ---------------- preview + publish ----------------
 function openPreview(jobId) {

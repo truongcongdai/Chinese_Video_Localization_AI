@@ -17,6 +17,7 @@ from universal_video_ai.timeline.service import TimelineService, TimelineConfig,
 from universal_video_ai.mixer.service import MixerService, MixerConfig, AudioMix, TimedAudioClip
 from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverlay
 from universal_video_ai.render.text_detector import OnScreenTextDetector
+from universal_video_ai.render import ocr_language_map
 
 __all__ = ["LocalizationService", "LocalizationConfig", "LocalizationResult"]
 
@@ -68,7 +69,12 @@ class LocalizationConfig:
     # (i.e. `run_transcription` using a backend that provides real
     # timestamps, such as Whisper). Silently skipped otherwise.
     enable_text_cover: bool = True
-    ocr_languages: Tuple[str, ...] = ("ch_sim", "en")
+    # Easyocr language pack(s) for detecting burned-in on-screen text.
+    # Default is the AUTO_OCR_SENTINEL ("auto"): pick automatically from
+    # whatever spoken language Whisper detected in the audio (see
+    # render.ocr_language_map), instead of assuming every source video is
+    # Chinese. Pass an explicit tuple (e.g. ("ch_sim", "en")) to pin it.
+    ocr_languages: Tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL
     # Static screen area(s) to ignore when detecting the burned-in subtitle,
     # as (x0, y0, x1, y1) fractions (0.0-1.0) of the frame — for a platform
     # watermark (logo/@username/reup title) that's present in nearly every
@@ -321,6 +327,7 @@ class LocalizationService:
                 video_path=download_result.video_path,
                 source_segments=source_segments,
                 translated_segments=translated_segments,
+                detected_language=audio_result.detected_language,
             )
 
         # Step 7: Mix audio (original + TTS)
@@ -498,6 +505,7 @@ class LocalizationService:
         video_path: Path,
         source_segments: List[TranscriptSegment],
         translated_segments: List[TranscriptSegment],
+        detected_language: Optional[str] = None,
     ) -> Optional[List[TextOverlay]]:
         """
         Detect the on-screen region of each sentence's burned-in original
@@ -508,8 +516,23 @@ class LocalizationService:
 
         Best-effort: returns None (and logs a warning) if OCR isn't available
         or detection fails, rather than failing the whole render.
+
+        :param detected_language: language Whisper detected the spoken
+            audio to be in, used to auto-pick the OCR language pack when
+            `self.config.ocr_languages` is left at its default "auto"
+            sentinel — see `render.ocr_language_map`.
         """
-        detector = self.text_detector or OnScreenTextDetector(languages=self.config.ocr_languages)
+        if self.text_detector is not None:
+            detector = self.text_detector
+        else:
+            resolved_ocr_languages = ocr_language_map.resolve_ocr_languages(
+                self.config.ocr_languages, detected_language
+            )
+            self.logger.info(
+                "LocalizationService: using OCR languages %s (configured=%s, detected_audio_language=%s)",
+                resolved_ocr_languages, self.config.ocr_languages, detected_language,
+            )
+            detector = OnScreenTextDetector(languages=resolved_ocr_languages)
         windows = [(s.start, s.end) for s in source_segments]
 
         try:

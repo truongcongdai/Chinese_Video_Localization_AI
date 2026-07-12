@@ -27,8 +27,17 @@ class YTDLPDownloader(BaseDownloader):
 
         Override in subclasses if needed.
         """
-
-        return {}
+        return {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Referer": "https://www.douyin.com/",
+            },
+            "cookiefile": None,  # Can be set to a cookie file path if needed
+            "nocheckcertificate": True,
+            "ignoreerrors": True,
+        }
 
     # ---------------------------------------------------------
 
@@ -45,6 +54,9 @@ class YTDLPDownloader(BaseDownloader):
         options = {
 
             "outtmpl": output_template,
+
+            # Force Douyin extractor for Douyin URLs
+            "force_generic_extractor": False,
 
             # TikTok/Douyin expose the SAME video as multiple format IDs:
             # a "download_addr" / "watermark" stream (the one their app
@@ -87,6 +99,9 @@ class YTDLPDownloader(BaseDownloader):
                 url,
                 download=True,
             )
+
+            if info is None:
+                raise RuntimeError(f"yt-dlp failed to extract info from {url}")
 
             filepath = Path(
                 ydl.prepare_filename(info)

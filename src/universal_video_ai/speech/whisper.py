@@ -55,6 +55,22 @@ class WhisperTranscriber:
         """
         self.config = config or WhisperConfig()
         self.logger = logger or _logger
+        self.last_detected_language: Optional[str] = None
+        
+        # Auto-detect GPU if device is not explicitly set
+        if self.config.device is None:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self.config.device = "cuda"
+                    self.logger.info("GPU detected, using CUDA for Whisper")
+                else:
+                    self.config.device = "cpu"
+                    self.logger.info("No GPU detected, using CPU for Whisper")
+            except ImportError:
+                self.config.device = "cpu"
+                self.logger.info("PyTorch not available, using CPU for Whisper")
+        
         self.logger.debug("WhisperTranscriber initialized with model=%s, device=%s", self.config.model, self.config.device)
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
@@ -141,6 +157,14 @@ class WhisperTranscriber:
             if not isinstance(result, dict):
                 # Defensive: some mocks/backends might return a plain string.
                 result = {"text": str(result), "segments": []}
+            # Whisper always reports the language it transcribed in
+            # (auto-detected when `language` wasn't passed as a hint, or
+            # just echoed back when it was). Stashing it here lets callers
+            # that only invoke transcribe()/transcribe_segments() — i.e.
+            # without touching this dict — still find out what language was
+            # actually detected, e.g. to pick a matching OCR language pack
+            # for on-screen burned-in text instead of assuming Chinese.
+            self.last_detected_language = result.get("language")
             return result
         except Exception as exc:
             self.logger.exception("Whisper transcription failed: %s", exc)

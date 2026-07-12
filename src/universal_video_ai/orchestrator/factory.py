@@ -14,6 +14,7 @@ from universal_video_ai.timeline.service import TimelineService
 from universal_video_ai.mixer.service import MixerService, MixerConfig
 from universal_video_ai.render.renderer import Renderer, RenderConfig
 from universal_video_ai.render.text_detector import OnScreenTextDetector
+from universal_video_ai.render import ocr_language_map
 from .service import LocalizationService, LocalizationConfig
 
 __all__ = ["create_localization_service"]
@@ -34,7 +35,7 @@ def create_localization_service(
         render_video: bool = False,
         render_config: Optional[RenderConfig] = None,
         enable_text_cover: bool = True,
-        ocr_languages: Tuple[str, ...] = ("ch_sim", "en"),
+        ocr_languages: Tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL,
         text_cover_samples_per_segment: int = 2,
         watermark_exclude_regions_fractional: Tuple[Tuple[float, float, float, float], ...] = (
             (0.80, 0.72, 1.0, 1.0),
@@ -67,7 +68,11 @@ def create_localization_service(
         its place, timed to that sentence's window. Requires `easyocr`
         (pip install easyocr) and real per-sentence timing (run_transcription
         with a Whisper-like backend); silently skipped otherwise.
-    :param ocr_languages: easyocr language codes to detect (default Chinese + English)
+    :param ocr_languages: easyocr language codes to detect. Defaults to the
+        "auto" sentinel, which picks the language pack automatically from
+        whatever spoken language Whisper detects in the audio (see
+        `render.ocr_language_map`) instead of assuming Chinese. Pass an
+        explicit tuple (e.g. ("ch_sim", "en")) to pin a specific language.
     :param text_cover_samples_per_segment: frames sampled per sentence for OCR
     :param watermark_exclude_regions_fractional: static screen area(s), as
         (x0,y0,x1,y1) fractions of the frame, to ignore when detecting the
@@ -110,14 +115,26 @@ def create_localization_service(
     # Renderer service (optional)
     renderer = Renderer(config=render_config or RenderConfig(), logger=logger) if render_video else None
 
-    # On-screen text detector (optional, best-effort — requires easyocr)
+    # On-screen text detector (optional, best-effort — requires easyocr).
+    # When ocr_languages is the "auto" sentinel, the actual easyocr language
+    # pack can't be chosen yet (it depends on the spoken-audio language
+    # Whisper hasn't detected yet at this point) — so we deliberately leave
+    # text_detector=None here and let LocalizationService build one lazily,
+    # AFTER transcription, once it knows what language to actually pass.
+    # For an explicit (non-auto) language tuple, building it eagerly here
+    # still works exactly as before and fails fast if easyocr is missing.
     text_detector = None
-    if enable_text_cover:
+    if enable_text_cover and tuple(ocr_languages) != ocr_language_map.AUTO_OCR_SENTINEL:
         try:
             text_detector = OnScreenTextDetector(languages=ocr_languages, logger=logger)
             logger.info("OnScreenTextDetector available; text-cover enabled")
         except Exception as exc:
             logger.warning("OnScreenTextDetector not available; text-cover disabled: %s", exc)
+    elif enable_text_cover:
+        logger.info(
+            "ocr_languages='auto': OnScreenTextDetector will be created lazily per-video "
+            "once the spoken audio language is detected."
+        )
 
     # Build config
     config = LocalizationConfig(

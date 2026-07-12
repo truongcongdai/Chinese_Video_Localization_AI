@@ -10,8 +10,23 @@ web/auth.py / README_WEB.md).
 """
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
+
+# Load .env before anything else touches os.environ — belt-and-suspenders
+# alongside universal_video_ai.config doing the same on import, so this
+# works correctly even if something changes import order later. Points at
+# the repo root's .env explicitly (one level up from this scripts/ file)
+# rather than relying on the process's current working directory, since
+# people commonly launch this script from elsewhere (e.g. an IDE, or a
+# different folder) — that mismatch was the actual root cause of
+# "WEB_SESSION_SECRET is not set" even when .env had a value in it.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+except ImportError:
+    pass
 
 
 def main() -> None:

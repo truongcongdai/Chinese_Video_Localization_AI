@@ -58,6 +58,12 @@ class WhisperBackend:
         self.logger.debug("WhisperBackend.transcribe_segments: audio=%s language=%s", audio_path, language)
         return self._transcriber.transcribe_segments(audio_path, language=language)
 
+    @property
+    def last_detected_language(self) -> Optional[str]:
+        """Language Whisper actually detected/used for the most recent
+        transcribe()/transcribe_segments() call (None before any call)."""
+        return self._transcriber.last_detected_language
+
 
 class NoOpSpeechBackend:
     """No-op speech backend for development and testing.

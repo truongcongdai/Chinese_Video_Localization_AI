@@ -41,6 +41,13 @@ class AudioPipelineResult:
     # with the original video's timing. May contain a single segment with
     # `end == UNKNOWN_TIMING` if the backend only provided flat text.
     segments: Optional[List[TranscriptSegment]] = None
+    # Language Whisper actually detected the spoken audio to be in (e.g.
+    # "zh", "en", "ja") — None if transcription was skipped, the backend
+    # doesn't expose it, or this result came from cache. Lets callers pick
+    # a matching OCR language pack for burned-in on-screen text (see
+    # LocalizationConfig.ocr_languages == ("auto",)) instead of assuming
+    # every source video is Chinese.
+    detected_language: Optional[str] = None
 
 
 class AudioPipeline:
@@ -86,6 +93,7 @@ class AudioPipeline:
         demucs_output: Optional[DemucsOutput] = None
         transcript: Optional[str] = None
         segments: Optional[List[TranscriptSegment]] = None
+        detected_language: Optional[str] = None
 
         # Demucs step (optional)
         if self.config.run_demucs:
@@ -113,10 +121,15 @@ class AudioPipeline:
                 audio_result.audio_path, language=self.config.transcription_language
             )
             transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip()) or None
+            # Best-effort: only populated when the backend actually ran (not
+            # a cache hit) and exposes `last_detected_language` (WhisperBackend
+            # does; NoOp/other backends simply won't have the attribute).
+            detected_language = getattr(self.speech_service.backend, "last_detected_language", None)
             self.logger.debug(
-                "AudioPipeline: transcript length=%d segments=%d",
+                "AudioPipeline: transcript length=%d segments=%d detected_language=%s",
                 len(transcript) if transcript else 0,
                 len(segments) if segments else 0,
+                detected_language,
             )
 
         return AudioPipelineResult(
@@ -124,4 +137,5 @@ class AudioPipeline:
             demucs_output=demucs_output,
             transcript=transcript,
             segments=segments,
+            detected_language=detected_language,
         )

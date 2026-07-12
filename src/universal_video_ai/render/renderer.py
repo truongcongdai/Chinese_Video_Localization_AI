@@ -142,7 +142,7 @@ class RenderConfig:
     audio_codec: str = "aac"
     audio_bitrate: str = "192k"
     overwrite: bool = True
-    timeout_seconds: int = 1800  # 30 minutes
+    timeout_seconds: int = 21600  # 6 hours
     blur_text: bool = False
     blur_box: Optional[str] = None
     default_overlay_font_path: Optional[str] = None
@@ -155,6 +155,57 @@ class RenderConfig:
     # videos. Example: (0.80, 0.72, 1.0, 1.0) covers the bottom-right ~20%
     # width x ~28% height corner.
     watermark_box_fractional: Optional[Tuple[float, float, float, float]] = None
+
+    # ---- Brand logo overlay (user-supplied image burned into every frame) ----
+    # Path to a logo/watermark image (PNG with alpha transparency recommended)
+    # to overlay on the output video for its entire duration. None disables
+    # this feature entirely (no extra input/filter added, zero cost).
+    logo_path: Optional[str] = None
+    # Which corner to place it in.
+    logo_corner: str = "bottom_right"  # top_left | top_right | bottom_left | bottom_right
+    # Target width in pixels; height is scaled automatically to preserve the
+    # logo image's own aspect ratio.
+    logo_size_px: int = 120
+    # Gap in pixels between the logo and the frame edge.
+    logo_margin_px: int = 24
+
+    # ---- Anti-copyright filters (to avoid content ID detection) ----
+    # Add black bars on sides (letterboxing) - format: "left:right:top:bottom" in pixels
+    # Example: "100:100:0:0" adds 100px black bars on left and right sides
+    letterbox: Optional[str] = None
+    # Zoom factor (1.0 = no zoom, 1.1 = 10% zoom into center)
+    zoom_factor: float = 1.0
+    # Flip video horizontally (mirror effect) - helps avoid fingerprinting
+    flip_horizontal: bool = False
+    # Slight speed change (0.95-1.05) to avoid audio fingerprinting
+    speed_factor: float = 1.0
+    # Brightness adjustment (-1.0 to 1.0, 0 = no change)
+    brightness: float = 0.0
+    # Contrast adjustment (0 to 2, 1 = no change)
+    contrast: float = 1.0
+    # Saturation adjustment (0 to 2, 1 = no change)
+    saturation: float = 1.0
+    # Add noise/grain (0 to 100, 0 = no noise)
+    noise_amount: int = 0
+    # Slight rotation in degrees (0 to 5, 0 = no rotation)
+    rotation_degrees: float = 0.0
+    # Crop from edges (left:right:top:bottom in pixels)
+    crop: Optional[str] = None
+
+    # ---- Platform-specific video optimization ----
+    # Target platform: 'tiktok', 'youtube_shorts', 'youtube_long', 'facebook', 'instagram', 'none'
+    target_platform: str = "none"
+    # Target aspect ratio: '9:16' (vertical), '16:9' (horizontal), '1:1' (square), 'auto' (keep original)
+    target_aspect_ratio: str = "auto"
+    # Target resolution (width x height). If None, auto-calculate based on aspect ratio
+    target_resolution: Optional[Tuple[int, int]] = None
+    # Subtitle position for platform: 'bottom' (default), 'top', 'middle'
+    subtitle_position: str = "bottom"
+    # Subtitle safe area margin (pixels) - avoid platform UI overlap
+    subtitle_safe_margin: int = 80
+    # Maximum video duration in seconds for processing (None = no limit)
+    # For long-form content (>10 min), recommend increasing timeout_seconds
+    max_video_duration: Optional[int] = None
 
 
 class Renderer:
@@ -189,6 +240,145 @@ class Renderer:
         out_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{video_path.stem}.final.mp4"
         return out_dir / filename
+
+    def _build_platform_optimization_filters(self, frame_w: Optional[int] = None, frame_h: Optional[int] = None) -> List[str]:
+        """
+        Build ffmpeg filters for platform-specific video optimization.
+        Handles aspect ratio conversion (9:16, 16:9, 1:1) and resolution scaling.
+        """
+        filters: List[str] = []
+
+        if self.config.target_aspect_ratio == "auto" and self.config.target_resolution is None:
+            return filters
+
+        # Platform-specific presets
+        platform_presets = {
+            "tiktok": {"aspect": "9:16", "resolution": (1080, 1920)},
+            "youtube_shorts": {"aspect": "9:16", "resolution": (1080, 1920)},
+            "youtube_long": {"aspect": "16:9", "resolution": (1920, 1080)},
+            "facebook": {"aspect": "1:1", "resolution": (1080, 1080)},
+            "instagram": {"aspect": "1:1", "resolution": (1080, 1080)},
+        }
+
+        # Determine target dimensions
+        target_w, target_h = None, None
+        target_aspect_ratio = self.config.target_aspect_ratio
+
+        if self.config.target_platform != "none" and self.config.target_platform in platform_presets:
+            preset = platform_presets[self.config.target_platform]
+            if target_aspect_ratio == "auto":
+                target_aspect_ratio = preset["aspect"]
+            if self.config.target_resolution is None:
+                target_w, target_h = preset["resolution"]
+
+        if self.config.target_resolution:
+            target_w, target_h = self.config.target_resolution
+
+        # Calculate target dimensions based on aspect ratio
+        aspect_ratios = {
+            "9:16": (9, 16),
+            "16:9": (16, 9),
+            "1:1": (1, 1),
+        }
+
+        if target_aspect_ratio in aspect_ratios and frame_w and frame_h:
+            ar_w, ar_h = aspect_ratios[target_aspect_ratio]
+
+            if target_w is None and target_h is None:
+                # Auto-calculate based on original video's longer side
+                if frame_w > frame_h:
+                    # Landscape source
+                    target_h = int(frame_h * (ar_w / ar_h))
+                    target_w = frame_w
+                else:
+                    # Portrait source
+                    target_w = int(frame_w * (ar_h / ar_w))
+                    target_h = frame_h
+
+            # Ensure minimum dimensions
+            target_w = max(target_w or 320, 320)
+            target_h = max(target_h or 320, 320)
+
+            # Apply scale filter with aspect ratio
+            filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2")
+
+        elif target_w and target_h:
+            # Direct scale to target resolution
+            filters.append(f"scale={target_w}:{target_h}")
+
+        return filters
+
+    def _build_anti_copyright_filters(self, frame_w: Optional[int] = None, frame_h: Optional[int] = None) -> List[str]:
+        """
+        Build ffmpeg filters for anti-copyright processing to avoid content ID detection.
+        Filters are applied in order: crop -> zoom/rotate -> flip -> color adjustments -> noise -> letterbox
+        """
+        filters: List[str] = []
+
+        # Crop from edges if specified
+        if self.config.crop:
+            try:
+                crop_left, crop_right, crop_top, crop_bottom = (int(v) for v in self.config.crop.split(":"))
+                if frame_w and frame_h:
+                    # crop filter uses iw-ow:ih-oh:ow:oh format
+                    out_w = frame_w - crop_left - crop_right
+                    out_h = frame_h - crop_top - crop_bottom
+                    filters.append(f"crop={out_w}:{out_h}:{crop_left}:{crop_top}")
+                    # Update frame dimensions for subsequent filters
+                    frame_w, frame_h = out_w, out_h
+            except ValueError:
+                self.logger.error("Malformed crop=%r (expected 'left:right:top:bottom' integers)", self.config.crop)
+
+        # Zoom into center
+        if self.config.zoom_factor != 1.0 and frame_w and frame_h:
+            zoom = self.config.zoom_factor
+            # Calculate crop region for zoom effect
+            new_w = int(frame_w / zoom)
+            new_h = int(frame_h / zoom)
+            x = (frame_w - new_w) // 2
+            y = (frame_h - new_h) // 2
+            filters.append(f"crop={new_w}:{new_h}:{x}:{y}")
+            # Scale back to original size
+            filters.append(f"scale={frame_w}:{frame_h}")
+
+        # Rotation
+        if self.config.rotation_degrees != 0.0:
+            # Use rotate filter with fill color black
+            filters.append(f"rotate={self.config.rotation_degrees}*PI/180:fillcolor=black")
+
+        # Horizontal flip
+        if self.config.flip_horizontal:
+            filters.append("hflip")
+
+        # Color adjustments (brightness, contrast, saturation)
+        eq_params = []
+        if self.config.brightness != 0.0:
+            eq_params.append(f"brightness={self.config.brightness}")
+        if self.config.contrast != 1.0:
+            eq_params.append(f"contrast={self.config.contrast}")
+        if self.config.saturation != 1.0:
+            eq_params.append(f"saturation={self.config.saturation}")
+        if eq_params:
+            filters.append(f"eq={':'.join(eq_params)}")
+
+        # Add noise/grain (disabled - filter syntax varies by FFmpeg version)
+        # if self.config.noise_amount > 0:
+        #     filters.append(f"noise=all_amount={self.config.noise_amount}:allf=t")
+
+        # Letterbox (add black bars)
+        if self.config.letterbox and frame_w and frame_h:
+            try:
+                pad_left, pad_right, pad_top, pad_bottom = (int(v) for v in self.config.letterbox.split(":"))
+                total_pad_w = pad_left + pad_right
+                total_pad_h = pad_top + pad_bottom
+                if total_pad_w > 0 or total_pad_h > 0:
+                    out_w = frame_w + total_pad_w
+                    out_h = frame_h + total_pad_h
+                    filters.append(f"pad={out_w}:{out_h}:{pad_left}:{pad_top}:color=black")
+            except ValueError:
+                self.logger.error("Malformed letterbox=%r (expected 'left:right:top:bottom' integers)", self.config.letterbox)
+
+        return filters
 
     def _build_text_overlay_filters(
         self, overlays: List[TextOverlay], frame_w: Optional[int] = None
@@ -341,14 +531,40 @@ class Renderer:
         cmd.extend(["-i", str(input_video)])
         cmd.extend(["-i", str(input_audio)])
 
+        logo_configured = bool(self.config.logo_path) and Path(self.config.logo_path).exists()
+        if self.config.logo_path and not logo_configured:
+            self.logger.warning(
+                "RenderConfig.logo_path=%r does not exist; skipping logo overlay for this render.",
+                self.config.logo_path,
+            )
+        if logo_configured:
+            # `-loop 1` keeps this single still image "playing" for the
+            # whole output duration instead of ending after one frame,
+            # which is what `overlay` needs to composite it onto every
+            # frame of the main video, not just the first.
+            cmd.extend(["-loop", "1", "-i", str(self.config.logo_path)])
+
         text_overlays = text_overlays or []
 
-        # Determine if we need video filters (subtitles, overlays, or blur)
+        # Determine if we need video filters (subtitles, overlays, blur, anti-copyright, or platform optimization)
         needs_reencode = (
             subtitles is not None
             or self.config.blur_text
             or bool(text_overlays)
             or self.config.watermark_box_fractional is not None
+            or logo_configured
+            or self.config.letterbox is not None
+            or self.config.zoom_factor != 1.0
+            or self.config.flip_horizontal
+            or self.config.speed_factor != 1.0
+            or self.config.brightness != 0.0
+            or self.config.contrast != 1.0
+            or self.config.saturation != 1.0
+            or self.config.noise_amount > 0
+            or self.config.rotation_degrees != 0.0
+            or self.config.crop is not None
+            or self.config.target_aspect_ratio != "auto"
+            or self.config.target_resolution is not None
         )
 
         if text_overlays and not self.config.default_overlay_font_path and not any(
@@ -435,6 +651,12 @@ class Renderer:
                         "on-screen text region is detected automatically via OCR."
                     )
 
+            # Add platform-specific optimization filters (aspect ratio, resolution)
+            filters.extend(self._build_platform_optimization_filters(frame_w=frame_w, frame_h=frame_h))
+
+            # Add anti-copyright filters
+            filters.extend(self._build_anti_copyright_filters(frame_w=frame_w, frame_h=frame_h))
+
             # Add per-sentence text-cover + translated-text overlays, each
             # only active during its own [start, end) window.
             filters.extend(self._build_text_overlay_filters(text_overlays, frame_w=frame_w))
@@ -451,18 +673,29 @@ class Renderer:
             if subtitles:
                 filters.append(f"subtitles={_escape_filter_path(str(subtitles))}")
 
-            # Combine filters with comma
-            vf = ",".join(filters) if filters else None
+            cmd.extend(["-map", "1:a"])
 
-            cmd.extend(
-                [
-                    "-map", "0:v",
-                    "-map", "1:a",
-                ]
-            )
-
-            if vf:
-                cmd.extend(["-vf", vf])
+            if logo_configured:
+                # A logo overlay needs a SECOND video stream (the logo
+                # image) composited onto the first, which `-vf` (a single
+                # linear chain over one stream) can't express — it needs
+                # `-filter_complex`'s labeled-pad graph instead. Every
+                # filter that would have gone in the simple `-vf` chain
+                # above is applied first (as `[0:v]<...>[base]`), then the
+                # logo is scaled and overlaid on top of that result.
+                base_chain = ",".join(filters) if filters else "copy"
+                x_expr, y_expr = self._logo_position_expr(self.config.logo_corner, self.config.logo_margin_px)
+                filter_complex = (
+                    f"[0:v]{base_chain}[base];"
+                    f"[2:v]scale={self.config.logo_size_px}:-1[wm];"
+                    f"[base][wm]overlay={x_expr}:{y_expr}[outv]"
+                )
+                cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
+            else:
+                cmd.extend(["-map", "0:v"])
+                vf = ",".join(filters) if filters else None
+                if vf:
+                    cmd.extend(["-vf", vf])
 
             cmd.extend(
                 [
@@ -471,9 +704,25 @@ class Renderer:
                     "-crf", str(self.config.crf),
                     "-c:a", self.config.audio_codec,
                     "-b:a", self.config.audio_bitrate,
-                    str(output),
                 ]
             )
+
+            # Handle speed factor for audio (avoids audio fingerprinting)
+            if self.config.speed_factor != 1.0:
+                # Use atempo filter - can only do 0.5 to 2.0 per filter, chain multiple if needed
+                speed = self.config.speed_factor
+                atempo_filters = []
+                while speed < 0.5 or speed > 2.0:
+                    if speed > 2.0:
+                        atempo_filters.append("atempo=2.0")
+                        speed /= 2.0
+                    elif speed < 0.5:
+                        atempo_filters.append("atempo=0.5")
+                        speed /= 0.5
+                atempo_filters.append(f"atempo={speed}")
+                cmd.extend(["-filter:a", ",".join(atempo_filters)])
+
+            cmd.append(str(output))
         else:
             # No filters: keep video stream (copy) and encode audio
             cmd.extend(
@@ -488,6 +737,25 @@ class Renderer:
             )
 
         return cmd
+
+    @staticmethod
+    def _logo_position_expr(corner: str, margin_px: int) -> Tuple[str, str]:
+        """
+        ffmpeg `overlay` x/y expressions for placing a logo in the requested
+        corner, using its built-in `main_w`/`main_h`/`overlay_w`/`overlay_h`
+        variables — this way we never need to know the actual frame or
+        scaled-logo pixel dimensions in Python; ffmpeg resolves them at
+        filter-graph run time, so it works for any source resolution and
+        any logo image size.
+        """
+        m = str(margin_px)
+        positions = {
+            "top_left": (m, m),
+            "top_right": (f"main_w-overlay_w-{m}", m),
+            "bottom_left": (m, f"main_h-overlay_h-{m}"),
+            "bottom_right": (f"main_w-overlay_w-{m}", f"main_h-overlay_h-{m}"),
+        }
+        return positions.get(corner, positions["bottom_right"])
 
     def render(
         self,
@@ -587,6 +855,8 @@ class Renderer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             bufsize=1,
         )
 
