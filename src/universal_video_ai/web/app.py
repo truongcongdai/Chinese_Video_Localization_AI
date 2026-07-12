@@ -674,6 +674,20 @@ def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     return {"ok": True}
 
 
+class BulkDeleteBody(BaseModel):
+    job_ids: List[str]
+
+
+@app.post("/api/jobs/bulk_delete")
+def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
+    """Delete several history entries at once (checkbox multi-select in the
+    UI) in a single query instead of N round trips."""
+    if not body.job_ids:
+        raise HTTPException(400, "Chưa chọn video nào để xoá")
+    deleted_count = store.delete_jobs(body.job_ids, user_id)
+    return {"ok": True, "deleted_count": deleted_count}
+
+
 def _get_owned_job(job_id: str, user_id: int):
     job = store.get_job(job_id)
     if job is None or job.user_id != user_id:

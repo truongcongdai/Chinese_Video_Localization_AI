@@ -456,6 +456,20 @@ class Store:
             )
             return cur.rowcount > 0
 
+    def delete_jobs(self, job_ids: List[str], user_id: int) -> int:
+        """Bulk-delete history entries (e.g. from a multi-select checkbox
+        list in the UI). Scoped to `user_id` same as delete_job. Returns how
+        many rows were actually deleted."""
+        if not job_ids:
+            return 0
+        with self._connect() as conn:
+            placeholders = ",".join("?" for _ in job_ids)
+            cur = conn.execute(
+                f"DELETE FROM jobs WHERE user_id = ? AND id IN ({placeholders})",
+                [user_id, *job_ids],
+            )
+            return cur.rowcount
+
     # ---- publish log ----
     def log_publish(self, job_id: str, platform: str, success: bool, message: str,
                      remote_url: Optional[str] = None) -> None:

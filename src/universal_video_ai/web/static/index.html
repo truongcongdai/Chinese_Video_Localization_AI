@@ -128,6 +128,9 @@
   /* history search/filter/delete */
   .history-toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
   .history-toolbar input[type="date"] { flex: none; width: 150px; }
+  .btn.danger { background: transparent; color: var(--err); border: 1px solid #4a2b2b; }
+  .btn.danger:hover { background: #2a1717; }
+  .btn.danger:disabled { opacity: .4; }
   .job-actions .btn.danger { background: transparent; color: var(--err); border: 1px solid #4a2b2b; }
   .job-actions .btn.danger:hover { background: #2a1717; }
 
@@ -382,6 +385,13 @@
       <input type="date" id="history-date-from" title="Từ ngày">
       <input type="date" id="history-date-to" title="Đến ngày">
       <button class="btn secondary small" id="history-clear-btn">Xoá lọc</button>
+    </div>
+    <div class="history-toolbar" style="margin-top:8px">
+      <label style="display:flex;align-items:center;gap:6px;width:auto;color:var(--text-dim);font-size:13px">
+        <input type="checkbox" id="select-all-checkbox" style="width:auto">
+        Chọn tất cả
+      </label>
+      <button class="btn danger small" id="bulk-delete-btn" disabled>Xoá đã chọn (<span id="selected-count">0</span>)</button>
     </div>
     <div id="job-list"></div>
     <div id="empty-history" class="hidden">Chưa có video nào. Dán link ở trên để bắt đầu.</div>
@@ -792,11 +802,18 @@ async function refreshJobs() {
   const list = $("#job-list");
   list.innerHTML = "";
   $("#empty-history").classList.toggle("hidden", jobs.length > 0);
+  const knownIds = new Set(jobs.map(j => j.id));
+  // Drop selections for jobs no longer in the current filtered view.
+  for (const id of [...selectedJobIds]) if (!knownIds.has(id)) selectedJobIds.delete(id);
   for (const job of jobs) {
     const el = document.createElement("div");
     el.className = "job";
     const created = new Date(job.created_at * 1000).toLocaleString("vi-VN");
     el.innerHTML = `
+      <label style="width:auto;display:flex;align-items:center">
+        <input type="checkbox" class="job-select-checkbox" data-id="${job.id}" style="width:auto"
+          ${selectedJobIds.has(job.id) ? "checked" : ""}>
+      </label>
       <div class="job-info">
         <div class="job-url">${job.title || job.source_url}</div>
         <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${job.progress_note || ""}</div>
@@ -812,6 +829,14 @@ async function refreshJobs() {
     `;
     list.appendChild(el);
   }
+  list.querySelectorAll(".job-select-checkbox").forEach(cb => {
+    cb.onchange = () => {
+      if (cb.checked) selectedJobIds.add(cb.dataset.id);
+      else selectedJobIds.delete(cb.dataset.id);
+      updateBulkDeleteUI();
+    };
+  });
+  updateBulkDeleteUI();
   list.querySelectorAll("[data-preview]").forEach(btn => {
     btn.onclick = () => openPreview(btn.dataset.preview);
   });
@@ -828,6 +853,36 @@ async function refreshJobs() {
 }
 
 let _historySearchDebounce = null;
+const selectedJobIds = new Set();
+
+function updateBulkDeleteUI() {
+  $("#selected-count").textContent = selectedJobIds.size;
+  $("#bulk-delete-btn").disabled = selectedJobIds.size === 0;
+  const allCheckboxes = document.querySelectorAll(".job-select-checkbox");
+  $("#select-all-checkbox").checked = allCheckboxes.length > 0 &&
+    [...allCheckboxes].every(cb => cb.checked);
+}
+
+$("#select-all-checkbox").onchange = (ev) => {
+  document.querySelectorAll(".job-select-checkbox").forEach(cb => {
+    cb.checked = ev.target.checked;
+    if (ev.target.checked) selectedJobIds.add(cb.dataset.id);
+    else selectedJobIds.delete(cb.dataset.id);
+  });
+  updateBulkDeleteUI();
+};
+
+$("#bulk-delete-btn").onclick = async () => {
+  const ids = [...selectedJobIds];
+  if (ids.length === 0) return;
+  if (!confirm(`Xoá ${ids.length} video đã chọn khỏi lịch sử? Không thể hoàn tác.`)) return;
+  try {
+    await api("/api/jobs/bulk_delete", { method: "POST", body: JSON.stringify({ job_ids: ids }) });
+    selectedJobIds.clear();
+    refreshJobs();
+  } catch (e) { alert(e.message); }
+};
+
 $("#history-search").addEventListener("input", () => {
   clearTimeout(_historySearchDebounce);
   _historySearchDebounce = setTimeout(refreshJobs, 300);
