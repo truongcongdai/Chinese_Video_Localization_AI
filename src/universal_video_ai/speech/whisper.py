@@ -56,21 +56,6 @@ class WhisperTranscriber:
         self.config = config or WhisperConfig()
         self.logger = logger or _logger
         self.last_detected_language: Optional[str] = None
-        
-        # Auto-detect GPU if device is not explicitly set
-        if self.config.device is None:
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    self.config.device = "cuda"
-                    self.logger.info("GPU detected, using CUDA for Whisper")
-                else:
-                    self.config.device = "cpu"
-                    self.logger.info("No GPU detected, using CPU for Whisper")
-            except ImportError:
-                self.config.device = "cpu"
-                self.logger.info("PyTorch not available, using CPU for Whisper")
-        
         self.logger.debug("WhisperTranscriber initialized with model=%s, device=%s", self.config.model, self.config.device)
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:

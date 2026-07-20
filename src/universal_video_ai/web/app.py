@@ -10,15 +10,19 @@ Run with: python scripts/run_web.py
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import traceback
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+
+import requests
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
@@ -26,9 +30,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from universal_video_ai.orchestrator.factory import create_localization_service
+from universal_video_ai.orchestrator.service import (
+    prepared_localization_to_dict, prepared_localization_from_dict,
+)
 from universal_video_ai.render.renderer import RenderConfig
 from universal_video_ai.render import ocr_language_map
+from universal_video_ai.render.quality_check import analyze_output_quality
 from universal_video_ai.tts.tts import DEFAULT_VOICES_BY_LANGUAGE
+from universal_video_ai.tts.voices import voices_for_language
+from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.config import TEMP_DIR
 from universal_video_ai.social import get_uploader
 
@@ -54,6 +64,8 @@ _OUTPUT_BASE_DIR = TEMP_DIR / "output"
 # no billing/payment wired up) — an admin tops up a user's balance from the
 # admin dashboard. Set to 0 to disable the whole credits gate.
 JOB_COST_CREDITS = int(os.environ.get("JOB_COST_CREDITS", "1"))
+WEB_RENDER_PRESET = os.environ.get("WEB_RENDER_PRESET", "fast")
+WEB_RENDER_TIMEOUT_SECONDS = int(os.environ.get("WEB_RENDER_TIMEOUT_SECONDS", "1800"))
 
 store = Store(_DB_PATH)
 
@@ -66,6 +78,11 @@ app.mount("/assets", StaticFiles(directory=str(STATIC_DIR)), name="assets")
 # always made admin regardless of this setting. Default true: this app is
 # meant to support multiple people signing up on their own now.
 OPEN_REGISTRATION = os.environ.get("OPEN_REGISTRATION", "true").lower() not in ("0", "false", "no")
+
+# Credits granted to BOTH the new user and whoever invited them, when
+# registering with a valid ?ref= referral code. Set to 0 to disable bonuses
+# while keeping the referral tracking itself.
+REFERRAL_BONUS_CREDITS = int(os.environ.get("REFERRAL_BONUS_CREDITS", "20"))
 
 _LOGO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "logos"
 _LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,6 +122,7 @@ class LoginBody(BaseModel):
 class RegisterBody(BaseModel):
     identifier: str  # an email address or a phone number
     password: str
+    referral_code: Optional[str] = None  # whoever invited this person, if anyone
 
 
 class NewJobBody(BaseModel):
@@ -118,45 +136,52 @@ class NewJobBody(BaseModel):
     logo_path: Optional[str] = None
     logo_corner: str = "bottom_right"  # top_left | top_right | bottom_left | bottom_right
     logo_size_px: int = 120
-    # ---- Anti-copyright options ----
-    enable_anti_copyright: bool = False
-    letterbox: Optional[str] = None  # "left:right:top:bottom" in pixels
-    zoom_factor: float = 1.0
-    flip_horizontal: bool = False
-    speed_factor: float = 1.0
-    brightness: float = 0.0
-    contrast: float = 1.0
-    saturation: float = 1.0
-    noise_amount: int = 0
-    rotation_degrees: float = 0.0
-    crop: Optional[str] = None  # "left:right:top:bottom" in pixels
-    # ---- Platform-specific optimization ----
-    target_platform: str = "none"  # none, tiktok, youtube_shorts, youtube_long, facebook, instagram
-    target_aspect_ratio: str = "auto"  # auto, 9:16, 16:9, 1:1
-    target_resolution: Optional[str] = None  # "width,height" e.g. "1080,1920"
+    # Explicit Edge-TTS voice id from GET /api/voices, e.g.
+    # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
+    tts_voice: Optional[str] = None
+    # When True, the job stops right after translation (status="review")
+    # instead of rendering straight through, so the person can edit the
+    # translated text first via PUT .../segments then POST .../render.
+    review_before_render: bool = False
 
 
-class BatchJobBody(BaseModel):
-    urls: List[str]
+class CreatorJobBody(BaseModel):
+    topic: str
+    script: Optional[str] = None
     target_language: str = "vi"
-    source_language: str = "auto"
-    logo_path: Optional[str] = None
-    logo_corner: str = "bottom_right"
-    logo_size_px: int = 120
-    enable_anti_copyright: bool = False
-    letterbox: Optional[str] = None
-    zoom_factor: float = 1.0
-    flip_horizontal: bool = False
-    speed_factor: float = 1.0
-    brightness: float = 0.0
-    contrast: float = 1.0
-    saturation: float = 1.0
-    noise_amount: int = 0
-    rotation_degrees: float = 0.0
-    crop: Optional[str] = None
-    target_platform: str = "none"
-    target_aspect_ratio: str = "auto"
-    target_resolution: Optional[str] = None
+    aspect_ratio: str = "9:16"
+    duration_seconds: int = 30
+
+
+class CreatorSuggestionBody(BaseModel):
+    topic: str
+    target_language: str = "vi"
+
+
+class SegmentBody(BaseModel):
+    start: float
+    end: float
+    text: str
+
+
+class UpdateSegmentsBody(BaseModel):
+    segments: List[SegmentBody]
+
+
+class FeedbackBody(BaseModel):
+    message: str
+    page: Optional[str] = None
+
+
+class TopUpRequestBody(BaseModel):
+    credits: int
+    amount_vnd: int
+    payment_method: str = "bank_transfer"
+    note: Optional[str] = None
+
+
+class TopUpDecisionBody(BaseModel):
+    admin_note: Optional[str] = None
 
 
 class PublishBody(BaseModel):
@@ -262,11 +287,25 @@ def register(body: RegisterBody):
         email = value if kind == "email" else None
         phone = value if kind == "phone" else None
 
+    referrer = None
+    if body.referral_code and body.referral_code.strip():
+        referrer = store.get_user_by_referral_code(body.referral_code.strip())
+        if referrer is None:
+            raise HTTPException(400, "Mã giới thiệu không hợp lệ")
+
     user_id = store.create_user(
         username, hash_password(body.password),
         is_admin=is_first_user, credits=10_000 if is_first_user else 10,
         email=email, phone=phone,
+        referred_by_user_id=referrer["id"] if referrer else None,
     )
+    if referrer is not None:
+        # Both sides get a bonus — the invitee starts with extra credit
+        # instead of the usual 10, and the person who invited them gets
+        # rewarded too, same moment their friend actually signs up (not
+        # requiring the friend to do anything further first).
+        store.adjust_credits(user_id, REFERRAL_BONUS_CREDITS)
+        store.adjust_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
     return _login_response(user_id)
 
 
@@ -303,11 +342,50 @@ def logout():
 @app.get("/api/me")
 def me(user_id: int = Depends(get_current_user_id)):
     user = store.get_user_by_id(user_id)
+    referral_code = user["referral_code"] or store.ensure_referral_code(user_id)
     return {
         "id": user["id"], "username": user["username"],
         "email": user["email"], "phone": user["phone"],
         "credits": user["credits"], "is_admin": bool(user["is_admin"]),
+        "referral_code": referral_code,
     }
+
+
+@app.get("/api/stats/me")
+def stats_me(user_id: int = Depends(get_current_user_id)):
+    """Personal usage stats for the logged-in user — powers the small
+    stats widget above their own history (not the admin-only site-wide
+    stats at /api/admin/stats)."""
+    return store.user_stats(user_id)
+
+
+@app.post("/api/top-up-requests")
+def create_top_up_request(body: TopUpRequestBody, user_id: int = Depends(get_current_user_id)):
+    if body.credits <= 0 or body.amount_vnd <= 0:
+        raise HTTPException(400, "Gói nạp không hợp lệ")
+    if body.credits > 1_000_000 or body.amount_vnd > 1_000_000_000:
+        raise HTTPException(400, "Gói nạp vượt giới hạn")
+    request_id = store.create_top_up_request(
+        user_id,
+        body.credits,
+        body.amount_vnd,
+        body.payment_method.strip()[:40] or "bank_transfer",
+        note=(body.note or "").strip()[:1000] or None,
+    )
+    return {"ok": True, "id": request_id}
+
+
+@app.get("/api/top-up-requests")
+def list_my_top_up_requests(user_id: int = Depends(get_current_user_id)):
+    return [
+        {
+            "id": r["id"], "credits": r["credits"], "amount_vnd": r["amount_vnd"],
+            "payment_method": r["payment_method"], "note": r["note"],
+            "status": r["status"], "admin_note": r["admin_note"],
+            "created_at": r["created_at"], "updated_at": r["updated_at"],
+        }
+        for r in store.list_top_up_requests_for_user(user_id)
+    ]
 
 
 # --------------------------------------------------- identity oauth (SSO) --
@@ -382,83 +460,142 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
 
 # ------------------------------------------------------------------ jobs --
 
+def _build_service_for_job(job):
+    """Shared service-construction logic for both the normal (straight-
+    through) job path and the resume-after-review render path — both need
+    the exact same source/OCR-language and logo/voice settings."""
+    # source_language "auto" -> both transcription_language=None (Whisper
+    # auto-detects the spoken language) and ocr_languages left at the
+    # "auto" sentinel (resolved later from whatever Whisper detected).
+    # An explicit language pins both to that language directly.
+    is_auto_source = not job.source_language or job.source_language == "auto"
+    transcription_language = None if is_auto_source else job.source_language
+    ocr_languages = (
+        ocr_language_map.AUTO_OCR_SENTINEL if is_auto_source
+        else ocr_language_map.OCR_LANGUAGE_MAP.get(job.source_language, ("en",))
+    )
+
+    render_config = RenderConfig(
+        preset=WEB_RENDER_PRESET,
+        timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
+    )
+    if job.logo_path and Path(job.logo_path).exists():
+        render_config = RenderConfig(
+            preset=WEB_RENDER_PRESET,
+            timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
+            logo_path=job.logo_path,
+            logo_corner=job.logo_corner or "bottom_right",
+            logo_size_px=job.logo_size_px or 120,
+        )
+
+    return create_localization_service(
+        run_transcription=True,
+        transcription_language=transcription_language,
+        run_translation=True,
+        target_language=job.target_language,
+        run_tts=True,
+        tts_voice=job.tts_voice,
+        generate_subtitles=True,
+        mix_audio=True,
+        render_video=True,
+        render_config=render_config,
+        enable_text_cover=True,
+        ocr_languages=ocr_languages,
+        logger=logger,
+    )
+
+
 async def _run_job(job_id: str) -> None:
     job = store.get_job(job_id)
     if job is None:
         return
     try:
         store.update_job(job_id, status="running", progress_note="Đang tải video...")
-
-        # source_language "auto" -> both transcription_language=None (Whisper
-        # auto-detects the spoken language) and ocr_languages left at the
-        # "auto" sentinel (resolved later from whatever Whisper detected).
-        # An explicit language pins both to that language directly.
-        is_auto_source = not job.source_language or job.source_language == "auto"
-        transcription_language = None if is_auto_source else job.source_language
-        ocr_languages = (
-            ocr_language_map.AUTO_OCR_SENTINEL if is_auto_source
-            else ocr_language_map.OCR_LANGUAGE_MAP.get(job.source_language, ("en",))
-        )
-
-        render_config = None
-        if job.logo_path and Path(job.logo_path).exists() or job.enable_anti_copyright or job.target_platform != "none":
-            # Parse target_resolution if provided
-            target_resolution = None
-            if job.target_resolution:
-                try:
-                    w, h = job.target_resolution.split(",")
-                    target_resolution = (int(w.strip()), int(h.strip()))
-                except:
-                    self.logger.warning("Invalid target_resolution format: %s", job.target_resolution)
-
-            render_config = RenderConfig(
-                logo_path=job.logo_path,
-                logo_corner=job.logo_corner or "bottom_right",
-                logo_size_px=job.logo_size_px or 120,
-                letterbox=job.letterbox,
-                zoom_factor=job.zoom_factor,
-                flip_horizontal=job.flip_horizontal,
-                speed_factor=job.speed_factor,
-                brightness=job.brightness,
-                contrast=job.contrast,
-                saturation=job.saturation,
-                noise_amount=job.noise_amount,
-                rotation_degrees=job.rotation_degrees,
-                crop=job.crop,
-                target_platform=job.target_platform,
-                target_aspect_ratio=job.target_aspect_ratio,
-                target_resolution=target_resolution,
-            )
-
-        service = create_localization_service(
-            run_transcription=True,
-            transcription_language=transcription_language,
-            run_translation=True,
-            target_language=job.target_language,
-            run_tts=True,
-            generate_subtitles=True,
-            mix_audio=True,
-            render_video=True,
-            render_config=render_config,
-            enable_text_cover=True,
-            ocr_languages=ocr_languages,
-            logger=logger,
-        )
+        service = _build_service_for_job(job)
         job_output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
+
+        if job.review_mode:
+            # Stop after translation and wait for the person to review/edit
+            # the translated sentences via PUT .../segments, then
+            # POST .../render (-> _run_render_from_review) to continue.
+            store.update_job(job_id, progress_note="Đang dịch phụ đề để bạn xem trước...")
+            prepared = await service.prepare_for_review(
+                job.source_url, job_output_dir, target_language=job.target_language
+            )
+            segments = prepared.translated_segments or [
+                {"start": 0.0, "end": 0.0, "text": prepared.translated_text or ""}
+            ]
+            segments_payload = (
+                [{"start": s.start, "end": s.end, "text": s.text} for s in prepared.translated_segments]
+                if prepared.translated_segments else segments
+            )
+            store.set_job_segments(job_id, segments_payload)
+            store.set_job_review_state(job_id, prepared_localization_to_dict(prepared))
+            store.update_job(
+                job_id, status="review",
+                progress_note="Đã dịch xong — chỉnh sửa phụ đề rồi bấm Render",
+            )
+            return
+
         store.update_job(job_id, progress_note="Đang xử lý (dịch, lồng tiếng, render)...")
         result = await service.localize(job.source_url, job_output_dir, target_language=job.target_language)
-
-        if result.final_video_path and Path(result.final_video_path).exists():
-            title = (result.translated_text or job.source_url)[:80]
-            store.update_job(
-                job_id, status="done", progress_note="Hoàn tất",
-                final_video_path=str(result.final_video_path), title=title,
-            )
-        else:
-            store.update_job(job_id, status="error", error="Không tạo được video đầu ra (final_video_path rỗng)")
-            _refund_job_credits(job)
+        _finish_job_from_result(job_id, job, result)
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
+        store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
+        _refund_job_credits(job)
+    finally:
+        _running_tasks.pop(job_id, None)
+
+
+def _finish_job_from_result(job_id: str, job, result) -> None:
+    if result.final_video_path and Path(result.final_video_path).exists():
+        title = (result.translated_text or job.source_url)[:80]
+        store.update_job(
+            job_id, status="done", progress_note="Hoàn tất",
+            final_video_path=str(result.final_video_path), title=title,
+        )
+        # Best-effort automated sanity check (quiet audio, wrong duration).
+        # Never fails the job over this — it's an informational warning
+        # badge in the UI, not a hard gate on publishing.
+        try:
+            source_duration = None
+            if result.audio_pipeline_result and result.audio_pipeline_result.audio_result:
+                source_duration = result.audio_pipeline_result.audio_result.duration
+            warnings = analyze_output_quality(Path(result.final_video_path), source_duration=source_duration)
+            if warnings:
+                store.set_job_qc_warnings(job_id, warnings)
+        except Exception:
+            logger.exception("Quality check failed for job %s (non-fatal)", job_id)
+    else:
+        store.update_job(job_id, status="error", error="Không tạo được video đầu ra (final_video_path rỗng)")
+        _refund_job_credits(job)
+
+
+async def _run_render_from_review(job_id: str) -> None:
+    """Resume a job sitting at status='review': re-hydrate what
+    prepare_for_review() produced, and render using whatever's currently in
+    segments_json (the person's edits, if they made any — otherwise still
+    the original machine translation, unedited)."""
+    job = store.get_job(job_id)
+    if job is None:
+        return
+    try:
+        store.update_job(job_id, status="running", progress_note="Đang lồng tiếng và render...")
+        service = _build_service_for_job(job)
+
+        review_state = json.loads(job.review_state_json)
+        prepared = prepared_localization_from_dict(review_state)
+
+        segments_data = json.loads(job.segments_json) if job.segments_json else []
+        edited_segments = [
+            TranscriptSegment(start=s["start"], end=s["end"], text=s["text"]) for s in segments_data
+        ] or None
+
+        result = await service.finalize_from_review(prepared, edited_segments)
+        _finish_job_from_result(job_id, job, result)
+    except Exception as exc:
+        logger.exception("Job %s failed to render from review", job_id)
         store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
         _refund_job_credits(job)
     finally:
@@ -472,6 +609,354 @@ def _refund_job_credits(job) -> None:
             store.adjust_credits(job.user_id, JOB_COST_CREDITS)
         except Exception:
             logger.exception("Failed to refund credits for job %s", job.id)
+
+
+def _creator_scene_brief_from_topic(topic: str, language: str) -> List[str]:
+    topic = topic.strip()
+    if language == "vi":
+        return [
+            f"Người trẻ đang học tập hoặc làm việc với laptop, không khí tập trung, chủ đề {topic}",
+            "Cận cảnh màn hình máy tính, tài liệu, email, slide thuyết trình và công việc văn phòng bận rộn",
+            "Không gian làm việc hiện đại với nhiều ứng dụng AI, ghi chú, biểu đồ và ý tưởng nội dung",
+            "Sinh viên nghiên cứu tài liệu, tìm kiếm thông tin, đọc nguồn tham khảo trên laptop",
+            "Người sáng tạo nội dung đang dựng video ngắn, viết caption, lập kế hoạch đăng mạng xã hội",
+            "Giao diện thuyết trình hoặc slide đẹp, bố cục rõ ràng, cảm giác chuyên nghiệp",
+            "Micro, tai nghe hoặc studio nhỏ tượng trưng cho giọng đọc AI và sản xuất nội dung",
+            "Tài liệu PDF, sách, ghi chú học tập, người đặt câu hỏi và tổng hợp kiến thức",
+            "Người dùng hoàn thành công việc nhanh hơn, cảm giác năng suất và nhẹ nhõm",
+            "Cảnh kết thúc với điện thoại hiển thị video social media, kêu gọi bình luận và theo dõi",
+        ]
+    return [
+        f"Young professional or student using a laptop, focused workspace, topic {topic}",
+        "Close-up of computer screen, documents, email, presentation slides, busy office tasks",
+        "Modern desk with AI apps, notes, charts, and content ideas",
+        "Student researching information, reading sources, studying on a laptop",
+        "Content creator editing short videos, writing captions, planning social posts",
+        "Clean presentation slides, professional layout, modern business visuals",
+        "Microphone, headphones, or small studio representing AI voice and content production",
+        "PDF documents, books, notes, question answering and knowledge management",
+        "Person finishing work faster, productive and relaxed mood",
+        "Phone showing a social media video, comment and follow call to action",
+    ]
+
+
+def _creator_script_text_from_topic(topic: str, language: str) -> str:
+    return "\n".join(_creator_scene_brief_from_topic(topic, language))
+
+
+def _creator_keywords_from_topic(topic: str, language: str) -> List[str]:
+    text = topic.lower()
+    words = [
+        w for w in re.sub(r"[^\w\sÀ-ỹ]", " ", text, flags=re.UNICODE).split()
+        if len(w) >= 3
+    ]
+    stopwords = {
+        "của", "cho", "với", "một", "những", "các", "trong", "bạn", "này",
+        "the", "and", "for", "with", "from", "that", "this", "your",
+    }
+    core = []
+    for word in words:
+        if word not in stopwords and word not in core:
+            core.append(word)
+    if language == "vi":
+        base = [
+            topic,
+            f"{topic} cho người mới",
+            f"cách dùng {topic}",
+            f"mẹo {topic}",
+            f"{topic} miễn phí",
+            f"{topic} hiệu quả",
+            "công cụ AI",
+            "năng suất làm việc",
+            "học tập với AI",
+            "tạo nội dung bằng AI",
+        ]
+    else:
+        base = [
+            topic,
+            f"{topic} for beginners",
+            f"how to use {topic}",
+            f"{topic} tips",
+            f"free {topic}",
+            f"best {topic} tools",
+            "AI tools",
+            "productivity",
+            "AI for learning",
+            "AI content creation",
+        ]
+    for word in core[:8]:
+        if word not in base:
+            base.append(word)
+    return base[:14]
+
+
+def _creator_stock_query(topic: str, scene: str, index: int) -> str:
+    generic = [
+        "student laptop productivity artificial intelligence",
+        "busy office computer email documents",
+        "modern workspace laptop technology apps",
+        "student research laptop studying library",
+        "content creator editing video social media",
+        "business presentation slides office",
+        "microphone headphones studio voice recording",
+        "books documents notes studying desk",
+        "productive worker laptop success",
+        "smartphone social media video vertical",
+    ]
+    topic_words = " ".join(re.findall(r"[A-Za-z0-9]+", topic))[:60]
+    if topic_words:
+        return f"{generic[index % len(generic)]} {topic_words}"
+    return generic[index % len(generic)]
+
+
+def _split_creator_script(topic: str, script: Optional[str], language: str) -> List[str]:
+    raw = (script or "").strip()
+    if not raw:
+        return _creator_scene_brief_from_topic(topic, language)
+    lines = [line.strip(" -\t") for line in raw.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        lines = [s.strip() for s in re.split(r"(?<=[.!?。！？])\s+", raw) if s.strip()]
+    return lines[:12] or _creator_scene_brief_from_topic(topic, language)
+
+
+def _wrap_creator_text(text: str, max_chars: int = 28) -> str:
+    words = text.split()
+    if not words:
+        return text
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > max_chars and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\n".join(lines[:5])
+
+
+def _stock_orientation(aspect_ratio: str) -> str:
+    return "landscape" if aspect_ratio == "16:9" else "portrait"
+
+
+def _pick_pexels_video_file(video: Dict[str, Any]) -> Optional[str]:
+    files = video.get("video_files") or []
+    mp4s = [f for f in files if f.get("file_type") == "video/mp4" and f.get("link")]
+    if not mp4s:
+        return None
+    mp4s.sort(key=lambda f: abs((f.get("width") or 720) - 1080) + abs((f.get("height") or 1280) - 1920))
+    return mp4s[0]["link"]
+
+
+def _search_stock_media(query: str, aspect_ratio: str) -> Optional[Dict[str, str]]:
+    orientation = _stock_orientation(aspect_ratio)
+    pexels_key = os.environ.get("PEXELS_API_KEY")
+    pixabay_key = os.environ.get("PIXABAY_API_KEY")
+
+    if pexels_key:
+        try:
+            resp = requests.get(
+                "https://api.pexels.com/videos/search",
+                headers={"Authorization": pexels_key},
+                params={"query": query, "per_page": 3, "orientation": orientation},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for video in resp.json().get("videos", []):
+                url = _pick_pexels_video_file(video)
+                if url:
+                    return {"type": "video", "url": url, "provider": "Pexels"}
+        except Exception:
+            logger.exception("Pexels video search failed for query=%s", query)
+
+        try:
+            resp = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers={"Authorization": pexels_key},
+                params={"query": query, "per_page": 3, "orientation": orientation},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for photo in resp.json().get("photos", []):
+                src = photo.get("src") or {}
+                url = src.get("large2x") or src.get("large") or src.get("original")
+                if url:
+                    return {"type": "image", "url": url, "provider": "Pexels"}
+        except Exception:
+            logger.exception("Pexels photo search failed for query=%s", query)
+
+    if pixabay_key:
+        try:
+            resp = requests.get(
+                "https://pixabay.com/api/videos/",
+                params={
+                    "key": pixabay_key, "q": query, "per_page": 3,
+                    "orientation": "horizontal" if aspect_ratio == "16:9" else "vertical",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for hit in resp.json().get("hits", []):
+                videos = hit.get("videos") or {}
+                item = videos.get("large") or videos.get("medium") or videos.get("small") or {}
+                if item.get("url"):
+                    return {"type": "video", "url": item["url"], "provider": "Pixabay"}
+        except Exception:
+            logger.exception("Pixabay video search failed for query=%s", query)
+
+        try:
+            resp = requests.get(
+                "https://pixabay.com/api/",
+                params={
+                    "key": pixabay_key, "q": query, "per_page": 3,
+                    "orientation": "horizontal" if aspect_ratio == "16:9" else "vertical",
+                    "image_type": "photo",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for hit in resp.json().get("hits", []):
+                url = hit.get("largeImageURL") or hit.get("webformatURL")
+                if url:
+                    return {"type": "image", "url": url, "provider": "Pixabay"}
+        except Exception:
+            logger.exception("Pixabay image search failed for query=%s", query)
+
+    return None
+
+
+def _download_stock_media(media: Dict[str, str], dest: Path) -> Path:
+    suffix = ".mp4" if media["type"] == "video" else ".jpg"
+    output = dest.with_suffix(suffix)
+    with requests.get(media["url"], stream=True, timeout=60) as resp:
+        resp.raise_for_status()
+        with output.open("wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+    return output
+
+
+def _render_stock_clip(
+    source_path: Path,
+    source_type: str,
+    output_path: Path,
+    width: int,
+    height: int,
+    duration: float,
+) -> None:
+    vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
+    if source_type == "image":
+        cmd = [
+            "ffmpeg", "-y", "-loop", "1", "-t", f"{duration:.3f}",
+            "-i", str(source_path), "-vf", vf, "-an",
+            "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+            str(output_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{duration:.3f}",
+            "-i", str(source_path), "-vf", vf, "-an",
+            "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+            str(output_path),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout or "FFmpeg stock clip render failed")
+
+
+def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
+    job = store.get_job(job_id)
+    if job is None:
+        return
+    try:
+        store.update_job(job_id, status="running", progress_note="Đang dựng video từ ý tưởng...")
+        output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        scenes = _split_creator_script(body.topic, body.script, body.target_language)
+        total_duration = max(10, min(180, int(body.duration_seconds or 30)))
+        scene_duration = max(2.5, total_duration / len(scenes))
+        if body.aspect_ratio == "16:9":
+            width, height = 1920, 1080
+            font_size = 58
+            box_y = "(h-text_h)/2"
+        else:
+            width, height = 1080, 1920
+            font_size = 54
+            box_y = "h*0.58"
+
+        font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        colors = ["0f1115", "17202a", "10241f", "251c2b", "1f2430", "202416"]
+        clip_paths: List[Path] = []
+        for idx, scene in enumerate(scenes):
+            clip_path = output_dir / f"scene_{idx:02d}.mp4"
+            media = _search_stock_media(_creator_stock_query(body.topic, scene, idx), body.aspect_ratio)
+            if media:
+                try:
+                    source_path = _download_stock_media(media, output_dir / f"stock_{idx:02d}")
+                    _render_stock_clip(source_path, media["type"], clip_path, width, height, scene_duration)
+                    store.update_job(
+                        job_id,
+                        progress_note=f"Đã lấy cảnh {idx + 1}/{len(scenes)} từ {media['provider']}...",
+                    )
+                except Exception:
+                    logger.exception("Stock media render failed for scene=%s", scene)
+                    media = None
+
+            if not media:
+                text_path = output_dir / f"scene_{idx:02d}.txt"
+                text_path.write_text(_wrap_creator_text(scene), encoding="utf-8")
+                color = colors[idx % len(colors)]
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi",
+                    "-i", f"color=c=0x{color}:s={width}x{height}:r=30:d={scene_duration:.3f}",
+                    "-vf",
+                    (
+                        "format=yuv420p,"
+                        f"drawbox=x=0:y=0:w=iw:h=ih:color=white@0.03:t=fill,"
+                        f"drawtext=fontfile={font}:textfile={text_path}:"
+                        f"x=(w-text_w)/2:y={box_y}:fontsize={font_size}:"
+                        "fontcolor=white:line_spacing=14:box=1:boxcolor=black@0.38:boxborderw=28"
+                    ),
+                    "-an", "-c:v", "libx264", "-preset", WEB_RENDER_PRESET,
+                    "-crf", "24", str(clip_path),
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr or result.stdout or "FFmpeg scene render failed")
+            clip_paths.append(clip_path)
+            store.update_job(job_id, progress_note=f"Đã dựng {idx + 1}/{len(scenes)} cảnh...")
+
+        concat_file = output_dir / "clips.txt"
+        concat_file.write_text(
+            "".join(f"file '{p.as_posix()}'\n" for p in clip_paths),
+            encoding="utf-8",
+        )
+        output_path = output_dir / "output_generated.mp4"
+        final_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-f", "lavfi", "-i", f"sine=frequency=220:sample_rate=44100:duration={total_duration}",
+            "-shortest", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+            str(output_path),
+        ]
+        result = subprocess.run(final_cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or result.stdout or "FFmpeg final render failed")
+        store.update_job(
+            job_id, status="done", progress_note="Hoàn tất",
+            final_video_path=str(output_path), title=body.topic.strip()[:80],
+        )
+    except Exception as exc:
+        logger.exception("Creator job %s failed", job_id)
+        store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
+        _refund_job_credits(job)
+    finally:
+        _running_tasks.pop(job_id, None)
 
 
 @app.post("/api/jobs")
@@ -506,20 +991,8 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         logo_path=logo_path,
         logo_corner=body.logo_corner or "bottom_right",
         logo_size_px=body.logo_size_px or 120,
-        enable_anti_copyright=body.enable_anti_copyright,
-        letterbox=body.letterbox,
-        zoom_factor=body.zoom_factor,
-        flip_horizontal=body.flip_horizontal,
-        speed_factor=body.speed_factor,
-        brightness=body.brightness,
-        contrast=body.contrast,
-        saturation=body.saturation,
-        noise_amount=body.noise_amount,
-        rotation_degrees=body.rotation_degrees,
-        crop=body.crop,
-        target_platform=body.target_platform,
-        target_aspect_ratio=body.target_aspect_ratio,
-        target_resolution=body.target_resolution,
+        tts_voice=body.tts_voice or None,
+        review_mode=body.review_before_render,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
@@ -528,84 +1001,40 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
     return job.to_dict()
 
 
-@app.post("/api/jobs/batch")
-async def create_batch_jobs(body: BatchJobBody, user_id: int = Depends(get_current_user_id)):
-    """Create multiple jobs at once with the same configuration."""
-    if not body.urls:
-        raise HTTPException(status_code=400, detail="No URLs provided")
-
-    # Check credits for all jobs
-    total_credits_needed = len(body.urls) * JOB_COST_CREDITS
+@app.post("/api/creator/jobs")
+async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_current_user_id)):
+    if not body.topic.strip():
+        raise HTTPException(400, "Thiếu chủ đề video")
+    if body.aspect_ratio not in ("9:16", "16:9"):
+        raise HTTPException(400, "Tỷ lệ khung hình không hợp lệ")
     user = store.get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
+        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
 
-    if user["credits"] < total_credits_needed:
-        raise HTTPException(
-            status_code=402,
-            detail=f"Not enough credits. Need {total_credits_needed}, have {user['credits']}"
-        )
-
-    # Resolve logo path if provided
-    logo_path = None
-    if body.logo_path:
-        logo_path = body.logo_path
-        # Try to find in logos directory
-        logos_dir = _OUTPUT_BASE_DIR / "logos"
-        candidate = logos_dir / body.logo_path
-        if candidate.exists():
-            logo_path = str(candidate)
-        elif Path(body.logo_path).exists():
-            logo_path = str(body.logo_path)
-
-    # Parse target_resolution if provided
-    target_resolution = None
-    if body.target_resolution:
-        try:
-            w, h = body.target_resolution.split(",")
-            target_resolution = (int(w.strip()), int(h.strip()))
-        except:
-            logger.warning("Invalid target_resolution format: %s", body.target_resolution)
-
-    # Create jobs
-    created_jobs = []
-    for url in body.urls:
-        url = url.strip()
-        if not url:
-            continue
-
-        job = store.create_job(
-            user_id, url, body.target_language,
-            source_language=body.source_language or "auto",
-            logo_path=logo_path,
-            logo_corner=body.logo_corner or "bottom_right",
-            logo_size_px=body.logo_size_px or 120,
-            enable_anti_copyright=body.enable_anti_copyright,
-            letterbox=body.letterbox,
-            zoom_factor=body.zoom_factor,
-            flip_horizontal=body.flip_horizontal,
-            speed_factor=body.speed_factor,
-            brightness=body.brightness,
-            contrast=body.contrast,
-            saturation=body.saturation,
-            noise_amount=body.noise_amount,
-            rotation_degrees=body.rotation_degrees,
-            crop=body.crop,
-            target_platform=body.target_platform,
-            target_aspect_ratio=body.target_aspect_ratio,
-            target_resolution=target_resolution,
-        )
-        created_jobs.append(job)
-
-        # Start job processing
-        task = asyncio.create_task(_run_job(job.id))
-        _running_tasks[job.id] = task
-
-    # Deduct credits
+    job = store.create_job(
+        user_id,
+        f"creator:{body.topic.strip()}",
+        body.target_language,
+        source_language="creator",
+    )
     if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -total_credits_needed)
+        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    task = asyncio.create_task(asyncio.to_thread(_run_creator_job, job.id, body))
+    _running_tasks[job.id] = task
+    return job.to_dict()
 
-    return {"jobs": [j.to_dict() for j in created_jobs], "total": len(created_jobs)}
+
+@app.post("/api/creator/suggestions")
+def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_current_user_id)):
+    if not body.topic.strip():
+        raise HTTPException(400, "Thiếu chủ đề video")
+    topic = body.topic.strip()
+    language = body.target_language or "vi"
+    return {
+        "keywords": _creator_keywords_from_topic(topic, language),
+        "visual_brief": _creator_script_text_from_topic(topic, language),
+        "script": _creator_script_text_from_topic(topic, language),
+    }
 
 
 @app.post("/api/upload-logo")
@@ -649,6 +1078,15 @@ def list_languages():
     return {"targets": targets, "sources": sources}
 
 
+@app.get("/api/voices")
+def list_voices(language: str = "vi"):
+    """Curated male/female voice choices for `language`, for the optional
+    'chọn giọng đọc' dropdown. Empty list means: no curated options for
+    this language, UI should just show 'Mặc định' (None -> whatever
+    tts.voice_for_language() picks automatically, unchanged behavior)."""
+    return {"voices": voices_for_language(language)}
+
+
 @app.get("/api/jobs")
 def list_jobs(
     q: Optional[str] = None,
@@ -674,20 +1112,6 @@ def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     return {"ok": True}
 
 
-class BulkDeleteBody(BaseModel):
-    job_ids: List[str]
-
-
-@app.post("/api/jobs/bulk_delete")
-def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
-    """Delete several history entries at once (checkbox multi-select in the
-    UI) in a single query instead of N round trips."""
-    if not body.job_ids:
-        raise HTTPException(400, "Chưa chọn video nào để xoá")
-    deleted_count = store.delete_jobs(body.job_ids, user_id)
-    return {"ok": True, "deleted_count": deleted_count}
-
-
 def _get_owned_job(job_id: str, user_id: int):
     job = store.get_job(job_id)
     if job is None or job.user_id != user_id:
@@ -710,6 +1134,97 @@ def get_job_video(job_id: str, download: bool = False, user_id: int = Depends(ge
         job.final_video_path,
         media_type="video/mp4",
         filename=filename if download else None,
+    )
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Re-submit a failed job with identical settings, as a brand-new job
+    (the failed attempt stays in history too, for reference)."""
+    old_job = _get_owned_job(job_id, user_id)
+    if old_job.status != "error":
+        raise HTTPException(400, "Chỉ có thể thử lại job bị lỗi")
+
+    user = store.get_user_by_id(user_id)
+    if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
+        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
+
+    new_job = store.retry_job(job_id, user_id)
+    if new_job is None:
+        raise HTTPException(404, "Không tìm thấy job")
+    if JOB_COST_CREDITS > 0:
+        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    task = asyncio.create_task(_run_job(new_job.id))
+    _running_tasks[new_job.id] = task
+    return new_job.to_dict()
+
+
+@app.get("/api/jobs/{job_id}/segments")
+def get_job_segments(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """The translated sentences for a job that's paused at status='review'
+    (or any job, really — useful after 'done' too, e.g. to review what was
+    actually said). Powers the subtitle-editor panel."""
+    job = _get_owned_job(job_id, user_id)
+    segments = json.loads(job.segments_json) if job.segments_json else []
+    return {"status": job.status, "segments": segments}
+
+
+@app.put("/api/jobs/{job_id}/segments")
+def update_job_segments(job_id: str, body: UpdateSegmentsBody, user_id: int = Depends(get_current_user_id)):
+    """Save edits to the translated sentences. Only allowed while the job
+    is sitting at status='review' — editing text that's already been
+    rendered into a video wouldn't do anything, which would be confusing
+    rather than harmless, so it's blocked instead of silently ignored."""
+    job = _get_owned_job(job_id, user_id)
+    if job.status != "review":
+        raise HTTPException(400, "Job này không ở trạng thái chờ chỉnh sửa phụ đề")
+    store.set_job_segments(job_id, [s.model_dump() for s in body.segments])
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/render")
+async def render_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Continue a job paused at status='review' through to a finished
+    video, using whatever's currently saved in its segments (edited or
+    not)."""
+    job = _get_owned_job(job_id, user_id)
+    if job.status != "review":
+        raise HTTPException(400, "Job này không ở trạng thái chờ render")
+    task = asyncio.create_task(_run_render_from_review(job_id))
+    _running_tasks[job_id] = task
+    return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}/subtitles.srt")
+def get_job_subtitles_srt(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Export the translated subtitles as a standalone .srt — independent
+    of the final video, e.g. for someone who wants to burn/sync them with
+    other editing software instead of (or in addition to) this app's own
+    render."""
+    job = _get_owned_job(job_id, user_id)
+    segments = json.loads(job.segments_json) if job.segments_json else []
+    if not segments:
+        raise HTTPException(404, "Job này chưa có phụ đề đã dịch")
+
+    def _srt_timestamp(seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        millis = int(round((secs - int(secs)) * 1000))
+        return f"{int(hours):02d}:{int(minutes):02d}:{int(secs):02d},{millis:03d}"
+
+    lines = []
+    for idx, seg in enumerate(segments, start=1):
+        lines.append(str(idx))
+        lines.append(f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}")
+        lines.append(seg["text"])
+        lines.append("")
+    srt_content = "\n".join(lines)
+
+    filename = f"{(job.title or job_id)[:60]}.srt".replace("/", "_")
+    return HTMLResponse(
+        content=srt_content, media_type="application/x-subrip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -884,6 +1399,63 @@ def admin_adjust_credits(target_user_id: int, body: CreditsAdjustBody,
 @app.get("/api/admin/stats")
 def admin_stats(_admin_id: int = Depends(require_admin_user_id)):
     return store.admin_stats()
+
+
+@app.get("/api/admin/feedback")
+def admin_list_feedback(_admin_id: int = Depends(require_admin_user_id)):
+    return [
+        {"id": f["id"], "username": f["username"], "message": f["message"],
+         "page": f["page"], "created_at": f["created_at"]}
+        for f in store.list_feedback()
+    ]
+
+
+@app.get("/api/admin/top-up-requests")
+def admin_list_top_up_requests(_admin_id: int = Depends(require_admin_user_id)):
+    return [
+        {
+            "id": r["id"], "user_id": r["user_id"], "username": r["username"],
+            "credits": r["credits"], "amount_vnd": r["amount_vnd"],
+            "payment_method": r["payment_method"], "note": r["note"],
+            "status": r["status"], "admin_note": r["admin_note"],
+            "created_at": r["created_at"], "updated_at": r["updated_at"],
+        }
+        for r in store.list_top_up_requests()
+    ]
+
+
+@app.post("/api/admin/top-up-requests/{request_id}/approve")
+def admin_approve_top_up_request(
+    request_id: int,
+    body: TopUpDecisionBody,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    row = store.approve_top_up_request(request_id, admin_note=(body.admin_note or "").strip() or None)
+    if row is None:
+        raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
+    return {"ok": True, "status": row["status"]}
+
+
+@app.post("/api/admin/top-up-requests/{request_id}/reject")
+def admin_reject_top_up_request(
+    request_id: int,
+    body: TopUpDecisionBody,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    row = store.reject_top_up_request(request_id, admin_note=(body.admin_note or "").strip() or None)
+    if row is None:
+        raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
+    return {"ok": True, "status": row["status"]}
+
+
+# ---------------------------------------------------------------- feedback --
+
+@app.post("/api/feedback")
+def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_id)):
+    if not body.message.strip():
+        raise HTTPException(400, "Nội dung góp ý không được để trống")
+    store.create_feedback(user_id, body.message.strip()[:4000], page=body.page)
+    return {"ok": True}
 
 
 @app.get("/health")

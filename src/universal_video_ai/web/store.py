@@ -8,6 +8,7 @@ small tables and doesn't need one.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import time
@@ -24,6 +25,12 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT,
     credits INTEGER NOT NULL DEFAULT 10,
     is_admin INTEGER NOT NULL DEFAULT 0,
+    email TEXT,
+    phone TEXT,
+    oauth_provider TEXT,
+    oauth_id TEXT,
+    referral_code TEXT,
+    referred_by_user_id INTEGER,
     created_at REAL NOT NULL
 );
 
@@ -33,7 +40,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     source_url TEXT NOT NULL,
     target_language TEXT NOT NULL,
     source_language TEXT DEFAULT 'auto',
-    status TEXT NOT NULL,           -- queued | running | done | error
+    status TEXT NOT NULL,           -- queued | running | review | done | error
     progress_note TEXT,
     error TEXT,
     title TEXT,
@@ -41,20 +48,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     logo_path TEXT,
     logo_corner TEXT DEFAULT 'bottom_right',
     logo_size_px INTEGER DEFAULT 120,
-    enable_anti_copyright INTEGER DEFAULT 0,
-    letterbox TEXT,
-    zoom_factor REAL DEFAULT 1.0,
-    flip_horizontal INTEGER DEFAULT 0,
-    speed_factor REAL DEFAULT 1.0,
-    brightness REAL DEFAULT 0.0,
-    contrast REAL DEFAULT 1.0,
-    saturation REAL DEFAULT 1.0,
-    noise_amount INTEGER DEFAULT 0,
-    rotation_degrees REAL DEFAULT 0.0,
-    crop TEXT,
-    target_platform TEXT DEFAULT 'none',
-    target_aspect_ratio TEXT DEFAULT 'auto',
-    target_resolution TEXT,
+    tts_voice TEXT,
+    review_mode INTEGER NOT NULL DEFAULT 0,
+    review_state_json TEXT,
+    segments_json TEXT,
+    qc_warnings_json TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -106,6 +104,31 @@ CREATE TABLE IF NOT EXISTS identity_oauth_states (
     provider TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+
+-- Feedback / bug reports sent in from the app's "Góp ý / Báo lỗi" button.
+-- user_id is nullable since someone might file feedback before ever
+-- logging in (e.g. from the auth screen), though the UI currently only
+-- shows the button once logged in.
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    message TEXT NOT NULL,
+    page TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS top_up_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    credits INTEGER NOT NULL,
+    amount_vnd INTEGER NOT NULL,
+    payment_method TEXT NOT NULL,
+    note TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    admin_note TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 _MIGRATIONS = [
@@ -124,30 +147,38 @@ _MIGRATIONS = [
     # finds the same row again instead of creating a duplicate account.
     ("users", "oauth_provider", "ALTER TABLE users ADD COLUMN oauth_provider TEXT"),
     ("users", "oauth_id", "ALTER TABLE users ADD COLUMN oauth_id TEXT"),
+    # Referral program: every user gets a shareable code; referred_by_user_id
+    # records who invited them (NULL if nobody / signed up before this
+    # feature existed). Bonus credits are granted once, at registration
+    # time, in the /api/register handler — this table just tracks the link.
+    ("users", "referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
+    ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
     ("jobs", "logo_path", "ALTER TABLE jobs ADD COLUMN logo_path TEXT"),
     ("jobs", "logo_corner", "ALTER TABLE jobs ADD COLUMN logo_corner TEXT DEFAULT 'bottom_right'"),
     ("jobs", "logo_size_px", "ALTER TABLE jobs ADD COLUMN logo_size_px INTEGER DEFAULT 120"),
-    # Anti-copyright filter options
-    ("jobs", "enable_anti_copyright", "ALTER TABLE jobs ADD COLUMN enable_anti_copyright INTEGER DEFAULT 0"),
-    ("jobs", "letterbox", "ALTER TABLE jobs ADD COLUMN letterbox TEXT"),
-    ("jobs", "zoom_factor", "ALTER TABLE jobs ADD COLUMN zoom_factor REAL DEFAULT 1.0"),
-    ("jobs", "flip_horizontal", "ALTER TABLE jobs ADD COLUMN flip_horizontal INTEGER DEFAULT 0"),
-    ("jobs", "speed_factor", "ALTER TABLE jobs ADD COLUMN speed_factor REAL DEFAULT 1.0"),
-    ("jobs", "brightness", "ALTER TABLE jobs ADD COLUMN brightness REAL DEFAULT 0.0"),
-    ("jobs", "contrast", "ALTER TABLE jobs ADD COLUMN contrast REAL DEFAULT 1.0"),
-    ("jobs", "saturation", "ALTER TABLE jobs ADD COLUMN saturation REAL DEFAULT 1.0"),
-    ("jobs", "noise_amount", "ALTER TABLE jobs ADD COLUMN noise_amount INTEGER DEFAULT 0"),
-    ("jobs", "rotation_degrees", "ALTER TABLE jobs ADD COLUMN rotation_degrees REAL DEFAULT 0.0"),
-    ("jobs", "crop", "ALTER TABLE jobs ADD COLUMN crop TEXT"),
-    # Platform-specific optimization
-    ("jobs", "target_platform", "ALTER TABLE jobs ADD COLUMN target_platform TEXT DEFAULT 'none'"),
-    ("jobs", "target_aspect_ratio", "ALTER TABLE jobs ADD COLUMN target_aspect_ratio TEXT DEFAULT 'auto'"),
-    ("jobs", "target_resolution", "ALTER TABLE jobs ADD COLUMN target_resolution TEXT"),
+    # TTS voice override (None = pick the language's default voice, see
+    # tts.voices.VOICE_OPTIONS).
+    ("jobs", "tts_voice", "ALTER TABLE jobs ADD COLUMN tts_voice TEXT"),
+    # "Chỉnh sửa phụ đề trước khi render" opt-in: when set, the job stops
+    # at status='review' after translation instead of rendering straight
+    # through, and `review_state_json` holds a serialized
+    # PreparedLocalization (see orchestrator.service.prepared_localization_
+    # to_dict) so a later request can resume rendering with edited text.
+    ("jobs", "review_mode", "ALTER TABLE jobs ADD COLUMN review_mode INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "review_state_json", "ALTER TABLE jobs ADD COLUMN review_state_json TEXT"),
+    # Current translated segments as [{start,end,text}, ...] JSON — the
+    # ORIGINAL machine translation once prepare_for_review() finishes, then
+    # overwritten with whatever the person edited it to before they hit
+    # "Render". Also what GET .../subtitles.srt is generated from.
+    ("jobs", "segments_json", "ALTER TABLE jobs ADD COLUMN segments_json TEXT"),
+    # Post-render automated sanity-check warnings (see
+    # render.quality_check.analyze_output_quality), as a JSON list of
+    # human-readable strings. Empty/NULL = no warnings triggered.
+    ("jobs", "qc_warnings_json", "ALTER TABLE jobs ADD COLUMN qc_warnings_json TEXT"),
 ]
-
 
 @dataclass
 class Job:
@@ -166,26 +197,25 @@ class Job:
     logo_path: Optional[str] = None
     logo_corner: str = "bottom_right"
     logo_size_px: int = 120
-    # Anti-copyright options
-    enable_anti_copyright: bool = False
-    letterbox: Optional[str] = None
-    zoom_factor: float = 1.0
-    flip_horizontal: bool = False
-    speed_factor: float = 1.0
-    brightness: float = 0.0
-    contrast: float = 1.0
-    saturation: float = 1.0
-    noise_amount: int = 0
-    rotation_degrees: float = 0.0
-    crop: Optional[str] = None
-    # Platform-specific optimization
-    target_platform: str = "none"
-    target_aspect_ratio: str = "auto"
-    target_resolution: Optional[str] = None
+    tts_voice: Optional[str] = None
+    review_mode: int = 0
+    review_state_json: Optional[str] = None
+    segments_json: Optional[str] = None
+    qc_warnings_json: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
         d["has_video"] = bool(self.final_video_path and Path(self.final_video_path).exists())
+        # review_state_json is an internal implementation detail (a
+        # serialized PreparedLocalization, can be sizeable) — not useful to
+        # the frontend and not something to leak. segments_json IS useful
+        # to the frontend (the review-editor reads it) so parse it into a
+        # real list rather than making every caller json.loads() it.
+        d.pop("review_state_json", None)
+        segments_json = d.pop("segments_json", None)
+        d["segments"] = json.loads(segments_json) if segments_json else None
+        qc_warnings_json = d.pop("qc_warnings_json", None)
+        d["qc_warnings"] = json.loads(qc_warnings_json) if qc_warnings_json else []
         return d
 
 
@@ -233,14 +263,32 @@ class Store:
     def create_user(
         self, username: str, password_hash: str, is_admin: bool = False,
         credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
+        referred_by_user_id: Optional[int] = None,
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO users (username, password_hash, credits, is_admin, email, phone, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (username, password_hash, credits, int(is_admin), email, phone, time.time()),
+                "INSERT INTO users (username, password_hash, credits, is_admin, email, phone, "
+                "referral_code, referred_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (username, password_hash, credits, int(is_admin), email, phone,
+                 self._new_referral_code(conn), referred_by_user_id, time.time()),
             )
             return cur.lastrowid
+
+    @staticmethod
+    def _new_referral_code(conn: sqlite3.Connection) -> str:
+        """Short, unique, easy-to-type-or-paste-into-a-URL referral code."""
+        import secrets
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I ambiguity
+        for _ in range(20):
+            code = "".join(secrets.choice(alphabet) for _ in range(7))
+            if not conn.execute("SELECT 1 FROM users WHERE referral_code = ?", (code,)).fetchone():
+                return code
+        return secrets.token_hex(6).upper()  # astronomically unlikely fallback
+
+    def get_user_by_referral_code(self, code: str) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            cur = conn.execute("SELECT * FROM users WHERE referral_code = ?", (code.strip().upper(),))
+            return cur.fetchone()
 
     def create_user_oauth(
         self, username: str, oauth_provider: str, oauth_id: str,
@@ -262,9 +310,9 @@ class Store:
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO users (username, password_hash, credits, is_admin, email, "
-                "oauth_provider, oauth_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "oauth_provider, oauth_id, referral_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (username, hash_password(secrets.token_urlsafe(32)), credits, int(is_admin),
-                 email, oauth_provider, oauth_id, time.time()),
+                 email, oauth_provider, oauth_id, self._new_referral_code(conn), time.time()),
             )
             return cur.lastrowid
 
@@ -339,13 +387,7 @@ class Store:
         self, user_id: int, source_url: str, target_language: str,
         source_language: str = "auto", logo_path: Optional[str] = None,
         logo_corner: str = "bottom_right", logo_size_px: int = 120,
-        enable_anti_copyright: bool = False, letterbox: Optional[str] = None,
-        zoom_factor: float = 1.0, flip_horizontal: bool = False,
-        speed_factor: float = 1.0, brightness: float = 0.0,
-        contrast: float = 1.0, saturation: float = 1.0,
-        noise_amount: int = 0, rotation_degrees: float = 0.0,
-        crop: Optional[str] = None, target_platform: str = "none",
-        target_aspect_ratio: str = "auto", target_resolution: Optional[str] = None,
+        tts_voice: Optional[str] = None, review_mode: bool = False,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -356,32 +398,165 @@ class Store:
             final_video_path=None, created_at=now, updated_at=now,
             source_language=source_language, logo_path=logo_path,
             logo_corner=logo_corner, logo_size_px=logo_size_px,
-            enable_anti_copyright=enable_anti_copyright, letterbox=letterbox,
-            zoom_factor=zoom_factor, flip_horizontal=flip_horizontal,
-            speed_factor=speed_factor, brightness=brightness,
-            contrast=contrast, saturation=saturation,
-            noise_amount=noise_amount, rotation_degrees=rotation_degrees,
-            crop=crop, target_platform=target_platform,
-            target_aspect_ratio=target_aspect_ratio, target_resolution=target_resolution,
+            tts_voice=tts_voice, review_mode=int(review_mode),
         )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
                 "progress_note, error, title, final_video_path, logo_path, logo_corner, logo_size_px, "
-                "enable_anti_copyright, letterbox, zoom_factor, flip_horizontal, speed_factor, "
-                "brightness, contrast, saturation, noise_amount, rotation_degrees, crop, "
-                "target_platform, target_aspect_ratio, target_resolution, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "tts_voice, review_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
                  job.status, job.progress_note, job.error, job.title, job.final_video_path,
-                 job.logo_path, job.logo_corner, job.logo_size_px,
-                 int(job.enable_anti_copyright), job.letterbox, job.zoom_factor,
-                 int(job.flip_horizontal), job.speed_factor, job.brightness,
-                 job.contrast, job.saturation, job.noise_amount,
-                 job.rotation_degrees, job.crop, job.target_platform,
-                 job.target_aspect_ratio, job.target_resolution, job.created_at, job.updated_at),
+                 job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
+                 job.created_at, job.updated_at),
             )
         return job
+
+    def retry_job(self, job_id: str, user_id: int) -> Optional[Job]:
+        """Create a brand-new job with the exact same settings as a
+        previously failed one — used by the history panel's "Thử lại"
+        button. Deliberately creates a NEW job row rather than resetting
+        the old one in place, so the failed attempt stays visible in
+        history alongside the retry."""
+        old = self.get_job(job_id)
+        if old is None or old.user_id != user_id:
+            return None
+        return self.create_job(
+            user_id, old.source_url, old.target_language,
+            source_language=old.source_language, logo_path=old.logo_path,
+            logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
+            tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
+        )
+
+    def set_job_segments(self, job_id: str, segments: List[Dict[str, Any]]) -> None:
+        """Overwrite the current translated segments (used both when
+        prepare_for_review() first produces them, and when the person
+        edits/saves changes before rendering)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET segments_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(segments, ensure_ascii=False), time.time(), job_id),
+            )
+
+    def set_job_review_state(self, job_id: str, review_state: Dict[str, Any]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET review_state_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(review_state, ensure_ascii=False), time.time(), job_id),
+            )
+
+    def ensure_referral_code(self, user_id: int) -> str:
+        """Backfill a referral_code for accounts created before this feature
+        existed (NULL in the DB). Idempotent — a no-op once set."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT referral_code FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row and row["referral_code"]:
+                return row["referral_code"]
+            code = self._new_referral_code(conn)
+            conn.execute("UPDATE users SET referral_code = ? WHERE id = ?", (code, user_id))
+            return code
+
+    def set_job_qc_warnings(self, job_id: str, warnings: List[str]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET qc_warnings_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(warnings, ensure_ascii=False), time.time(), job_id),
+            )
+
+    def user_stats(self, user_id: int) -> Dict[str, Any]:
+        """Personal stats for the logged-in user's own history — total
+        jobs, breakdown by status, and an estimated total credits spent
+        (JOB_COST_CREDITS is applied per submission at the app layer, so
+        this counts submissions rather than re-deriving the cost here)."""
+        with self._connect() as conn:
+            total = conn.execute("SELECT COUNT(*) c FROM jobs WHERE user_id = ?", (user_id,)).fetchone()["c"]
+            by_status = {
+                row["status"]: row["c"] for row in conn.execute(
+                    "SELECT status, COUNT(*) c FROM jobs WHERE user_id = ? GROUP BY status", (user_id,)
+                )
+            }
+        done = by_status.get("done", 0)
+        error = by_status.get("error", 0)
+        finished = done + error
+        return {
+            "total_jobs": total,
+            "by_status": by_status,
+            "success_rate": round(done / finished * 100, 1) if finished else None,
+        }
+
+    # ---- feedback ----
+    def create_feedback(self, user_id: Optional[int], message: str, page: Optional[str] = None) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO feedback (user_id, message, page, created_at) VALUES (?,?,?,?)",
+                (user_id, message, page, time.time()),
+            )
+            return cur.lastrowid
+
+    def list_feedback(self, limit: int = 200) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT f.*, u.username FROM feedback f LEFT JOIN users u ON u.id = f.user_id "
+                "ORDER BY f.created_at DESC LIMIT ?",
+                (limit,),
+            )
+            return cur.fetchall()
+
+    # ---- top-up requests ----
+    def create_top_up_request(
+        self, user_id: int, credits: int, amount_vnd: int,
+        payment_method: str, note: Optional[str] = None,
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO top_up_requests "
+                "(user_id, credits, amount_vnd, payment_method, note, status, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, credits, amount_vnd, payment_method, note, "pending", now, now),
+            )
+            return cur.lastrowid
+
+    def list_top_up_requests_for_user(self, user_id: int, limit: int = 50) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM top_up_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            )
+            return cur.fetchall()
+
+    def list_top_up_requests(self, limit: int = 200) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT r.*, u.username FROM top_up_requests r "
+                "LEFT JOIN users u ON u.id = r.user_id "
+                "ORDER BY r.created_at DESC LIMIT ?",
+                (limit,),
+            )
+            return cur.fetchall()
+
+    def approve_top_up_request(self, request_id: int, admin_note: Optional[str] = None) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
+            if not row or row["status"] != "pending":
+                return None
+            conn.execute("UPDATE users SET credits = credits + ? WHERE id = ?", (row["credits"], row["user_id"]))
+            conn.execute(
+                "UPDATE top_up_requests SET status = 'approved', admin_note = ?, updated_at = ? WHERE id = ?",
+                (admin_note, time.time(), request_id),
+            )
+            return conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
+
+    def reject_top_up_request(self, request_id: int, admin_note: Optional[str] = None) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
+            if not row or row["status"] != "pending":
+                return None
+            conn.execute(
+                "UPDATE top_up_requests SET status = 'rejected', admin_note = ?, updated_at = ? WHERE id = ?",
+                (admin_note, time.time(), request_id),
+            )
+            return conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -392,11 +567,33 @@ class Store:
         with self._connect() as conn:
             conn.execute(f"UPDATE jobs SET {set_clause} WHERE id = ?", values)
 
+    _JOB_FIELDS = {f.name for f in dataclasses.fields(Job)}
+
+    @classmethod
+    def _row_to_job(cls, row: sqlite3.Row) -> Job:
+        """
+        Build a `Job` from a DB row, silently ignoring any column that
+        isn't a field on the current `Job` dataclass.
+
+        Without this, a database that has ever had columns added by a
+        different/older version of this app (e.g. a stray
+        `enable_anti_copyright` column from an earlier build) makes EVERY
+        job-listing call crash with `Job.__init__() got an unexpected
+        keyword argument ...` — the row itself is fine, only unknown-to-us
+        columns need to be dropped before constructing the dataclass.
+        """
+        row_dict = dict(row)
+        unknown = set(row_dict) - cls._JOB_FIELDS
+        if unknown:
+            for key in unknown:
+                row_dict.pop(key, None)
+        return Job(**row_dict)
+
     def get_job(self, job_id: str) -> Optional[Job]:
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             row = cur.fetchone()
-            return Job(**dict(row)) if row else None
+            return self._row_to_job(row) if row else None
 
     def list_jobs_for_user(self, user_id: int, limit: int = 100) -> List[Job]:
         with self._connect() as conn:
@@ -404,7 +601,7 @@ class Store:
                 "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
                 (user_id, limit),
             )
-            return [Job(**dict(row)) for row in cur.fetchall()]
+            return [self._row_to_job(row) for row in cur.fetchall()]
 
     def search_jobs_for_user(
         self,
@@ -442,7 +639,7 @@ class Store:
                 f"SELECT * FROM jobs WHERE {where} ORDER BY created_at DESC LIMIT ?",
                 params,
             )
-            return [Job(**dict(row)) for row in cur.fetchall()]
+            return [self._row_to_job(row) for row in cur.fetchall()]
 
     def delete_job(self, job_id: str, user_id: int) -> bool:
         """
@@ -455,20 +652,6 @@ class Store:
                 "DELETE FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id)
             )
             return cur.rowcount > 0
-
-    def delete_jobs(self, job_ids: List[str], user_id: int) -> int:
-        """Bulk-delete history entries (e.g. from a multi-select checkbox
-        list in the UI). Scoped to `user_id` same as delete_job. Returns how
-        many rows were actually deleted."""
-        if not job_ids:
-            return 0
-        with self._connect() as conn:
-            placeholders = ",".join("?" for _ in job_ids)
-            cur = conn.execute(
-                f"DELETE FROM jobs WHERE user_id = ? AND id IN ({placeholders})",
-                [user_id, *job_ids],
-            )
-            return cur.rowcount
 
     # ---- publish log ----
     def log_publish(self, job_id: str, platform: str, success: bool, message: str,

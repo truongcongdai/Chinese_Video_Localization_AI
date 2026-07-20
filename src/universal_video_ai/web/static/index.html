@@ -69,6 +69,7 @@
   }
   .badge.queued { background: #3a3f4c; color: var(--text-dim); }
   .badge.running { background: #2b3a5c; color: var(--accent); }
+  .badge.review { background: #3a331c; color: var(--warn); }
   .badge.done { background: #17352a; color: var(--ok); }
   .badge.error { background: #3a2323; color: var(--err); }
   .job-actions { display: flex; gap: 8px; }
@@ -128,11 +129,20 @@
   /* history search/filter/delete */
   .history-toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
   .history-toolbar input[type="date"] { flex: none; width: 150px; }
-  .btn.danger { background: transparent; color: var(--err); border: 1px solid #4a2b2b; }
-  .btn.danger:hover { background: #2a1717; }
-  .btn.danger:disabled { opacity: .4; }
   .job-actions .btn.danger { background: transparent; color: var(--err); border: 1px solid #4a2b2b; }
   .job-actions .btn.danger:hover { background: #2a1717; }
+
+  /* floating feedback button */
+  #feedback-fab {
+    position: fixed; right: 24px; bottom: 24px; z-index: 50;
+    border-radius: 999px; padding: 12px 18px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  }
+
+  /* subtitle review editor */
+  #review-segments-list { max-height: 50vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .review-segment { display: flex; gap: 10px; align-items: flex-start; }
+  .review-segment .seg-time { flex: none; width: 90px; font-size: 11px; color: var(--text-dim); padding-top: 10px; }
+  .review-segment textarea { flex: 1; min-height: 44px; resize: vertical; }
 
   .connect-card {
     border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
@@ -154,11 +164,33 @@
   .stat-box { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
   .stat-box .num { font-size: 22px; font-weight: 800; }
   .stat-box .label { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  .referral-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    border-top: 1px solid var(--border); padding-top: 14px; margin-top: 4px;
+  }
+  .referral-row code { background: var(--panel-2); padding: 3px 8px; border-radius: 6px; font-size: 12px; }
+  .hashtag-chip {
+    display: inline-block; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+    padding: 2px 10px; font-size: 12px; color: var(--accent); cursor: pointer; margin: 2px;
+  }
+  .hashtag-chip:hover { border-color: var(--accent); }
   table.admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
   table.admin-table th, table.admin-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
   table.admin-table th { color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; }
   .credit-adjust { display: flex; gap: 6px; align-items: center; }
   .credit-adjust input { width: 70px; padding: 6px 8px; }
+  .topup-packages { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 10px; margin-bottom: 14px; }
+  .topup-package {
+    border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+    background: var(--panel-2); cursor: pointer;
+  }
+  .topup-package.active { border-color: var(--accent); background: #16233f; }
+  .topup-package .credits { font-weight: 800; font-size: 18px; }
+  .topup-package .price { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
+  .status-pending { color: var(--warn); }
+  .status-approved { color: var(--ok); }
+  .status-rejected { color: var(--err); }
+  .section-title { margin: 0 0 12px; font-size: 16px; }
 </style>
 </head>
 <body>
@@ -175,6 +207,7 @@
         <input id="auth-identifier" autocomplete="username">
       </div>
       <div class="field"><label>Mật khẩu</label><input id="auth-password" type="password" autocomplete="current-password"></div>
+      <div class="field"><label>Mã giới thiệu (không bắt buộc, chỉ dùng khi đăng ký)</label><input id="auth-referral-code" placeholder="VD: 6QNRHSW"></div>
       <div class="row" style="gap:10px">
         <button class="btn" type="submit" id="auth-login-btn" style="flex:1">Đăng nhập</button>
         <button class="btn secondary" type="button" id="auth-register-btn" style="flex:1">Đăng ký</button>
@@ -200,22 +233,29 @@
     <div id="userbar">
       <span id="userbar-credits" class="credits-badge" title="Credit còn lại"></span>
       <span id="userbar-name"></span>
+      <button class="btn secondary small" id="topup-btn">Nạp token</button>
       <button class="btn secondary small hidden" id="admin-btn">Quản trị</button>
       <button class="btn secondary small" id="logout-btn">Đăng xuất</button>
     </div>
   </header>
 
-  <div class="card">
-    <div class="field">
-      <label>
-        <input type="checkbox" id="batch-mode-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-        Chế độ xử lý hàng loạt (nhiều video cùng lúc)
-      </label>
+  <div class="card" id="personal-stats-card">
+    <div class="stat-grid" id="personal-stats"></div>
+    <div class="referral-row">
+      <div>
+        <div style="font-size:13px;color:var(--text-dim)">Mời bạn bè — cả 2 nhận <b id="referral-bonus-amount">20</b> credit khi họ đăng ký</div>
+        <div style="font-size:13px;margin-top:4px">Link mời: <code id="referral-link"></code></div>
+      </div>
+      <button class="btn secondary small" id="referral-copy-btn">Sao chép link</button>
     </div>
-    <div id="single-url-panel" class="row">
+  </div>
+
+  <div class="card">
+    <h3 class="section-title">Dịch &amp; lồng tiếng video có sẵn</h3>
+    <div class="row">
       <div class="field" style="flex: 3">
-        <label>Đường link video (TikTok / Douyin / v.v.)</label>
-        <input id="url-input" placeholder="https://v.douyin.com/....">
+        <label>Đường link video — 1 link mỗi dòng để xử lý hàng loạt (TikTok / Douyin / v.v.)</label>
+        <textarea id="url-input" rows="2" placeholder="https://v.douyin.com/....&#10;https://v.douyin.com/.... (dán thêm dòng khác để xử lý hàng loạt)"></textarea>
       </div>
       <div class="field" style="flex: 1">
         <label>Ngôn ngữ gốc</label>
@@ -226,23 +266,17 @@
         <select id="lang-select"></select>
       </div>
     </div>
-    <div id="batch-url-panel" class="hidden">
-      <div class="field">
-        <label>Danh sách đường link (mỗi dòng 1 link)</label>
-        <textarea id="batch-urls-input" rows="6" placeholder="https://v.douyin.com/....&#10;https://v.douyin.com/....&#10;https://v.douyin.com/...."></textarea>
+
+    <div class="row">
+      <div class="field" style="flex: 1">
+        <label>Giọng đọc</label>
+        <select id="voice-select"><option value="">Mặc định</option></select>
       </div>
-      <div class="row">
-        <div class="field" style="flex: 1">
-          <label>Ngôn ngữ gốc</label>
-          <select id="batch-source-lang-select"></select>
-        </div>
-        <div class="field" style="flex: 1">
-          <label>Ngôn ngữ đích</label>
-          <select id="batch-lang-select"></select>
-        </div>
-      </div>
-      <div style="font-size:12px;color:var(--text-dim);margin-top:8px">
-        💡 Tất cả video sẽ được xử lý với cùng một cấu hình. Credits sẽ được trừ cho tất cả video cùng lúc.
+      <div class="field" style="flex: 2; display:flex; align-items:flex-end; padding-bottom: 10px;">
+        <label style="margin:0">
+          <input type="checkbox" id="review-mode-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+          Cho tôi xem &amp; sửa phụ đề dịch trước khi render (không phù hợp khi xử lý hàng loạt nhiều link)
+        </label>
       </div>
     </div>
 
@@ -275,107 +309,50 @@
       </div>
     </div>
 
-    <div class="field">
-      <label>
-        <input type="checkbox" id="anticopyright-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-        Bật chống quét bản quyền (tránh Content ID)
-      </label>
-    </div>
-    <div id="anticopyright-panel" class="hidden" style="margin-bottom: 14px;">
-      <div class="row">
-        <div class="field">
-          <label>Khung đen (left:right:top:bottom px)</label>
-          <input type="text" id="letterbox-input" placeholder="100:100:0:0" value="100:100:0:0">
-        </div>
-        <div class="field">
-          <label>Zoom (1.0 = không zoom)</label>
-          <input type="number" id="zoom-input" value="1.05" min="1.0" max="1.3" step="0.01">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>
-            <input type="checkbox" id="flip-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-            Lật ngang (mirror)
-          </label>
-        </div>
-        <div class="field">
-          <label>Tốc độ (1.0 = bình thường)</label>
-          <input type="number" id="speed-input" value="1.02" min="0.95" max="1.05" step="0.01">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>Độ sáng (-1.0 đến 1.0)</label>
-          <input type="number" id="brightness-input" value="0.05" min="-1.0" max="1.0" step="0.05">
-        </div>
-        <div class="field">
-          <label>Độ tương phản (0 đến 2)</label>
-          <input type="number" id="contrast-input" value="1.05" min="0" max="2" step="0.05">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>Độ bão hòa (0 đến 2)</label>
-          <input type="number" id="saturation-input" value="1.05" min="0" max="2" step="0.05">
-        </div>
-        <div class="field">
-          <label>Nhiễu (0 đến 100)</label>
-          <input type="number" id="noise-input" value="5" min="0" max="100" step="1">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>Xoay (độ, 0 đến 5)</label>
-          <input type="number" id="rotation-input" value="0.5" min="0" max="5" step="0.1">
-        </div>
-        <div class="field">
-          <label>Crop (left:right:top:bottom px)</label>
-          <input type="text" id="crop-input" placeholder="10:10:10:10">
-        </div>
-      </div>
-    </div>
-
-    <div class="field">
-      <label>
-        <input type="checkbox" id="platform-opt-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-        Tối ưu cho nền tảng cụ thể (TikTok, YouTube, v.v.)
-      </label>
-    </div>
-    <div id="platform-opt-panel" class="hidden" style="margin-bottom: 14px;">
-      <div class="field">
-        <label>Nền tảng đích</label>
-        <select id="target-platform-select">
-          <option value="none">Không (giữ nguyên)</option>
-          <option value="tiktok">TikTok (9:16, 1080x1920)</option>
-          <option value="youtube_shorts">YouTube Shorts (9:16, 1080x1920)</option>
-          <option value="youtube_long">YouTube Long (16:9, 1920x1080)</option>
-          <option value="facebook">Facebook (1:1, 1080x1080)</option>
-          <option value="instagram">Instagram (1:1, 1080x1080)</option>
-        </select>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>Tỷ lệ khung hình</label>
-          <select id="target-aspect-ratio-select">
-            <option value="auto">Tự động (giữ nguyên)</option>
-            <option value="9:16">9:16 (Dọc - TikTok/Shorts)</option>
-            <option value="16:9">16:9 (Ngang - YouTube thường)</option>
-            <option value="1:1">1:1 (Vuông - Facebook/Instagram)</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Độ phân giải tùy chỉnh (rộng x cao)</label>
-          <input type="text" id="target-resolution-input" placeholder="1080,1920" title="Để trống để dùng mặc định">
-        </div>
-      </div>
-      <div style="font-size:12px;color:var(--text-dim);margin-top:8px">
-        💡 Chọn nền tảng để tự động tối ưu tỷ lệ khung hình và độ phân giải. Video dài (YouTube Long) cũng được hỗ trợ, không chỉ short video.
-      </div>
-    </div>
-
     <button class="btn" id="submit-btn">Bắt đầu xử lý</button>
     <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
+
+  <div class="card">
+    <h3 class="section-title">Tạo video AI từ ý tưởng/cảnh quay</h3>
+    <div class="row">
+      <div class="field" style="flex: 2">
+        <label>Chủ đề</label>
+        <input id="creator-topic" placeholder="VD: 5 mẹo học tiếng Trung nhanh hơn">
+      </div>
+      <div class="field">
+        <label>Tỷ lệ</label>
+        <select id="creator-aspect">
+          <option value="9:16">Dọc 9:16</option>
+          <option value="16:9">Ngang 16:9</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Thời lượng</label>
+        <select id="creator-duration">
+          <option value="30">30 giây</option>
+          <option value="45">45 giây</option>
+          <option value="60">60 giây</option>
+        </select>
+      </div>
+    </div>
+    <div class="field">
+      <label>Video keyword</label>
+      <textarea id="creator-keywords" rows="3" placeholder="Keyword sẽ được tự gen từ chủ đề, dùng cho tìm footage và đăng video."></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn secondary small" id="creator-keywords-generate" type="button">Gen keyword</button>
+        <button class="btn secondary small" id="creator-keywords-copy" type="button">Copy keyword</button>
+      </div>
+    </div>
+    <div class="field">
+      <label>Visual brief / ý tưởng cảnh quay (không bắt buộc, mỗi dòng là một cảnh)</label>
+      <textarea id="creator-script" rows="4" placeholder="VD: Người làm việc với laptop trong văn phòng hiện đại&#10;Cận cảnh màn hình đang tạo slide bằng AI&#10;Điện thoại hiển thị video social media đã hoàn thành"></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn secondary small" id="creator-script-generate" type="button">Gen visual brief từ chủ đề</button>
+      </div>
+    </div>
+    <button class="btn" id="creator-submit-btn">Tạo video AI</button>
+    <div id="creator-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
 
   <div class="card">
@@ -386,15 +363,57 @@
       <input type="date" id="history-date-to" title="Đến ngày">
       <button class="btn secondary small" id="history-clear-btn">Xoá lọc</button>
     </div>
-    <div class="history-toolbar" style="margin-top:8px">
-      <label style="display:flex;align-items:center;gap:6px;width:auto;color:var(--text-dim);font-size:13px">
-        <input type="checkbox" id="select-all-checkbox" style="width:auto">
-        Chọn tất cả
-      </label>
-      <button class="btn danger small" id="bulk-delete-btn" disabled>Xoá đã chọn (<span id="selected-count">0</span>)</button>
-    </div>
     <div id="job-list"></div>
-    <div id="empty-history" class="hidden">Chưa có video nào. Dán link ở trên để bắt đầu.</div>
+    <div id="empty-history" class="hidden">
+      Chưa có video nào. Dán link ở trên để bắt đầu — có thể dán nhiều link (mỗi dòng 1 link) để xử lý hàng loạt,
+      chọn giọng đọc, chèn logo riêng, hoặc tick "xem &amp; sửa phụ đề trước khi render" nếu muốn tinh chỉnh bản dịch.
+    </div>
+  </div>
+</div>
+
+<div id="review-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="review-close">×</button>
+    <h3>Chỉnh sửa phụ đề trước khi render</h3>
+    <p class="sub" style="margin-top:-8px">Sửa lại câu dịch cho tự nhiên hơn, rồi bấm Render. Thời gian (giây) giữ nguyên theo video gốc.</p>
+    <div id="review-segments-list"></div>
+    <div class="row" style="margin-top:14px;gap:10px">
+      <button class="btn secondary" id="review-save-btn" style="flex:1">Lưu thay đổi</button>
+      <button class="btn" id="review-render-btn" style="flex:1">Lưu &amp; Render</button>
+    </div>
+    <div id="review-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
+</div>
+
+<div id="feedback-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="feedback-close">×</button>
+    <h3>Góp ý / Báo lỗi</h3>
+    <p class="sub" style="margin-top:-8px">Gặp lỗi hay có ý tưởng cải thiện? Cho chúng tôi biết.</p>
+    <div class="field"><textarea id="feedback-message" rows="5" placeholder="Mô tả vấn đề hoặc góp ý của bạn..."></textarea></div>
+    <button class="btn" id="feedback-submit-btn">Gửi góp ý</button>
+    <div id="feedback-status" style="font-size: 13px; margin-top: 8px;"></div>
+  </div>
+</div>
+
+<button class="btn secondary hidden" id="feedback-fab" title="Góp ý / Báo lỗi">💬 Góp ý</button>
+
+<div id="topup-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="topup-close">×</button>
+    <h3>Nạp token</h3>
+    <div class="topup-packages" id="topup-packages"></div>
+    <div class="field">
+      <label>Ghi chú thanh toán</label>
+      <textarea id="topup-note" rows="3" placeholder="VD: đã chuyển khoản, mã giao dịch, số điện thoại..."></textarea>
+    </div>
+    <button class="btn" id="topup-submit">Gửi yêu cầu nạp</button>
+    <div id="topup-status" style="font-size:13px;margin-top:8px"></div>
+    <h3 style="margin-top:22px">Lịch sử nạp</h3>
+    <table class="admin-table">
+      <thead><tr><th>Gói</th><th>Số tiền</th><th>Trạng thái</th><th>Thời gian</th></tr></thead>
+      <tbody id="topup-history-body"></tbody>
+    </table>
   </div>
 </div>
 
@@ -424,7 +443,11 @@
     </div>
     <div class="field"><label>Tiêu đề</label><input id="publish-title"></div>
     <div class="field"><label>Mô tả</label><textarea id="publish-desc" rows="3"></textarea></div>
-    <div class="field"><label>Hashtag (cách nhau bằng dấu cách)</label><input id="publish-hashtags" placeholder="#anime #shortdrama"></div>
+    <div class="field">
+      <label>Hashtag (cách nhau bằng dấu cách)</label>
+      <input id="publish-hashtags" placeholder="#anime #shortdrama">
+      <div id="publish-hashtag-suggestions" style="margin-top:6px"></div>
+    </div>
     <button class="btn" id="publish-submit">Đăng ngay</button>
     <div id="publish-results"></div>
   </div>
@@ -462,6 +485,24 @@
       <tbody id="admin-users-body"></tbody>
     </table>
   </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Yêu cầu nạp token</h3>
+    <table class="admin-table" id="admin-topups-table">
+      <thead><tr><th>Người dùng</th><th>Gói</th><th>Số tiền</th><th>Ghi chú</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
+      <tbody id="admin-topups-body"></tbody>
+    </table>
+    <div id="admin-topups-empty" class="hidden" style="color:var(--text-dim);font-size:13px">Chưa có yêu cầu nạp nào.</div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Góp ý / Báo lỗi từ người dùng</h3>
+    <table class="admin-table" id="admin-feedback-table">
+      <thead><tr><th>Người dùng</th><th>Nội dung</th><th>Trang</th><th>Thời gian</th></tr></thead>
+      <tbody id="admin-feedback-body"></tbody>
+    </table>
+    <div id="admin-feedback-empty" class="hidden" style="color:var(--text-dim);font-size:13px">Chưa có góp ý nào.</div>
+  </div>
 </div>
 
 <script>
@@ -470,6 +511,13 @@ let currentJobId = null;
 let selectedPlatforms = new Set();
 let pollTimer = null;
 let pollTimer2 = null;
+let selectedTopupPackage = null;
+const TOPUP_PACKAGES = [
+  { credits: 50, amount_vnd: 50000 },
+  { credits: 120, amount_vnd: 100000 },
+  { credits: 300, amount_vnd: 250000 },
+  { credits: 700, amount_vnd: 500000 },
+];
 
 async function api(path, opts = {}) {
   const resp = await fetch(path, {
@@ -526,6 +574,11 @@ async function initAuth() {
     $("#auth-error").textContent = "Đăng nhập thất bại: " + params.get("login_error");
     history.replaceState(null, "", location.pathname);
   }
+  // Someone followed a friend's invite link (?ref=CODE) — prefill it so
+  // they don't have to type/paste it manually.
+  if (params.get("ref")) {
+    $("#auth-referral-code").value = params.get("ref");
+  }
 }
 
 // Pressing Enter in either field submits the <form>, which defaults to the
@@ -553,6 +606,7 @@ async function doRegister() {
   try {
     await api("/api/register", { method: "POST", body: JSON.stringify({
       identifier: $("#auth-identifier").value.trim(), password: $("#auth-password").value,
+      referral_code: $("#auth-referral-code").value.trim() || null,
     })});
     const me = await api("/api/me");
     showApp(me);
@@ -572,10 +626,60 @@ function showApp(me) {
   $("#userbar-name").textContent = me.username;
   $("#userbar-credits").textContent = `💳 ${me.credits}`;
   $("#admin-btn").classList.toggle("hidden", !me.is_admin);
+  $("#feedback-fab").classList.remove("hidden");
+
+  $("#referral-link").textContent = `${location.origin}/?ref=${me.referral_code}`;
   loadLanguages();
+  loadPersonalStats();
+  requestNotificationPermission();
   refreshJobs();
   pollTimer = setInterval(refreshJobs, 4000);
   pollTimer2 = setInterval(refreshMe, 10000);
+}
+
+$("#referral-copy-btn").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("#referral-link").textContent);
+    $("#referral-copy-btn").textContent = "Đã sao chép ✓";
+    setTimeout(() => { $("#referral-copy-btn").textContent = "Sao chép link"; }, 1500);
+  } catch { /* clipboard API unavailable (e.g. non-HTTPS) — link is still selectable by hand */ }
+};
+
+async function loadPersonalStats() {
+  try {
+    const stats = await api("/api/stats/me");
+    const by = stats.by_status || {};
+    $("#personal-stats").innerHTML = `
+      <div class="stat-box"><div class="num">${stats.total_jobs}</div><div class="label">Tổng số video đã xử lý</div></div>
+      <div class="stat-box"><div class="num">${by.done || 0}</div><div class="label">Hoàn tất</div></div>
+      <div class="stat-box"><div class="num">${by.error || 0}</div><div class="label">Lỗi</div></div>
+      <div class="stat-box"><div class="num">${stats.success_rate != null ? stats.success_rate + "%" : "—"}</div><div class="label">Tỷ lệ thành công</div></div>
+    `;
+  } catch (e) { /* non-critical widget, fail silently */ }
+}
+
+// ---------------- browser notifications ----------------
+// Fires a desktop notification when a job finishes (done or error) while
+// the tab isn't focused, so the person doesn't have to sit staring at the
+// page waiting — this is why refreshJobs() diffs against _lastKnownStatus
+// below instead of just re-rendering blindly.
+let _lastKnownStatus = {};
+
+function requestNotificationPermission() {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    Notification.requestPermission();
+  }
+}
+
+function _notifyJobStatusChange(job) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  if (document.visibilityState === "visible") return; // no need to nag while they're already looking
+  if (job.status === "done") {
+    new Notification("Video đã xử lý xong 🎉", { body: job.title || job.source_url });
+  } else if (job.status === "error") {
+    new Notification("Xử lý video bị lỗi", { body: job.title || job.source_url });
+  }
 }
 
 async function refreshMe() {
@@ -597,69 +701,104 @@ $("#logout-btn").onclick = async () => {
   location.reload();
 };
 
+// ---------------- top-up requests ----------------
+function _formatVnd(amount) {
+  return new Intl.NumberFormat("vi-VN").format(amount) + "đ";
+}
+
+function _topupStatusLabel(status) {
+  return { pending: "Đang chờ", approved: "Đã duyệt", rejected: "Từ chối" }[status] || status;
+}
+
+function renderTopupPackages() {
+  selectedTopupPackage = selectedTopupPackage || TOPUP_PACKAGES[1];
+  $("#topup-packages").innerHTML = TOPUP_PACKAGES.map(pkg => `
+    <div class="topup-package ${pkg.credits === selectedTopupPackage.credits && pkg.amount_vnd === selectedTopupPackage.amount_vnd ? "active" : ""}"
+         data-credits="${pkg.credits}" data-amount="${pkg.amount_vnd}">
+      <div class="credits">${pkg.credits} token</div>
+      <div class="price">${_formatVnd(pkg.amount_vnd)}</div>
+    </div>
+  `).join("");
+  $("#topup-packages").querySelectorAll(".topup-package").forEach(el => {
+    el.onclick = () => {
+      selectedTopupPackage = { credits: parseInt(el.dataset.credits, 10), amount_vnd: parseInt(el.dataset.amount, 10) };
+      renderTopupPackages();
+    };
+  });
+}
+
+async function loadTopupHistory() {
+  const rows = await api("/api/top-up-requests");
+  $("#topup-history-body").innerHTML = rows.map(r => `
+    <tr>
+      <td>${r.credits} token</td>
+      <td>${_formatVnd(r.amount_vnd)}</td>
+      <td class="status-${r.status}">${_topupStatusLabel(r.status)}</td>
+      <td>${new Date(r.created_at * 1000).toLocaleString("vi-VN")}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="4" style="color:var(--text-dim)">Chưa có yêu cầu nạp nào.</td></tr>`;
+}
+
+$("#topup-btn").onclick = async () => {
+  $("#topup-status").textContent = "";
+  renderTopupPackages();
+  $("#topup-modal").classList.remove("hidden");
+  try {
+    await loadTopupHistory();
+  } catch (e) {
+    $("#topup-status").style.color = "var(--err)";
+    $("#topup-status").textContent = e.message;
+  }
+};
+$("#topup-close").onclick = () => $("#topup-modal").classList.add("hidden");
+$("#topup-submit").onclick = async () => {
+  $("#topup-status").textContent = "";
+  const pkg = selectedTopupPackage || TOPUP_PACKAGES[1];
+  try {
+    await api("/api/top-up-requests", { method: "POST", body: JSON.stringify({
+      credits: pkg.credits,
+      amount_vnd: pkg.amount_vnd,
+      payment_method: "bank_transfer",
+      note: $("#topup-note").value.trim() || null,
+    })});
+    $("#topup-note").value = "";
+    $("#topup-status").style.color = "var(--ok)";
+    $("#topup-status").textContent = "Đã gửi yêu cầu. Admin duyệt xong credit sẽ tự cộng vào tài khoản.";
+    await loadTopupHistory();
+  } catch (e) {
+    $("#topup-status").style.color = "var(--err)";
+    $("#topup-status").textContent = e.message;
+  }
+};
+
 // ---------------- languages ----------------
 async function loadLanguages() {
   try {
     const { targets, sources } = await api("/api/languages");
-    const targetOptions = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
-    const sourceOptions = sources.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
-
-    $("#lang-select").innerHTML = targetOptions;
+    $("#lang-select").innerHTML = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
     $("#lang-select").value = "vi";
-    $("#source-lang-select").innerHTML = sourceOptions;
+    $("#source-lang-select").innerHTML = sources.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
     $("#source-lang-select").value = "auto";
-
-    // Populate batch selects too
-    $("#batch-lang-select").innerHTML = targetOptions;
-    $("#batch-lang-select").value = "vi";
-    $("#batch-source-lang-select").innerHTML = sourceOptions;
-    $("#batch-source-lang-select").value = "auto";
+    loadVoices();
   } catch (e) { /* keep whatever was already in the selects if this fails */ }
 }
+
+async function loadVoices() {
+  try {
+    const { voices } = await api(`/api/voices?language=${encodeURIComponent($("#lang-select").value)}`);
+    $("#voice-select").innerHTML = `<option value="">Mặc định</option>` +
+      voices.map(v => `<option value="${v.id}">${v.label}</option>`).join("");
+  } catch (e) {
+    $("#voice-select").innerHTML = `<option value="">Mặc định</option>`;
+  }
+}
+$("#lang-select").addEventListener("change", loadVoices);
 
 // ---------------- logo overlay ----------------
 let uploadedLogoId = null;
 
 $("#logo-enable-checkbox").onchange = (ev) => {
   $("#logo-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-// ---------------- anti-copyright ----------------
-$("#anticopyright-enable-checkbox").onchange = (ev) => {
-  $("#anticopyright-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-// ---------------- platform optimization ----------------
-$("#platform-opt-enable-checkbox").onchange = (ev) => {
-  $("#platform-opt-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-// Auto-update aspect ratio when platform is selected
-$("#target-platform-select").onchange = (ev) => {
-  const platform = ev.target.value;
-  const aspectSelect = $("#target-aspect-ratio-select");
-  const platformToAspect = {
-    "tiktok": "9:16",
-    "youtube_shorts": "9:16",
-    "youtube_long": "16:9",
-    "facebook": "1:1",
-    "instagram": "1:1",
-  };
-  if (platformToAspect[platform]) {
-    aspectSelect.value = platformToAspect[platform];
-  }
-};
-
-// ---------------- batch processing ----------------
-$("#batch-mode-checkbox").onchange = (ev) => {
-  const isBatch = ev.target.checked;
-  $("#single-url-panel").classList.toggle("hidden", isBatch);
-  $("#batch-url-panel").classList.toggle("hidden", !isBatch);
-  // Sync language selects
-  if (isBatch) {
-    $("#batch-source-lang-select").value = $("#source-lang-select").value;
-    $("#batch-lang-select").value = $("#lang-select").value;
-  }
 };
 
 document.querySelectorAll(".corner-opt").forEach(el => {
@@ -692,95 +831,147 @@ $("#logo-file-input").onchange = async (ev) => {
 // ---------------- jobs ----------------
 $("#submit-btn").onclick = async () => {
   $("#submit-error").textContent = "";
-  const isBatch = $("#batch-mode-checkbox").checked;
-
-  if (isBatch) {
-    // Batch mode
-    const urlsText = $("#batch-urls-input").value.trim();
-    const urls = urlsText.split("\n").map(u => u.trim()).filter(u => u);
-    if (urls.length === 0) { $("#submit-error").textContent = "Nhập ít nhất 1 đường link"; return; }
-  } else {
-    // Single mode
-    const url = $("#url-input").value.trim();
-    if (!url) { $("#submit-error").textContent = "Nhập đường link video"; return; }
-  }
-
+  const urls = $("#url-input").value.split("\n").map(u => u.trim()).filter(Boolean);
+  if (urls.length === 0) { $("#submit-error").textContent = "Nhập ít nhất 1 đường link video"; return; }
   const logoEnabled = $("#logo-enable-checkbox").checked;
   if (logoEnabled && !uploadedLogoId) {
     $("#submit-error").textContent = "Chọn ảnh logo trước (hoặc bỏ tick 'Chèn logo')";
     return;
   }
-
+  const reviewMode = $("#review-mode-checkbox").checked;
+  if (reviewMode && urls.length > 1) {
+    $("#submit-error").textContent = "Chế độ 'xem & sửa phụ đề' chỉ dùng được với 1 link mỗi lần, không dùng chung với xử lý hàng loạt";
+    return;
+  }
   const activeCorner = document.querySelector(".corner-opt.active");
-  const antiCopyrightEnabled = $("#anticopyright-enable-checkbox").checked;
-  const platformOptEnabled = $("#platform-opt-enable-checkbox").checked;
-
-  // Use appropriate language selects based on mode
-  const langSelect = isBatch ? $("#batch-lang-select") : $("#lang-select");
-  const sourceLangSelect = isBatch ? $("#batch-source-lang-select") : $("#source-lang-select");
+  const commonBody = {
+    target_language: $("#lang-select").value,
+    source_language: $("#source-lang-select").value,
+    tts_voice: $("#voice-select").value || null,
+    logo_path: logoEnabled ? uploadedLogoId : null,
+    logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
+    logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
+    review_before_render: reviewMode,
+  };
 
   $("#submit-btn").disabled = true;
+  const failures = [];
   try {
-    if (isBatch) {
-      const urlsText = $("#batch-urls-input").value.trim();
-      const urls = urlsText.split("\n").map(u => u.trim()).filter(u => u);
-      const result = await api("/api/jobs/batch", { method: "POST", body: JSON.stringify({
-        urls,
-        target_language: langSelect.value,
-        source_language: sourceLangSelect.value,
-        logo_path: logoEnabled ? uploadedLogoId : null,
-        logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
-        logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
-        enable_anti_copyright: antiCopyrightEnabled,
-        letterbox: antiCopyrightEnabled ? $("#letterbox-input").value : null,
-        zoom_factor: antiCopyrightEnabled ? parseFloat($("#zoom-input").value) || 1.0 : 1.0,
-        flip_horizontal: antiCopyrightEnabled ? $("#flip-checkbox").checked : false,
-        speed_factor: antiCopyrightEnabled ? parseFloat($("#speed-input").value) || 1.0 : 1.0,
-        brightness: antiCopyrightEnabled ? parseFloat($("#brightness-input").value) || 0.0 : 0.0,
-        contrast: antiCopyrightEnabled ? parseFloat($("#contrast-input").value) || 1.0 : 1.0,
-        saturation: antiCopyrightEnabled ? parseFloat($("#saturation-input").value) || 1.0 : 1.0,
-        noise_amount: antiCopyrightEnabled ? parseInt($("#noise-input").value, 10) || 0 : 0,
-        rotation_degrees: antiCopyrightEnabled ? parseFloat($("#rotation-input").value) || 0.0 : 0.0,
-        crop: antiCopyrightEnabled ? $("#crop-input").value || null : null,
-        target_platform: platformOptEnabled ? $("#target-platform-select").value : "none",
-        target_aspect_ratio: platformOptEnabled ? $("#target-aspect-ratio-select").value : "auto",
-        target_resolution: platformOptEnabled ? $("#target-resolution-input").value || null : null,
-      })});
-      $("#batch-urls-input").value = "";
-      alert(`Đã tạo ${result.total} job thành công!`);
+    for (const url of urls) {
+      try {
+        await api("/api/jobs", { method: "POST", body: JSON.stringify({ url, ...commonBody }) });
+      } catch (e) {
+        failures.push(`${url}: ${e.message}`);
+      }
+    }
+    if (failures.length) {
+      $("#submit-error").textContent = `${failures.length}/${urls.length} link gửi thất bại — ${failures.join(" | ")}`;
     } else {
-      const url = $("#url-input").value.trim();
-      await api("/api/jobs", { method: "POST", body: JSON.stringify({
-        url,
-        target_language: langSelect.value,
-        source_language: sourceLangSelect.value,
-        logo_path: logoEnabled ? uploadedLogoId : null,
-        logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
-        logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
-        enable_anti_copyright: antiCopyrightEnabled,
-        letterbox: antiCopyrightEnabled ? $("#letterbox-input").value : null,
-        zoom_factor: antiCopyrightEnabled ? parseFloat($("#zoom-input").value) || 1.0 : 1.0,
-        flip_horizontal: antiCopyrightEnabled ? $("#flip-checkbox").checked : false,
-        speed_factor: antiCopyrightEnabled ? parseFloat($("#speed-input").value) || 1.0 : 1.0,
-        brightness: antiCopyrightEnabled ? parseFloat($("#brightness-input").value) || 0.0 : 0.0,
-        contrast: antiCopyrightEnabled ? parseFloat($("#contrast-input").value) || 1.0 : 1.0,
-        saturation: antiCopyrightEnabled ? parseFloat($("#saturation-input").value) || 1.0 : 1.0,
-        noise_amount: antiCopyrightEnabled ? parseInt($("#noise-input").value, 10) || 0 : 0,
-        rotation_degrees: antiCopyrightEnabled ? parseFloat($("#rotation-input").value) || 0.0 : 0.0,
-        crop: antiCopyrightEnabled ? $("#crop-input").value || null : null,
-        target_platform: platformOptEnabled ? $("#target-platform-select").value : "none",
-        target_aspect_ratio: platformOptEnabled ? $("#target-aspect-ratio-select").value : "auto",
-        target_resolution: platformOptEnabled ? $("#target-resolution-input").value || null : null,
-      })});
       $("#url-input").value = "";
     }
     refreshJobs();
     refreshMe();
-  } catch (e) { $("#submit-error").textContent = e.message; }
-  finally { $("#submit-btn").disabled = false; }
+  } finally { $("#submit-btn").disabled = false; }
 };
 
-const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", done: "Xong", error: "Lỗi" };
+async function loadCreatorSuggestions() {
+  const topic = $("#creator-topic").value.trim();
+  if (!topic) throw new Error("Nhập chủ đề video trước");
+  return api("/api/creator/suggestions", { method: "POST", body: JSON.stringify({
+    topic,
+    target_language: $("#lang-select").value || "vi",
+  })});
+}
+
+$("#creator-keywords-generate").onclick = async () => {
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = "Đang gen keyword...";
+  try {
+    const data = await loadCreatorSuggestions();
+    $("#creator-keywords").value = data.keywords.join(", ");
+    $("#creator-error").style.color = "var(--ok)";
+    $("#creator-error").textContent = "Đã gen keyword.";
+  } catch (e) {
+    $("#creator-error").style.color = "var(--err)";
+    $("#creator-error").textContent = e.message;
+  }
+};
+
+$("#creator-keywords-copy").onclick = async () => {
+  const text = $("#creator-keywords").value.trim();
+  if (!text) { $("#creator-error").textContent = "Chưa có keyword để copy"; return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    $("#creator-error").style.color = "var(--ok)";
+    $("#creator-error").textContent = "Đã copy keyword.";
+  } catch {
+    $("#creator-keywords").select();
+    $("#creator-error").style.color = "var(--warn)";
+    $("#creator-error").textContent = "Trình duyệt không cho copy tự động, keyword đã được bôi chọn.";
+  }
+};
+
+$("#creator-script-generate").onclick = async () => {
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = "Đang gen visual brief...";
+  try {
+    const data = await loadCreatorSuggestions();
+    $("#creator-script").value = data.visual_brief || data.script;
+    if (!$("#creator-keywords").value.trim()) $("#creator-keywords").value = data.keywords.join(", ");
+    $("#creator-error").style.color = "var(--ok)";
+    $("#creator-error").textContent = "Đã gen visual brief.";
+  } catch (e) {
+    $("#creator-error").style.color = "var(--err)";
+    $("#creator-error").textContent = e.message;
+  }
+};
+
+$("#creator-topic").addEventListener("blur", async () => {
+  if (!$("#creator-topic").value.trim() || $("#creator-keywords").value.trim()) return;
+  try {
+    const data = await loadCreatorSuggestions();
+    $("#creator-keywords").value = data.keywords.join(", ");
+  } catch { /* non-critical convenience */ }
+});
+
+$("#creator-submit-btn").onclick = async () => {
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = "";
+  const topic = $("#creator-topic").value.trim();
+  if (!topic) { $("#creator-error").textContent = "Nhập chủ đề video trước"; return; }
+  $("#creator-submit-btn").disabled = true;
+  try {
+    $("#creator-error").textContent = "Đang chuẩn bị job tạo video...";
+    let script = $("#creator-script").value.trim();
+    if (!script) {
+      $("#creator-error").textContent = "Visual brief đang trống, tự gen từ chủ đề...";
+      const data = await loadCreatorSuggestions();
+      script = data.visual_brief || data.script;
+      $("#creator-script").value = script;
+      if (!$("#creator-keywords").value.trim()) $("#creator-keywords").value = data.keywords.join(", ");
+    }
+    $("#creator-error").textContent = "Đang gửi job tạo video...";
+    await api("/api/creator/jobs", { method: "POST", body: JSON.stringify({
+      topic,
+      script,
+      target_language: $("#lang-select").value || "vi",
+      aspect_ratio: $("#creator-aspect").value,
+      duration_seconds: parseInt($("#creator-duration").value, 10) || 30,
+    })});
+    $("#creator-topic").value = "";
+    $("#creator-error").style.color = "var(--ok)";
+    $("#creator-error").textContent = "Đã tạo job. Xem tiến độ trong Lịch sử.";
+    refreshJobs();
+    refreshMe();
+  } catch (e) {
+    $("#creator-error").style.color = "var(--err)";
+    $("#creator-error").textContent = e.message;
+  } finally {
+    $("#creator-submit-btn").disabled = false;
+  }
+};
+
+const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", review: "Chờ sửa phụ đề", done: "Xong", error: "Lỗi" };
 
 function _dateToUnix(dateStr, endOfDay) {
   if (!dateStr) return null;
@@ -799,49 +990,59 @@ async function refreshJobs() {
   const qs = params.toString();
 
   const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
+  window._jobsById = Object.fromEntries(jobs.map(j => [j.id, j]));
+  for (const job of jobs) {
+    const prevStatus = _lastKnownStatus[job.id];
+    if (prevStatus && prevStatus !== job.status && (job.status === "done" || job.status === "error")) {
+      _notifyJobStatusChange(job);
+    }
+    _lastKnownStatus[job.id] = job.status;
+  }
   const list = $("#job-list");
   list.innerHTML = "";
   $("#empty-history").classList.toggle("hidden", jobs.length > 0);
-  const knownIds = new Set(jobs.map(j => j.id));
-  // Drop selections for jobs no longer in the current filtered view.
-  for (const id of [...selectedJobIds]) if (!knownIds.has(id)) selectedJobIds.delete(id);
   for (const job of jobs) {
     const el = document.createElement("div");
     el.className = "job";
     const created = new Date(job.created_at * 1000).toLocaleString("vi-VN");
+    const hasSubtitles = job.segments && job.segments.length > 0;
     el.innerHTML = `
-      <label style="width:auto;display:flex;align-items:center">
-        <input type="checkbox" class="job-select-checkbox" data-id="${job.id}" style="width:auto"
-          ${selectedJobIds.has(job.id) ? "checked" : ""}>
-      </label>
       <div class="job-info">
-        <div class="job-url">${job.title || job.source_url}</div>
+        <div class="job-url">${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
         <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${job.progress_note || ""}</div>
       </div>
       <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
       <div class="job-actions">
+        ${job.status === "review" ? `
+          <button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>
+        ` : ""}
         ${job.has_video ? `
           <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
           <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
         ` : ""}
+        ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>Tải .srt</a>` : ""}
+        ${job.status === "error" ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
         <button class="btn danger small" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
       </div>
     `;
     list.appendChild(el);
   }
-  list.querySelectorAll(".job-select-checkbox").forEach(cb => {
-    cb.onchange = () => {
-      if (cb.checked) selectedJobIds.add(cb.dataset.id);
-      else selectedJobIds.delete(cb.dataset.id);
-      updateBulkDeleteUI();
-    };
-  });
-  updateBulkDeleteUI();
   list.querySelectorAll("[data-preview]").forEach(btn => {
     btn.onclick = () => openPreview(btn.dataset.preview);
   });
   list.querySelectorAll("[data-publish]").forEach(btn => {
     btn.onclick = () => openPublish(btn.dataset.publish);
+  });
+  list.querySelectorAll("[data-review]").forEach(btn => {
+    btn.onclick = () => openReview(btn.dataset.review);
+  });
+  list.querySelectorAll("[data-retry]").forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try { await api(`/api/jobs/${btn.dataset.retry}/retry`, { method: "POST" }); refreshJobs(); refreshMe(); }
+      catch (e) { alert(e.message); }
+      finally { btn.disabled = false; }
+    };
   });
   list.querySelectorAll("[data-delete]").forEach(btn => {
     btn.onclick = async () => {
@@ -853,36 +1054,6 @@ async function refreshJobs() {
 }
 
 let _historySearchDebounce = null;
-const selectedJobIds = new Set();
-
-function updateBulkDeleteUI() {
-  $("#selected-count").textContent = selectedJobIds.size;
-  $("#bulk-delete-btn").disabled = selectedJobIds.size === 0;
-  const allCheckboxes = document.querySelectorAll(".job-select-checkbox");
-  $("#select-all-checkbox").checked = allCheckboxes.length > 0 &&
-    [...allCheckboxes].every(cb => cb.checked);
-}
-
-$("#select-all-checkbox").onchange = (ev) => {
-  document.querySelectorAll(".job-select-checkbox").forEach(cb => {
-    cb.checked = ev.target.checked;
-    if (ev.target.checked) selectedJobIds.add(cb.dataset.id);
-    else selectedJobIds.delete(cb.dataset.id);
-  });
-  updateBulkDeleteUI();
-};
-
-$("#bulk-delete-btn").onclick = async () => {
-  const ids = [...selectedJobIds];
-  if (ids.length === 0) return;
-  if (!confirm(`Xoá ${ids.length} video đã chọn khỏi lịch sử? Không thể hoàn tác.`)) return;
-  try {
-    await api("/api/jobs/bulk_delete", { method: "POST", body: JSON.stringify({ job_ids: ids }) });
-    selectedJobIds.clear();
-    refreshJobs();
-  } catch (e) { alert(e.message); }
-};
-
 $("#history-search").addEventListener("input", () => {
   clearTimeout(_historySearchDebounce);
   _historySearchDebounce = setTimeout(refreshJobs, 300);
@@ -894,6 +1065,76 @@ $("#history-clear-btn").onclick = () => {
   $("#history-date-from").value = "";
   $("#history-date-to").value = "";
   refreshJobs();
+};
+
+// ---------------- subtitle review editor ----------------
+let currentReviewJobId = null;
+
+async function openReview(jobId) {
+  currentReviewJobId = jobId;
+  $("#review-error").textContent = "";
+  const { segments } = await api(`/api/jobs/${jobId}/segments`);
+  $("#review-segments-list").innerHTML = segments.map((s, i) => `
+    <div class="review-segment">
+      <div class="seg-time">${_fmtTime(s.start)} → ${_fmtTime(s.end)}</div>
+      <textarea data-idx="${i}" data-start="${s.start}" data-end="${s.end}">${_escapeHtml(s.text)}</textarea>
+    </div>
+  `).join("");
+  $("#review-modal").classList.remove("hidden");
+}
+
+function _fmtTime(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function _collectReviewSegments() {
+  return Array.from($("#review-segments-list").querySelectorAll("textarea")).map(ta => ({
+    start: parseFloat(ta.dataset.start), end: parseFloat(ta.dataset.end), text: ta.value,
+  }));
+}
+
+$("#review-close").onclick = () => $("#review-modal").classList.add("hidden");
+
+$("#review-save-btn").onclick = async () => {
+  $("#review-error").textContent = "";
+  try {
+    await api(`/api/jobs/${currentReviewJobId}/segments`, {
+      method: "PUT", body: JSON.stringify({ segments: _collectReviewSegments() }),
+    });
+    $("#review-error").style.color = "var(--accent)";
+    $("#review-error").textContent = "Đã lưu.";
+  } catch (e) { $("#review-error").style.color = "var(--err)"; $("#review-error").textContent = e.message; }
+};
+
+$("#review-render-btn").onclick = async () => {
+  $("#review-error").textContent = "";
+  try {
+    await api(`/api/jobs/${currentReviewJobId}/segments`, {
+      method: "PUT", body: JSON.stringify({ segments: _collectReviewSegments() }),
+    });
+    await api(`/api/jobs/${currentReviewJobId}/render`, { method: "POST" });
+    $("#review-modal").classList.add("hidden");
+    refreshJobs();
+  } catch (e) { $("#review-error").textContent = e.message; }
+};
+
+// ---------------- feedback ----------------
+$("#feedback-fab").onclick = () => {
+  $("#feedback-status").textContent = "";
+  $("#feedback-message").value = "";
+  $("#feedback-modal").classList.remove("hidden");
+};
+$("#feedback-close").onclick = () => $("#feedback-modal").classList.add("hidden");
+$("#feedback-submit-btn").onclick = async () => {
+  const message = $("#feedback-message").value.trim();
+  if (!message) { $("#feedback-status").textContent = "Nhập nội dung góp ý trước đã."; return; }
+  try {
+    await api("/api/feedback", { method: "POST", body: JSON.stringify({ message, page: location.pathname }) });
+    $("#feedback-status").textContent = "Cảm ơn bạn! Đã gửi góp ý.";
+    setTimeout(() => $("#feedback-modal").classList.add("hidden"), 1200);
+  } catch (e) { $("#feedback-status").textContent = e.message; }
 };
 
 // ---------------- preview + publish ----------------
@@ -919,8 +1160,54 @@ function openPublish(jobId) {
   $("#publish-results").innerHTML = "";
   $("#publish-modal").classList.remove("hidden");
   loadConnections();
+  _prefillPublishSuggestions(jobId);
 }
 $("#publish-close").onclick = () => $("#publish-modal").classList.add("hidden");
+
+// Pre-fills the title from the job's translated text and suggests a
+// handful of hashtag chips derived from its most distinctive words — a
+// starting point to tweak, not meant to be used verbatim untouched.
+const _VI_STOPWORDS = new Set([
+  "và","của","là","có","cho","trong","với","một","này","đã","không","được",
+  "cũng","để","khi","như","thì","tôi","bạn","anh","chị","nó","đó","các","những",
+  "vì","nên","nhưng","mà","về","trên","dưới","ra","vào","lại","rồi","sẽ","đang",
+]);
+
+function _suggestHashtags(text, max = 5) {
+  if (!text) return [];
+  const words = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(w => w.length >= 3 && !_VI_STOPWORDS.has(w));
+  const freq = {};
+  for (const w of words) freq[w] = (freq[w] || 0) + 1;
+  return Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, max)
+    .map(([w]) => "#" + w.replace(/\s+/g, ""));
+}
+
+function _prefillPublishSuggestions(jobId) {
+  const job = (window._jobsById || {})[jobId];
+  if (!job) return;
+  if (!$("#publish-title").value) $("#publish-title").value = job.title || "";
+
+  const suggestions = _suggestHashtags(job.title || "");
+  const box = $("#publish-hashtag-suggestions");
+  if (!suggestions.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<span style="font-size:12px;color:var(--text-dim)">Gợi ý: </span>` +
+    suggestions.map(tag => `<span class="hashtag-chip" data-tag="${tag}">${tag}</span>`).join(" ");
+  box.querySelectorAll(".hashtag-chip").forEach(chip => {
+    chip.onclick = () => {
+      const current = $("#publish-hashtags").value.trim();
+      const tag = chip.dataset.tag;
+      if (!current.includes(tag)) {
+        $("#publish-hashtags").value = current ? `${current} ${tag}` : tag;
+      }
+    };
+  });
+}
 
 document.querySelectorAll(".chip").forEach(chip => {
   chip.onclick = () => {
@@ -1018,7 +1305,9 @@ $("#admin-back-btn").onclick = () => {
 };
 
 async function loadAdmin() {
-  const [stats, users] = await Promise.all([api("/api/admin/stats"), api("/api/admin/users")]);
+  const [stats, users, feedback, topups] = await Promise.all([
+    api("/api/admin/stats"), api("/api/admin/users"), api("/api/admin/feedback"), api("/api/admin/top-up-requests"),
+  ]);
 
   $("#admin-stats").innerHTML = `
     <div class="stat-box"><div class="num">${stats.total_users}</div><div class="label">Người dùng</div></div>
@@ -1053,6 +1342,56 @@ async function loadAdmin() {
       loadAdmin();
     };
   });
+
+  $("#admin-topups-empty").classList.toggle("hidden", topups.length > 0);
+  $("#admin-topups-body").innerHTML = topups.map(r => `
+    <tr>
+      <td>${r.username || ("#" + r.user_id)}</td>
+      <td>${r.credits} token</td>
+      <td>${_formatVnd(r.amount_vnd)}</td>
+      <td style="max-width:260px;white-space:pre-wrap">${_escapeHtml(r.note || "")}</td>
+      <td class="status-${r.status}">${_topupStatusLabel(r.status)}</td>
+      <td>
+        ${r.status === "pending" ? `
+          <button class="btn secondary small" data-topup-approve="${r.id}">Duyệt</button>
+          <button class="btn secondary small" data-topup-reject="${r.id}">Từ chối</button>
+        ` : ""}
+      </td>
+    </tr>
+  `).join("");
+  $("#admin-topups-body").querySelectorAll("[data-topup-approve]").forEach(btn => {
+    btn.onclick = async () => {
+      await api(`/api/admin/top-up-requests/${btn.dataset.topupApprove}/approve`, {
+        method: "POST", body: JSON.stringify({ admin_note: null }),
+      });
+      loadAdmin();
+    };
+  });
+  $("#admin-topups-body").querySelectorAll("[data-topup-reject]").forEach(btn => {
+    btn.onclick = async () => {
+      const note = prompt("Lý do từ chối (không bắt buộc):") || null;
+      await api(`/api/admin/top-up-requests/${btn.dataset.topupReject}/reject`, {
+        method: "POST", body: JSON.stringify({ admin_note: note }),
+      });
+      loadAdmin();
+    };
+  });
+
+  $("#admin-feedback-empty").classList.toggle("hidden", feedback.length > 0);
+  $("#admin-feedback-body").innerHTML = feedback.map(f => `
+    <tr>
+      <td>${f.username || "(ẩn danh)"}</td>
+      <td style="max-width:400px;white-space:pre-wrap">${_escapeHtml(f.message)}</td>
+      <td>${f.page || ""}</td>
+      <td>${new Date(f.created_at * 1000).toLocaleString("vi-VN")}</td>
+    </tr>
+  `).join("");
+}
+
+function _escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
 }
 
 $("#new-user-submit").onclick = async () => {

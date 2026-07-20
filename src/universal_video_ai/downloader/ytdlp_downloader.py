@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import yt_dlp
@@ -8,35 +7,6 @@ import yt_dlp
 from .base import BaseDownloader
 from .download_result import DownloadResult
 from .platform import Platform
-
-try:
-    from universal_video_ai.config import COOKIE_DIR
-except Exception:  # config import shouldn't be able to break downloading
-    COOKIE_DIR = None
-
-
-def _resolve_cookiefile() -> "str | None":
-    """
-    Find a Netscape-format cookies.txt to hand to yt-dlp, if one exists.
-
-    Douyin (and sometimes TikTok) now reject anonymous requests with
-    "Fresh cookies (not necessarily logged in) are needed" — yt-dlp's own
-    documented workaround is supplying real browser cookies. Priority:
-    1. DOUYIN_COOKIES_FILE env var (explicit override)
-    2. <COOKIE_DIR>/douyin.txt (project convention — see README_WEB.md)
-    Export cookies with a browser extension like "Get cookies.txt LOCALLY"
-    while logged into douyin.com, and save the file at that path. This is
-    read fresh on every download call, so updating the file takes effect
-    immediately with no restart needed.
-    """
-    env_path = os.environ.get("DOUYIN_COOKIES_FILE")
-    if env_path and Path(env_path).is_file():
-        return env_path
-    if COOKIE_DIR is not None:
-        default_path = Path(COOKIE_DIR) / "douyin.txt"
-        if default_path.is_file():
-            return str(default_path)
-    return None
 
 
 class YTDLPDownloader(BaseDownloader):
@@ -57,17 +27,8 @@ class YTDLPDownloader(BaseDownloader):
 
         Override in subclasses if needed.
         """
-        return {
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Referer": "https://www.douyin.com/",
-            },
-            "cookiefile": _resolve_cookiefile(),
-            "nocheckcertificate": True,
-            "ignoreerrors": True,
-        }
+
+        return {}
 
     # ---------------------------------------------------------
 
@@ -84,9 +45,6 @@ class YTDLPDownloader(BaseDownloader):
         options = {
 
             "outtmpl": output_template,
-
-            # Force Douyin extractor for Douyin URLs
-            "force_generic_extractor": False,
 
             # TikTok/Douyin expose the SAME video as multiple format IDs:
             # a "download_addr" / "watermark" stream (the one their app
@@ -129,9 +87,6 @@ class YTDLPDownloader(BaseDownloader):
                 url,
                 download=True,
             )
-
-            if info is None:
-                raise RuntimeError(f"yt-dlp failed to extract info from {url}")
 
             filepath = Path(
                 ydl.prepare_filename(info)

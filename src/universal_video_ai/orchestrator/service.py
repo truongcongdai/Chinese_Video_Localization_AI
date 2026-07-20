@@ -4,12 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.downloader.download_result import DownloadResult
+from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.audio.factory import create_audio_pipeline
 from universal_video_ai.audio.pipeline import AudioPipelineResult
+from universal_video_ai.audio.audio_result import AudioResult
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.tts.service import TTSService
@@ -19,7 +21,10 @@ from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverl
 from universal_video_ai.render.text_detector import OnScreenTextDetector
 from universal_video_ai.render import ocr_language_map
 
-__all__ = ["LocalizationService", "LocalizationConfig", "LocalizationResult"]
+__all__ = [
+    "LocalizationService", "LocalizationConfig", "LocalizationResult",
+    "PreparedLocalization", "prepared_localization_to_dict", "prepared_localization_from_dict",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -38,6 +43,12 @@ class LocalizationConfig:
     run_translation: bool = False
     target_language: Optional[str] = None
     run_tts: bool = False
+    # Explicit Edge-TTS voice id (e.g. "vi-VN-NamMinhNeural") to use instead
+    # of the target language's default voice — see tts.voices.VOICE_OPTIONS
+    # for the curated male/female choices the web UI offers. None = use
+    # tts.voice_for_language()'s default for target_language, unchanged
+    # from before this option existed.
+    tts_voice: Optional[str] = None
 
     # Subtitles & mixing
     generate_subtitles: bool = False
@@ -105,6 +116,92 @@ class LocalizationResult:
     final_video_path: Optional[Path] = None
 
 
+@dataclass(frozen=True)
+class PreparedLocalization:
+    """Everything `_finalize()` needs to pick up where `_prepare()` left
+    off: the downloaded video, the processed/transcribed audio, and the
+    machine translation — but before TTS/subtitles/render have happened.
+    This is the hand-off point for an optional "let a person edit the
+    translated text before rendering" step."""
+
+    download_result: DownloadResult
+    audio_result: AudioPipelineResult
+    source_segments: List[TranscriptSegment]
+    translated_segments: Optional[List[TranscriptSegment]]
+    translated_text: Optional[str]
+    target_language: str
+    output_dir: Path
+
+
+def prepared_localization_to_dict(prepared: PreparedLocalization) -> Dict[str, Any]:
+    """
+    JSON-serializable snapshot of a `PreparedLocalization`, for persisting
+    across the gap between "translation is ready, waiting on a person to
+    review it" and "they clicked render" — which, in the web app, are two
+    separate HTTP requests (and the process may even have restarted served
+    a DB-backed job queue). Round-trip with `prepared_localization_from_dict`.
+
+    Only the fields `_finalize()` actually reads are kept (video path;
+    audio path/duration; detected language; the segments) — this is a
+    deliberately narrow snapshot, not a generic object dump.
+    """
+    audio_result = prepared.audio_result.audio_result
+    return {
+        "video_path": str(prepared.download_result.video_path),
+        "audio_path": str(audio_result.audio_path),
+        "audio_duration": audio_result.duration,
+        "detected_language": prepared.audio_result.detected_language,
+        "target_language": prepared.target_language,
+        "output_dir": str(prepared.output_dir),
+        "source_segments": [
+            {"start": s.start, "end": s.end, "text": s.text} for s in prepared.source_segments
+        ],
+        "translated_segments": [
+            {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.translated_segments or [])
+        ],
+        "translated_text": prepared.translated_text,
+    }
+
+
+def prepared_localization_from_dict(data: Dict[str, Any]) -> PreparedLocalization:
+    """Inverse of `prepared_localization_to_dict`. Reconstructs minimal-but-
+    sufficient `DownloadResult`/`AudioPipelineResult` stand-ins — only the
+    fields `_finalize()` reads are populated with real values; everything
+    else gets an inert placeholder, since nothing downstream of `_finalize`
+    reads them."""
+    download_result = DownloadResult(
+        success=True, platform=Platform.OTHER, original_url="", final_url="",
+        video_path=Path(data["video_path"]),
+    )
+    audio_result = AudioResult(
+        success=True, audio_path=Path(data["audio_path"]), duration=data["audio_duration"],
+        sample_rate=0, channels=0, bitrate=None, format="wav", filesize=0,
+    )
+    audio_pipeline_result = AudioPipelineResult(
+        audio_result=audio_result,
+        transcript=None,
+        segments=None,
+        detected_language=data.get("detected_language"),
+    )
+    source_segments = [
+        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        for s in data.get("source_segments", [])
+    ]
+    translated_segments = [
+        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        for s in data.get("translated_segments", [])
+    ] or None
+    return PreparedLocalization(
+        download_result=download_result,
+        audio_result=audio_pipeline_result,
+        source_segments=source_segments,
+        translated_segments=translated_segments,
+        translated_text=data.get("translated_text"),
+        target_language=data["target_language"],
+        output_dir=Path(data["output_dir"]),
+    )
+
+
 class LocalizationService:
     """Orchestrator: download → audio → transcribe → translate → TTS → subtitles → mix → render.
 
@@ -169,7 +266,11 @@ class LocalizationService:
         )
 
     async def localize(self, url: str, output_dir: Path, target_language: Optional[str] = None) -> LocalizationResult:
-        """Execute full video localization workflow.
+        """Execute full video localization workflow, start to finish, with
+        no pause for review. For a workflow that stops after translation so
+        a person can edit the translated text first, use
+        `prepare_for_review()` + `finalize_from_review()` instead — this
+        method is just `_prepare()` immediately followed by `_finalize()`.
 
         :param url: video URL to download.
         :param output_dir: directory where to save all artifacts.
@@ -179,13 +280,53 @@ class LocalizationService:
         :raises ValueError: if download fails or processing fails.
         :return: LocalizationResult
         """
+        prepared = await self._prepare(url, output_dir, target_language)
+        return await self._finalize(prepared)
+
+    async def prepare_for_review(
+        self, url: str, output_dir: Path, target_language: Optional[str] = None
+    ) -> "PreparedLocalization":
+        """
+        Run just the download + transcribe + translate steps and stop there,
+        returning everything needed to either inspect/edit the translated
+        text or continue on to `finalize_from_review()`.
+
+        Use this (instead of `localize()`) when the caller wants a chance to
+        review/edit the translated sentences before TTS + render actually
+        happen — e.g. the web UI's optional "chỉnh sửa phụ đề trước khi
+        render" step.
+        """
+        return await self._prepare(url, output_dir, target_language)
+
+    async def finalize_from_review(
+        self,
+        prepared: "PreparedLocalization",
+        edited_segments: Optional[List[TranscriptSegment]] = None,
+    ) -> LocalizationResult:
+        """
+        Resume a `prepare_for_review()` call through to a finished video.
+
+        :param prepared: whatever `prepare_for_review()` returned earlier
+            (or reconstructed via `prepared_localization_from_dict` after a
+            round-trip through storage — see that function's docstring).
+        :param edited_segments: the (possibly user-edited) translated
+            segments to actually render with. None uses `prepared`'s
+            original machine translation unchanged.
+        """
+        return await self._finalize(prepared, edited_segments)
+
+    async def _prepare(
+        self, url: str, output_dir: Path, target_language: Optional[str] = None
+    ) -> "PreparedLocalization":
+        """Steps 1-3: download the source video, extract/transcribe its
+        audio, and translate the transcript. See `localize()`."""
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
         effective_target_language = target_language or self.config.target_language or "en"
 
         self.logger.info(
-            "LocalizationService.localize: url=%s output_dir=%s target_language=%s",
+            "LocalizationService._prepare: url=%s output_dir=%s target_language=%s",
             url, output_dir, effective_target_language,
         )
 
@@ -216,7 +357,6 @@ class LocalizationService:
 
         translated_text: Optional[str] = None
         translated_segments: Optional[List[TranscriptSegment]] = None
-        tts_audio_path: Optional[Path] = None
 
         # Step 3: Translate transcript — prefer segment-level translation so
         # every sentence keeps the timestamp it had in the source video.
@@ -264,6 +404,39 @@ class LocalizationService:
                     translated_text = None
                     translated_segments = None
 
+        return PreparedLocalization(
+            download_result=download_result,
+            audio_result=audio_result,
+            source_segments=source_segments,
+            translated_segments=translated_segments,
+            translated_text=translated_text,
+            target_language=effective_target_language,
+            output_dir=output_dir,
+        )
+
+    async def _finalize(
+        self,
+        prepared: "PreparedLocalization",
+        edited_segments: Optional[List[TranscriptSegment]] = None,
+    ) -> LocalizationResult:
+        """Steps 4-8: TTS, subtitles, on-screen text-cover, audio mix, and
+        final render — resuming from whatever `_prepare()` produced. See
+        `localize()`."""
+        download_result = prepared.download_result
+        audio_result = prepared.audio_result
+        source_segments = prepared.source_segments
+        output_dir = prepared.output_dir
+        effective_target_language = prepared.target_language
+
+        if edited_segments is not None:
+            translated_segments = edited_segments
+            translated_text = " ".join(s.text for s in translated_segments if s.text)
+        else:
+            translated_segments = prepared.translated_segments
+            translated_text = prepared.translated_text
+
+        tts_audio_path: Optional[Path] = None
+
         # Step 4: Synthesize TTS from translated text, anchored to the
         # original sentence timestamps whenever we have them.
         if self.config.run_tts and (translated_segments or translated_text):
@@ -277,6 +450,7 @@ class LocalizationService:
                             total_duration=audio_result.audio_result.duration,
                             output_dir=output_dir,
                             target_language=effective_target_language,
+                            voice=self.config.tts_voice,
                         )
                     else:
                         self.logger.info("LocalizationService: synthesizing TTS (whole-text fallback)")
@@ -285,6 +459,7 @@ class LocalizationService:
                             translated_text,
                             output_path=tts_audio_path,
                             language=effective_target_language,
+                            voice=self.config.tts_voice,
                         )
                     self.logger.info("LocalizationService: TTS complete: %s", tts_audio_path)
                 except Exception as exc:
@@ -442,6 +617,7 @@ class LocalizationService:
         total_duration: float,
         output_dir: Path,
         target_language: str,
+        voice: Optional[str] = None,
     ) -> Path:
         """
         Synthesize each translated sentence separately, then assemble them
@@ -464,6 +640,7 @@ class LocalizationService:
                 seg.text,
                 output_path=clip_path,
                 language=target_language,
+                voice=voice,
             )
             if seg.has_timing:
                 clips.append(TimedAudioClip(start=seg.start, end=seg.end, audio_path=clip_path))

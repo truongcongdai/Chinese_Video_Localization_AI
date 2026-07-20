@@ -124,7 +124,9 @@ class RenderConfig:
         audio_codec: codec for audio (default "aac").
         audio_bitrate: bitrate for audio (e.g. "192k").
         overwrite: whether to overwrite existing output file.
-        timeout_seconds: ffmpeg timeout for rendering.
+        timeout_seconds: ffmpeg idle timeout for rendering. FFmpeg is only
+                  stopped after this many seconds without exit/progress
+                  output, so a slow but active render is allowed to finish.
         blur_text: whether to apply blur filter to cover original text (e.g., Chinese subtitles).
                    This is a coarse legacy option; prefer passing `text_overlays`
                    to `render()` for accurate, per-sentence, timestamp-aware covering.
@@ -142,7 +144,7 @@ class RenderConfig:
     audio_codec: str = "aac"
     audio_bitrate: str = "192k"
     overwrite: bool = True
-    timeout_seconds: int = 21600  # 6 hours
+    timeout_seconds: int = 1800  # 30 minutes without progress output
     blur_text: bool = False
     blur_box: Optional[str] = None
     default_overlay_font_path: Optional[str] = None
@@ -168,44 +170,6 @@ class RenderConfig:
     logo_size_px: int = 120
     # Gap in pixels between the logo and the frame edge.
     logo_margin_px: int = 24
-
-    # ---- Anti-copyright filters (to avoid content ID detection) ----
-    # Add black bars on sides (letterboxing) - format: "left:right:top:bottom" in pixels
-    # Example: "100:100:0:0" adds 100px black bars on left and right sides
-    letterbox: Optional[str] = None
-    # Zoom factor (1.0 = no zoom, 1.1 = 10% zoom into center)
-    zoom_factor: float = 1.0
-    # Flip video horizontally (mirror effect) - helps avoid fingerprinting
-    flip_horizontal: bool = False
-    # Slight speed change (0.95-1.05) to avoid audio fingerprinting
-    speed_factor: float = 1.0
-    # Brightness adjustment (-1.0 to 1.0, 0 = no change)
-    brightness: float = 0.0
-    # Contrast adjustment (0 to 2, 1 = no change)
-    contrast: float = 1.0
-    # Saturation adjustment (0 to 2, 1 = no change)
-    saturation: float = 1.0
-    # Add noise/grain (0 to 100, 0 = no noise)
-    noise_amount: int = 0
-    # Slight rotation in degrees (0 to 5, 0 = no rotation)
-    rotation_degrees: float = 0.0
-    # Crop from edges (left:right:top:bottom in pixels)
-    crop: Optional[str] = None
-
-    # ---- Platform-specific video optimization ----
-    # Target platform: 'tiktok', 'youtube_shorts', 'youtube_long', 'facebook', 'instagram', 'none'
-    target_platform: str = "none"
-    # Target aspect ratio: '9:16' (vertical), '16:9' (horizontal), '1:1' (square), 'auto' (keep original)
-    target_aspect_ratio: str = "auto"
-    # Target resolution (width x height). If None, auto-calculate based on aspect ratio
-    target_resolution: Optional[Tuple[int, int]] = None
-    # Subtitle position for platform: 'bottom' (default), 'top', 'middle'
-    subtitle_position: str = "bottom"
-    # Subtitle safe area margin (pixels) - avoid platform UI overlap
-    subtitle_safe_margin: int = 80
-    # Maximum video duration in seconds for processing (None = no limit)
-    # For long-form content (>10 min), recommend increasing timeout_seconds
-    max_video_duration: Optional[int] = None
 
 
 class Renderer:
@@ -240,145 +204,6 @@ class Renderer:
         out_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{video_path.stem}.final.mp4"
         return out_dir / filename
-
-    def _build_platform_optimization_filters(self, frame_w: Optional[int] = None, frame_h: Optional[int] = None) -> List[str]:
-        """
-        Build ffmpeg filters for platform-specific video optimization.
-        Handles aspect ratio conversion (9:16, 16:9, 1:1) and resolution scaling.
-        """
-        filters: List[str] = []
-
-        if self.config.target_aspect_ratio == "auto" and self.config.target_resolution is None:
-            return filters
-
-        # Platform-specific presets
-        platform_presets = {
-            "tiktok": {"aspect": "9:16", "resolution": (1080, 1920)},
-            "youtube_shorts": {"aspect": "9:16", "resolution": (1080, 1920)},
-            "youtube_long": {"aspect": "16:9", "resolution": (1920, 1080)},
-            "facebook": {"aspect": "1:1", "resolution": (1080, 1080)},
-            "instagram": {"aspect": "1:1", "resolution": (1080, 1080)},
-        }
-
-        # Determine target dimensions
-        target_w, target_h = None, None
-        target_aspect_ratio = self.config.target_aspect_ratio
-
-        if self.config.target_platform != "none" and self.config.target_platform in platform_presets:
-            preset = platform_presets[self.config.target_platform]
-            if target_aspect_ratio == "auto":
-                target_aspect_ratio = preset["aspect"]
-            if self.config.target_resolution is None:
-                target_w, target_h = preset["resolution"]
-
-        if self.config.target_resolution:
-            target_w, target_h = self.config.target_resolution
-
-        # Calculate target dimensions based on aspect ratio
-        aspect_ratios = {
-            "9:16": (9, 16),
-            "16:9": (16, 9),
-            "1:1": (1, 1),
-        }
-
-        if target_aspect_ratio in aspect_ratios and frame_w and frame_h:
-            ar_w, ar_h = aspect_ratios[target_aspect_ratio]
-
-            if target_w is None and target_h is None:
-                # Auto-calculate based on original video's longer side
-                if frame_w > frame_h:
-                    # Landscape source
-                    target_h = int(frame_h * (ar_w / ar_h))
-                    target_w = frame_w
-                else:
-                    # Portrait source
-                    target_w = int(frame_w * (ar_h / ar_w))
-                    target_h = frame_h
-
-            # Ensure minimum dimensions
-            target_w = max(target_w or 320, 320)
-            target_h = max(target_h or 320, 320)
-
-            # Apply scale filter with aspect ratio
-            filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2")
-
-        elif target_w and target_h:
-            # Direct scale to target resolution
-            filters.append(f"scale={target_w}:{target_h}")
-
-        return filters
-
-    def _build_anti_copyright_filters(self, frame_w: Optional[int] = None, frame_h: Optional[int] = None) -> List[str]:
-        """
-        Build ffmpeg filters for anti-copyright processing to avoid content ID detection.
-        Filters are applied in order: crop -> zoom/rotate -> flip -> color adjustments -> noise -> letterbox
-        """
-        filters: List[str] = []
-
-        # Crop from edges if specified
-        if self.config.crop:
-            try:
-                crop_left, crop_right, crop_top, crop_bottom = (int(v) for v in self.config.crop.split(":"))
-                if frame_w and frame_h:
-                    # crop filter uses iw-ow:ih-oh:ow:oh format
-                    out_w = frame_w - crop_left - crop_right
-                    out_h = frame_h - crop_top - crop_bottom
-                    filters.append(f"crop={out_w}:{out_h}:{crop_left}:{crop_top}")
-                    # Update frame dimensions for subsequent filters
-                    frame_w, frame_h = out_w, out_h
-            except ValueError:
-                self.logger.error("Malformed crop=%r (expected 'left:right:top:bottom' integers)", self.config.crop)
-
-        # Zoom into center
-        if self.config.zoom_factor != 1.0 and frame_w and frame_h:
-            zoom = self.config.zoom_factor
-            # Calculate crop region for zoom effect
-            new_w = int(frame_w / zoom)
-            new_h = int(frame_h / zoom)
-            x = (frame_w - new_w) // 2
-            y = (frame_h - new_h) // 2
-            filters.append(f"crop={new_w}:{new_h}:{x}:{y}")
-            # Scale back to original size
-            filters.append(f"scale={frame_w}:{frame_h}")
-
-        # Rotation
-        if self.config.rotation_degrees != 0.0:
-            # Use rotate filter with fill color black
-            filters.append(f"rotate={self.config.rotation_degrees}*PI/180:fillcolor=black")
-
-        # Horizontal flip
-        if self.config.flip_horizontal:
-            filters.append("hflip")
-
-        # Color adjustments (brightness, contrast, saturation)
-        eq_params = []
-        if self.config.brightness != 0.0:
-            eq_params.append(f"brightness={self.config.brightness}")
-        if self.config.contrast != 1.0:
-            eq_params.append(f"contrast={self.config.contrast}")
-        if self.config.saturation != 1.0:
-            eq_params.append(f"saturation={self.config.saturation}")
-        if eq_params:
-            filters.append(f"eq={':'.join(eq_params)}")
-
-        # Add noise/grain (disabled - filter syntax varies by FFmpeg version)
-        # if self.config.noise_amount > 0:
-        #     filters.append(f"noise=all_amount={self.config.noise_amount}:allf=t")
-
-        # Letterbox (add black bars)
-        if self.config.letterbox and frame_w and frame_h:
-            try:
-                pad_left, pad_right, pad_top, pad_bottom = (int(v) for v in self.config.letterbox.split(":"))
-                total_pad_w = pad_left + pad_right
-                total_pad_h = pad_top + pad_bottom
-                if total_pad_w > 0 or total_pad_h > 0:
-                    out_w = frame_w + total_pad_w
-                    out_h = frame_h + total_pad_h
-                    filters.append(f"pad={out_w}:{out_h}:{pad_left}:{pad_top}:color=black")
-            except ValueError:
-                self.logger.error("Malformed letterbox=%r (expected 'left:right:top:bottom' integers)", self.config.letterbox)
-
-        return filters
 
     def _build_text_overlay_filters(
         self, overlays: List[TextOverlay], frame_w: Optional[int] = None
@@ -546,25 +371,13 @@ class Renderer:
 
         text_overlays = text_overlays or []
 
-        # Determine if we need video filters (subtitles, overlays, blur, anti-copyright, or platform optimization)
+        # Determine if we need video filters (subtitles, overlays, or blur)
         needs_reencode = (
             subtitles is not None
             or self.config.blur_text
             or bool(text_overlays)
             or self.config.watermark_box_fractional is not None
             or logo_configured
-            or self.config.letterbox is not None
-            or self.config.zoom_factor != 1.0
-            or self.config.flip_horizontal
-            or self.config.speed_factor != 1.0
-            or self.config.brightness != 0.0
-            or self.config.contrast != 1.0
-            or self.config.saturation != 1.0
-            or self.config.noise_amount > 0
-            or self.config.rotation_degrees != 0.0
-            or self.config.crop is not None
-            or self.config.target_aspect_ratio != "auto"
-            or self.config.target_resolution is not None
         )
 
         if text_overlays and not self.config.default_overlay_font_path and not any(
@@ -651,12 +464,6 @@ class Renderer:
                         "on-screen text region is detected automatically via OCR."
                     )
 
-            # Add platform-specific optimization filters (aspect ratio, resolution)
-            filters.extend(self._build_platform_optimization_filters(frame_w=frame_w, frame_h=frame_h))
-
-            # Add anti-copyright filters
-            filters.extend(self._build_anti_copyright_filters(frame_w=frame_w, frame_h=frame_h))
-
             # Add per-sentence text-cover + translated-text overlays, each
             # only active during its own [start, end) window.
             filters.extend(self._build_text_overlay_filters(text_overlays, frame_w=frame_w))
@@ -688,7 +495,7 @@ class Renderer:
                 filter_complex = (
                     f"[0:v]{base_chain}[base];"
                     f"[2:v]scale={self.config.logo_size_px}:-1[wm];"
-                    f"[base][wm]overlay={x_expr}:{y_expr}[outv]"
+                    f"[base][wm]overlay={x_expr}:{y_expr}:shortest=1[outv]"
                 )
                 cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
             else:
@@ -704,25 +511,9 @@ class Renderer:
                     "-crf", str(self.config.crf),
                     "-c:a", self.config.audio_codec,
                     "-b:a", self.config.audio_bitrate,
+                    str(output),
                 ]
             )
-
-            # Handle speed factor for audio (avoids audio fingerprinting)
-            if self.config.speed_factor != 1.0:
-                # Use atempo filter - can only do 0.5 to 2.0 per filter, chain multiple if needed
-                speed = self.config.speed_factor
-                atempo_filters = []
-                while speed < 0.5 or speed > 2.0:
-                    if speed > 2.0:
-                        atempo_filters.append("atempo=2.0")
-                        speed /= 2.0
-                    elif speed < 0.5:
-                        atempo_filters.append("atempo=0.5")
-                        speed /= 0.5
-                atempo_filters.append(f"atempo={speed}")
-                cmd.extend(["-filter:a", ",".join(atempo_filters)])
-
-            cmd.append(str(output))
         else:
             # No filters: keep video stream (copy) and encode audio
             cmd.extend(
@@ -823,7 +614,7 @@ class Renderer:
             return output
 
         except subprocess.TimeoutExpired:
-            self.logger.exception("FFmpeg rendering timed out after %s seconds", self.config.timeout_seconds)
+            self.logger.exception("FFmpeg rendering stalled for %s seconds", self.config.timeout_seconds)
             raise RuntimeError("FFmpeg rendering timed out")
         except FileNotFoundError as exc:
             # Raised when ffmpeg binary not found
@@ -842,8 +633,9 @@ class Renderer:
         makes the process *look* hung even when it's still working. This
         logs ffmpeg's own progress line (it reports `frame=`/`time=` on
         stderr) at most once every `heartbeat_seconds`, so long renders stay
-        visibly alive, and still enforces `timeout_seconds` by killing the
-        process if it runs over.
+        visibly alive, and enforces `timeout_seconds` as an idle timeout by
+        killing the process only if it stops exiting or producing progress
+        output for that long.
 
         :return: (returncode, full stderr text) — stderr text is used for
             error reporting on failure, matching the previous behavior.
@@ -855,39 +647,45 @@ class Renderer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            encoding='utf-8',
-            errors='replace',
             bufsize=1,
         )
 
         stderr_lines: List[str] = []
         last_heartbeat = time.monotonic()
+        last_activity = time.monotonic()
         last_progress_line = ""
         lock = threading.Lock()
 
         def _reader() -> None:
-            nonlocal last_heartbeat, last_progress_line
+            nonlocal last_heartbeat, last_activity, last_progress_line
             assert process.stderr is not None
             for line in process.stderr:
                 with lock:
                     stderr_lines.append(line)
+                    last_activity = time.monotonic()
                     stripped = line.strip()
                     if stripped:
                         last_progress_line = stripped
-                    now = time.monotonic()
-                    if now - last_heartbeat >= heartbeat_seconds:
-                        last_heartbeat = now
+                    if last_activity - last_heartbeat >= heartbeat_seconds:
+                        last_heartbeat = last_activity
                         self.logger.info("FFmpeg still running... %s", last_progress_line)
 
         reader_thread = threading.Thread(target=_reader, daemon=True)
         reader_thread.start()
 
-        try:
-            returncode = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            raise
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                break
+
+            with lock:
+                idle_seconds = time.monotonic() - last_activity
+            if idle_seconds >= timeout_seconds:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(cmd, timeout_seconds)
+
+            time.sleep(min(1.0, max(0.1, timeout_seconds / 100.0)))
 
         reader_thread.join(timeout=5.0)
         with lock:

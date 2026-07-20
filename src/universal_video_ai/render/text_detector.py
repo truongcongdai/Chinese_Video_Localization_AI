@@ -103,22 +103,13 @@ class OnScreenTextDetector:
             return self._reader
         try:
             import easyocr  # type: ignore
-            import torch
         except Exception as exc:
             raise RuntimeError(
                 "OnScreenTextDetector requires the 'easyocr' package, which is not installed. "
                 "Install it with: pip install easyocr"
             ) from exc
-        
-        # Auto-detect GPU availability
-        use_gpu = torch.cuda.is_available()
-        if use_gpu:
-            self.logger.info("GPU detected, using CUDA for EasyOCR")
-        else:
-            self.logger.info("No GPU detected, using CPU for EasyOCR")
-        
         self.logger.debug("Loading easyocr reader for languages=%s", self.languages)
-        self._reader = easyocr.Reader(self.languages, gpu=use_gpu)
+        self._reader = easyocr.Reader(self.languages, gpu=False)
         return self._reader
 
     def _get_video_dimensions(self, video_path: Path) -> Optional[Tuple[int, int]]:

@@ -87,18 +87,6 @@ class DemucsProcessor:
             self.logger.warning(
                 "Demucs not found in PATH; separation may fail at runtime. Install with: pip install demucs")
 
-        # Auto-detect GPU if device is not explicitly set
-        if self.config.device == "cpu":
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    self.config.device = "cuda"
-                    self.logger.info("GPU detected, using CUDA for Demucs")
-                else:
-                    self.logger.info("No GPU detected, using CPU for Demucs")
-            except ImportError:
-                self.logger.info("PyTorch not available, using CPU for Demucs")
-
         self.logger.debug(
             "DemucsProcessor initialized with model=%s, device=%s, output_format=%s",
             self.config.model,

@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import subprocess
+import time
 import pytest
 
 from universal_video_ai.render.renderer import Renderer, RenderConfig, _check_ffmpeg_available
@@ -44,6 +45,9 @@ def _make_fake_popen(returncode: int, stderr_text: str, output_writer=None):
                 output_writer(cmd)
 
         def wait(self, timeout=None):
+            return self._returncode
+
+        def poll(self):
             return self._returncode
 
         def kill(self):
@@ -112,3 +116,37 @@ def test_render_ffmpeg_error(tmp_path: Path, monkeypatch):
     renderer = Renderer()
     with pytest.raises(RuntimeError):
         renderer.render(video, audio)
+
+
+def test_ffmpeg_timeout_allows_active_progress(monkeypatch):
+    class ActiveFakePopen:
+        def __init__(self, cmd, stdout=None, stderr=None, text=None, bufsize=None):
+            self.started_at = time.monotonic()
+            self.killed = False
+            self.stderr = self._stderr()
+
+        def _stderr(self):
+            for idx in range(6):
+                time.sleep(0.05)
+                yield f"frame={idx * 100} time=00:00:0{idx}.00\n"
+
+        def poll(self):
+            return 0 if time.monotonic() - self.started_at >= 0.3 else None
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    monkeypatch.setattr("universal_video_ai.render.renderer.subprocess.Popen", ActiveFakePopen)
+
+    renderer = Renderer()
+    returncode, stderr_text = renderer._run_ffmpeg_with_progress(
+        ["ffmpeg", "-version"],
+        timeout_seconds=0.12,
+        heartbeat_seconds=10.0,
+    )
+
+    assert returncode == 0
+    assert "frame=500" in stderr_text
