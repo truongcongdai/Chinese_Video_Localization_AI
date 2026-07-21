@@ -21,11 +21,20 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; color: var(--text); min-height: 100vh;
+    background:
+      radial-gradient(circle at 12% 0%, rgba(91,140,255,.14), transparent 32rem),
+      radial-gradient(circle at 95% 20%, rgba(62,207,142,.08), transparent 28rem),
+      var(--bg);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
-  .wrap { max-width: 920px; margin: 0 auto; padding: 32px 20px 80px; }
-  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  .wrap { width: min(96vw, 1560px); max-width: none; margin: 0 auto; padding: 24px 0 80px; }
+  header {
+    position: sticky; top: 12px; z-index: 30; display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 24px; padding: 14px 18px;
+    background: rgba(23,26,33,.88); border: 1px solid var(--border); border-radius: 14px;
+    backdrop-filter: blur(14px); box-shadow: 0 12px 36px rgba(0,0,0,.22);
+  }
   header h1 { font-size: 20px; font-weight: 600; margin: 0; }
   header .sub { color: var(--text-dim); font-size: 13px; }
   #userbar { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--text-dim); }
@@ -38,10 +47,27 @@
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .btn.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
   .btn.secondary:hover { background: #262b35; }
+  .btn.danger { background: #c83f49; color: #fff; border: 1px solid #df5962; }
+  .btn.danger:hover { background: #a92f39; }
   .btn.small { padding: 6px 12px; font-size: 13px; }
+  .btn .loading-spinner {
+    width: 14px; height: 14px; display: inline-block; flex: 0 0 14px;
+    border: 2px solid rgba(255,255,255,.28); border-top-color: currentColor;
+    border-radius: 50%; animation: button-spin .7s linear infinite;
+  }
+  .btn.is-loading { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+  @keyframes button-spin { to { transform: rotate(360deg); } }
+  .creator-progress { margin-top: 12px; padding: 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; }
+  .creator-progress-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 7px; font-size: 13px; }
+  .progress-track { height: 8px; overflow: hidden; background: rgba(255,255,255,.08); border-radius: 999px; }
+  .progress-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), #62d6a8); border-radius: inherit; transition: width .45s ease; }
+  .job-progress { margin-top: 7px; max-width: 520px; }
+  .job-progress .progress-track { height: 5px; }
+  .job-progress-label { color: var(--text-dim); font-size: 11px; margin-top: 3px; text-align: right; }
   .card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 20px; margin-bottom: 20px;
+    background: linear-gradient(145deg, rgba(31,35,44,.76), rgba(23,26,33,.96));
+    border: 1px solid var(--border); border-radius: 16px; padding: 22px; margin-bottom: 20px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.16);
   }
   input, select, textarea {
     width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
@@ -51,17 +77,26 @@
   .field { margin-bottom: 14px; }
   .row { display: flex; gap: 14px; }
   .row > * { flex: 1; }
+  .reup-language-row .reup-language-field label {
+    min-height: 32px; display: flex; align-items: flex-end;
+  }
   #auth-view { max-width: 380px; margin: 80px auto 0; }
   #auth-view h2 { text-align: center; margin-bottom: 4px; }
   #auth-view p.sub { text-align: center; color: var(--text-dim); font-size: 13px; margin-top: 0; margin-bottom: 24px; }
   #auth-error { color: var(--err); font-size: 13px; min-height: 18px; margin-top: 8px; }
   .hidden { display: none !important; }
   .job {
-    display: flex; align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--border);
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px 14px;
+    align-items: stretch; padding: 14px 0; border-bottom: 1px solid var(--border);
   }
   .job:last-child { border-bottom: none; }
+  .job .job-main { min-width: 0; display: grid; grid-template-rows: auto auto; gap: 10px; }
+  .history-job-check { align-self: start; margin-top: 4px; }
+  .job .job-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .job .job-info { flex: 1; min-width: 0; }
   .job .job-url { font-size: 14px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .job .job-url.playable { cursor: pointer; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+  .job .job-url.playable:hover { color: #91b6ff; }
   .job .job-meta { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
   .badge {
     font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase;
@@ -72,7 +107,8 @@
   .badge.review { background: #3a331c; color: var(--warn); }
   .badge.done { background: #17352a; color: var(--ok); }
   .badge.error { background: #3a2323; color: var(--err); }
-  .job-actions { display: flex; gap: 8px; }
+  .job-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .job-delete { grid-column: 3; grid-row: 1; min-width: 62px; height: 100%; }
   #empty-history { color: var(--text-dim); font-size: 14px; padding: 20px 0; text-align: center; }
 
   .modal-backdrop {
@@ -129,8 +165,6 @@
   /* history search/filter/delete */
   .history-toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
   .history-toolbar input[type="date"] { flex: none; width: 150px; }
-  .job-actions .btn.danger { background: transparent; color: var(--err); border: 1px solid #4a2b2b; }
-  .job-actions .btn.danger:hover { background: #2a1717; }
 
   /* floating feedback button */
   #feedback-fab {
@@ -143,6 +177,8 @@
   .review-segment { display: flex; gap: 10px; align-items: flex-start; }
   .review-segment .seg-time { flex: none; width: 90px; font-size: 11px; color: var(--text-dim); padding-top: 10px; }
   .review-segment textarea { flex: 1; min-height: 44px; resize: vertical; }
+  #review-source-video { width: 100%; max-height: 38vh; background: #000; border-radius: 8px; margin-bottom: 12px; }
+  .review-segment.active { outline: 1px solid var(--accent); border-radius: 8px; background: #111a2a; }
 
   .connect-card {
     border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
@@ -187,10 +223,44 @@
   .topup-package.active { border-color: var(--accent); background: #16233f; }
   .topup-package .credits { font-weight: 800; font-size: 18px; }
   .topup-package .price { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
+  .payment-box { border: 1px solid var(--border); background: var(--panel-2); border-radius: 10px; padding: 14px; margin: 14px 0; }
+  .payment-box img { display: block; width: min(260px, 100%); margin: 12px auto; border-radius: 10px; background: white; }
+  .payment-line { display:flex; justify-content:space-between; gap:12px; margin:7px 0; font-size:13px; }
   .status-pending { color: var(--warn); }
   .status-approved { color: var(--ok); }
   .status-rejected { color: var(--err); }
   .section-title { margin: 0 0 12px; font-size: 16px; }
+  .dashboard-grid {
+    display:grid; grid-template-columns:minmax(680px, 1.45fr) minmax(440px, .85fr);
+    gap:24px; align-items:start;
+  }
+  .tool-column, .result-column { min-width:0; }
+  .result-column { position:sticky; top:100px; max-height:calc(100vh - 112px); overflow:auto; padding-right:3px; }
+  .latest-result video { width:100%; max-height:52vh; background:#000; border-radius:10px; object-fit:contain; }
+  .latest-result-title { font-size:13px; color:var(--text-dim); margin:8px 0 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  @media (max-width: 760px) {
+    .wrap { width:auto; padding:12px 12px 60px; }
+    header { position: static; align-items: flex-start; gap: 14px; }
+    #userbar { flex-wrap: wrap; justify-content: flex-end; }
+    .row { flex-direction: column; gap: 0; }
+    .history-toolbar { flex-wrap: wrap; }
+    .history-toolbar input[type="date"] { width: 100%; }
+    .job { grid-template-columns: auto minmax(0, 1fr); }
+    .job-head { align-items: flex-start !important; flex-wrap: wrap; }
+    .job-actions { width: 100%; }
+    .job-delete { grid-column: 2; grid-row: auto; width: 100%; min-height: 38px; }
+    .dashboard-grid { display:block; }
+    .result-column { position:static; max-height:none; overflow:visible; }
+  }
+  @media (min-width: 761px) and (max-width: 1199px) {
+    .wrap { width:min(96vw, 1080px); }
+    .dashboard-grid { display:block; }
+    .result-column { position:static; max-height:none; overflow:visible; }
+  }
+  @media (min-width: 1600px) {
+    .wrap { width:min(94vw, 1720px); }
+    .dashboard-grid { grid-template-columns:minmax(820px, 1.55fr) minmax(500px, .85fr); gap:28px; }
+  }
 </style>
 </head>
 <body>
@@ -199,21 +269,26 @@
   <h2 id="auth-title">Đăng nhập</h2>
   <p class="sub" id="auth-sub">Video Localization AI</p>
   <div class="card">
-    <!-- Real <form> so pressing Enter in either field submits it (as a
-         login), instead of only working via mouse click on a button. -->
-    <form id="auth-form">
+    <div class="auth-tabs">
+      <button class="auth-tab active" type="button" id="show-login-tab">Đăng nhập</button>
+      <button class="auth-tab" type="button" id="show-register-tab">Đăng ký</button>
+    </div>
+    <form id="login-form">
       <div class="field">
-        <label id="auth-identifier-label">Tên đăng nhập / Email / Số điện thoại</label>
-        <input id="auth-identifier" autocomplete="username">
+        <label>Tên đăng nhập / Email / Số điện thoại</label>
+        <input id="login-identifier" autocomplete="username" required>
       </div>
-      <div class="field"><label>Mật khẩu</label><input id="auth-password" type="password" autocomplete="current-password"></div>
-      <div class="field"><label>Mã giới thiệu (không bắt buộc, chỉ dùng khi đăng ký)</label><input id="auth-referral-code" placeholder="VD: 6QNRHSW"></div>
-      <div class="row" style="gap:10px">
-        <button class="btn" type="submit" id="auth-login-btn" style="flex:1">Đăng nhập</button>
-        <button class="btn secondary" type="button" id="auth-register-btn" style="flex:1">Đăng ký</button>
-      </div>
-      <div id="auth-error"></div>
+      <div class="field"><label>Mật khẩu</label><input id="login-password" type="password" autocomplete="current-password" required></div>
+      <button class="btn" type="submit" style="width:100%">Đăng nhập</button>
     </form>
+    <form id="register-form" class="hidden">
+      <div class="field"><label>Email / Số điện thoại</label><input id="register-contact" autocomplete="email" required></div>
+      <div class="field"><label>Tên đăng nhập</label><input id="register-username" autocomplete="username" required></div>
+      <div class="field"><label>Mật khẩu</label><input id="register-password" type="password" autocomplete="new-password" required></div>
+      <div class="field"><label>Mã giới thiệu (nếu có)</label><input id="register-referral-code" placeholder="VD: 6QNRHSW"></div>
+      <button class="btn" type="submit" style="width:100%">Đăng ký</button>
+    </form>
+    <div id="auth-error"></div>
 
     <div class="auth-divider">hoặc</div>
     <div class="social-row" id="social-login-row">
@@ -234,6 +309,7 @@
       <span id="userbar-credits" class="credits-badge" title="Credit còn lại"></span>
       <span id="userbar-name"></span>
       <button class="btn secondary small" id="topup-btn">Nạp token</button>
+      <button class="btn secondary small hidden" id="feedback-header-btn" title="Gửi phản hồi, góp ý hoặc báo lỗi">💬 Phản hồi / Góp ý</button>
       <button class="btn secondary small hidden" id="admin-btn">Quản trị</button>
       <button class="btn secondary small" id="logout-btn">Đăng xuất</button>
     </div>
@@ -250,27 +326,31 @@
     </div>
   </div>
 
+  <div class="dashboard-grid">
+  <main class="tool-column">
+
   <div class="card">
     <h3 class="section-title">Dịch &amp; lồng tiếng video có sẵn</h3>
-    <div class="row">
+    <div class="row reup-language-row">
       <div class="field" style="flex: 3">
         <label>Đường link video — 1 link mỗi dòng để xử lý hàng loạt (TikTok / Douyin / v.v.)</label>
         <textarea id="url-input" rows="2" placeholder="https://v.douyin.com/....&#10;https://v.douyin.com/.... (dán thêm dòng khác để xử lý hàng loạt)"></textarea>
       </div>
-      <div class="field" style="flex: 1">
-        <label>Ngôn ngữ gốc</label>
+      <div class="field reup-language-field" style="flex: 1">
+        <label>Ngôn ngữ gốc video reup</label>
         <select id="source-lang-select"></select>
       </div>
-      <div class="field" style="flex: 1">
-        <label>Ngôn ngữ đích</label>
+      <div class="field reup-language-field" style="flex: 1">
+        <label>Ngôn ngữ voice &amp; subtitle video reup</label>
         <select id="lang-select"></select>
       </div>
     </div>
 
     <div class="row">
       <div class="field" style="flex: 1">
-        <label>Giọng đọc</label>
+        <label>Chọn voice giọng đọc video reup</label>
         <select id="voice-select"><option value="">Mặc định</option></select>
+        <div style="font-size:12px;color:var(--text-dim);margin-top:5px">Danh sách voice thay đổi theo ngôn ngữ voice &amp; subtitle ở phía trên.</div>
       </div>
       <div class="field" style="flex: 2; display:flex; align-items:flex-end; padding-bottom: 10px;">
         <label style="margin:0">
@@ -335,6 +415,31 @@
           <option value="60">60 giây</option>
         </select>
       </div>
+      <div class="field">
+        <label>Chuyển cảnh</label>
+        <select id="creator-transition">
+          <option value="fade">Mờ dần</option>
+          <option value="slideleft">Trượt sang trái</option>
+          <option value="slideright">Trượt sang phải</option>
+          <option value="slideup">Trượt lên trên</option>
+          <option value="slidedown">Trượt xuống dưới</option>
+          <option value="zoomin">Phóng to chậm</option>
+          <option value="zoomout">Thu nhỏ chậm</option>
+          <option value="none">Không hiệu ứng</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field"><label>Ngôn ngữ voice &amp; subtitle</label><select id="creator-lang-select"></select></div>
+      <div class="field"><label>Giọng đọc video AI</label><select id="creator-voice-select"><option value="">Mặc định</option></select><div id="creator-voice-help" style="font-size:11px;color:var(--text-dim);margin-top:5px"></div></div>
+      <div class="field">
+        <label>Nguồn hình ảnh</label>
+        <select id="creator-image-provider">
+          <option value="stock">Pexels / Pixabay</option>
+          <option value="cpu_ai">AI Sinh Ảnh</option>
+          <option value="ai_video">AI Sinh Video (GPU)</option>
+        </select>
+      </div>
     </div>
     <div class="field">
       <label>Video keyword</label>
@@ -351,22 +456,59 @@
         <button class="btn secondary small" id="creator-script-generate" type="button">Gen visual brief từ chủ đề</button>
       </div>
     </div>
-    <button class="btn" id="creator-submit-btn">Tạo video AI</button>
+    <div class="field">
+      <label>Kịch bản voice &amp; subtitle (mỗi dòng là một câu thoại)</label>
+      <textarea id="creator-narration" rows="5" placeholder="Đây mới là nội dung được đọc và hiển thị subtitle. Visual brief phía trên chỉ dùng để tìm cảnh."></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn secondary small" id="creator-narration-generate" type="button">Gen kịch bản voice</button>
+      </div>
+    </div>
+    <button class="btn" id="creator-submit-btn" disabled>Tạo video AI</button>
+    <div class="creator-progress hidden" id="creator-progress" aria-live="polite">
+      <div class="creator-progress-head"><span id="creator-progress-label">Đang chuẩn bị...</span><strong id="creator-progress-percent">0%</strong></div>
+      <div class="progress-track"><div class="progress-fill" id="creator-progress-fill"></div></div>
+    </div>
     <div id="creator-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
+
+  </main>
+  <aside class="result-column">
+  <div class="card latest-result hidden" id="latest-result-card">
+    <h3 class="section-title">Video đang xem</h3>
+    <video id="latest-result-video" controls preload="metadata"></video>
+    <div class="latest-result-title" id="latest-result-title"></div>
   </div>
 
   <div class="card">
     <h3 style="margin-top:0">Lịch sử</h3>
     <div class="history-toolbar">
       <input id="history-search" placeholder="Tìm theo tên hoặc link...">
-      <input type="date" id="history-date-from" title="Từ ngày">
-      <input type="date" id="history-date-to" title="Đến ngày">
+      <div><label>Từ ngày</label><input type="date" id="history-date-from"></div>
+      <div><label>Đến ngày</label><input type="date" id="history-date-to"></div>
       <button class="btn secondary small" id="history-clear-btn">Xoá lọc</button>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
+      <label style="margin:0"><input type="checkbox" id="history-select-all" style="width:auto"> Chọn tất cả</label>
+      <button class="btn danger small" id="history-bulk-delete" disabled>Xoá mục đã chọn</button>
+      <span id="history-selected-count" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
     <div id="job-list"></div>
     <div id="empty-history" class="hidden">
       Chưa có video nào. Dán link ở trên để bắt đầu — có thể dán nhiều link (mỗi dòng 1 link) để xử lý hàng loạt,
       chọn giọng đọc, chèn logo riêng, hoặc tick "xem &amp; sửa phụ đề trước khi render" nếu muốn tinh chỉnh bản dịch.
+    </div>
+  </div>
+  </aside>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal-backdrop hidden">
+  <div class="modal" style="max-width:430px;text-align:center">
+    <h3 id="confirm-title" style="margin-top:0">Xác nhận</h3>
+    <p id="confirm-message" style="color:var(--text-dim);line-height:1.6"></p>
+    <div class="row" style="margin-top:20px;gap:10px">
+      <button class="btn secondary" id="confirm-cancel">Hủy</button>
+      <button class="btn danger" id="confirm-accept">Xóa</button>
     </div>
   </div>
 </div>
@@ -376,6 +518,7 @@
     <button class="modal-close" id="review-close">×</button>
     <h3>Chỉnh sửa phụ đề trước khi render</h3>
     <p class="sub" style="margin-top:-8px">Sửa lại câu dịch cho tự nhiên hơn, rồi bấm Render. Thời gian (giây) giữ nguyên theo video gốc.</p>
+    <video id="review-source-video" controls preload="metadata"></video>
     <div id="review-segments-list"></div>
     <div class="row" style="margin-top:14px;gap:10px">
       <button class="btn secondary" id="review-save-btn" style="flex:1">Lưu thay đổi</button>
@@ -403,6 +546,7 @@
     <button class="modal-close" id="topup-close">×</button>
     <h3>Nạp token</h3>
     <div class="topup-packages" id="topup-packages"></div>
+    <div id="payment-box" class="payment-box"></div>
     <div class="field">
       <label>Ghi chú thanh toán</label>
       <textarea id="topup-note" rows="3" placeholder="VD: đã chuyển khoản, mã giao dịch, số điện thoại..."></textarea>
@@ -422,8 +566,10 @@
     <button class="modal-close" id="preview-close">×</button>
     <h3>Xem trước</h3>
     <video id="preview-video" controls></video>
+    <div id="prepublish-result" class="hidden" style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:8px"></div>
     <div style="margin-top: 14px; display:flex; gap:10px;">
       <a class="btn" id="preview-download">Tải xuống</a>
+      <button class="btn secondary" id="prepublish-check-btn">Kiểm tra trước đăng</button>
       <button class="btn secondary" id="preview-publish-btn">Đăng lên mạng xã hội</button>
     </div>
   </div>
@@ -448,7 +594,12 @@
       <input id="publish-hashtags" placeholder="#anime #shortdrama">
       <div id="publish-hashtag-suggestions" style="margin-top:6px"></div>
     </div>
-    <button class="btn" id="publish-submit">Đăng ngay</button>
+    <div class="field"><label>Hẹn giờ đăng (theo giờ trên thiết bị)</label><input type="datetime-local" id="publish-scheduled-at"></div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" id="publish-submit">Đăng ngay</button>
+      <button class="btn secondary" id="publish-schedule">Hẹn giờ đăng</button>
+    </div>
+    <div id="scheduled-posts" style="margin-top:12px"></div>
     <div id="publish-results"></div>
   </div>
 </div>
@@ -498,7 +649,7 @@
   <div class="card">
     <h3 style="margin-top:0">Góp ý / Báo lỗi từ người dùng</h3>
     <table class="admin-table" id="admin-feedback-table">
-      <thead><tr><th>Người dùng</th><th>Nội dung</th><th>Trang</th><th>Thời gian</th></tr></thead>
+      <thead><tr><th>Người dùng / Liên hệ</th><th>Nội dung</th><th>Trang</th><th>Thời gian</th></tr></thead>
       <tbody id="admin-feedback-body"></tbody>
     </table>
     <div id="admin-feedback-empty" class="hidden" style="color:var(--text-dim);font-size:13px">Chưa có góp ý nào.</div>
@@ -507,11 +658,48 @@
 
 <script>
 const $ = (sel) => document.querySelector(sel);
+const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, ch => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
+}[ch]));
 let currentJobId = null;
 let selectedPlatforms = new Set();
 let pollTimer = null;
 let pollTimer2 = null;
 let selectedTopupPackage = null;
+let selectedHistoryJobs = new Set();
+let latestResultJobId = null;
+let _confirmResolver = null;
+
+function showConfirmDialog(title, message, confirmLabel = "Xóa") {
+  $("#confirm-title").textContent = title;
+  $("#confirm-message").textContent = message;
+  $("#confirm-accept").textContent = confirmLabel;
+  $("#confirm-modal").classList.remove("hidden");
+  return new Promise(resolve => { _confirmResolver = resolve; });
+}
+
+function closeConfirmDialog(accepted) {
+  $("#confirm-modal").classList.add("hidden");
+  const resolve = _confirmResolver;
+  _confirmResolver = null;
+  if (resolve) resolve(accepted);
+}
+
+$("#confirm-cancel").onclick = () => closeConfirmDialog(false);
+$("#confirm-accept").onclick = () => closeConfirmDialog(true);
+$("#confirm-modal").addEventListener("click", ev => {
+  if (ev.target === $("#confirm-modal")) closeConfirmDialog(false);
+});
+
+function showHistoryVideo(job) {
+  if (!job || !job.has_video) return;
+  $("#latest-result-card").classList.remove("hidden");
+  $("#latest-result-title").textContent = job.title || job.source_url;
+  if (latestResultJobId !== job.id) {
+    latestResultJobId = job.id;
+    $("#latest-result-video").src = `/api/jobs/${job.id}/video`;
+  }
+}
 const TOPUP_PACKAGES = [
   { credits: 50, amount_vnd: 50000 },
   { credits: 120, amount_vnd: 100000 },
@@ -539,13 +727,14 @@ async function initAuth() {
   needsRegistrationGlobal = boot.needs_registration;
 
   if (needsRegistrationGlobal) {
-    // First-ever account on this server: nothing to log into yet, so only
-    // "Đăng ký" makes sense — hide the "Đăng nhập" button entirely instead
-    // of leaving a button that can only ever fail.
     $("#auth-title").textContent = "Tạo tài khoản admin";
     $("#auth-sub").textContent = "Tài khoản đầu tiên sẽ là quản trị viên hệ thống";
-    $("#auth-login-btn").classList.add("hidden");
-    $("#auth-register-btn").style.flex = "1 1 100%";
+    // Keep both tabs visible even on a brand-new database. The first visit
+    // opens registration because an admin must be created, but an existing
+    // user can always switch back to Login (for example after changing the
+    // local database path or restoring a database).
+    $("#show-login-tab").classList.remove("hidden");
+    showAuthTab("register");
   }
 
   // Buttons always stay clickable — this way clicking one always DOES
@@ -577,24 +766,37 @@ async function initAuth() {
   // Someone followed a friend's invite link (?ref=CODE) — prefill it so
   // they don't have to type/paste it manually.
   if (params.get("ref")) {
-    $("#auth-referral-code").value = params.get("ref");
+    $("#register-referral-code").value = params.get("ref");
+    showAuthTab("register");
   }
 }
 
-// Pressing Enter in either field submits the <form>, which defaults to the
-// "Đăng nhập" action (the submit button) — same as clicking it. "Đăng ký"
-// is a separate, non-submit button so it never fires from Enter by accident.
-$("#auth-form").addEventListener("submit", (ev) => {
+function showAuthTab(tab) {
+  const isLogin = tab === "login";
+  $("#login-form").classList.toggle("hidden", !isLogin);
+  $("#register-form").classList.toggle("hidden", isLogin);
+  $("#show-login-tab").classList.toggle("active", isLogin);
+  $("#show-register-tab").classList.toggle("active", !isLogin);
+  $("#auth-title").textContent = isLogin ? "Đăng nhập" : (needsRegistrationGlobal ? "Tạo tài khoản admin" : "Đăng ký");
+  $("#auth-error").textContent = "";
+}
+
+$("#show-login-tab").onclick = () => showAuthTab("login");
+$("#show-register-tab").onclick = () => showAuthTab("register");
+$("#login-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   doLogin();
 });
-$("#auth-register-btn").addEventListener("click", () => doRegister());
+$("#register-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  doRegister();
+});
 
 async function doLogin() {
   $("#auth-error").textContent = "";
   try {
     await api("/api/login", { method: "POST", body: JSON.stringify({
-      identifier: $("#auth-identifier").value.trim(), password: $("#auth-password").value,
+      identifier: $("#login-identifier").value.trim(), password: $("#login-password").value,
     })});
     const me = await api("/api/me");
     showApp(me);
@@ -605,8 +807,10 @@ async function doRegister() {
   $("#auth-error").textContent = "";
   try {
     await api("/api/register", { method: "POST", body: JSON.stringify({
-      identifier: $("#auth-identifier").value.trim(), password: $("#auth-password").value,
-      referral_code: $("#auth-referral-code").value.trim() || null,
+      contact_identifier: $("#register-contact").value.trim(),
+      username: $("#register-username").value.trim(),
+      password: $("#register-password").value,
+      referral_code: $("#register-referral-code").value.trim() || null,
     })});
     const me = await api("/api/me");
     showApp(me);
@@ -627,6 +831,7 @@ function showApp(me) {
   $("#userbar-credits").textContent = `💳 ${me.credits}`;
   $("#admin-btn").classList.toggle("hidden", !me.is_admin);
   $("#feedback-fab").classList.remove("hidden");
+  $("#feedback-header-btn").classList.remove("hidden");
 
   $("#referral-link").textContent = `${location.origin}/?ref=${me.referral_code}`;
   loadLanguages();
@@ -739,12 +944,30 @@ async function loadTopupHistory() {
   `).join("") || `<tr><td colspan="4" style="color:var(--text-dim)">Chưa có yêu cầu nạp nào.</td></tr>`;
 }
 
+function renderPayment(payment, amount = 0, content = "") {
+  const box = $("#payment-box");
+  if (!payment || !payment.configured) {
+    box.innerHTML = `<div style="color:var(--warn)">Chưa cấu hình tài khoản nhận tiền. Admin cần thêm PAYMENT_BANK_ID, PAYMENT_ACCOUNT_NUMBER và PAYMENT_ACCOUNT_NAME vào .env rồi khởi động lại web.</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <b>Chuyển khoản ngân hàng</b>
+    ${payment.qr_url ? `<img src="${escapeHtml(payment.qr_url)}" alt="QR thanh toán">` : ""}
+    <div class="payment-line"><span>Ngân hàng</span><b>${escapeHtml(payment.bank_name || payment.bank_id)}</b></div>
+    <div class="payment-line"><span>Số tài khoản</span><b>${escapeHtml(payment.account_number)}</b></div>
+    <div class="payment-line"><span>Chủ tài khoản</span><b>${escapeHtml(payment.account_name)}</b></div>
+    ${amount ? `<div class="payment-line"><span>Số tiền</span><b>${_formatVnd(amount)}</b></div>` : ""}
+    ${content ? `<div class="payment-line"><span>Nội dung CK</span><b>${escapeHtml(content)}</b></div>` : `<div style="color:var(--text-dim);font-size:12px;margin-top:8px">Chọn gói và gửi yêu cầu để tạo đúng số tiền, nội dung và mã QR.</div>`}
+  `;
+}
+
 $("#topup-btn").onclick = async () => {
   $("#topup-status").textContent = "";
   renderTopupPackages();
   $("#topup-modal").classList.remove("hidden");
   try {
-    await loadTopupHistory();
+    const [payment] = await Promise.all([api("/api/payment-config"), loadTopupHistory()]);
+    renderPayment(payment);
   } catch (e) {
     $("#topup-status").style.color = "var(--err)";
     $("#topup-status").textContent = e.message;
@@ -755,7 +978,7 @@ $("#topup-submit").onclick = async () => {
   $("#topup-status").textContent = "";
   const pkg = selectedTopupPackage || TOPUP_PACKAGES[1];
   try {
-    await api("/api/top-up-requests", { method: "POST", body: JSON.stringify({
+    const result = await api("/api/top-up-requests", { method: "POST", body: JSON.stringify({
       credits: pkg.credits,
       amount_vnd: pkg.amount_vnd,
       payment_method: "bank_transfer",
@@ -763,7 +986,8 @@ $("#topup-submit").onclick = async () => {
     })});
     $("#topup-note").value = "";
     $("#topup-status").style.color = "var(--ok)";
-    $("#topup-status").textContent = "Đã gửi yêu cầu. Admin duyệt xong credit sẽ tự cộng vào tài khoản.";
+    renderPayment(result.payment, pkg.amount_vnd, result.transfer_content);
+    $("#topup-status").textContent = "Đã tạo yêu cầu. Quét QR/chuyển khoản đúng nội dung; admin duyệt xong token sẽ tự cộng.";
     await loadTopupHistory();
   } catch (e) {
     $("#topup-status").style.color = "var(--err)";
@@ -777,9 +1001,12 @@ async function loadLanguages() {
     const { targets, sources } = await api("/api/languages");
     $("#lang-select").innerHTML = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
     $("#lang-select").value = "vi";
+    $("#creator-lang-select").innerHTML = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
+    $("#creator-lang-select").value = "vi";
     $("#source-lang-select").innerHTML = sources.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
     $("#source-lang-select").value = "auto";
     loadVoices();
+    loadCreatorVoices();
   } catch (e) { /* keep whatever was already in the selects if this fails */ }
 }
 
@@ -793,6 +1020,29 @@ async function loadVoices() {
   }
 }
 $("#lang-select").addEventListener("change", loadVoices);
+
+async function loadCreatorVoices() {
+  try {
+    const { voices, language_label, default_voice } = await api(`/api/voices?language=${encodeURIComponent($("#creator-lang-select").value)}`);
+    $("#creator-voice-select").innerHTML = `<option value="">Mặc định · ${default_voice}</option>` +
+      voices.map(v => `<option value="${v.id}">${v.label}</option>`).join("");
+    $("#creator-voice-help").textContent = `${language_label}: ${voices.length} lựa chọn giọng đọc`;
+  } catch {
+    $("#creator-voice-select").innerHTML = `<option value="">Mặc định theo ngôn ngữ</option>`;
+    $("#creator-voice-help").textContent = "Không tải được danh sách giọng đọc";
+  }
+}
+$("#creator-lang-select").addEventListener("change", async () => {
+  await loadCreatorVoices();
+  $("#creator-keywords").value = "";
+  $("#creator-script").value = "";
+  $("#creator-narration").value = "";
+  window._creatorSuggestionCache = null;
+  window._creatorSuggestionPending = null;
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = "Đã đổi ngôn ngữ. Hãy gen lại nội dung để đồng nhất.";
+  updateCreatorSubmitState();
+});
 
 // ---------------- logo overlay ----------------
 let uploadedLogoId = null;
@@ -877,23 +1127,154 @@ $("#submit-btn").onclick = async () => {
 async function loadCreatorSuggestions() {
   const topic = $("#creator-topic").value.trim();
   if (!topic) throw new Error("Nhập chủ đề video trước");
-  return api("/api/creator/suggestions", { method: "POST", body: JSON.stringify({
+  const requestBody = {
     topic,
-    target_language: $("#lang-select").value || "vi",
-  })});
+    target_language: $("#creator-lang-select").value || "vi",
+    aspect_ratio: $("#creator-aspect").value,
+    duration_seconds: parseInt($("#creator-duration").value, 10),
+    transition: $("#creator-transition").value,
+  };
+  const cacheKey = JSON.stringify(requestBody);
+  if (window._creatorSuggestionCache && window._creatorSuggestionCache.key === cacheKey) {
+    return window._creatorSuggestionCache.data;
+  }
+  // Reuse an in-flight request too: clicking Keyword, Visual and Voice in
+  // quick succession must generate once, not spend three API quota units.
+  if (window._creatorSuggestionPending && window._creatorSuggestionPending.key === cacheKey) {
+    return window._creatorSuggestionPending.promise;
+  }
+  const promise = api("/api/creator/suggestions", { method: "POST", body: JSON.stringify(requestBody) })
+    .then(data => {
+      if (data.generator && data.generator !== "template") {
+        window._creatorSuggestionCache = { key: cacheKey, data };
+      }
+      return data;
+    })
+    .finally(() => {
+      if (window._creatorSuggestionPending && window._creatorSuggestionPending.key === cacheKey) {
+        window._creatorSuggestionPending = null;
+      }
+    });
+  window._creatorSuggestionPending = { key: cacheKey, promise };
+  return promise;
 }
 
+function creatorGeneratorMessage(data, successText) {
+  if (data.warning) return data.warning;
+  const searched = (data.search_queries || []).slice(0, 2).join(" · ");
+  const grounding = data.grounded ? " + Google Search" : "";
+  return `${successText} bằng ${data.model || "AI"}${grounding}${data.cached ? " (cache)" : ""}${searched ? ` (${searched})` : ""}.`;
+}
+
+const creatorGenerateButtons = [
+  $("#creator-keywords-generate"),
+  $("#creator-script-generate"),
+  $("#creator-narration-generate"),
+];
+creatorGenerateButtons.forEach(button => { button.dataset.idleLabel = button.textContent; });
+
+function setCreatorGenerationLoading(activeButton, loading, loadingLabel = "Đang gen...") {
+  creatorGenerateButtons.forEach(button => { button.disabled = loading; });
+  if (loading) {
+    activeButton.classList.add("is-loading");
+    activeButton.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span>${loadingLabel}</span>`;
+    activeButton.setAttribute("aria-busy", "true");
+  } else {
+    creatorGenerateButtons.forEach(button => {
+      button.classList.remove("is-loading");
+      button.textContent = button.dataset.idleLabel;
+      button.removeAttribute("aria-busy");
+    });
+  }
+}
+
+let activeCreatorJobId = null;
+let creatorJobSubmitting = false;
+
+function creatorFormComplete() {
+  return Boolean(
+    $("#creator-topic").value.trim() &&
+    $("#creator-keywords").value.trim() &&
+    $("#creator-script").value.trim() &&
+    $("#creator-narration").value.trim()
+  );
+}
+
+function updateCreatorSubmitState() {
+  const button = $("#creator-submit-btn");
+  if (creatorJobSubmitting || activeCreatorJobId) return;
+  button.disabled = !creatorFormComplete();
+  button.title = button.disabled
+    ? "Cần đủ chủ đề, keyword, visual brief và kịch bản voice"
+    : "Tạo video từ nội dung đã chuẩn bị";
+}
+
+function setCreatorSubmitLoading(loading, label = "Đang tạo video...") {
+  const button = $("#creator-submit-btn");
+  creatorJobSubmitting = loading;
+  button.classList.toggle("is-loading", loading);
+  button.disabled = loading || !creatorFormComplete();
+  button.innerHTML = loading
+    ? `<span class="loading-spinner" aria-hidden="true"></span><span>${label}</span>`
+    : "Tạo video AI";
+  if (loading) button.setAttribute("aria-busy", "true");
+  else button.removeAttribute("aria-busy");
+}
+
+function jobProgress(job) {
+  if (!job) return 0;
+  if (job.status === "done") return 100;
+  if (job.status === "error") return 0;
+  if (job.status === "queued") return 2;
+  const note = (job.progress_note || "").toLowerCase();
+  const explicit = note.match(/^\[(\d{1,3})%\]/);
+  if (explicit) return Math.max(0, Math.min(100, Number(explicit[1])));
+  const scene = note.match(/(?:lấy|dựng) cảnh\s+(\d+)\/(\d+)/) || note.match(/khung hình\s+(\d+)\/(\d+)/);
+  if (scene) return Math.min(65, 10 + Math.round((Number(scene[1]) / Math.max(1, Number(scene[2]))) * 55));
+  if (note.includes("ghép") && note.includes("chuyển cảnh")) return 70;
+  if (note.includes("giọng đọc")) return 80;
+  if (note.includes("subtitle")) return 92;
+  if (note.includes("dựng video")) return 5;
+  if (note.includes("tải video")) return 5;
+  if (note.includes("dịch phụ đề")) return 45;
+  if (note.includes("dịch, lồng tiếng, render")) return 20;
+  if (note.includes("lồng tiếng") && note.includes("render")) return 70;
+  return job.status === "running" ? 5 : 0;
+}
+
+function jobProgressNote(job) {
+  return String(job.progress_note || "").replace(/^\[\d{1,3}%\]\s*/, "");
+}
+
+function showCreatorProgress(job) {
+  const percent = jobProgress(job);
+  $("#creator-progress").classList.remove("hidden");
+  $("#creator-progress-label").textContent = jobProgressNote(job) || "Đang xử lý video...";
+  $("#creator-progress-percent").textContent = `${percent}%`;
+  $("#creator-progress-fill").style.width = `${percent}%`;
+  setCreatorSubmitLoading(true, `Đang tạo ${percent}%`);
+}
+
+["creator-topic", "creator-keywords", "creator-script", "creator-narration"].forEach(id => {
+  $(`#${id}`).addEventListener("input", updateCreatorSubmitState);
+});
+
 $("#creator-keywords-generate").onclick = async () => {
+  const button = $("#creator-keywords-generate");
+  setCreatorGenerationLoading(button, true, "Đang gen keyword...");
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "Đang gen keyword...";
   try {
     const data = await loadCreatorSuggestions();
     $("#creator-keywords").value = data.keywords.join(", ");
     $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = "Đã gen keyword.";
+    $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen keyword");
   } catch (e) {
     $("#creator-error").style.color = "var(--err)";
     $("#creator-error").textContent = e.message;
+  } finally {
+    setCreatorGenerationLoading(button, false);
+    updateCreatorSubmitState();
   }
 };
 
@@ -912,6 +1293,8 @@ $("#creator-keywords-copy").onclick = async () => {
 };
 
 $("#creator-script-generate").onclick = async () => {
+  const button = $("#creator-script-generate");
+  setCreatorGenerationLoading(button, true, "Đang gen visual brief...");
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "Đang gen visual brief...";
   try {
@@ -919,10 +1302,32 @@ $("#creator-script-generate").onclick = async () => {
     $("#creator-script").value = data.visual_brief || data.script;
     if (!$("#creator-keywords").value.trim()) $("#creator-keywords").value = data.keywords.join(", ");
     $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = "Đã gen visual brief.";
+    $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen visual brief");
   } catch (e) {
     $("#creator-error").style.color = "var(--err)";
     $("#creator-error").textContent = e.message;
+  } finally {
+    setCreatorGenerationLoading(button, false);
+    updateCreatorSubmitState();
+  }
+};
+
+$("#creator-narration-generate").onclick = async () => {
+  const button = $("#creator-narration-generate");
+  setCreatorGenerationLoading(button, true, "Đang gen voice...");
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = "Đang gen kịch bản voice...";
+  try {
+    const data = await loadCreatorSuggestions();
+    $("#creator-narration").value = data.narration_script;
+    $("#creator-error").style.color = "var(--ok)";
+    $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen kịch bản voice");
+  } catch (e) {
+    $("#creator-error").style.color = "var(--err)";
+    $("#creator-error").textContent = e.message;
+  } finally {
+    setCreatorGenerationLoading(button, false);
+    updateCreatorSubmitState();
   }
 };
 
@@ -932,42 +1337,44 @@ $("#creator-topic").addEventListener("blur", async () => {
     const data = await loadCreatorSuggestions();
     $("#creator-keywords").value = data.keywords.join(", ");
   } catch { /* non-critical convenience */ }
+  finally { updateCreatorSubmitState(); }
 });
 
 $("#creator-submit-btn").onclick = async () => {
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "";
   const topic = $("#creator-topic").value.trim();
-  if (!topic) { $("#creator-error").textContent = "Nhập chủ đề video trước"; return; }
-  $("#creator-submit-btn").disabled = true;
+  if (!creatorFormComplete()) {
+    $("#creator-error").textContent = "Cần nhập đủ keyword, visual brief và kịch bản voice trước khi tạo video.";
+    updateCreatorSubmitState();
+    return;
+  }
+  setCreatorSubmitLoading(true, "Đang gửi job...");
   try {
-    $("#creator-error").textContent = "Đang chuẩn bị job tạo video...";
-    let script = $("#creator-script").value.trim();
-    if (!script) {
-      $("#creator-error").textContent = "Visual brief đang trống, tự gen từ chủ đề...";
-      const data = await loadCreatorSuggestions();
-      script = data.visual_brief || data.script;
-      $("#creator-script").value = script;
-      if (!$("#creator-keywords").value.trim()) $("#creator-keywords").value = data.keywords.join(", ");
-    }
     $("#creator-error").textContent = "Đang gửi job tạo video...";
-    await api("/api/creator/jobs", { method: "POST", body: JSON.stringify({
+    const job = await api("/api/creator/jobs", { method: "POST", body: JSON.stringify({
       topic,
-      script,
-      target_language: $("#lang-select").value || "vi",
+      script: $("#creator-script").value.trim(),
+      narration_script: $("#creator-narration").value.trim(),
+      target_language: $("#creator-lang-select").value || "vi",
       aspect_ratio: $("#creator-aspect").value,
       duration_seconds: parseInt($("#creator-duration").value, 10) || 30,
+      transition: $("#creator-transition").value,
+      tts_voice: $("#creator-voice-select").value || null,
+      image_provider: $("#creator-image-provider").value,
     })});
-    $("#creator-topic").value = "";
+    activeCreatorJobId = job.id;
+    showCreatorProgress(job);
     $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = "Đã tạo job. Xem tiến độ trong Lịch sử.";
+    $("#creator-error").textContent = "Đã nhận job. Tiến độ sẽ được cập nhật tự động.";
     refreshJobs();
     refreshMe();
   } catch (e) {
+    activeCreatorJobId = null;
     $("#creator-error").style.color = "var(--err)";
     $("#creator-error").textContent = e.message;
   } finally {
-    $("#creator-submit-btn").disabled = false;
+    if (!activeCreatorJobId) setCreatorSubmitLoading(false);
   }
 };
 
@@ -990,6 +1397,37 @@ async function refreshJobs() {
   const qs = params.toString();
 
   const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
+  if (!activeCreatorJobId) {
+    const runningCreator = jobs.find(job =>
+      String(job.source_url || "").startsWith("creator:") &&
+      (job.status === "queued" || job.status === "running")
+    );
+    if (runningCreator) activeCreatorJobId = runningCreator.id;
+  }
+  if (activeCreatorJobId) {
+    const activeCreatorJob = jobs.find(job => job.id === activeCreatorJobId);
+    if (activeCreatorJob && (activeCreatorJob.status === "queued" || activeCreatorJob.status === "running")) {
+      showCreatorProgress(activeCreatorJob);
+    } else if (activeCreatorJob) {
+      const succeeded = activeCreatorJob.status === "done";
+      const percent = succeeded ? 100 : 0;
+      $("#creator-progress").classList.remove("hidden");
+      $("#creator-progress-label").textContent = succeeded ? "Hoàn tất video" : "Tạo video không thành công";
+      $("#creator-progress-percent").textContent = `${percent}%`;
+      $("#creator-progress-fill").style.width = `${percent}%`;
+      activeCreatorJobId = null;
+      setCreatorSubmitLoading(false);
+      updateCreatorSubmitState();
+    }
+  }
+  const latestDone = jobs.find(job => job.status === "done" && job.has_video);
+  // Pick an initial video once. Polling must never replace a video the user
+  // is currently watching merely because a newer job just completed.
+  if (latestResultJobId === null && latestDone) {
+    showHistoryVideo(latestDone);
+  } else if (latestResultJobId === null && !latestDone) {
+    $("#latest-result-card").classList.add("hidden");
+  }
   window._jobsById = Object.fromEntries(jobs.map(j => [j.id, j]));
   for (const job of jobs) {
     const prevStatus = _lastKnownStatus[job.id];
@@ -1007,29 +1445,48 @@ async function refreshJobs() {
     const created = new Date(job.created_at * 1000).toLocaleString("vi-VN");
     const hasSubtitles = job.segments && job.segments.length > 0;
     el.innerHTML = `
-      <div class="job-info">
-        <div class="job-url">${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
-        <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${job.progress_note || ""}</div>
+      <input type="checkbox" class="history-job-check" data-job-check="${job.id}" style="width:auto" ${selectedHistoryJobs.has(job.id) ? "checked" : ""}>
+      <div class="job-main">
+        <div class="job-head">
+          <div class="job-info">
+            <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
+            <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}</div>
+            ${(job.status === "queued" || job.status === "running" || job.status === "review" || job.status === "done") ? `
+              <div class="job-progress">
+                <div class="progress-track"><div class="progress-fill" style="width:${jobProgress(job)}%"></div></div>
+                <div class="job-progress-label">${jobProgress(job)}%</div>
+              </div>` : ""}
+          </div>
+          <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
+        </div>
+        <div class="job-actions">
+          ${job.status === "review" ? `<button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>` : ""}
+          ${job.has_video ? `
+            <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
+            <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
+          ` : ""}
+          ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>Tải .srt</a>` : ""}
+          ${job.status === "error" ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
+        </div>
       </div>
-      <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
-      <div class="job-actions">
-        ${job.status === "review" ? `
-          <button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>
-        ` : ""}
-        ${job.has_video ? `
-          <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
-          <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
-        ` : ""}
-        ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>Tải .srt</a>` : ""}
-        ${job.status === "error" ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
-        <button class="btn danger small" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
-      </div>
+      <button class="btn danger small job-delete" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
     `;
     list.appendChild(el);
   }
   list.querySelectorAll("[data-preview]").forEach(btn => {
     btn.onclick = () => openPreview(btn.dataset.preview);
   });
+  list.querySelectorAll("[data-play-video]").forEach(title => {
+    title.onclick = () => showHistoryVideo(window._jobsById[title.dataset.playVideo]);
+  });
+  list.querySelectorAll("[data-job-check]").forEach(box => {
+    box.onchange = () => {
+      if (box.checked) selectedHistoryJobs.add(box.dataset.jobCheck);
+      else selectedHistoryJobs.delete(box.dataset.jobCheck);
+      updateHistorySelection(jobs);
+    };
+  });
+  updateHistorySelection(jobs);
   list.querySelectorAll("[data-publish]").forEach(btn => {
     btn.onclick = () => openPublish(btn.dataset.publish);
   });
@@ -1046,12 +1503,62 @@ async function refreshJobs() {
   });
   list.querySelectorAll("[data-delete]").forEach(btn => {
     btn.onclick = async () => {
-      if (!confirm("Xoá mục này khỏi lịch sử? Không thể hoàn tác.")) return;
-      try { await api(`/api/jobs/${btn.dataset.delete}`, { method: "DELETE" }); refreshJobs(); }
+      const job = window._jobsById[btn.dataset.delete];
+      const label = job ? (job.title || job.source_url) : "video này";
+      const accepted = await showConfirmDialog(
+        "Xóa video khỏi lịch sử?",
+        `Bạn có chắc muốn xóa “${label}”? Video và dữ liệu liên quan sẽ không thể khôi phục.`,
+        "Xóa video",
+      );
+      if (!accepted) return;
+      try {
+        await api(`/api/jobs/${btn.dataset.delete}`, { method: "DELETE" });
+        if (latestResultJobId === btn.dataset.delete) {
+          latestResultJobId = null;
+          $("#latest-result-video").removeAttribute("src");
+          $("#latest-result-video").load();
+        }
+        refreshJobs();
+      }
       catch (e) { alert(e.message); }
     };
   });
 }
+
+function updateHistorySelection(jobs = []) {
+  const visibleIds = jobs.map(j => j.id);
+  const selectedVisible = visibleIds.filter(id => selectedHistoryJobs.has(id)).length;
+  $("#history-selected-count").textContent = selectedHistoryJobs.size ? `${selectedHistoryJobs.size} mục đã chọn` : "";
+  $("#history-bulk-delete").disabled = selectedHistoryJobs.size === 0;
+  $("#history-select-all").checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
+  $("#history-select-all").indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
+}
+
+$("#history-select-all").onchange = () => {
+  const ids = Object.keys(window._jobsById || {});
+  ids.forEach(id => $("#history-select-all").checked ? selectedHistoryJobs.add(id) : selectedHistoryJobs.delete(id));
+  refreshJobs();
+};
+$("#history-bulk-delete").onclick = async () => {
+  const ids = [...selectedHistoryJobs];
+  if (!ids.length) return;
+  const accepted = await showConfirmDialog(
+    `Xóa ${ids.length} video đã chọn?`,
+    "Tất cả video và dữ liệu liên quan trong những mục đã chọn sẽ bị xóa vĩnh viễn. Thao tác này không thể hoàn tác.",
+    `Xóa ${ids.length} video`,
+  );
+  if (!accepted) return;
+  try {
+    const result = await api("/api/jobs/bulk-delete", { method: "POST", body: JSON.stringify({ job_ids: ids }) });
+    if (latestResultJobId && ids.includes(latestResultJobId)) {
+      latestResultJobId = null;
+      $("#latest-result-video").removeAttribute("src");
+      $("#latest-result-video").load();
+    }
+    selectedHistoryJobs.clear();
+    await refreshJobs();
+  } catch (e) { alert(e.message); }
+};
 
 let _historySearchDebounce = null;
 $("#history-search").addEventListener("input", () => {
@@ -1073,13 +1580,28 @@ let currentReviewJobId = null;
 async function openReview(jobId) {
   currentReviewJobId = jobId;
   $("#review-error").textContent = "";
+  const sourceVideo = $("#review-source-video");
+  sourceVideo.src = `/api/jobs/${jobId}/source-video`;
   const { segments } = await api(`/api/jobs/${jobId}/segments`);
   $("#review-segments-list").innerHTML = segments.map((s, i) => `
-    <div class="review-segment">
+    <div class="review-segment" data-segment-row="${i}" data-start="${s.start}" data-end="${s.end}">
       <div class="seg-time">${_fmtTime(s.start)} → ${_fmtTime(s.end)}</div>
       <textarea data-idx="${i}" data-start="${s.start}" data-end="${s.end}">${_escapeHtml(s.text)}</textarea>
     </div>
   `).join("");
+  $("#review-segments-list").querySelectorAll("[data-segment-row]").forEach(row => {
+    row.onclick = ev => {
+      if (ev.target.tagName === "TEXTAREA") return;
+      sourceVideo.currentTime = Number(row.dataset.start);
+      sourceVideo.play().catch(() => {});
+    };
+  });
+  sourceVideo.ontimeupdate = () => {
+    const current = sourceVideo.currentTime;
+    $("#review-segments-list").querySelectorAll("[data-segment-row]").forEach(row => {
+      row.classList.toggle("active", current >= Number(row.dataset.start) && current < Number(row.dataset.end));
+    });
+  };
   $("#review-modal").classList.remove("hidden");
 }
 
@@ -1095,7 +1617,11 @@ function _collectReviewSegments() {
   }));
 }
 
-$("#review-close").onclick = () => $("#review-modal").classList.add("hidden");
+$("#review-close").onclick = () => {
+  $("#review-modal").classList.add("hidden");
+  $("#review-source-video").pause();
+  $("#review-source-video").removeAttribute("src");
+};
 
 $("#review-save-btn").onclick = async () => {
   $("#review-error").textContent = "";
@@ -1116,6 +1642,8 @@ $("#review-render-btn").onclick = async () => {
     });
     await api(`/api/jobs/${currentReviewJobId}/render`, { method: "POST" });
     $("#review-modal").classList.add("hidden");
+    $("#review-source-video").pause();
+    $("#review-source-video").removeAttribute("src");
     refreshJobs();
   } catch (e) { $("#review-error").textContent = e.message; }
 };
@@ -1126,6 +1654,7 @@ $("#feedback-fab").onclick = () => {
   $("#feedback-message").value = "";
   $("#feedback-modal").classList.remove("hidden");
 };
+$("#feedback-header-btn").onclick = () => $("#feedback-fab").click();
 $("#feedback-close").onclick = () => $("#feedback-modal").classList.add("hidden");
 $("#feedback-submit-btn").onclick = async () => {
   const message = $("#feedback-message").value.trim();
@@ -1142,12 +1671,38 @@ function openPreview(jobId) {
   currentJobId = jobId;
   $("#preview-video").src = `/api/jobs/${jobId}/video`;
   $("#preview-download").href = `/api/jobs/${jobId}/video?download=true`;
+  $("#prepublish-check-btn").dataset.jobId = jobId;
+  $("#prepublish-result").classList.add("hidden");
+  $("#prepublish-result").innerHTML = "";
   $("#preview-modal").classList.remove("hidden");
 }
 $("#preview-close").onclick = () => {
   $("#preview-modal").classList.add("hidden");
   $("#preview-video").pause();
   $("#preview-video").src = "";
+};
+
+$("#prepublish-check-btn").onclick = async () => {
+  const box = $("#prepublish-result");
+  box.classList.remove("hidden");
+  box.innerHTML = `<span style="color:var(--text-dim)">Đang đọc thông số video...</span>`;
+  try {
+    const report = await api(`/api/jobs/${$("#prepublish-check-btn").dataset.jobId}/prepublish-check`);
+    const facts = report.facts;
+    const issues = report.issues.length ? report.issues.map(item =>
+      `<div style="color:${item.severity === 'error' ? 'var(--err)' : 'var(--warn)'};margin-top:5px">• ${_escapeHtml(item.message)}</div>`
+    ).join("") : `<div style="color:var(--accent);margin-top:5px">Không phát hiện lỗi kỹ thuật cơ bản.</div>`;
+    const platforms = report.platforms.map(item =>
+      `<div style="margin-top:5px"><b>${_escapeHtml(item.platform)} · ${_escapeHtml(item.format_name)}</b>: ` +
+      `<span style="color:${item.status === 'ready' ? 'var(--accent)' : 'var(--warn)'}">${item.status === 'ready' ? 'Phù hợp' : 'Cần điều chỉnh'}</span>` +
+      `<div style="font-size:12px;color:var(--text-dim)">${_escapeHtml(item.message)}</div></div>`
+    ).join("");
+    box.innerHTML = `<div style="font-weight:600">${report.ready ? '✓ Có thể tiếp tục kiểm tra bằng mắt' : '⚠ Có lỗi cần xử lý'}</div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:4px">${facts.width}×${facts.height} · ${facts.fps} FPS · ${facts.duration}s · ${facts.video_codec}/${facts.audio_codec || 'không audio'}</div>
+      ${issues}<div style="margin-top:10px;font-weight:600">Độ phù hợp nền tảng</div>${platforms}`;
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--err)">${_escapeHtml(e.message)}</span>`;
+  }
 };
 
 $("#preview-publish-btn").onclick = () => {
@@ -1161,6 +1716,7 @@ function openPublish(jobId) {
   $("#publish-modal").classList.remove("hidden");
   loadConnections();
   _prefillPublishSuggestions(jobId);
+  loadScheduledPosts();
 }
 $("#publish-close").onclick = () => $("#publish-modal").classList.add("hidden");
 
@@ -1293,6 +1849,41 @@ $("#publish-submit").onclick = async () => {
   }
 };
 
+async function loadScheduledPosts() {
+  try {
+    const rows = await api("/api/scheduled-posts");
+    $("#scheduled-posts").innerHTML = rows.slice(0, 5).map(r => `
+      <div class="connect-card"><b>${escapeHtml(r.title)}</b><div class="connect-sub">
+      ${r.platforms.map(p => PLATFORM_LABEL[p] || p).join(", ")} · ${new Date(r.scheduled_at * 1000).toLocaleString("vi-VN")} · ${r.status}
+      </div>${r.status === "pending" ? `<button class="btn danger small" data-cancel-schedule="${r.id}" style="margin-top:8px">Huỷ lịch</button>` : ""}</div>`).join("");
+    $("#scheduled-posts").querySelectorAll("[data-cancel-schedule]").forEach(btn => {
+      btn.onclick = async () => {
+        await api(`/api/scheduled-posts/${btn.dataset.cancelSchedule}`, { method: "DELETE" });
+        loadScheduledPosts();
+      };
+    });
+  } catch { $("#scheduled-posts").innerHTML = ""; }
+}
+
+$("#publish-schedule").onclick = async () => {
+  if (selectedPlatforms.size === 0) { alert("Chọn ít nhất 1 nền tảng"); return; }
+  const localValue = $("#publish-scheduled-at").value;
+  if (!localValue) { alert("Chọn ngày và giờ đăng"); return; }
+  const scheduledAt = new Date(localValue).getTime() / 1000;
+  try {
+    await api(`/api/jobs/${currentJobId}/schedule-publish`, {
+      method: "POST", body: JSON.stringify({
+        platforms: [...selectedPlatforms], title: $("#publish-title").value,
+        description: $("#publish-desc").value,
+        hashtags: $("#publish-hashtags").value.split(/\s+/).filter(Boolean),
+        scheduled_at: scheduledAt,
+      }),
+    });
+    $("#publish-results").innerHTML = `<div class="publish-result ok">Đã lên lịch đăng tự động.</div>`;
+    loadScheduledPosts();
+  } catch (e) { $("#publish-results").innerHTML = `<div class="publish-result fail">${escapeHtml(e.message)}</div>`; }
+};
+
 // ---------------- admin ----------------
 $("#admin-btn").onclick = () => {
   $("#app-view").classList.add("hidden");
@@ -1380,7 +1971,7 @@ async function loadAdmin() {
   $("#admin-feedback-empty").classList.toggle("hidden", feedback.length > 0);
   $("#admin-feedback-body").innerHTML = feedback.map(f => `
     <tr>
-      <td>${f.username || "(ẩn danh)"}</td>
+      <td><b>${_escapeHtml(f.username || "(ẩn danh)")}</b><br><span style="color:var(--text-dim);font-size:12px">${_escapeHtml(f.email || f.phone || "Không có liên hệ")}</span></td>
       <td style="max-width:400px;white-space:pre-wrap">${_escapeHtml(f.message)}</td>
       <td>${f.page || ""}</td>
       <td>${new Date(f.created_at * 1000).toLocaleString("vi-VN")}</td>

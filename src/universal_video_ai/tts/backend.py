@@ -47,13 +47,19 @@ class EdgeTTSBackend:
         :param voice: explicit voice override; takes precedence over the
             language-based lookup.
         """
-        effective_voice = voice or voice_for_language(language, fallback=self.default_voice)
+        preset = voice or voice_for_language(language, fallback=self.default_voice)
+        parts = preset.split("|")
+        effective_voice = parts[0]
+        options = dict(part.split("=", 1) for part in parts[1:] if "=" in part)
         try:
             self.logger.debug(
                 "EdgeTTSBackend.synthesize: output=%s text_len=%d language=%s voice=%s",
                 output_path, len(text), language, effective_voice,
             )
-            return self._tts.synthesize(text, output_path, voice=effective_voice)
+            return self._tts.synthesize(
+                text, output_path, voice=effective_voice,
+                rate=options.get("rate"), pitch=options.get("pitch"),
+            )
         except SynthesisError:
             raise
         except Exception as exc:

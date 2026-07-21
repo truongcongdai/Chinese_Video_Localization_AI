@@ -19,6 +19,7 @@ from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.timeline.service import TimelineService
 from universal_video_ai.mixer.service import MixerService, TimedAudioClip
 from universal_video_ai.render.renderer import Renderer, TextOverlay
+from universal_video_ai.orchestrator.service import LocalizationService
 
 
 def test_whisper_transcribe_segments_preserves_timestamps(tmp_path: Path, monkeypatch):
@@ -157,3 +158,56 @@ def test_renderer_builds_per_segment_overlay_filters():
     assert "between(t\\,5.000\\,8.000)" in combined
     assert "drawbox" in combined
     assert "drawtext" in combined
+
+
+def test_overlay_text_is_centered_inside_detected_cover_box():
+    renderer = Renderer()
+    overlay = TextOverlay(
+        start=1.0, end=2.0, x=100, y=300, width=240, height=56,
+        text="Mới",
+    )
+
+    filters = renderer._build_text_overlay_filters([overlay], frame_w=1080)
+    drawtext = next(item for item in filters if item.startswith("drawtext="))
+
+    assert "text='Mới'" in drawtext
+    assert "x=100+(240-text_w)/2" in drawtext
+    assert "y=300+(56-text_h)/2" in drawtext
+
+
+def test_gap_fill_only_returns_segments_without_an_overlay():
+    timeline = TimelineService()
+    segments = timeline.from_segments([
+        TranscriptSegment(start=0.0, end=2.0, text="Đã được OCR che"),
+        TranscriptSegment(start=2.0, end=4.0, text="OCR bỏ sót"),
+    ], audio_duration=4.0)
+    overlays = [
+        TextOverlay(start=0.0, end=2.0, x=10, y=20, width=200, height=40, text="Đã được OCR che"),
+    ]
+
+    uncovered = LocalizationService._filter_uncovered_subtitle_segments(segments, overlays)
+
+    assert [segment.text for segment in uncovered] == ["OCR bỏ sót"]
+
+
+def test_ass_karaoke_can_be_centered_in_ocr_box_with_one_font_size():
+    timeline = TimelineService()
+    segments = timeline.from_segments([
+        TranscriptSegment(start=0.0, end=2.0, text="Xin chào bạn"),
+        TranscriptSegment(start=2.0, end=4.0, text="Câu tiếp theo"),
+    ], audio_duration=4.0)
+
+    ass = timeline.generate_ass_karaoke(
+        segments,
+        frame_width=1080,
+        frame_height=1920,
+        # The first OCR window is deliberately wider than its child cue;
+        # overlap matching must still position that karaoke cue correctly.
+        positions={(0.0, 2.5): (540, 920), (2.5, 4.0): (540, 930)},
+        font_size=34,
+    )
+
+    assert "Style: Default,DejaVu Sans,34," in ass
+    assert r"\an5\pos(540,920)" in ass
+    assert r"\an5\pos(540,930)" in ass
+    assert r"\kf" in ass

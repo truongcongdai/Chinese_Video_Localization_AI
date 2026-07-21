@@ -19,6 +19,12 @@ logging.basicConfig(
     ],
 )
 
+# httpx logs complete Telegram API URLs at INFO level. Telegram embeds the
+# bot token in that URL, so routine getUpdates/getMe lines would leak a live
+# credential into Docker logs. Keep HTTP client details to warnings/errors.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 def setup_logger(name: str, level: str | None = None) -> logging.Logger:
     """
     Convenience function to create/get a named logger configured with the

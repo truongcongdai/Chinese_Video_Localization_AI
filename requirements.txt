@@ -1,9 +1,17 @@
 yt-dlp>=2024.1.1
 python-dotenv>=1.0.1
 demucs
+# NumPy 2.4 lazy dtype loading recurses inside Accelerate under concurrent
+# web workers; keep the broadly compatible 2.2 line.
+numpy>=1.26,<2.3
 torch
 torchvision
 torchaudio
+# Local CPU/CUDA image generation for creator scenes (SD-Turbo).
+diffusers>=0.39.0
+transformers>=5.0.0
+accelerate>=1.14.0
+safetensors>=0.8.0
 openai-whisper
 edge-tts>=7.2.8
 redis>=5.0.0

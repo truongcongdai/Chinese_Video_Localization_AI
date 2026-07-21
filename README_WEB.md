@@ -12,6 +12,16 @@ python scripts/run_web.py
 # mở http://localhost:8080
 ```
 
+Nếu đã có `WEB_SESSION_SECRET` trong `.env` thì không cần lệnh `export`.
+Entrypoint local của giao diện web là **`scripts/run_web.py`**; không chạy
+`scripts/run_bot.py` trừ khi bạn còn muốn dùng Telegram bot. Redis không bắt
+buộc khi chạy local: nếu `redis://127.0.0.1:6379` không hoạt động, cache sẽ tự
+chuyển sang bộ nhớ trong tiến trình.
+
+Database local mặc định nên đặt `WEB_DB_PATH=./local_data/database.sqlite3`.
+Không trỏ vào thư mục `temp/` cũ do Docker tạo nếu thư mục đó đang thuộc user
+`root`/`nobody`, vì tiến trình local sẽ không có quyền ghi.
+
 Lần đầu mở trang, hệ thống sẽ cho tạo 1 tài khoản admin (chỉ tạo được đúng 1
 lần — sau đó là màn hình đăng nhập bình thường). Đây là auth đơn giản
 (cookie + bcrypt), phù hợp cho một nhóm nhỏ tự host, không phải hệ thống
@@ -58,6 +68,35 @@ sudo docker compose -f docker-compose.prod.yml up -d
   cộng/trừ credit cho từng người dùng
 
 ## Đăng lên mạng xã hội
+
+## Gen nội dung bằng AI miễn phí
+
+Phương án không mất phí API là Ollama chạy model ngay trên máy. Cài Ollama,
+chạy `ollama pull qwen3:8b`, sau đó thêm vào `.env`:
+
+```env
+CREATOR_AI_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:8b
+```
+
+Nếu máy yếu hoặc không muốn chạy model local, có thể dùng OpenRouter Free
+(có giới hạn request/ngày):
+
+```env
+CREATOR_AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=your_key_here
+OPENROUTER_MODEL=openrouter/free
+```
+
+Đặt `CREATOR_AI_PROVIDER=auto` để thử lần lượt Ollama, OpenRouter rồi Gemini.
+Chỉ Gemini có Google Search grounding trong luồng hiện tại; Ollama/OpenRouter
+tạo nội dung từ kiến thức model và không giả vờ đã tìm kiếm web.
+
+Prompt gửi kèm chủ đề, ngôn ngữ, tỷ lệ khung hình, thời lượng và hiệu ứng đã
+chọn. Một kết quả AI được dùng chung cho cả ba ô để keyword, cảnh và lời đọc
+đồng nhất; khi đổi thông số hệ thống sẽ gen lại. Nếu chưa có key hoặc API lỗi,
+giao diện thông báo rõ và dùng template local làm dự phòng.
 
 ### Cách hoạt động (mô hình "Connect" theo từng người dùng)
 
@@ -114,9 +153,10 @@ trong app, chưa đăng được cho người dùng bất kỳ.
 Chưa cấu hình platform nào thì nút "Kết nối" tương ứng sẽ bị vô hiệu hoá
 và hiện rõ hướng dẫn thiếu gì, thay vì báo lỗi mập mờ.
 
-### Chế độ cũ (1 tài khoản dùng chung — vẫn hỗ trợ, không khuyến khích)
+### Chế độ cũ (1 tài khoản dùng chung — mặc định bị tắt)
 
-Nếu bạn chỉ có đúng 1 người dùng và muốn bỏ qua bước OAuth, vẫn có thể set
+Nếu bạn chỉ có đúng 1 người dùng và muốn bỏ qua bước OAuth, đặt
+`ALLOW_SHARED_SOCIAL_CREDENTIALS=true`, rồi set
 thẳng các biến `TIKTOK_ACCESS_TOKEN`, `FACEBOOK_PAGE_ID` +
 `FACEBOOK_PAGE_ACCESS_TOKEN`, `YOUTUBE_CLIENT_ID` + `YOUTUBE_CLIENT_SECRET`
 + `YOUTUBE_REFRESH_TOKEN` như bản trước — hệ thống sẽ dùng các giá trị này

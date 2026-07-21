@@ -245,6 +245,9 @@ class OnScreenTextDetector:
             watermark is present in nearly every sampled frame (unlike the
             subtitle, which only appears during its own window), it would
             otherwise often win the band-clustering vote.
+            A top-right exclusion is recommended for Chinese advertising
+            banners, which are frequently present in every frame and can
+            otherwise be mistaken for the subtitle band.
         :param fill_undetected_windows: when a window's own sampled frames
             produced NO in-band OCR box (e.g. the on-screen text was on
             screen too briefly, in motion, or just missed by OCR on the
@@ -504,4 +507,3 @@ class OnScreenTextDetector:
         typical_line_height = max(int(typical_line_height), 10)
 
         return band_center, typical_line_height
-

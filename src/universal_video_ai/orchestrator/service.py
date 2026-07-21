@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.downloader.download_result import DownloadResult
@@ -92,6 +92,12 @@ class LocalizationConfig:
     # frame and would otherwise confuse subtitle-band detection. Should
     # match RenderConfig.watermark_box_fractional used for the actual cover.
     watermark_exclude_regions_fractional: Tuple[Tuple[float, float, float, float], ...] = (
+        # Persistent banners/ads in the upper-right are especially likely
+        # to beat real subtitles in the OCR density vote because they are
+        # present in every sampled frame. Exclude only that corner, leaving
+        # upper-centre captions detectable.
+        (0.65, 0.00, 1.00, 0.35),
+        # Common Douyin/TikTok watermark/account area.
         (0.80, 0.72, 1.0, 1.0),
     )
     text_cover_samples_per_segment: int = 2
@@ -244,6 +250,7 @@ class LocalizationService:
             text_detector: Optional[OnScreenTextDetector] = None,
             config: Optional[LocalizationConfig] = None,
             logger: Optional[logging.Logger] = None,
+            progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> None:
         self.downloader = downloader or DownloadService()
         self.translate_service = translate_service
@@ -254,6 +261,7 @@ class LocalizationService:
         self.text_detector = text_detector
         self.config = config or LocalizationConfig()
         self.logger = logger or _logger
+        self.progress_callback = progress_callback
 
         self.logger.debug(
             "LocalizationService initialized run_transcription=%s run_translation=%s run_tts=%s run_render=%s "
@@ -264,6 +272,13 @@ class LocalizationService:
             self.config.render_video,
             self.config.enable_text_cover,
         )
+
+    def _progress(self, percent: int, message: str) -> None:
+        if self.progress_callback:
+            try:
+                self.progress_callback(max(0, min(100, percent)), message)
+            except Exception:
+                self.logger.exception("Progress callback failed")
 
     async def localize(self, url: str, output_dir: Path, target_language: Optional[str] = None) -> LocalizationResult:
         """Execute full video localization workflow, start to finish, with
@@ -331,6 +346,7 @@ class LocalizationService:
         )
 
         # Step 1: Download video
+        self._progress(5, "Đang tải video nguồn")
         self.logger.info("LocalizationService: downloading video")
         download_result = self.downloader.download(url, output_dir)
 
@@ -338,6 +354,7 @@ class LocalizationService:
             raise ValueError(f"Download failed for {url}")
 
         self.logger.info("LocalizationService: download successful: %s", download_result.video_path)
+        self._progress(15, "Đã tải video, đang xử lý âm thanh")
 
         # Step 2: Process audio (extract → demucs → transcribe)
         self.logger.info("LocalizationService: processing audio")
@@ -350,6 +367,7 @@ class LocalizationService:
         )
         audio_result = pipeline.process(download_result, output_dir=output_dir / "audio")
         self.logger.info("LocalizationService: audio processing complete")
+        self._progress(40, "Đã tách âm thanh và nhận diện lời nói")
 
         source_segments: List[TranscriptSegment] = [
             s for s in (audio_result.segments or []) if s.has_timing
@@ -361,6 +379,7 @@ class LocalizationService:
         # Step 3: Translate transcript — prefer segment-level translation so
         # every sentence keeps the timestamp it had in the source video.
         if self.config.run_translation and audio_result.transcript:
+            self._progress(45, "Đang dịch nội dung")
             if self.translate_service is None:
                 self.logger.warning("Translation requested but no TranslateService injected; skipping")
             else:
@@ -399,6 +418,7 @@ class LocalizationService:
                         "LocalizationService: translation complete (length=%d)",
                         len(translated_text) if translated_text else 0,
                     )
+                    self._progress(58, "Đã dịch nội dung")
                 except Exception as exc:
                     self.logger.error("Translation failed: %s", exc)
                     translated_text = None
@@ -440,6 +460,7 @@ class LocalizationService:
         # Step 4: Synthesize TTS from translated text, anchored to the
         # original sentence timestamps whenever we have them.
         if self.config.run_tts and (translated_segments or translated_text):
+            self._progress(62, "Đang tạo giọng đọc")
             if self.tts_service is None:
                 self.logger.warning("TTS requested but no TTSService injected; skipping")
             else:
@@ -462,14 +483,18 @@ class LocalizationService:
                             voice=self.config.tts_voice,
                         )
                     self.logger.info("LocalizationService: TTS complete: %s", tts_audio_path)
+                    self._progress(72, "Đã tạo giọng đọc")
                 except Exception as exc:
                     self.logger.error("TTS synthesis failed: %s", exc)
-                    tts_audio_path = None
+                    # Never silently deliver a "dubbed" reup with no dub.
+                    # Surface the failure so the job is refundable/retryable.
+                    raise RuntimeError(f"Không tạo được giọng đọc TTS: {exc}") from exc
 
         # Step 5: Generate subtitles — directly from real timestamps when available.
         subtitle_segments: Optional[List[TimelineSegment]] = None
         subtitles_path: Optional[Path] = None
         if self.config.generate_subtitles and (translated_segments or translated_text or audio_result.transcript):
+            self._progress(75, "Đang tạo phụ đề")
             self.logger.info("LocalizationService: generating subtitles")
             if translated_segments:
                 subtitle_segments = self.timeline.from_segments(
@@ -485,10 +510,18 @@ class LocalizationService:
                 )
             self.logger.info("LocalizationService: generated %d subtitle segments", len(subtitle_segments))
 
-            subtitles_path = output_dir / "subtitles.srt"
-            srt_content = self.timeline.generate_srt(subtitle_segments)
-            subtitles_path.write_text(srt_content, encoding="utf-8")
+            subtitles_path = output_dir / "subtitles.ass"
+            dimensions = (
+                self.renderer._get_video_dimensions(download_result.video_path)
+                if self.renderer and download_result.video_path else None
+            )
+            frame_width, frame_height = dimensions or (1080, 1920)
+            ass_content = self.timeline.generate_ass_karaoke(
+                subtitle_segments, frame_width=frame_width, frame_height=frame_height,
+            )
+            subtitles_path.write_text(ass_content, encoding="utf-8")
             self.logger.info("LocalizationService: subtitles written to %s", subtitles_path)
+            self._progress(79, "Đã tạo phụ đề")
 
         # Step 6: Detect + build on-screen text-cover overlays (best-effort).
         text_overlays: Optional[List[TextOverlay]] = None
@@ -504,10 +537,45 @@ class LocalizationService:
                 translated_segments=translated_segments,
                 detected_language=audio_result.detected_language,
             )
+            if text_overlays and subtitles_path and subtitle_segments:
+                # ASS owns all translated text so every cue keeps the karaoke
+                # fill effect. Detected cues are middle-centred at their OCR
+                # box; unmatched cues remain bottom-centred as a safety net.
+                # One explicit size is shared by every cue in this video.
+                common_font_size = text_overlays[0].font_size or 48
+                positions = {
+                    (round(overlay.start, 3), round(overlay.end, 3)): (
+                        round(overlay.x + overlay.width / 2),
+                        round(overlay.y + overlay.height / 2),
+                    )
+                    for overlay in text_overlays
+                }
+                subtitles_path.write_text(
+                    self.timeline.generate_ass_karaoke(
+                        subtitle_segments,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        positions=positions,
+                        font_size=common_font_size,
+                    ),
+                    encoding="utf-8",
+                )
+                # The FFmpeg overlays now only cover the original pixels;
+                # drawing their text too would duplicate the ASS captions.
+                text_overlays = [
+                    TextOverlay(
+                        start=o.start, end=o.end, x=o.x, y=o.y,
+                        width=o.width, height=o.height, text="",
+                        box_color=o.box_color, font_color=o.font_color,
+                        font_path=o.font_path, font_size=common_font_size,
+                    )
+                    for o in text_overlays
+                ]
 
         # Step 7: Mix audio (original + TTS)
         mixed_audio_path: Optional[Path] = None
         if self.config.mix_audio and tts_audio_path:
+            self._progress(83, "Đang phối âm thanh")
             self.logger.info("LocalizationService: mixing audio streams")
             mixed_audio_path = output_dir / "audio_mixed.wav"
             self.mixer.mix(
@@ -519,10 +587,12 @@ class LocalizationService:
                 mixed_audio_path
             )
             self.logger.info("LocalizationService: audio mix complete: %s", mixed_audio_path)
+            self._progress(87, "Đã phối âm thanh")
 
         # Step 8: Render final video (merge video + audio + optional subtitles/overlays)
         final_video_path: Optional[Path] = None
         if self.config.render_video and download_result.video_path:
+            self._progress(90, "Đang render video cuối")
             if self.renderer is None:
                 self.logger.warning("Rendering requested but no Renderer available; skipping")
             else:
@@ -553,7 +623,9 @@ class LocalizationService:
                     subtitles_for_render = subtitles_path
                     if (
                         self.config.skip_srt_when_text_overlays_present
+                        and subtitles_path is not None
                         and text_overlays
+                        and any(overlay.text for overlay in text_overlays)
                         and subtitle_segments
                     ):
                         uncovered = self._filter_uncovered_subtitle_segments(
@@ -565,14 +637,16 @@ class LocalizationService:
                             # happen) — keep the original full .srt.
                             subtitles_for_render = subtitles_path
                         elif uncovered:
-                            gap_srt_path = output_dir / "subtitles_gap_fill.srt"
+                            gap_srt_path = output_dir / "subtitles_gap_fill.ass"
                             gap_srt_path.write_text(
-                                self.timeline.generate_srt(uncovered), encoding="utf-8"
+                                self.timeline.generate_ass_karaoke(
+                                    uncovered, frame_width=frame_width, frame_height=frame_height,
+                                ), encoding="utf-8"
                             )
                             subtitles_for_render = gap_srt_path
                             self.logger.info(
                                 "LocalizationService: %d/%d subtitle segment(s) not covered by "
-                                "a text_overlay; burning them as a gap-fill .srt so no sentence "
+                                "a text_overlay; burning them as a gap-fill ASS so no sentence "
                                 "is left without a translated caption",
                                 len(uncovered), len(subtitle_segments),
                             )
@@ -594,6 +668,7 @@ class LocalizationService:
                         output_path=final_video_path,
                         text_overlays=text_overlays,
                     )
+                    self._progress(98, "Đã render, đang kiểm tra video")
                     self.logger.info("LocalizationService: render complete: %s", final_video_path)
                 except Exception as exc:
                     self.logger.error("Rendering failed: %s", exc)

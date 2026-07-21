@@ -129,6 +129,21 @@ CREATE TABLE IF NOT EXISTS top_up_requests (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    job_id TEXT NOT NULL,
+    platforms_json TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    hashtags_json TEXT NOT NULL DEFAULT '[]',
+    scheduled_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    result_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 _MIGRATIONS = [
@@ -336,7 +351,7 @@ class Store:
         used at login time so one input box can accept any of the three."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM users WHERE username = ? OR email = ? OR phone = ?",
+                "SELECT * FROM users WHERE username = ? OR lower(email) = lower(?) OR phone = ?",
                 (identifier, identifier, identifier),
             )
             return cur.fetchone()
@@ -496,7 +511,7 @@ class Store:
     def list_feedback(self, limit: int = 200) -> List[sqlite3.Row]:
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT f.*, u.username FROM feedback f LEFT JOIN users u ON u.id = f.user_id "
+                "SELECT f.*, u.username, u.email, u.phone FROM feedback f LEFT JOIN users u ON u.id = f.user_id "
                 "ORDER BY f.created_at DESC LIMIT ?",
                 (limit,),
             )
@@ -566,6 +581,30 @@ class Store:
         values = list(fields.values()) + [job_id]
         with self._connect() as conn:
             conn.execute(f"UPDATE jobs SET {set_clause} WHERE id = ?", values)
+
+    def fail_interrupted_jobs(self, refund_credits: int = 0) -> int:
+        """Resolve in-process jobs orphaned by a server restart."""
+        now = time.time()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, user_id FROM jobs WHERE status IN ('queued', 'running')"
+            ).fetchall()
+            for row in rows:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'error', progress_note = ?, error = ?, updated_at = ? "
+                    "WHERE id = ? AND status IN ('queued', 'running')",
+                    (
+                        "Tiến trình bị gián đoạn do server khởi động lại",
+                        "Job không thể tiếp tục sau khi server khởi động lại. Hãy bấm Thử lại.",
+                        now, row["id"],
+                    ),
+                )
+                if cursor.rowcount and refund_credits > 0:
+                    conn.execute(
+                        "UPDATE users SET credits = credits + ? WHERE id = ?",
+                        (refund_credits, row["user_id"]),
+                    )
+            return len(rows)
 
     _JOB_FIELDS = {f.name for f in dataclasses.fields(Job)}
 
@@ -648,8 +687,89 @@ class Store:
         Returns True if a row was actually deleted.
         """
         with self._connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_posts SET status='cancelled', updated_at=? "
+                "WHERE job_id=? AND user_id=? AND status='pending'",
+                (time.time(), job_id, user_id),
+            )
             cur = conn.execute(
                 "DELETE FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    def delete_jobs(self, job_ids: List[str], user_id: int) -> int:
+        ids = list(dict.fromkeys(job_ids))[:200]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE scheduled_posts SET status='cancelled', updated_at=? "
+                f"WHERE user_id=? AND status='pending' AND job_id IN ({placeholders})",
+                [time.time(), user_id, *ids],
+            )
+            cur = conn.execute(
+                f"DELETE FROM jobs WHERE user_id = ? AND id IN ({placeholders})",
+                [user_id, *ids],
+            )
+            return cur.rowcount
+
+    def create_scheduled_post(self, user_id: int, job_id: str, platforms: List[str],
+                              title: str, description: str, hashtags: List[str],
+                              scheduled_at: float) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO scheduled_posts (user_id,job_id,platforms_json,title,description,"
+                "hashtags_json,scheduled_at,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (user_id, job_id, json.dumps(platforms), title, description,
+                 json.dumps(hashtags, ensure_ascii=False), scheduled_at, "pending", now, now),
+            )
+            return int(cur.lastrowid)
+
+    def list_scheduled_posts(self, user_id: int) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM scheduled_posts WHERE user_id = ? ORDER BY scheduled_at DESC LIMIT 100",
+                (user_id,),
+            ).fetchall()
+
+    def claim_due_scheduled_posts(self, now: float) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT 20",
+                (now,),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE scheduled_posts SET status='processing', updated_at=? WHERE id=? AND status='pending'",
+                    (now, row["id"]),
+                )
+                if cur.rowcount:
+                    claimed.append(row)
+            return claimed
+
+    def recover_processing_scheduled_posts(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_posts SET status='error', result_json=?, updated_at=? WHERE status='processing'",
+                (json.dumps({"message": "Server khởi động lại khi đang đăng; không tự thử lại để tránh đăng trùng."}, ensure_ascii=False), time.time()),
+            )
+
+    def finish_scheduled_post(self, post_id: int, status: str, result: Any) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_posts SET status=?, result_json=?, updated_at=? WHERE id=?",
+                (status, json.dumps(result, ensure_ascii=False), time.time(), post_id),
+            )
+
+    def cancel_scheduled_post(self, post_id: int, user_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE scheduled_posts SET status='cancelled', updated_at=? "
+                "WHERE id=? AND user_id=? AND status='pending'",
+                (time.time(), post_id, user_id),
             )
             return cur.rowcount > 0
 

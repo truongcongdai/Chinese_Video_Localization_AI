@@ -235,7 +235,9 @@ class Renderer:
         # room to spare than overflows.
         avg_char_width_ratio = 0.58
         box_padding_x = 20  # px of breathing room inside the box, each side
-        min_font_size = 14
+        # Allow long translated OCR overlays to shrink enough to stay
+        # inside the horizontal safe area instead of clipping off-screen.
+        min_font_size = 8
         max_font_size = 64
 
         for overlay in overlays:
@@ -256,7 +258,7 @@ class Renderer:
             # Don't let the cover box balloon past ~92% of the frame width
             # even for very long sentences — beyond that we shrink the font
             # instead so it still reads as a caption, not a banner.
-            max_box_width = int(frame_w * 0.92) if frame_w else overlay.width * 4
+            max_box_width = int(frame_w * 0.86) if frame_w else overlay.width * 4
 
             est_text_width = text_len * font_size * avg_char_width_ratio
             avail_width = overlay.width - 2 * box_padding_x
@@ -289,15 +291,16 @@ class Renderer:
             # inside the (possibly widened) cover box. `text_w`/`text_h` are
             # ffmpeg drawtext's built-in expressions for the rendered text's
             # own pixel size, so this stays centered regardless of length.
-            filters.append(
-                "drawtext="
-                f"{font_clause}"
-                f"text='{_escape_drawtext(overlay.text)}':"
-                f"x={box_x}+({box_width}-text_w)/2:"
-                f"y={overlay.y}+({overlay.height}-text_h)/2:"
-                f"fontsize={font_size}:fontcolor={overlay.font_color}:"
-                f"enable='{enable_expr}'"
-            )
+            if overlay.text:
+                filters.append(
+                    "drawtext="
+                    f"{font_clause}"
+                    f"text='{_escape_drawtext(overlay.text)}':"
+                    f"x={box_x}+({box_width}-text_w)/2:"
+                    f"y={overlay.y}+({overlay.height}-text_h)/2:"
+                    f"fontsize={font_size}:fontcolor={overlay.font_color}:"
+                    f"enable='{enable_expr}'"
+                )
         return filters
 
     def _get_video_dimensions(self, video_path: Path) -> Optional[Tuple[int, int]]:
@@ -478,7 +481,17 @@ class Renderer:
             # in single quotes (ffmpeg's documented approach for filter
             # option values with special characters) avoids this entirely.
             if subtitles:
-                filters.append(f"subtitles={_escape_filter_path(str(subtitles))}")
+                if Path(subtitles).suffix.lower() == ".ass":
+                    # Preserve ASS karaoke colours, timing tags and its
+                    # deterministic two-line layout.
+                    filters.append(f"subtitles={_escape_filter_path(str(subtitles))}")
+                else:
+                    filters.append(
+                        f"subtitles={_escape_filter_path(str(subtitles))}:"
+                        "force_style='FontName=DejaVu Sans,FontSize=13,"
+                        "MarginL=28,MarginR=28,MarginV=45,Alignment=2,WrapStyle=0,"
+                        "BorderStyle=3,Outline=1,Shadow=0'"
+                    )
 
             cmd.extend(["-map", "1:a"])
 

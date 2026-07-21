@@ -27,9 +27,19 @@ except ImportError:
 
 from universal_video_ai.cache import RedisCache
 
-TEMP_DIR = BASE_DIR / "temp"
-LOG_DIR = BASE_DIR / "logs"
-COOKIE_DIR = BASE_DIR / "cookies"
+def _local_path_from_env(name: str, default: str) -> Path:
+    """Resolve local storage settings consistently for Docker and local runs.
+
+    Relative values are anchored at the repository root, not at whatever
+    directory happened to be current when the launcher was invoked.
+    """
+    configured = Path(os.getenv(name, default)).expanduser()
+    return configured if configured.is_absolute() else BASE_DIR / configured
+
+
+TEMP_DIR = _local_path_from_env("TEMP_DIR", "local_data/temp")
+LOG_DIR = _local_path_from_env("LOGS_DIR", "local_data/logs")
+COOKIE_DIR = _local_path_from_env("COOKIE_DIR", "local_data/cookies")
 
 for directory in (
     TEMP_DIR,

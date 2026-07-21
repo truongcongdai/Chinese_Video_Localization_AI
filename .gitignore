@@ -5,6 +5,8 @@ __pycache__/
 
 logs/*
 temp/*
+local_data/*
+!local_data/.gitkeep
 cookies/*
 
 .idea/

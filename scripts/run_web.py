@@ -10,9 +10,18 @@ web/auth.py / README_WEB.md).
 """
 import logging
 import os
+import sys
 from pathlib import Path
 
 import uvicorn
+
+# Make the src-layout package importable when this file is executed directly
+# (`python scripts/run_web.py`). This keeps local startup independent from an
+# editable `pip install -e .`; Docker may still install the package normally.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 # Load .env before anything else touches os.environ — belt-and-suspenders
 # alongside universal_video_ai.config doing the same on import, so this
@@ -24,7 +33,7 @@ import uvicorn
 # "WEB_SESSION_SECRET is not set" even when .env had a value in it.
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    load_dotenv(REPO_ROOT / ".env")
 except ImportError:
     pass
 

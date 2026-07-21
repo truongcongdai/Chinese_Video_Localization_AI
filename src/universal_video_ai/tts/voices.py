@@ -24,15 +24,27 @@ class VoiceOption(TypedDict):
 VOICE_OPTIONS: Dict[str, List[VoiceOption]] = {
     "vi": [
         {"id": "vi-VN-HoaiMyNeural", "label": "Nữ - Hoài My"},
+        {"id": "vi-VN-HoaiMyNeural|rate=+12%", "label": "Nữ - Hoài My năng động"},
+        {"id": "vi-VN-HoaiMyNeural|rate=-10%|pitch=-2Hz", "label": "Nữ - Hoài My trầm, chậm"},
         {"id": "vi-VN-NamMinhNeural", "label": "Nam - Nam Minh"},
+        {"id": "vi-VN-NamMinhNeural|rate=+12%|pitch=+2Hz", "label": "Nam - Nam Minh trẻ trung"},
+        {"id": "vi-VN-NamMinhNeural|rate=-10%|pitch=-3Hz", "label": "Nam - Nam Minh trầm ấm"},
     ],
     "en": [
         {"id": "en-US-JennyNeural", "label": "Nữ - Jenny (US)"},
         {"id": "en-US-GuyNeural", "label": "Nam - Guy (US)"},
+        {"id": "en-US-AriaNeural", "label": "Nữ - Aria (US)"},
+        {"id": "en-US-DavisNeural", "label": "Nam - Davis (US)"},
+        {"id": "en-GB-SoniaNeural", "label": "Nữ - Sonia (UK)"},
+        {"id": "en-GB-RyanNeural", "label": "Nam - Ryan (UK)"},
     ],
     "zh": [
         {"id": "zh-CN-XiaoxiaoNeural", "label": "Nữ - Xiaoxiao"},
         {"id": "zh-CN-YunxiNeural", "label": "Nam - Yunxi"},
+    ],
+    "zh-tw": [
+        {"id": "zh-TW-HsiaoChenNeural", "label": "Nữ - Hsiao Chen (Đài Loan)"},
+        {"id": "zh-TW-YunJheNeural", "label": "Nam - Yun Jhe (Đài Loan)"},
     ],
     "ja": [
         {"id": "ja-JP-NanamiNeural", "label": "Nữ - Nanami"},
@@ -83,7 +95,21 @@ VOICE_OPTIONS: Dict[str, List[VoiceOption]] = {
 
 def voices_for_language(language: str) -> List[VoiceOption]:
     key = (language or "").strip().lower()
-    if key in VOICE_OPTIONS:
-        return VOICE_OPTIONS[key]
-    primary = key.split("-")[0]
-    return VOICE_OPTIONS.get(primary, [])
+    base = VOICE_OPTIONS.get(key)
+    if base is None:
+        base = VOICE_OPTIONS.get(key.split("-")[0], [])
+    if key.split("-")[0] == "vi":
+        return list(base)
+
+    # Every non-Vietnamese base voice also gets expressive pacing choices.
+    # Edge TTS supports rate/pitch independently of locale, so this expands
+    # all languages consistently without maintaining hundreds of near-
+    # duplicate hardcoded entries.
+    expanded: List[VoiceOption] = []
+    for voice in base:
+        expanded.extend([
+            voice,
+            {"id": f'{voice["id"]}|rate=+12%|pitch=+2Hz', "label": f'{voice["label"]} · năng động'},
+            {"id": f'{voice["id"]}|rate=-10%|pitch=-2Hz', "label": f'{voice["label"]} · trầm, chậm'},
+        ])
+    return expanded

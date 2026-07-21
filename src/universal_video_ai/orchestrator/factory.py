@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.translate.service import TranslateService
@@ -39,9 +39,11 @@ def create_localization_service(
         ocr_languages: Tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL,
         text_cover_samples_per_segment: int = 2,
         watermark_exclude_regions_fractional: Tuple[Tuple[float, float, float, float], ...] = (
+            (0.65, 0.00, 1.00, 0.35),
             (0.80, 0.72, 1.0, 1.0),
         ),
         logger: Optional[logging.Logger] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> LocalizationService:
     """Convenience factory for LocalizationService with auto-detected backends.
 
@@ -167,4 +169,5 @@ def create_localization_service(
         text_detector=text_detector,
         config=config,
         logger=logger,
+        progress_callback=progress_callback,
     )

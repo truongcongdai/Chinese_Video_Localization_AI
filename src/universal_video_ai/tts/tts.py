@@ -156,7 +156,10 @@ class EdgeTTS:
             self.logger.warning("edge-tts CLI not found in PATH; EdgeTTS may fail at runtime")
         self.logger.debug("EdgeTTS initialized with config=%s", self.config)
 
-    def synthesize(self, text: str, output_path: Path, voice: Optional[str] = None) -> Path:
+    def synthesize(
+        self, text: str, output_path: Path, voice: Optional[str] = None,
+        rate: Optional[str] = None, pitch: Optional[str] = None,
+    ) -> Path:
         """
         Synthesize `text` to `output_path`.
 
@@ -184,6 +187,10 @@ class EdgeTTS:
             "--write-media", str(output_path),
             "--text", text,
         ]
+        if rate:
+            cmd.append(f"--rate={rate}")
+        if pitch:
+            cmd.append(f"--pitch={pitch}")
 
         self.logger.info("EdgeTTS synthesizing to %s using voice=%s", output_path, effective_voice)
         self.logger.debug("Running command: %s", " ".join(cmd))

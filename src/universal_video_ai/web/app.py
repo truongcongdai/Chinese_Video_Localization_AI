@@ -19,10 +19,17 @@ import subprocess
 import traceback
 import urllib.parse
 import uuid
+import time
+import unicodedata
+import inspect
+import threading
+import gc
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 import requests
+import numpy as np
+import numpy.dtypes  # eagerly initialize dtype namespace before worker threads
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
@@ -36,9 +43,13 @@ from universal_video_ai.orchestrator.service import (
 from universal_video_ai.render.renderer import RenderConfig
 from universal_video_ai.render import ocr_language_map
 from universal_video_ai.render.quality_check import analyze_output_quality
+from universal_video_ai.render.prepublish import inspect_for_publish, prepublish_report_to_dict
 from universal_video_ai.tts.tts import DEFAULT_VOICES_BY_LANGUAGE
+from universal_video_ai.tts.tts import voice_for_language
 from universal_video_ai.tts.voices import voices_for_language
+from universal_video_ai.tts.backend import EdgeTTSBackend
 from universal_video_ai.segment import TranscriptSegment
+from universal_video_ai.timeline.service import _balanced_caption_chunks
 from universal_video_ai.config import TEMP_DIR
 from universal_video_ai.social import get_uploader
 
@@ -54,6 +65,16 @@ logger = logging.getLogger("universal_video_ai.web")
 
 app = FastAPI(title="Video Localization AI")
 
+_CREATOR_AI_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+_CREATOR_AI_LOCK = threading.Lock()
+_CREATOR_AI_CACHE_TTL_SECONDS = 3600
+_IMAGE_AI_PIPELINE: Any = None
+_IMAGE_AI_DEVICE: Optional[str] = None
+_IMAGE_AI_LOCK = threading.Lock()
+_VIDEO_AI_PIPELINE: Any = None
+_VIDEO_AI_MODEL: Optional[str] = None
+_VIDEO_AI_LOCK = threading.Lock()
+
 # Same default DB as the Telegram bot (scripts/run_bot.py's --db), but the
 # web app gets its own table set (users/jobs/publish_log) inside it via
 # Store's schema, so both can safely share one sqlite file if you want.
@@ -66,8 +87,17 @@ _OUTPUT_BASE_DIR = TEMP_DIR / "output"
 JOB_COST_CREDITS = int(os.environ.get("JOB_COST_CREDITS", "1"))
 WEB_RENDER_PRESET = os.environ.get("WEB_RENDER_PRESET", "fast")
 WEB_RENDER_TIMEOUT_SECONDS = int(os.environ.get("WEB_RENDER_TIMEOUT_SECONDS", "1800"))
+TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
+
+
+@app.on_event("startup")
+def recover_jobs_interrupted_by_restart() -> None:
+    """Background jobs cannot survive a process restart; expose that state."""
+    recovered = store.fail_interrupted_jobs(JOB_COST_CREDITS)
+    if recovered:
+        logger.warning("Recovered %s interrupted jobs", recovered)
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/assets", StaticFiles(directory=str(STATIC_DIR)), name="assets")
@@ -78,6 +108,14 @@ app.mount("/assets", StaticFiles(directory=str(STATIC_DIR)), name="assets")
 # always made admin regardless of this setting. Default true: this app is
 # meant to support multiple people signing up on their own now.
 OPEN_REGISTRATION = os.environ.get("OPEN_REGISTRATION", "true").lower() not in ("0", "false", "no")
+
+# SaaS/multi-user mode is the safe default: publishing must use the social
+# account connected by the current user.  The legacy shared tokens can only be
+# used when an operator explicitly opts in (useful for a private, single-user
+# installation, but unsafe as an implicit fallback on a client-facing server).
+ALLOW_SHARED_SOCIAL_CREDENTIALS = os.environ.get(
+    "ALLOW_SHARED_SOCIAL_CREDENTIALS", "false"
+).lower() in ("1", "true", "yes")
 
 # Credits granted to BOTH the new user and whoever invited them, when
 # registering with a valid ?ref= referral code. Set to 0 to disable bonuses
@@ -120,7 +158,8 @@ class LoginBody(BaseModel):
 
 
 class RegisterBody(BaseModel):
-    identifier: str  # an email address or a phone number
+    username: str
+    contact_identifier: str  # email address or phone number
     password: str
     referral_code: Optional[str] = None  # whoever invited this person, if anyone
 
@@ -148,14 +187,25 @@ class NewJobBody(BaseModel):
 class CreatorJobBody(BaseModel):
     topic: str
     script: Optional[str] = None
+    narration_script: Optional[str] = None
     target_language: str = "vi"
     aspect_ratio: str = "9:16"
     duration_seconds: int = 30
+    transition: str = "fade"
+    tts_voice: Optional[str] = None
+    image_provider: str = "stock"  # stock | cpu_ai | ai_video
 
 
 class CreatorSuggestionBody(BaseModel):
     topic: str
     target_language: str = "vi"
+    aspect_ratio: str = "9:16"
+    duration_seconds: int = 30
+    transition: str = "fade"
+
+
+class BulkDeleteBody(BaseModel):
+    job_ids: List[str]
 
 
 class SegmentBody(BaseModel):
@@ -184,11 +234,49 @@ class TopUpDecisionBody(BaseModel):
     admin_note: Optional[str] = None
 
 
+def _env_first(*names: str) -> str:
+    """Read the first non-empty setting, tolerating whitespace in .env."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _payment_config(amount_vnd: int = 0, transfer_content: str = "") -> Dict[str, Any]:
+    bank_id = _env_first("PAYMENT_BANK_ID", "BANK_ID", "BANK_BIN")
+    account_number = _env_first("PAYMENT_ACCOUNT_NUMBER", "BANK_ACCOUNT_NUMBER")
+    account_name = _env_first("PAYMENT_ACCOUNT_NAME", "BANK_ACCOUNT_NAME")
+    bank_name = _env_first("PAYMENT_BANK_NAME", "BANK_NAME") or bank_id
+    explicit_qr = _env_first("PAYMENT_QR_URL")
+    qr_url = explicit_qr
+    if not qr_url and bank_id and account_number:
+        query = urllib.parse.urlencode({
+            "amount": max(0, amount_vnd),
+            "addInfo": transfer_content,
+            "accountName": account_name,
+        })
+        qr_url = (
+            f"https://img.vietqr.io/image/{urllib.parse.quote(bank_id, safe='')}-"
+            f"{urllib.parse.quote(account_number, safe='')}-compact2.png?{query}"
+        )
+    return {
+        "configured": bool(qr_url and account_number),
+        "bank_id": bank_id, "bank_name": bank_name,
+        "account_number": account_number, "account_name": account_name,
+        "qr_url": qr_url,
+    }
+
+
 class PublishBody(BaseModel):
     platforms: List[str]
     title: str
     description: str = ""
     hashtags: List[str] = []
+
+
+class SchedulePublishBody(PublishBody):
+    scheduled_at: float
 
 
 class CreditsAdjustBody(BaseModel):
@@ -206,7 +294,12 @@ class CreateUserBody(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    # The UI is a single HTML file with inline JavaScript. Prevent browsers
+    # from keeping an old auth form after a deploy/restart.
+    return HTMLResponse(
+        (STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 # ------------------------------------------------------------------ auth --
@@ -226,20 +319,6 @@ def _classify_identifier(identifier: str) -> tuple[str, str]:
     if _PHONE_RE.match(value):
         return "phone", digits_only
     return "username", value
-
-
-def _unique_username_from(base: str) -> str:
-    """Derive a `users.username` value (that column is UNIQUE NOT NULL) from
-    an email/phone identifier, since a person registering with just an
-    email never picked a separate username. Appends a numeric suffix on
-    collision."""
-    base = re.sub(r"[^a-zA-Z0-9_.-]", "", base.split("@")[0]) or "user"
-    candidate = base
-    suffix = 0
-    while store.get_user_by_username(candidate):
-        suffix += 1
-        candidate = f"{base}{suffix}"
-    return candidate
 
 
 def _login_response(user_id: int) -> JSONResponse:
@@ -269,23 +348,21 @@ def register(body: RegisterBody):
     if len(body.password) < 8:
         raise HTTPException(400, "Mật khẩu cần tối thiểu 8 ký tự")
 
-    kind, value = _classify_identifier(body.identifier)
-    if not value:
-        raise HTTPException(400, "Vui lòng nhập tên đăng nhập, email hoặc số điện thoại")
+    username = body.username.strip()
+    if len(username) < 3:
+        raise HTTPException(400, "Tên đăng nhập cần tối thiểu 3 ký tự")
+    if _classify_identifier(username)[0] != "username":
+        raise HTTPException(400, "Tên đăng nhập không được là email hoặc số điện thoại")
+    if store.get_user_by_identifier(username):
+        raise HTTPException(409, "Tên đăng nhập này đã được sử dụng")
 
-    if kind == "username":
-        if len(value) < 3:
-            raise HTTPException(400, "Tên đăng nhập cần tối thiểu 3 ký tự")
-        if store.get_user_by_username(value):
-            raise HTTPException(409, "Tên đăng nhập này đã được sử dụng")
-        username, email, phone = value, None, None
-    else:
-        existing = store.get_user_by_email(value) if kind == "email" else store.get_user_by_phone(value)
-        if existing:
-            raise HTTPException(409, "Email/số điện thoại này đã được đăng ký")
-        username = _unique_username_from(value)
-        email = value if kind == "email" else None
-        phone = value if kind == "phone" else None
+    kind, value = _classify_identifier(body.contact_identifier)
+    if kind not in ("email", "phone"):
+        raise HTTPException(400, "Vui lòng nhập đúng email hoặc số điện thoại")
+    if store.get_user_by_identifier(value):
+        raise HTTPException(409, "Email/số điện thoại này đã được đăng ký")
+    email = value if kind == "email" else None
+    phone = value if kind == "phone" else None
 
     referrer = None
     if body.referral_code and body.referral_code.strip():
@@ -326,7 +403,8 @@ def bootstrap():
 
 @app.post("/api/login")
 def login(body: LoginBody):
-    user = store.get_user_by_identifier(body.identifier.strip())
+    _kind, identifier = _classify_identifier(body.identifier)
+    user = store.get_user_by_identifier(identifier)
     if not user or not user["password_hash"] or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(401, "Sai thông tin đăng nhập hoặc mật khẩu")
     return _login_response(user["id"])
@@ -361,10 +439,8 @@ def stats_me(user_id: int = Depends(get_current_user_id)):
 
 @app.post("/api/top-up-requests")
 def create_top_up_request(body: TopUpRequestBody, user_id: int = Depends(get_current_user_id)):
-    if body.credits <= 0 or body.amount_vnd <= 0:
+    if TOP_UP_PACKAGES.get(body.credits) != body.amount_vnd:
         raise HTTPException(400, "Gói nạp không hợp lệ")
-    if body.credits > 1_000_000 or body.amount_vnd > 1_000_000_000:
-        raise HTTPException(400, "Gói nạp vượt giới hạn")
     request_id = store.create_top_up_request(
         user_id,
         body.credits,
@@ -372,7 +448,17 @@ def create_top_up_request(body: TopUpRequestBody, user_id: int = Depends(get_cur
         body.payment_method.strip()[:40] or "bank_transfer",
         note=(body.note or "").strip()[:1000] or None,
     )
-    return {"ok": True, "id": request_id}
+    transfer_content = f"UVAI {user_id} {request_id}"
+    return {
+        "ok": True, "id": request_id, "transfer_content": transfer_content,
+        "payment": _payment_config(body.amount_vnd, transfer_content),
+    }
+
+
+@app.get("/api/payment-config")
+def payment_config(user_id: int = Depends(get_current_user_id)):
+    """Public-to-authenticated-users payment destination (never secrets)."""
+    return _payment_config()
 
 
 @app.get("/api/top-up-requests")
@@ -502,6 +588,9 @@ def _build_service_for_job(job):
         enable_text_cover=True,
         ocr_languages=ocr_languages,
         logger=logger,
+        progress_callback=lambda percent, message: store.update_job(
+            job.id, progress_note=f"[{percent}%] {message}"
+        ),
     )
 
 
@@ -613,35 +702,278 @@ def _refund_job_credits(job) -> None:
 
 def _creator_scene_brief_from_topic(topic: str, language: str) -> List[str]:
     topic = topic.strip()
+    profile = _creator_stock_profile(topic)
+    if profile["category"] == "beauty":
+        if language == "vi":
+            return [
+                f"Chân dung người phụ nữ với làn da tự nhiên, ánh sáng mềm, chủ đề {topic}",
+                "Cận cảnh quy trình chăm sóc da, thoa serum lên khuôn mặt sạch",
+                "Các sản phẩm mỹ phẩm và skincare được sắp xếp đẹp trên bàn trang điểm",
+                "Chuyên viên trang điểm đang sử dụng cọ và mỹ phẩm cho khách hàng",
+                "Người phụ nữ rửa mặt và thực hiện routine dưỡng da buổi sáng",
+                "Cận cảnh làn da khỏe, lớp makeup tự nhiên và nụ cười tự tin",
+                "Không gian spa hoặc beauty salon sạch sẽ, thư giãn và sang trọng",
+                "Cận cảnh son môi, phấn nền, mascara và dụng cụ trang điểm",
+                "Người dùng soi gương sau khi hoàn thành quy trình làm đẹp",
+                "Kết quả trước và sau khi chăm sóc da, phong thái tự tin, rạng rỡ",
+            ]
+        return [f"Natural beauty portrait in soft light, topic {topic}", *profile["queries"][1:]]
     if language == "vi":
         return [
-            f"Người trẻ đang học tập hoặc làm việc với laptop, không khí tập trung, chủ đề {topic}",
-            "Cận cảnh màn hình máy tính, tài liệu, email, slide thuyết trình và công việc văn phòng bận rộn",
-            "Không gian làm việc hiện đại với nhiều ứng dụng AI, ghi chú, biểu đồ và ý tưởng nội dung",
-            "Sinh viên nghiên cứu tài liệu, tìm kiếm thông tin, đọc nguồn tham khảo trên laptop",
-            "Người sáng tạo nội dung đang dựng video ngắn, viết caption, lập kế hoạch đăng mạng xã hội",
-            "Giao diện thuyết trình hoặc slide đẹp, bố cục rõ ràng, cảm giác chuyên nghiệp",
-            "Micro, tai nghe hoặc studio nhỏ tượng trưng cho giọng đọc AI và sản xuất nội dung",
-            "Tài liệu PDF, sách, ghi chú học tập, người đặt câu hỏi và tổng hợp kiến thức",
-            "Người dùng hoàn thành công việc nhanh hơn, cảm giác năng suất và nhẹ nhõm",
-            "Cảnh kết thúc với điện thoại hiển thị video social media, kêu gọi bình luận và theo dõi",
+            f"Toàn cảnh giới thiệu trực quan về {topic}", f"Cận cảnh chi tiết quan trọng nhất của {topic}",
+            f"Một người đang trực tiếp trải nghiệm hoặc thực hiện {topic}", f"Các công cụ và vật dụng liên quan đến {topic}",
+            f"Quy trình thực hiện {topic} theo từng bước", f"Góc quay cận cảnh thể hiện chất liệu và chi tiết của {topic}",
+            f"Bối cảnh đời thực nơi {topic} thường diễn ra", f"Kết quả trước và sau khi áp dụng {topic}",
+            f"Người dùng hài lòng với kết quả của {topic}", f"Cảnh kết thúc đẹp và tích cực liên quan trực tiếp đến {topic}",
         ]
     return [
-        f"Young professional or student using a laptop, focused workspace, topic {topic}",
-        "Close-up of computer screen, documents, email, presentation slides, busy office tasks",
-        "Modern desk with AI apps, notes, charts, and content ideas",
-        "Student researching information, reading sources, studying on a laptop",
-        "Content creator editing short videos, writing captions, planning social posts",
-        "Clean presentation slides, professional layout, modern business visuals",
-        "Microphone, headphones, or small studio representing AI voice and content production",
-        "PDF documents, books, notes, question answering and knowledge management",
-        "Person finishing work faster, productive and relaxed mood",
-        "Phone showing a social media video, comment and follow call to action",
+        f"Wide establishing shot visually introducing {topic}", f"Close-up of the most important detail of {topic}",
+        f"A person directly experiencing or doing {topic}", f"Tools and objects directly related to {topic}",
+        f"Step by step process of {topic}", f"Detailed close-up showing the texture and features of {topic}",
+        f"Real-life environment where {topic} happens", f"Before and after result of {topic}",
+        f"A person satisfied with the result of {topic}", f"Positive cinematic closing shot directly related to {topic}",
     ]
 
 
 def _creator_script_text_from_topic(topic: str, language: str) -> str:
     return "\n".join(_creator_scene_brief_from_topic(topic, language))
+
+
+def _creator_narration_from_topic(topic: str, language: str) -> List[str]:
+    topic = topic.strip()
+    if language == "vi":
+        return [
+            f"Bạn đang quan tâm đến {topic}?",
+            f"Trong video này, chúng ta sẽ tìm hiểu nhanh về {topic}.",
+            "Điều quan trọng đầu tiên là xác định mục tiêu bạn thực sự muốn đạt được.",
+            "Tiếp theo, hãy chia mục tiêu lớn thành những bước nhỏ và dễ thực hiện.",
+            "Bạn nên ưu tiên các công cụ đơn giản, phù hợp với nhu cầu của mình.",
+            "Hãy thử nghiệm từng bước và ghi lại kết quả để biết điều gì hiệu quả.",
+            "Đừng quên kiểm tra nguồn thông tin trước khi đưa ra quyết định.",
+            "Khi đã quen, bạn có thể tối ưu quy trình để tiết kiệm nhiều thời gian hơn.",
+            f"Chỉ cần bắt đầu từ một bước nhỏ, {topic} sẽ trở nên dễ tiếp cận hơn.",
+            "Nếu thấy nội dung hữu ích, hãy lưu video và theo dõi để xem thêm.",
+        ]
+    return [
+        f"Are you interested in {topic}?", f"Here is a quick introduction to {topic}.",
+        "First, decide on the result you actually want to achieve.",
+        "Break the larger goal into small and practical steps.",
+        "Choose simple tools that match your real needs.",
+        "Test each step and keep track of what works best.",
+        "Always verify your sources before making a decision.",
+        "Once the basics work, optimize the process to save time.",
+        f"Start with one small step and {topic} will feel much easier.",
+        "Save this video and follow for more useful ideas.",
+    ]
+
+
+def _creator_narration_text_from_topic(topic: str, language: str) -> str:
+    return "\n".join(_creator_narration_from_topic(topic, language))
+
+
+def _available_gemini_models(api_key: str) -> List[str]:
+    response = requests.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        headers={"x-goog-api-key": api_key}, params={"pageSize": 1000}, timeout=30,
+    )
+    response.raise_for_status()
+    available: List[str] = []
+    for item in response.json().get("models", []):
+        methods = item.get("supportedGenerationMethods") or []
+        name = str(item.get("name", "")).removeprefix("models/")
+        lowered = name.lower()
+        if (
+            name and "generateContent" in methods and "gemini" in lowered
+            and not any(word in lowered for word in ("image", "embedding", "live", "tts", "robotics"))
+        ):
+            available.append(name)
+    return available
+
+
+def _select_gemini_models(api_key: str, configured: str) -> List[str]:
+    preferred = [
+        configured, "gemini-3.1-flash-lite", "gemini-3.5-flash",
+        "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+    ]
+    try:
+        available = _available_gemini_models(api_key)
+        selected = list(dict.fromkeys(name for name in preferred if name and name in available))
+        selected.extend(name for name in available if name not in selected and "flash" in name.lower())
+        if selected:
+            return selected
+        raise RuntimeError("API key không có model Gemini hỗ trợ generateContent")
+    except Exception as exc:
+        logger.warning("Could not list Gemini models; trying known model names: %s", exc)
+        return list(dict.fromkeys(name for name in preferred if name))
+
+
+def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False) -> tuple[str, int]:
+    duration = max(10, min(180, int(body.duration_seconds or 30)))
+    scene_count = max(4, min(12, round(duration / 4)))
+    language_name = LANGUAGE_LABELS.get(body.target_language, body.target_language)
+    search_instruction = (
+        "BẮT BUỘC dùng Google Search để nghiên cứu search intent và các góc nội dung đang phù hợp."
+        if require_search else
+        "Tạo nội dung SEO sát search intent; không bịa số liệu xu hướng hoặc tuyên bố đã tìm kiếm web."
+    )
+    prompt = f"""Bạn là biên kịch video ngắn và chuyên gia SEO YouTube/TikTok.
+{search_instruction}
+Hãy lập nội dung cho video với thông số bắt buộc:
+- Chủ đề: {body.topic.strip()}
+- Ngôn ngữ đầu ra: {language_name}
+- Tỷ lệ khung hình: {body.aspect_ratio}
+- Thời lượng: {duration} giây
+- Hiệu ứng hình: {body.transition}
+
+QUY TẮC NGÔN NGỮ TUYỆT ĐỐI: mọi chuỗi trong cả keywords, visual_brief và
+narration_lines phải viết duy nhất bằng {language_name}. Ngôn ngữ của chủ đề
+đầu vào không được làm thay đổi ngôn ngữ đầu ra. Không xen tiếng Anh, trừ tên
+riêng hoặc thuật ngữ không có bản dịch tự nhiên.
+
+Trả về đúng JSON theo schema. Yêu cầu:
+1. keywords: 12-18 keyword/long-tail keyword sát chủ đề, có search intent, không nhồi từ khóa, không bịa số liệu xu hướng.
+2. visual_brief: đúng {scene_count} cảnh, mỗi phần tử phải có chủ thể cụ thể + hành động nhìn thấy được và có thể tìm hoặc tái tạo thành footage. Mỗi cảnh phải liên quan trực tiếp đến chủ đề; tránh mô tả trừu tượng, chữ/UI/logo. Không được tạo một phần tử chỉ nói về phong cách, màu sắc, góc máy hoặc thể loại phim.
+3. narration_lines: kịch bản hook → giá trị chính → CTA; mỗi phần tử là một câu nói tự nhiên. Tổng độ dài phải vừa khoảng {duration} giây khi đọc, không lặp ý, không tuyên bố thiếu căn cứ. Visual và lời thoại phải cùng một mạch nội dung.
+Chỉ xuất một JSON object hợp lệ có đúng ba key: keywords, visual_brief, narration_lines. Không dùng Markdown hay code fence.
+"""
+    return prompt, scene_count
+
+
+def _parse_creator_ai_result(
+    raw: str, scene_count: int, *, generator: str, model: str,
+    target_language: str,
+    grounded: bool = False, search_queries: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
+    data = json.loads(raw)
+    keywords = [str(item).strip() for item in data.get("keywords", []) if str(item).strip()][:18]
+    visuals = [str(item).strip() for item in data.get("visual_brief", []) if str(item).strip()][:scene_count]
+    narration = [str(item).strip() for item in data.get("narration_lines", []) if str(item).strip()]
+    if not keywords or not visuals or not narration:
+        raise RuntimeError(f"{model} trả về nội dung không đầy đủ")
+    # Small local models occasionally ignore the requested language for one
+    # JSON field. Translate every field as a final normalization pass so the
+    # three editor boxes can never intentionally target different languages.
+    normalized = _translate_texts([*keywords, *visuals, *narration], target_language)
+    keyword_end = len(keywords)
+    visual_end = keyword_end + len(visuals)
+    keywords = normalized[:keyword_end]
+    visuals = normalized[keyword_end:visual_end]
+    narration = normalized[visual_end:]
+    return {
+        "keywords": keywords,
+        "visual_brief": "\n".join(visuals), "script": "\n".join(visuals),
+        "narration_script": "\n".join(narration),
+        "generator": generator, "model": model, "warning": None,
+        "language": target_language,
+        "grounded": grounded, "search_queries": (search_queries or [])[:8],
+    }
+
+
+def _ollama_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
+    base_url = (_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+    configured_model = _env_first("OLLAMA_MODEL")
+    tags = requests.get(f"{base_url}/api/tags", timeout=3)
+    tags.raise_for_status()
+    names = [str(item.get("name", "")) for item in tags.json().get("models", []) if item.get("name")]
+    if not names:
+        raise RuntimeError("Ollama chưa có model; hãy chạy: ollama pull qwen3:8b")
+    model = configured_model if configured_model in names else names[0]
+    if configured_model and configured_model not in names:
+        logger.warning(
+            "Ollama model %s is not installed; using available model %s",
+            configured_model, model,
+        )
+    prompt, scene_count = _creator_ai_prompt(body)
+    response = requests.post(
+        f"{base_url}/api/chat", timeout=180,
+        json={
+            "model": model, "stream": False, "format": "json",
+            "messages": [
+                {"role": "system", "content": "Chỉ trả về JSON hợp lệ, không thêm giải thích."},
+                {"role": "user", "content": prompt},
+            ],
+            "options": {"temperature": 0.7},
+        },
+    )
+    response.raise_for_status()
+    raw = response.json().get("message", {}).get("content", "")
+    return _parse_creator_ai_result(
+        raw, scene_count, generator="ollama", model=model,
+        target_language=body.target_language,
+    )
+
+
+def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
+    api_key = _env_first("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("Chưa cấu hình OPENROUTER_API_KEY")
+    requested_model = _env_first("OPENROUTER_MODEL") or "openrouter/free"
+    prompt, scene_count = _creator_ai_prompt(body)
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions", timeout=120,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": requested_model,
+            "messages": [
+                {"role": "system", "content": "Return only one valid JSON object with no markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.7,
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    raw = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    actual_model = str(payload.get("model") or requested_model)
+    return _parse_creator_ai_result(
+        raw, scene_count, generator="openrouter", model=actual_model,
+        target_language=body.target_language,
+    )
+
+
+def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
+    api_key = _env_first("GEMINI_API_KEY", "GOOGLE_AI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Chưa cấu hình GEMINI_API_KEY")
+    configured_model = _env_first("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    prompt, scene_count = _creator_ai_prompt(body, require_search=True)
+    request_payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
+    }
+    response = None
+    model = configured_model
+    attempted_errors: List[str] = []
+    for candidate_model in _select_gemini_models(api_key, configured_model):
+        model = candidate_model
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=request_payload, timeout=60,
+        )
+        if response.ok:
+            break
+        detail = response.text.strip().replace("\n", " ")[:500]
+        attempted_errors.append(f"{model}: HTTP {response.status_code} {detail}")
+        if response.status_code not in (404, 429):
+            break
+    if response is None or not response.ok:
+        raise RuntimeError("; ".join(attempted_errors) or "Không gọi được Gemini API")
+    payload = response.json()
+    candidate = payload.get("candidates", [{}])[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    raw = "".join(part.get("text", "") for part in parts).strip()
+    grounding = candidate.get("groundingMetadata") or {}
+    search_queries = grounding.get("webSearchQueries") or []
+    if not search_queries:
+        raise RuntimeError("Gemini không thực hiện Google Search grounding")
+    return _parse_creator_ai_result(
+        raw, scene_count, generator="gemini", model=model,
+        target_language=body.target_language,
+        grounded=True, search_queries=search_queries,
+    )
 
 
 def _creator_keywords_from_topic(topic: str, language: str) -> List[str]:
@@ -658,55 +990,212 @@ def _creator_keywords_from_topic(topic: str, language: str) -> List[str]:
     for word in words:
         if word not in stopwords and word not in core:
             core.append(word)
-    if language == "vi":
-        base = [
-            topic,
-            f"{topic} cho người mới",
-            f"cách dùng {topic}",
-            f"mẹo {topic}",
-            f"{topic} miễn phí",
-            f"{topic} hiệu quả",
-            "công cụ AI",
-            "năng suất làm việc",
-            "học tập với AI",
-            "tạo nội dung bằng AI",
-        ]
-    else:
-        base = [
-            topic,
-            f"{topic} for beginners",
-            f"how to use {topic}",
-            f"{topic} tips",
-            f"free {topic}",
-            f"best {topic} tools",
-            "AI tools",
-            "productivity",
-            "AI for learning",
-            "AI content creation",
-        ]
-    for word in core[:8]:
-        if word not in base:
-            base.append(word)
-    return base[:14]
+    # SEO keywords should be short search intents/tags, not sentence-length
+    # variants of the title. Topic words come first, then platform intents.
+    base = core[:6] + ["youtube", "shorts", "trending", "viral", "tutorial", "tips", "ai"]
+    result: List[str] = []
+    for keyword in base:
+        keyword = keyword.strip().lower()[:24]
+        if keyword and keyword not in result:
+            result.append(keyword)
+    return result[:12]
 
 
-def _creator_stock_query(topic: str, scene: str, index: int) -> str:
-    generic = [
-        "student laptop productivity artificial intelligence",
-        "busy office computer email documents",
-        "modern workspace laptop technology apps",
-        "student research laptop studying library",
-        "content creator editing video social media",
-        "business presentation slides office",
-        "microphone headphones studio voice recording",
-        "books documents notes studying desk",
-        "productive worker laptop success",
-        "smartphone social media video vertical",
+def _ascii_topic(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.lower().replace("đ", "d"))
+    return " ".join(re.findall(r"[a-z0-9]+", normalized.encode("ascii", "ignore").decode("ascii")))
+
+
+def _creator_stock_profile(topic: str) -> Dict[str, Any]:
+    normalized = _ascii_topic(topic)
+    profiles = [
+        ("beauty", ("lam dep", "my pham", "trang diem", "cham soc da", "skincare", "makeup", "beauty", "cosmetic", "spa"), [
+            "natural beauty woman portrait soft light", "woman applying face serum skincare routine",
+            "skincare cosmetics products flat lay", "makeup artist applying cosmetics beauty salon",
+            "woman washing face morning skincare", "healthy glowing skin natural makeup close up",
+            "luxury spa beauty treatment relaxing", "lipstick foundation mascara makeup products",
+            "woman looking mirror beauty routine", "confident radiant woman beauty portrait",
+        ]),
+        ("food", ("nau an", "mon an", "am thuc", "food", "recipe", "cooking"), [
+            "chef preparing fresh ingredients", "close up cooking healthy meal", "beautiful food plating restaurant",
+        ]),
+        ("fitness", ("tap luyen", "the hinh", "giam can", "yoga", "fitness", "workout", "gym"), [
+            "fitness workout gym training", "healthy woman exercising", "yoga stretching wellness",
+        ]),
+        ("travel", ("du lich", "kham pha", "travel", "tourism", "hotel"), [
+            "traveler exploring beautiful destination", "travel landscape adventure", "tourist enjoying vacation",
+        ]),
+        ("finance", ("tai chinh", "dau tu", "tiet kiem", "kinh doanh", "finance", "investment", "money"), [
+            "personal finance planning money", "business investment charts", "saving money financial goals",
+        ]),
+        ("technology", ("cong nghe", "phan mem", "tri tue nhan tao", "ai", "technology", "software", "computer"), [
+            "modern technology artificial intelligence", "professional using laptop software", "digital innovation interface",
+        ]),
+        ("education", ("hoc tap", "giao duc", "sinh vien", "education", "study", "learning"), [
+            "student focused studying", "online learning laptop", "books notes education desk",
+        ]),
     ]
-    topic_words = " ".join(re.findall(r"[A-Za-z0-9]+", topic))[:60]
-    if topic_words:
-        return f"{generic[index % len(generic)]} {topic_words}"
-    return generic[index % len(generic)]
+    for category, markers, queries in profiles:
+        if any(re.search(rf"(?<!\w){re.escape(marker)}(?!\w)", normalized) for marker in markers):
+            return {"category": category, "queries": queries, "topic": normalized}
+    # Unknown topics remain topic-led. Never silently replace them with
+    # unrelated office/AI footage.
+    return {"category": "general", "queries": [normalized or "lifestyle"], "topic": normalized}
+
+
+def _translate_texts(values: List[str], destination: str) -> List[str]:
+    """Normalize a list of strings to one requested output language."""
+    cleaned = [" ".join(value.split()) for value in values]
+    if not cleaned:
+        return []
+    try:
+        from googletrans import Translator as GoogleTranslator
+        translator = GoogleTranslator()
+        translated = translator.translate(cleaned, src="auto", dest=destination)
+        # googletrans 3.x returns immediately, while newer 4.x builds return
+        # a coroutine. This function runs inside the creator worker thread,
+        # so asyncio.run is safe here and supports both package families.
+        if inspect.isawaitable(translated):
+            translated = asyncio.run(translated)
+        if not isinstance(translated, list):
+            translated = [translated]
+        results = [" ".join(item.text.split()) for item in translated]
+        if len(results) == len(cleaned) and all(results):
+            return results
+    except Exception:
+        logger.exception("Could not normalize generated content to language=%s", destination)
+    return cleaned
+
+
+def _translate_stock_texts_to_english(values: List[str]) -> List[str]:
+    """Translate arbitrary user topics/scenes for stock providers dynamically."""
+    translated = _translate_texts(values, "en")
+    return [value or _ascii_topic(original) or "lifestyle" for value, original in zip(translated, values)]
+
+
+_STOCK_QUERY_STOPWORDS = {
+    "a", "an", "the", "there", "is", "are", "was", "were", "this", "that",
+    "with", "and", "or", "of", "to", "from", "in", "on", "at", "for", "into",
+    "scene", "shot", "footage", "video", "showing", "shows", "appears", "suddenly",
+    "one", "some", "very", "then", "next", "about", "related", "directly",
+}
+
+
+def _compact_stock_terms(text: str, limit: int = 7) -> str:
+    """Keep concrete English search terms instead of sending prose to stock APIs."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    result: List[str] = []
+    for word in words:
+        if word in _STOCK_QUERY_STOPWORDS or len(word) < 2 or word in result:
+            continue
+        result.append(word)
+        if len(result) >= limit:
+            break
+    return " ".join(result)
+
+
+def _disambiguate_stock_terms(source_text: str, terms: str) -> str:
+    """Resolve a few high-impact stock-search ambiguities from nearby verbs."""
+    source_words = set(re.findall(r"[a-z0-9]+", source_text.lower()))
+    if "mouse" in source_words:
+        if source_words.intersection({"run", "runs", "running", "emerge", "emerges", "appears", "escape"}):
+            return _compact_stock_terms(f"animal rodent {terms}", 7)
+        if source_words.intersection({"click", "clicking", "computer", "laptop", "cursor"}):
+            return _compact_stock_terms(f"computer mouse {terms}", 7)
+    return terms
+
+
+def _creator_stock_queries(
+    translated_topic: str, translated_visual: str, translated_narration: str,
+) -> List[str]:
+    """Build short, specificity-first queries for one timeline scene.
+
+    Voice content wins because it represents what the viewer hears at that
+    exact moment. Visual brief is the second choice, while the broad topic is
+    only a last resort and cannot drown out concrete subjects/actions.
+    """
+    narration = _disambiguate_stock_terms(
+        translated_narration, _compact_stock_terms(translated_narration, 6),
+    )
+    visual = _compact_stock_terms(translated_visual, 7)
+    topic = _compact_stock_terms(translated_topic, 5)
+    candidates = [narration, visual]
+    if narration and visual:
+        candidates.insert(1, _compact_stock_terms(f"{narration} {visual}", 8))
+    candidates.append(topic)
+    return list(dict.fromkeys(query for query in candidates if query))
+
+
+def _creator_image_story_prompts(
+    topic: str, visuals: List[str], narrations: List[str],
+) -> tuple[str, List[str]]:
+    """Plan a coherent image sequence before invoking the diffusion model."""
+    scene_count = len(visuals)
+    aligned_narrations = [
+        narrations[min(len(narrations) - 1, int(i * len(narrations) / max(1, scene_count)))]
+        for i in range(scene_count)
+    ]
+    fallback_bible = (
+        f"One coherent live-action documentary about {topic}; same recurring subjects, "
+        "same appearance and location logic, realistic anatomy, natural light, real camera footage"
+    )
+    fallback_prompts = [
+        f"Exact scene action: {visual}. Narration meaning: {aligned_narrations[i]}. {fallback_bible}"
+        for i, visual in enumerate(visuals)
+    ]
+    try:
+        base_url = (_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        model = _env_first("OLLAMA_MODEL") or "llama3:latest"
+        scene_lines = "\n".join(
+            f"Scene {i + 1}: visual={visual} | narration={aligned_narrations[i]}"
+            for i, visual in enumerate(visuals)
+        )
+        prompt = f"""You are a film storyboard director. Turn the following complete short-video story into a visually coherent image sequence.
+Topic: {topic}
+{scene_lines}
+
+Return JSON with exactly two keys:
+- story_bible: one English string, maximum 45 words. Lock recurring character/species appearance, clothing, location logic, lighting and color palette for the whole story. The style MUST be live-action documentary photography with real anatomy and real-world textures, never animation, illustration, 3D render, CGI or cartoon.
+- scene_prompts: exactly {scene_count} English strings, each maximum 55 words.
+
+Every scene prompt MUST begin with the exact concrete subject and action from that scene. Preserve species and objects literally: never replace an animal/object with a person. Then repeat the relevant fixed appearance and style from story_bible. Scenes must progress chronologically as one story, not look like unrelated illustrations. Do not request diagrams, text, labels, UI, logos or split screens.
+Only output valid JSON."""
+        storyboard_timeout = max(15, min(180, int(_env_first("OLLAMA_STORYBOARD_TIMEOUT") or "60")))
+        response = requests.post(
+            f"{base_url}/api/chat", timeout=storyboard_timeout,
+            json={
+                "model": model, "stream": False, "format": "json",
+                "messages": [
+                    {"role": "system", "content": "Return only valid JSON. Preserve every concrete subject and action exactly."},
+                    {"role": "user", "content": prompt},
+                ],
+                "options": {"temperature": 0.25, "num_predict": 600, "num_ctx": 4096},
+            },
+        )
+        response.raise_for_status()
+        raw = response.json().get("message", {}).get("content", "")
+        data = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE))
+        story_bible = " ".join(str(data.get("story_bible", "")).split())
+        prompts = [" ".join(str(item).split()) for item in data.get("scene_prompts", [])]
+        if not story_bible or len(prompts) != scene_count or not all(prompts):
+            raise RuntimeError("Storyboard AI returned the wrong number of scene prompts")
+        # Put the exact user scene first so a verbose style bible cannot
+        # push the important subject/action past SD-Turbo's token window.
+        final_prompts = []
+        bible_short = " ".join(story_bible.split()[:20])
+        for i, visual in enumerate(visuals):
+            visual_short = " ".join(visual.split()[:18])
+            director_short = " ".join(prompts[i].split()[:22])
+            final_prompts.append(
+                f"{visual_short}. Continuity: {bible_short}. Scene direction: {director_short}"
+            )
+        return story_bible, final_prompts
+    except requests.Timeout:
+        logger.warning("Ollama storyboard timed out; using deterministic continuity prompts")
+        return fallback_bible, fallback_prompts
+    except Exception:
+        logger.exception("Could not create AI storyboard; using deterministic continuity prompts")
+        return fallback_bible, fallback_prompts
 
 
 def _split_creator_script(topic: str, script: Optional[str], language: str) -> List[str]:
@@ -716,6 +1205,17 @@ def _split_creator_script(topic: str, script: Optional[str], language: str) -> L
     lines = [line.strip(" -\t") for line in raw.splitlines() if line.strip()]
     if len(lines) <= 1:
         lines = [s.strip() for s in re.split(r"(?<=[.!?。！？])\s+", raw) if s.strip()]
+    if len(lines) > 1:
+        style_only_prefixes = (
+            "phong cách", "màu sắc", "tông màu", "góc máy", "thể loại",
+            "style", "color palette", "colour palette", "camera style", "genre",
+        )
+        concrete_lines = [
+            line for line in lines
+            if not line.lower().lstrip().startswith(style_only_prefixes)
+        ]
+        if concrete_lines:
+            lines = concrete_lines
     return lines[:12] or _creator_scene_brief_from_topic(topic, language)
 
 
@@ -752,8 +1252,8 @@ def _pick_pexels_video_file(video: Dict[str, Any]) -> Optional[str]:
 
 def _search_stock_media(query: str, aspect_ratio: str) -> Optional[Dict[str, str]]:
     orientation = _stock_orientation(aspect_ratio)
-    pexels_key = os.environ.get("PEXELS_API_KEY")
-    pixabay_key = os.environ.get("PIXABAY_API_KEY")
+    pexels_key = _env_first("PEXELS_API_KEY", "PEXELS_KEY")
+    pixabay_key = _env_first("PIXABAY_API_KEY", "PIXABAY_KEY")
 
     if pexels_key:
         try:
@@ -830,13 +1330,168 @@ def _search_stock_media(query: str, aspect_ratio: str) -> Optional[Dict[str, str
 def _download_stock_media(media: Dict[str, str], dest: Path) -> Path:
     suffix = ".mp4" if media["type"] == "video" else ".jpg"
     output = dest.with_suffix(suffix)
-    with requests.get(media["url"], stream=True, timeout=60) as resp:
+    with requests.get(
+        media["url"], stream=True, timeout=(15, 120),
+        headers={"User-Agent": "Mozilla/5.0 VideoLocalizationAI/1.0"},
+    ) as resp:
         resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").lower()
+        if "text/html" in content_type:
+            raise RuntimeError("Nhà cung cấp media trả về HTML thay vì ảnh/video")
         with output.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
     return output
+
+
+def _generate_ai_image(
+    prompt: str, output_path: Path, aspect_ratio: str, story_seed: Optional[int] = None,
+) -> Path:
+    """Generate a scene image locally, automatically using CUDA when available."""
+    global _IMAGE_AI_PIPELINE, _IMAGE_AI_DEVICE
+    # Diffusers exposes several lazy modules; importing AutoPipeline from
+    # two creator worker threads at the same time can recurse through its
+    # optional PEFT/ControlNet imports. Serialize the import and use the
+    # concrete SD pipeline required by sd-turbo instead.
+    with _IMAGE_AI_LOCK:
+        try:
+            import torch
+            from diffusers import StableDiffusionPipeline
+        except (ImportError, RuntimeError, RecursionError) as exc:
+            raise RuntimeError(
+                "Không khởi tạo được thư viện AI ảnh; hãy restart backend rồi thử lại"
+            ) from exc
+
+    model_id = _env_first("IMAGE_AI_MODEL", "CPU_IMAGE_MODEL") or "stabilityai/sd-turbo"
+    requested_device = (_env_first("IMAGE_AI_DEVICE") or "auto").lower()
+    if requested_device not in ("auto", "cpu", "cuda"):
+        raise RuntimeError("IMAGE_AI_DEVICE chỉ nhận auto, cpu hoặc cuda")
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Đã chọn CUDA nhưng PyTorch không nhận được GPU NVIDIA")
+    device = "cuda" if (requested_device == "cuda" or (requested_device == "auto" and torch.cuda.is_available())) else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    with _IMAGE_AI_LOCK:
+        if _IMAGE_AI_PIPELINE is None or _IMAGE_AI_DEVICE != device:
+            logger.info("Loading image model %s on %s (first run may download several GB)", model_id, device.upper())
+            _IMAGE_AI_PIPELINE = StableDiffusionPipeline.from_pretrained(
+                model_id, torch_dtype=dtype, use_safetensors=True,
+            )
+            _IMAGE_AI_PIPELINE.to(device)
+            _IMAGE_AI_DEVICE = device
+            if device == "cpu":
+                _IMAGE_AI_PIPELINE.enable_attention_slicing()
+
+        # Keep CPU inference practical. FFmpeg scales/crops this image to the
+        # final 1080p canvas later.
+        width, height = ((640, 384) if aspect_ratio == "16:9" else (384, 640))
+        steps = max(1, min(4, int(_env_first("IMAGE_AI_STEPS", "CPU_IMAGE_STEPS") or "1")))
+        full_prompt = (
+            f"{prompt}, RAW live-action documentary photograph, real camera frame, "
+            "physically accurate anatomy, lifelike skin fur and materials, natural unedited colors, clear main subject, "
+            "natural lighting, no illustration, no animation, no cartoon, no 3D render, no CGI, no text, no logo, no watermark, "
+            "do not add people unless the scene explicitly mentions a person"
+        )
+        seed = story_seed if story_seed is not None else int.from_bytes(
+            full_prompt.encode("utf-8")[:8].ljust(8, b"0"), "little",
+        ) % (2**31)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        result = _IMAGE_AI_PIPELINE(
+            prompt=full_prompt, width=width, height=height,
+            num_inference_steps=steps, guidance_scale=0.0, generator=generator,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result.images[0].save(output_path, format="JPEG", quality=92)
+    return output_path
+
+
+def _release_image_ai_pipeline() -> None:
+    """Free the storyboard image model before loading the much larger video model."""
+    global _IMAGE_AI_PIPELINE, _IMAGE_AI_DEVICE
+    with _IMAGE_AI_LOCK:
+        _IMAGE_AI_PIPELINE = None
+        _IMAGE_AI_DEVICE = None
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def _generate_ai_video(
+    image_path: Path,
+    prompt: str,
+    output_path: Path,
+    aspect_ratio: str,
+    duration: float,
+    story_seed: int,
+) -> Path:
+    """Animate a storyboard keyframe with LTX-Video on an NVIDIA GPU."""
+    global _VIDEO_AI_PIPELINE, _VIDEO_AI_MODEL
+    try:
+        import torch
+        from PIL import Image
+        from diffusers import LTXImageToVideoPipeline
+        from diffusers.utils import export_to_video
+    except (ImportError, RuntimeError, RecursionError) as exc:
+        raise RuntimeError("Không khởi tạo được LTX-Video; hãy kiểm tra diffusers/transformers") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("AI Sinh Video cần NVIDIA GPU/CUDA nhưng PyTorch hiện không nhận GPU")
+
+    model_id = _env_first("LTX_VIDEO_MODEL") or "Lightricks/LTX-Video-0.9.5"
+    # LTX requires dimensions divisible by 32 and frame counts in the form 8n+1.
+    width, height = ((704, 416) if aspect_ratio == "16:9" else (416, 704))
+    fps = max(8, min(30, int(_env_first("LTX_VIDEO_FPS") or "24")))
+    requested_frames = min(
+        max(25, int(round(min(duration, 4.0) * fps))),
+        max(25, int(_env_first("LTX_VIDEO_MAX_FRAMES") or "49")),
+    )
+    num_frames = max(25, ((requested_frames - 1) // 8) * 8 + 1)
+    steps = max(4, min(50, int(_env_first("LTX_VIDEO_STEPS") or "30")))
+    use_offload = (_env_first("LTX_VIDEO_CPU_OFFLOAD") or "true").lower() not in ("0", "false", "no")
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    with _VIDEO_AI_LOCK:
+        if _VIDEO_AI_PIPELINE is None or _VIDEO_AI_MODEL != model_id:
+            logger.info("Loading LTX video model %s on CUDA (first run downloads model weights)", model_id)
+            _VIDEO_AI_PIPELINE = LTXImageToVideoPipeline.from_pretrained(
+                model_id, torch_dtype=dtype,
+            )
+            _VIDEO_AI_PIPELINE.vae.enable_tiling()
+            if use_offload:
+                _VIDEO_AI_PIPELINE.enable_model_cpu_offload()
+            else:
+                _VIDEO_AI_PIPELINE.to("cuda")
+            _VIDEO_AI_MODEL = model_id
+
+        image = Image.open(image_path).convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        negative_prompt = (
+            "cartoon, animation, illustration, CGI, 3D render, deformed anatomy, "
+            "identity change, flicker, jitter, text, logo, watermark, blurry"
+        )
+        generator = torch.Generator(device="cuda").manual_seed(story_seed)
+        frames = _VIDEO_AI_PIPELINE(
+            image=image,
+            prompt=(
+                f"{prompt}. Live-action cinematic documentary footage, natural realistic motion, "
+                "physically accurate movement, stable subject identity, coherent camera movement, no scene cut."
+            ),
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            frame_rate=fps,
+            num_inference_steps=steps,
+            guidance_scale=3.0,
+            decode_timestep=0.05,
+            decode_noise_scale=0.025,
+            generator=generator,
+        ).frames[0]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        export_to_video(frames, str(output_path), fps=fps)
+    return output_path
 
 
 def _render_stock_clip(
@@ -846,13 +1501,61 @@ def _render_stock_clip(
     width: int,
     height: int,
     duration: float,
+    animation: str = "fade",
 ) -> None:
-    vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
+    # Stock sources commonly mix 23.976/25/29.97 fps. xfade rejects mixed
+    # or variable rates, so normalize every scene to a real CFR timeline.
+    base_vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},fps=30,settb=AVTB,setpts=N/(30*TB),format=yuv420p"
+    )
+    effect = min(0.55, max(0.25, duration / 5))
+    if animation in {"slideleft", "slideright"}:
+        x_expr = (
+            f"if(lt(t,{effect:.3f}),{width}*(1-t/{effect:.3f}),"
+            f"if(gt(t,{duration - effect:.3f}),{width}*(t-{duration - effect:.3f})/{effect:.3f},0))"
+            if animation == "slideleft" else
+            f"if(lt(t,{effect:.3f}),{width}*t/{effect:.3f},"
+            f"if(gt(t,{duration - effect:.3f}),{width}*(1-(t-{duration - effect:.3f})/{effect:.3f}),{width}))"
+        )
+        vf = (
+            f"{base_vf},pad={width * 2}:{height}:{width if animation == 'slideright' else 0}:0:black,"
+            f"crop={width}:{height}:x='{x_expr}':y=0"
+        )
+    elif animation in {"slideup", "slidedown"}:
+        y_expr = (
+            f"if(lt(t,{effect:.3f}),{height}*(1-t/{effect:.3f}),"
+            f"if(gt(t,{duration - effect:.3f}),{height}*(t-{duration - effect:.3f})/{effect:.3f},0))"
+            if animation == "slideup" else
+            f"if(lt(t,{effect:.3f}),{height}*t/{effect:.3f},"
+            f"if(gt(t,{duration - effect:.3f}),{height}*(1-(t-{duration - effect:.3f})/{effect:.3f}),{height}))"
+        )
+        vf = (
+            f"{base_vf},pad={width}:{height * 2}:0:{height if animation == 'slidedown' else 0}:black,"
+            f"crop={width}:{height}:x=0:y='{y_expr}'"
+        )
+    elif animation in {"zoomin", "zoomout"}:
+        zoom = (
+            "min(zoom+0.0015,1.12)" if animation == "zoomin"
+            else "if(eq(on,1),1.12,max(1.0,zoom-0.0015))"
+        )
+        vf = (
+            f"{base_vf},zoompan=z='{zoom}':x='iw/2-(iw/zoom/2)':"
+            f"y='ih/2-(ih/zoom/2)':d=1:s={width}x{height}:fps=30"
+        )
+    elif animation != "none":
+        vf = (
+            f"{base_vf},fade=t=in:st=0:d={effect:.3f},"
+            f"fade=t=out:st={max(0, duration - effect):.3f}:d={effect:.3f}"
+        )
+    else:
+        vf = base_vf
     if source_type == "image":
         cmd = [
             "ffmpeg", "-y", "-loop", "1", "-t", f"{duration:.3f}",
             "-i", str(source_path), "-vf", vf, "-an",
             "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+            "-r", "30", "-fps_mode", "cfr",
             str(output_path),
         ]
     else:
@@ -860,11 +1563,286 @@ def _render_stock_clip(
             "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{duration:.3f}",
             "-i", str(source_path), "-vf", vf, "-an",
             "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+            "-r", "30", "-fps_mode", "cfr",
             str(output_path),
         ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout or "FFmpeg stock clip render failed")
+
+
+CREATOR_TRANSITIONS = {
+    "none", "fade", "slideleft", "slideright", "slideup", "slidedown", "zoomin", "zoomout",
+}
+
+
+def _render_creator_timeline(
+    clip_paths: List[Path], output_path: Path, scene_duration: float,
+    requested_duration: float, transition: str,
+) -> bool:
+    """Join clips with normalized timestamps, optionally using xfade."""
+    inputs: List[str] = []
+    for path in clip_paths:
+        inputs.extend(["-i", str(path)])
+
+    if transition == "none" or len(clip_paths) == 1:
+        prepared = "".join(
+            f"[{i}:v]framerate=fps=30,setpts=PTS-STARTPTS[v{i}];"
+            for i in range(len(clip_paths))
+        )
+        joined = "".join(f"[v{i}]" for i in range(len(clip_paths)))
+        graph = f"{prepared}{joined}concat=n={len(clip_paths)}:v=1:a=0[vout]"
+        final_duration = scene_duration * len(clip_paths)
+    else:
+        effect_duration = min(0.7, max(0.3, scene_duration / 4))
+        parts = [
+            f"[{i}:v]framerate=fps=30,setpts=PTS-STARTPTS[v{i}]"
+            for i in range(len(clip_paths))
+        ]
+        previous = "v0"
+        for i in range(1, len(clip_paths)):
+            raw_output = f"rawx{i}"
+            output = f"x{i}"
+            offset = i * scene_duration - i * effect_duration
+            parts.append(
+                f"[{previous}][v{i}]xfade=transition={transition}:duration={effect_duration:.3f}:"
+                f"offset={offset:.3f}[{raw_output}]"
+            )
+            # FFmpeg 7 can drop the frame-rate metadata on an xfade output;
+            # restore it before feeding that output into the next xfade.
+            parts.append(f"[{raw_output}]framerate=fps=30[{output}]")
+            previous = output
+        parts.append(f"[{previous}]format=yuv420p[vout]")
+        graph = ";".join(parts)
+        final_duration = scene_duration * len(clip_paths) - effect_duration * (len(clip_paths) - 1)
+
+    cmd = [
+        "ffmpeg", "-y", *inputs, "-filter_complex", graph,
+        "-map", "[vout]", "-t", f"{final_duration:.3f}", "-an",
+        "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+        "-r", "30", "-fps_mode", "cfr",
+        "-movflags", "+faststart", str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        if transition != "none":
+            logger.warning(
+                "Transition %s failed; completing video without transition: %s",
+                transition, (result.stderr or result.stdout or "unknown FFmpeg error")[-2000:],
+            )
+            return _render_creator_timeline(
+                clip_paths, output_path, scene_duration, requested_duration, "none",
+            )
+        raise RuntimeError((result.stderr or result.stdout or "FFmpeg timeline render failed")[-4000:])
+    return transition != "none"
+
+
+def _srt_timestamp(seconds: float) -> str:
+    millis = max(0, round(seconds * 1000))
+    hours, millis = divmod(millis, 3_600_000)
+    minutes, millis = divmod(millis, 60_000)
+    secs, millis = divmod(millis, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _ass_timestamp(seconds: float) -> str:
+    centis = max(0, round(seconds * 100))
+    hours, centis = divmod(centis, 360_000)
+    minutes, centis = divmod(centis, 6_000)
+    secs, centis = divmod(centis, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def _ass_karaoke_text(
+    text: str, duration: float, word_durations_cs: Optional[List[int]] = None,
+) -> str:
+    """ASS karaoke: unspoken words are white, spoken words turn yellow."""
+    lines = text.split("\n")
+    words = [word for line in lines for word in line.split()]
+    total_chars = sum(max(1, len(word)) for word in words) or 1
+    measured = word_durations_cs if word_durations_cs and len(word_durations_cs) == len(words) else None
+    total_cs = max(len(words), round(duration * 100))
+    remaining_cs = total_cs
+    remaining_chars = total_chars
+    rendered_lines: List[str] = []
+    flat_word_index = 0
+    for line_index, line in enumerate(lines):
+        rendered_words: List[str] = []
+        line_words = line.split()
+        for word_index, word in enumerate(line_words):
+            is_last = line_index == len(lines) - 1 and word_index == len(line_words) - 1
+            weight = max(1, len(word))
+            if measured:
+                word_cs = max(1, measured[flat_word_index])
+            else:
+                word_cs = remaining_cs if is_last else max(1, round(remaining_cs * weight / remaining_chars))
+            remaining_cs -= word_cs
+            remaining_chars -= weight
+            flat_word_index += 1
+            safe_word = word.replace("{", "(").replace("}", ")").replace("\\", "")
+            rendered_words.append(f"{{\\kf{word_cs}}}{safe_word}")
+        rendered_lines.append(" ".join(rendered_words))
+    return r"\N".join(rendered_lines)
+
+
+def _write_creator_subtitles(
+    scenes: List[str], path: Path, spoken_duration: float,
+    cue_durations: Optional[List[float]] = None, frame_width: int = 1080,
+    frame_height: int = 1920, cue_word_durations: Optional[List[List[int]]] = None,
+) -> tuple[List[Dict[str, Any]], float]:
+    segments: List[Dict[str, Any]] = []
+    dialogues: List[str] = []
+    cues_text = [chunk for scene in scenes for chunk in _balanced_caption_chunks(scene)]
+    weights = (
+        [max(0.01, duration) for duration in cue_durations]
+        if cue_durations and len(cue_durations) == len(cues_text)
+        else [max(1, len(re.sub(r"\s+", "", cue))) for cue in cues_text]
+    )
+    total_weight = sum(weights) or 1
+    cues: List[tuple[str, float, float]] = []
+    elapsed_weight = 0
+    for cue, weight in zip(cues_text, weights):
+        start = spoken_duration * elapsed_weight / total_weight
+        elapsed_weight += weight
+        end = spoken_duration * elapsed_weight / total_weight
+        cues.append((cue, start, end))
+    for cue_index, (text, start, end) in enumerate(cues):
+        segments.append({"start": start, "end": end, "text": text})
+        measured_words = (
+            cue_word_durations[cue_index]
+            if cue_word_durations and cue_index < len(cue_word_durations) else None
+        )
+        # If the complete narration was compressed to fit the visual track,
+        # apply the same scale to Edge's real word-boundary durations.
+        cue_scale = (end - start) / weights[cue_index] if measured_words and weights[cue_index] else 1.0
+        scaled_words = [max(1, round(cs * cue_scale)) for cs in measured_words] if measured_words else None
+        karaoke = _ass_karaoke_text(text, end - start, scaled_words)
+        dialogues.append(
+            f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},Default,,0,0,0,,"
+            f"{{\\fad(100,120)}}{karaoke}"
+        )
+    # Explicit PlayRes makes margins/font sizes deterministic on both 9:16
+    # and 16:9 output. WrapStyle=2 respects our one intentional \N only, so
+    # libass cannot turn a two-line cue into four/five lines.
+    font_size = 48 if frame_height >= frame_width else 50
+    margin_lr = max(40, round(frame_width * 0.07))
+    margin_v = max(70, round(frame_height * 0.07))
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {frame_width}
+PlayResY: {frame_height}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,{font_size},&H0000D7FF,&H00FFFFFF,&H00101010,&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,{margin_lr},{margin_lr},{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    path.write_text(header + "\n".join(dialogues) + "\n", encoding="utf-8")
+    return segments, spoken_duration
+
+
+def _media_duration(path: Path) -> float:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    try:
+        return max(0.0, float(probe.stdout.strip()))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _synthesize_creator_cues(
+    scenes: List[str], output_dir: Path, language: str, voice: Optional[str], output_path: Path,
+) -> tuple[List[float], List[List[int]]]:
+    """Synthesize each displayed cue separately and concatenate the audio.
+
+    Measuring every cue's real audio duration gives subtitle boundaries that
+    follow the selected voice, including its pauses and speaking style.
+    """
+    cues = [chunk for scene in scenes for chunk in _balanced_caption_chunks(scene)]
+    cue_dir = output_dir / "narration_cues"
+    cue_dir.mkdir(parents=True, exist_ok=True)
+    import edge_tts
+    preset = voice or voice_for_language(language)
+    preset_parts = preset.split("|")
+    effective_voice = preset_parts[0]
+    options = dict(part.split("=", 1) for part in preset_parts[1:] if "=" in part)
+    paths: List[Path] = []
+    durations: List[float] = []
+    word_durations: List[List[int]] = []
+    for index, cue in enumerate(cues):
+        cue_path = cue_dir / f"cue_{index:03d}.mp3"
+        communicate = edge_tts.Communicate(
+            cue.replace("\n", " "), effective_voice,
+            rate=options.get("rate", "+0%"), pitch=options.get("pitch", "+0Hz"),
+            boundary="WordBoundary",
+        )
+        measured_boundaries: List[tuple[int, int]] = []
+        with cue_path.open("wb") as audio_file:
+            for event in communicate.stream_sync():
+                if event["type"] == "audio":
+                    audio_file.write(event["data"])
+                elif event["type"] == "WordBoundary":
+                    measured_boundaries.append((event["offset"], event["duration"]))
+        duration = _media_duration(cue_path)
+        if duration <= 0:
+            raise RuntimeError(f"Không đo được thời lượng voice đoạn {index + 1}")
+        paths.append(cue_path)
+        durations.append(duration)
+        # Karaoke tags are sequential. Use the distance between Edge's real
+        # word start offsets so natural inter-word pauses remain attached to
+        # the word being spoken; the final word runs to the cue audio end.
+        measured_words: List[int] = []
+        for boundary_index, (offset, boundary_duration) in enumerate(measured_boundaries):
+            if boundary_index + 1 < len(measured_boundaries):
+                end_offset = measured_boundaries[boundary_index + 1][0]
+            else:
+                end_offset = max(offset + boundary_duration, round(duration * 10_000_000))
+            measured_words.append(max(1, round((end_offset - offset) / 100_000)))
+        word_durations.append(measured_words)
+    concat_file = cue_dir / "concat.txt"
+    concat_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in paths), encoding="utf-8")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(output_path)],
+        capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Không ghép được các đoạn voice")[-4000:])
+    return durations, word_durations
+
+
+def _add_creator_voice_and_subtitles(
+    video_path: Path, voice_path: Path, subtitles_path: Path,
+    output_path: Path, duration: float,
+) -> None:
+    # Job paths are generated internally and contain no filtergraph-special
+    # characters; quote the filename for FFmpeg's subtitles filter.
+    subtitle_filter = f"subtitles=filename='{subtitles_path.as_posix()}'"
+    voice_duration = _media_duration(voice_path)
+    audio_filters: List[str] = []
+    speed = voice_duration / duration if duration > 0 and voice_duration > duration else 1.0
+    while speed > 2.0:
+        audio_filters.append("atempo=2.0")
+        speed /= 2.0
+    if speed > 1.001:
+        audio_filters.append(f"atempo={speed:.5f}")
+    audio_filters.append("apad")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path), "-i", str(voice_path),
+        "-vf", subtitle_filter, "-filter:a", ",".join(audio_filters),
+        "-map", "0:v:0", "-map", "1:a:0", "-t", f"{duration:.3f}",
+        "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+        "-r", "30", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "FFmpeg voice/subtitle render failed")[-4000:])
 
 
 def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
@@ -877,27 +1855,114 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         scenes = _split_creator_script(body.topic, body.script, body.target_language)
+        narration_scenes = _split_creator_script(
+            body.topic,
+            body.narration_script or _creator_narration_text_from_topic(body.topic, body.target_language),
+            body.target_language,
+        )
         total_duration = max(10, min(180, int(body.duration_seconds or 30)))
         scene_duration = max(2.5, total_duration / len(scenes))
         if body.aspect_ratio == "16:9":
             width, height = 1920, 1080
-            font_size = 58
-            box_y = "(h-text_h)/2"
         else:
             width, height = 1080, 1920
-            font_size = 54
-            box_y = "h*0.58"
 
-        font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        colors = ["0f1115", "17202a", "10241f", "251c2b", "1f2430", "202416"]
+        translated_stock_context = _translate_stock_texts_to_english([
+            body.topic, *scenes, *narration_scenes,
+        ])
+        translated_topic = translated_stock_context[0]
+        translated_scenes = translated_stock_context[1:1 + len(scenes)]
+        translated_narration = translated_stock_context[1 + len(scenes):]
         clip_paths: List[Path] = []
+        image_provider = body.image_provider.lower()
+        ai_scene_prompts: List[str] = []
+        story_seed: Optional[int] = None
+        if image_provider in ("ai", "cpu_ai", "ai_video"):
+            store.update_job(job_id, progress_note="AI đang lập storyboard và mạch hình ảnh...")
+            story_bible, ai_scene_prompts = _creator_image_story_prompts(
+                translated_topic, translated_scenes, translated_narration,
+            )
+            story_seed = int.from_bytes(story_bible.encode("utf-8")[:8].ljust(8, b"0"), "little") % (2**31)
+            logger.info("Creator AI story bible: %s", story_bible)
+        ai_keyframes: List[Path] = []
+        if image_provider == "ai_video":
+            # Generate all coherent keyframes in one pass, then release SD so
+            # LTX has as much VRAM as possible while animating the scenes.
+            for idx, prompt in enumerate(ai_scene_prompts):
+                store.update_job(
+                    job_id,
+                    progress_note=f"AI đang tạo storyboard {idx + 1}/{len(ai_scene_prompts)}...",
+                )
+                ai_keyframes.append(_generate_ai_image(
+                    prompt, output_dir / f"keyframe_{idx:02d}.jpg",
+                    body.aspect_ratio, story_seed=story_seed,
+                ))
+            _release_image_ai_pipeline()
         for idx, scene in enumerate(scenes):
             clip_path = output_dir / f"scene_{idx:02d}.mp4"
-            media = _search_stock_media(_creator_stock_query(body.topic, scene, idx), body.aspect_ratio)
-            if media:
+            # Visual and narration lists may have different lengths. Map
+            # them proportionally so each shot follows what is being spoken
+            # around the same point in the video.
+            narration_idx = min(
+                len(translated_narration) - 1,
+                int(idx * len(translated_narration) / max(1, len(scenes))),
+            )
+            queries = _creator_stock_queries(
+                translated_topic,
+                translated_scenes[idx],
+                translated_narration[narration_idx],
+            )
+            logger.info("Creator scene %s/%s stock queries: %s", idx + 1, len(scenes), queries)
+            media = None
+            if image_provider in ("ai", "cpu_ai"):
+                try:
+                    store.update_job(
+                        job_id,
+                        progress_note=f"AI đang sinh khung hình {idx + 1}/{len(scenes)}...",
+                    )
+                    ai_path = _generate_ai_image(
+                        ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
+                        body.aspect_ratio, story_seed=story_seed,
+                    )
+                    _render_stock_clip(
+                        ai_path, "image", clip_path, width, height,
+                        scene_duration, body.transition,
+                    )
+                    media = {"type": "image", "url": str(ai_path), "provider": f"AI sinh ảnh ({_IMAGE_AI_DEVICE})"}
+                except Exception as exc:
+                    logger.exception("AI image generation failed for scene=%s", scene)
+                    raise RuntimeError(f"AI không sinh được khung hình {idx + 1}: {exc}") from exc
+            elif image_provider == "ai_video":
+                try:
+                    store.update_job(
+                        job_id,
+                        progress_note=f"GPU đang sinh video cảnh {idx + 1}/{len(scenes)}...",
+                    )
+                    raw_video = _generate_ai_video(
+                        ai_keyframes[idx], ai_scene_prompts[idx],
+                        output_dir / f"ai_video_{idx:02d}.mp4",
+                        body.aspect_ratio, scene_duration, story_seed or 0,
+                    )
+                    _render_stock_clip(
+                        raw_video, "video", clip_path, width, height,
+                        scene_duration, body.transition,
+                    )
+                    media = {"type": "video", "url": str(raw_video), "provider": "AI Sinh Video (LTX)"}
+                except Exception as exc:
+                    logger.exception("AI video generation failed for scene=%s", scene)
+                    raise RuntimeError(f"AI không sinh được video cảnh {idx + 1}: {exc}") from exc
+            else:
+                for query in queries:
+                    media = _search_stock_media(query, body.aspect_ratio)
+                    if media:
+                        break
+            if media and not media["provider"].startswith(("AI sinh ảnh", "AI Sinh Video")):
                 try:
                     source_path = _download_stock_media(media, output_dir / f"stock_{idx:02d}")
-                    _render_stock_clip(source_path, media["type"], clip_path, width, height, scene_duration)
+                    _render_stock_clip(
+                        source_path, media["type"], clip_path, width, height,
+                        scene_duration, body.transition,
+                    )
                     store.update_job(
                         job_id,
                         progress_note=f"Đã lấy cảnh {idx + 1}/{len(scenes)} từ {media['provider']}...",
@@ -907,46 +1972,49 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                     media = None
 
             if not media:
-                text_path = output_dir / f"scene_{idx:02d}.txt"
-                text_path.write_text(_wrap_creator_text(scene), encoding="utf-8")
-                color = colors[idx % len(colors)]
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "lavfi",
-                    "-i", f"color=c=0x{color}:s={width}x{height}:r=30:d={scene_duration:.3f}",
-                    "-vf",
-                    (
-                        "format=yuv420p,"
-                        f"drawbox=x=0:y=0:w=iw:h=ih:color=white@0.03:t=fill,"
-                        f"drawtext=fontfile={font}:textfile={text_path}:"
-                        f"x=(w-text_w)/2:y={box_y}:fontsize={font_size}:"
-                        "fontcolor=white:line_spacing=14:box=1:boxcolor=black@0.38:boxborderw=28"
-                    ),
-                    "-an", "-c:v", "libx264", "-preset", WEB_RENDER_PRESET,
-                    "-crf", "24", str(clip_path),
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr or result.stdout or "FFmpeg scene render failed")
+                raise RuntimeError(
+                    "Không lấy được ảnh/video stock. Hãy kiểm tra PEXELS_API_KEY trong .env "
+                    "và khởi động lại web; hệ thống không tạo video nền chữ thay thế nữa."
+                )
             clip_paths.append(clip_path)
             store.update_job(job_id, progress_note=f"Đã dựng {idx + 1}/{len(scenes)} cảnh...")
 
-        concat_file = output_dir / "clips.txt"
-        concat_file.write_text(
-            "".join(f"file '{p.as_posix()}'\n" for p in clip_paths),
-            encoding="utf-8",
+        visual_path = output_dir / "visual_timeline.mp4"
+        store.update_job(job_id, progress_note="Đang ghép và tạo hiệu ứng chuyển cảnh...")
+        # Entrance/exit animation is already rendered into every scene.
+        # A timestamp-safe concat avoids FFmpeg 7's broken multi-xfade path.
+        _render_creator_timeline(
+            clip_paths, visual_path, scene_duration, total_duration, "none",
         )
+        store.update_job(job_id, progress_note="Đang tạo giọng đọc AI...")
+        voice_path = output_dir / "narration.mp3"
+        cue_durations, cue_word_durations = _synthesize_creator_cues(
+            narration_scenes, output_dir, body.target_language, body.tts_voice, voice_path,
+        )
+        if not voice_path.exists() or voice_path.stat().st_size < 1024:
+            raise RuntimeError("TTS không tạo được file giọng đọc hợp lệ")
+
+        # Build subtitle cues only after TTS exists. Their timeline follows
+        # the audible voice duration (or the time-compressed duration when
+        # narration is longer than the visual), rather than arbitrary equal
+        # scene slots that drift away from what is being spoken.
+        final_duration = scene_duration * len(scenes)
+        voice_duration = _media_duration(voice_path)
+        spoken_duration = final_duration if voice_duration > final_duration else voice_duration
+        if spoken_duration <= 0:
+            spoken_duration = final_duration
+        subtitles_path = output_dir / "subtitles.ass"
+        segments, _ = _write_creator_subtitles(
+            narration_scenes, subtitles_path, spoken_duration, cue_durations, width, height,
+            cue_word_durations,
+        )
+        store.set_job_segments(job_id, segments)
+
+        store.update_job(job_id, progress_note="Đang ghép voice và đóng subtitle...")
         output_path = output_dir / "output_generated.mp4"
-        final_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-f", "lavfi", "-i", f"sine=frequency=220:sample_rate=44100:duration={total_duration}",
-            "-shortest", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
-            str(output_path),
-        ]
-        result = subprocess.run(final_cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr or result.stdout or "FFmpeg final render failed")
+        _add_creator_voice_and_subtitles(
+            visual_path, voice_path, subtitles_path, output_path, final_duration,
+        )
         store.update_job(
             job_id, status="done", progress_note="Hoàn tất",
             final_video_path=str(output_path), title=body.topic.strip()[:80],
@@ -1007,6 +2075,25 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
         raise HTTPException(400, "Thiếu chủ đề video")
     if body.aspect_ratio not in ("9:16", "16:9"):
         raise HTTPException(400, "Tỷ lệ khung hình không hợp lệ")
+    if body.transition not in CREATOR_TRANSITIONS:
+        raise HTTPException(400, "Hiệu ứng chuyển cảnh không hợp lệ")
+    if body.image_provider not in ("stock", "ai", "cpu_ai", "ai_video"):
+        raise HTTPException(400, "Nguồn hình ảnh không hợp lệ")
+    if body.image_provider == "ai_video":
+        try:
+            import torch
+        except ImportError as exc:
+            raise HTTPException(503, "Máy chủ chưa cài PyTorch để chạy AI Sinh Video") from exc
+        if not torch.cuda.is_available():
+            raise HTTPException(
+                503,
+                "AI Sinh Video cần NVIDIA GPU/CUDA. Máy chủ hiện chưa nhận GPU; hãy kiểm tra driver và PyTorch CUDA.",
+            )
+    if body.image_provider == "stock" and not _env_first("PEXELS_API_KEY", "PEXELS_KEY", "PIXABAY_API_KEY", "PIXABAY_KEY"):
+        raise HTTPException(
+            503,
+            "Chưa cấu hình kho ảnh. Thêm PEXELS_API_KEY vào file .env rồi khởi động lại web.",
+        )
     user = store.get_user_by_id(user_id)
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
         raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
@@ -1015,7 +2102,7 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
         user_id,
         f"creator:{body.topic.strip()}",
         body.target_language,
-        source_language="creator",
+        source_language=f"creator:{'ai' if body.image_provider == 'cpu_ai' else body.image_provider}",
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
@@ -1030,10 +2117,44 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
         raise HTTPException(400, "Thiếu chủ đề video")
     topic = body.topic.strip()
     language = body.target_language or "vi"
+    provider = (_env_first("CREATOR_AI_PROVIDER") or "auto").lower()
+    providers = []
+    if provider in ("auto", "ollama"):
+        providers.append(("Ollama", _ollama_creator_suggestions))
+    if provider in ("auto", "openrouter") and _env_first("OPENROUTER_API_KEY"):
+        providers.append(("OpenRouter", _openrouter_creator_suggestions))
+    if provider in ("auto", "gemini") and _env_first("GEMINI_API_KEY", "GOOGLE_AI_API_KEY"):
+        providers.append(("Gemini", _creator_ai_suggestions))
+    if providers:
+        cache_key = (
+            provider, topic.lower(), language, body.aspect_ratio,
+            int(body.duration_seconds or 30), body.transition,
+        )
+        with _CREATOR_AI_LOCK:
+            cached = _CREATOR_AI_CACHE.get(cache_key)
+            if cached and time.time() - cached[0] < _CREATOR_AI_CACHE_TTL_SECONDS:
+                result = dict(cached[1])
+                result["cached"] = True
+                return result
+            errors = []
+            for provider_name, generate in providers:
+                try:
+                    result = generate(body)
+                    _CREATOR_AI_CACHE[cache_key] = (time.time(), dict(result))
+                    return result
+                except Exception as exc:
+                    logger.warning("%s creator suggestions failed: %s", provider_name, exc)
+                    errors.append(f"{provider_name}: {exc}")
+                    if provider != "auto":
+                        break
+        raise HTTPException(502, "Không tạo được nội dung AI — " + " | ".join(errors))
     return {
         "keywords": _creator_keywords_from_topic(topic, language),
         "visual_brief": _creator_script_text_from_topic(topic, language),
         "script": _creator_script_text_from_topic(topic, language),
+        "narration_script": _creator_narration_text_from_topic(topic, language),
+        "generator": "template", "model": None,
+        "warning": "AI chưa được cấu hình hoặc tạm thời không phản hồi; đang dùng nội dung mẫu local.",
     }
 
 
@@ -1068,8 +2189,9 @@ def list_languages():
     languages are whatever TTS actually has a matching voice for, so this
     list can never silently drift out of sync with what actually works."""
     targets = [
-        {"code": code, "label": LANGUAGE_LABELS.get(code, code)}
-        for code in DEFAULT_VOICES_BY_LANGUAGE
+        {"code": code, "label": label}
+        for code, label in LANGUAGE_LABELS.items()
+        if voice_for_language(code)
     ]
     sources = [{"code": "auto", "label": "Tự động phát hiện"}] + [
         {"code": code, "label": LANGUAGE_LABELS.get(code, code)}
@@ -1084,7 +2206,13 @@ def list_voices(language: str = "vi"):
     'chọn giọng đọc' dropdown. Empty list means: no curated options for
     this language, UI should just show 'Mặc định' (None -> whatever
     tts.voice_for_language() picks automatically, unchanged behavior)."""
-    return {"voices": voices_for_language(language)}
+    voices = voices_for_language(language)
+    return {
+        "voices": voices,
+        "language": language,
+        "language_label": LANGUAGE_LABELS.get(language, language),
+        "default_voice": voice_for_language(language),
+    }
 
 
 @app.get("/api/jobs")
@@ -1112,6 +2240,13 @@ def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     return {"ok": True}
 
 
+@app.post("/api/jobs/bulk-delete")
+def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
+    if not body.job_ids:
+        raise HTTPException(400, "Chưa chọn video cần xoá")
+    return {"ok": True, "deleted": store.delete_jobs(body.job_ids, user_id)}
+
+
 def _get_owned_job(job_id: str, user_id: int):
     job = store.get_job(job_id)
     if job is None or job.user_id != user_id:
@@ -1137,6 +2272,37 @@ def get_job_video(job_id: str, download: bool = False, user_id: int = Depends(ge
     )
 
 
+@app.get("/api/jobs/{job_id}/source-video")
+def get_job_source_video(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Stream the source while a review-mode job is paused.
+
+    Read-only and scoped to the owning user; this does not alter review
+    segments or start the renderer.
+    """
+    job = _get_owned_job(job_id, user_id)
+    if job.status != "review" or not job.review_state_json:
+        raise HTTPException(404, "Video nguồn chỉ có khi job đang chờ duyệt")
+    state = json.loads(job.review_state_json)
+    source_path = Path(state.get("video_path", ""))
+    if not source_path.exists() or not source_path.is_file():
+        raise HTTPException(404, "Không tìm thấy video nguồn của job")
+    return FileResponse(source_path, media_type="video/mp4")
+
+
+@app.get("/api/jobs/{job_id}/prepublish-check")
+def get_prepublish_check(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Return a read-only technical and platform-fit report."""
+    job = _get_owned_job(job_id, user_id)
+    if not job.final_video_path:
+        raise HTTPException(404, "Video chưa sẵn sàng để kiểm tra")
+    try:
+        return prepublish_report_to_dict(inspect_for_publish(Path(job.final_video_path)))
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Không tìm thấy video đầu ra") from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     """Re-submit a failed job with identical settings, as a brand-new job
@@ -1154,7 +2320,16 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
         raise HTTPException(404, "Không tìm thấy job")
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
-    task = asyncio.create_task(_run_job(new_job.id))
+    if old_job.source_language.startswith("creator"):
+        topic = old_job.source_url.removeprefix("creator:").strip()
+        image_provider = old_job.source_language.partition(":")[2] or "stock"
+        retry_body = CreatorJobBody(
+            topic=topic, target_language=old_job.target_language,
+            image_provider=image_provider,
+        )
+        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, new_job.id, retry_body))
+    else:
+        task = asyncio.create_task(_run_job(new_job.id))
     _running_tasks[new_job.id] = task
     return new_job.to_dict()
 
@@ -1252,14 +2427,93 @@ def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_curre
     return {"results": results}
 
 
+@app.post("/api/jobs/{job_id}/schedule-publish")
+def schedule_publish(job_id: str, body: SchedulePublishBody, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    if not job.final_video_path or not Path(job.final_video_path).exists():
+        raise HTTPException(400, "Video chưa sẵn sàng để lên lịch")
+    allowed = {"tiktok", "facebook", "youtube"}
+    if not body.platforms or any(p not in allowed for p in body.platforms):
+        raise HTTPException(400, "Nền tảng không hợp lệ")
+    if body.scheduled_at < time.time() + 60:
+        raise HTTPException(400, "Thời gian đăng phải muộn hơn hiện tại ít nhất 1 phút")
+    post_id = store.create_scheduled_post(
+        user_id, job_id, body.platforms, body.title, body.description,
+        body.hashtags, body.scheduled_at,
+    )
+    return {"ok": True, "id": post_id}
+
+
+@app.get("/api/scheduled-posts")
+def scheduled_posts(user_id: int = Depends(get_current_user_id)):
+    return [{
+        "id": r["id"], "job_id": r["job_id"],
+        "platforms": json.loads(r["platforms_json"]), "title": r["title"],
+        "scheduled_at": r["scheduled_at"], "status": r["status"],
+        "result": json.loads(r["result_json"]) if r["result_json"] else None,
+    } for r in store.list_scheduled_posts(user_id)]
+
+
+@app.delete("/api/scheduled-posts/{post_id}")
+def cancel_scheduled_post(post_id: int, user_id: int = Depends(get_current_user_id)):
+    if not store.cancel_scheduled_post(post_id, user_id):
+        raise HTTPException(400, "Lịch đăng không còn ở trạng thái chờ")
+    return {"ok": True}
+
+
+def _run_scheduled_post(row) -> None:
+    job = store.get_job(row["job_id"])
+    results = []
+    try:
+        if not job or job.user_id != row["user_id"] or not job.final_video_path or not Path(job.final_video_path).exists():
+            raise RuntimeError("Video nguồn không còn tồn tại")
+        for platform in json.loads(row["platforms_json"]):
+            uploader = get_uploader(platform)
+            token, account_ref = _resolve_publish_credentials(row["user_id"], platform)
+            result = uploader.upload(
+                Path(job.final_video_path), row["title"], row["description"],
+                json.loads(row["hashtags_json"]), access_token=token, account_ref=account_ref,
+            )
+            store.log_publish(job.id, result.platform, result.success, result.message, result.remote_url)
+            results.append(result.__dict__)
+        store.finish_scheduled_post(row["id"], "done" if all(r["success"] for r in results) else "error", results)
+    except Exception as exc:
+        logger.exception("Scheduled post %s failed", row["id"])
+        store.finish_scheduled_post(row["id"], "error", {"message": str(exc)})
+
+
+async def _scheduled_publish_loop() -> None:
+    while True:
+        for row in store.claim_due_scheduled_posts(time.time()):
+            await asyncio.to_thread(_run_scheduled_post, row)
+        await asyncio.sleep(15)
+
+
+@app.on_event("startup")
+async def start_scheduled_publish_worker() -> None:
+    store.recover_processing_scheduled_posts()
+    app.state.scheduled_publish_task = asyncio.create_task(_scheduled_publish_loop())
+
+
+@app.on_event("shutdown")
+async def stop_scheduled_publish_worker() -> None:
+    task = getattr(app.state, "scheduled_publish_task", None)
+    if task:
+        task.cancel()
+
+
 def _resolve_publish_credentials(user_id: int, platform: str) -> tuple[Optional[str], Optional[str]]:
     """Look up the logged-in user's own connected account for this platform
-    (see `/api/social/connect/*`). Falls back to no override (letting the
-    uploader use its shared env-var credentials, if any admin configured
-    those instead) when the user hasn't connected this platform themselves."""
+    (see `/api/social/connect/*`). Shared env credentials are only considered
+    when the operator explicitly enables the legacy single-account mode."""
     row = store.get_social_account(user_id, platform)
     if not row:
-        return None, None
+        if ALLOW_SHARED_SOCIAL_CREDENTIALS:
+            return None, None
+        raise HTTPException(
+            400,
+            f"Bạn chưa kết nối tài khoản {platform}. Hãy bấm Kết nối trước khi đăng.",
+        )
     access_token = row["access_token"]
     if platform == "youtube" and row["refresh_token"]:
         # YouTube access tokens are short-lived (~1h); always mint a fresh
@@ -1404,7 +2658,7 @@ def admin_stats(_admin_id: int = Depends(require_admin_user_id)):
 @app.get("/api/admin/feedback")
 def admin_list_feedback(_admin_id: int = Depends(require_admin_user_id)):
     return [
-        {"id": f["id"], "username": f["username"], "message": f["message"],
+        {"id": f["id"], "username": f["username"], "email": f["email"], "phone": f["phone"], "message": f["message"],
          "page": f["page"], "created_at": f["created_at"]}
         for f in store.list_feedback()
     ]
