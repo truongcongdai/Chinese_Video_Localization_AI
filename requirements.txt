@@ -2,11 +2,13 @@ yt-dlp>=2024.1.1
 python-dotenv>=1.0.1
 demucs
 # NumPy 2.4 lazy dtype loading recurses inside Accelerate under concurrent
-# web workers; keep the broadly compatible 2.2 line.
+# web workers. Use the CUDA wheel explicitly: installing these packages from
+# PyPI alone can silently select a CPU-only torch even on an NVIDIA machine.
 numpy>=1.26,<2.3
-torch
-torchvision
-torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
 # Local CPU/CUDA image generation for creator scenes (SD-Turbo).
 diffusers>=0.39.0
 transformers>=5.0.0
