@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import traceback
 import urllib.parse
 import uuid
@@ -80,12 +81,14 @@ _VIDEO_AI_LOCK = threading.Lock()
 # Store's schema, so both can safely share one sqlite file if you want.
 _DB_PATH = Path(os.environ.get("WEB_DB_PATH", TEMP_DIR / "database.sqlite3"))
 _OUTPUT_BASE_DIR = TEMP_DIR / "output"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Credits consumed per submitted job. Purely a usage-limiting knob (there's
 # no billing/payment wired up) — an admin tops up a user's balance from the
 # admin dashboard. Set to 0 to disable the whole credits gate.
 JOB_COST_CREDITS = int(os.environ.get("JOB_COST_CREDITS", "1"))
 WEB_RENDER_PRESET = os.environ.get("WEB_RENDER_PRESET", "fast")
+WEB_RENDER_CRF = max(16, min(28, int(os.environ.get("WEB_RENDER_CRF", "20"))))
 WEB_RENDER_TIMEOUT_SECONDS = int(os.environ.get("WEB_RENDER_TIMEOUT_SECONDS", "1800"))
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
@@ -702,6 +705,33 @@ def _refund_job_credits(job) -> None:
 
 def _creator_scene_brief_from_topic(topic: str, language: str) -> List[str]:
     topic = topic.strip()
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    if entity_kind == "animal":
+        if language == "vi":
+            return [
+                f"Toàn cảnh {subject} trong môi trường sống tự nhiên",
+                f"Cận cảnh khuôn mặt và đặc điểm cơ thể của {subject}",
+                f"{subject.capitalize()} di chuyển trong tự nhiên",
+                f"{subject.capitalize()} tìm kiếm thức ăn",
+                f"Cận cảnh tập tính tự nhiên nổi bật của {subject}",
+                f"{subject.capitalize()} phản ứng với một mối đe dọa trong tự nhiên",
+                f"{subject.capitalize()} tương tác với môi trường sống xung quanh",
+                f"Góc rộng theo chân {subject} trong môi trường hoang dã",
+                f"Cận cảnh một đặc điểm ít người biết của {subject}",
+                f"Cảnh kết thúc với {subject} rời đi trong tự nhiên",
+            ]
+        return [
+            f"Wide shot of {subject} in its natural habitat",
+            f"Close-up of the face and physical features of {subject}",
+            f"{subject.capitalize()} moving through the wild",
+            f"{subject.capitalize()} searching for food",
+            f"Close-up of a distinctive natural behavior of {subject}",
+            f"{subject.capitalize()} reacting to a threat in the wild",
+            f"{subject.capitalize()} interacting with its habitat",
+            f"Wide tracking shot following {subject} in the wild",
+            f"Close-up illustrating a little-known feature of {subject}",
+            f"Closing shot of {subject} walking away in nature",
+        ]
     profile = _creator_stock_profile(topic)
     if profile["category"] == "beauty":
         if language == "vi":
@@ -735,12 +765,46 @@ def _creator_scene_brief_from_topic(topic: str, language: str) -> List[str]:
     ]
 
 
-def _creator_script_text_from_topic(topic: str, language: str) -> str:
-    return "\n".join(_creator_scene_brief_from_topic(topic, language))
+def _creator_script_text_from_topic(topic: str, language: str, duration_seconds: int = 30) -> str:
+    duration = max(10, min(1200, int(duration_seconds or 30)))
+    seconds_per_scene = 5 if duration <= 60 else 8
+    scene_count = max(4, min(150, round(duration / seconds_per_scene)))
+    base = _creator_scene_brief_from_topic(topic, language)
+    scenes = list(base[:scene_count])
+    while len(scenes) < scene_count:
+        source = base[len(scenes) % len(base)]
+        prefix = "Cảnh bổ sung" if language == "vi" else "Additional scene"
+        scenes.append(f"{prefix} {len(scenes) + 1}: {source}")
+    return "\n".join(scenes)
 
 
 def _creator_narration_from_topic(topic: str, language: str) -> List[str]:
     topic = topic.strip()
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    if entity_kind == "animal":
+        if language == "vi":
+            return [
+                f"Bạn nghĩ mình đã biết rõ về {subject} chưa?",
+                f"Video này sẽ khám phá những đặc điểm ít người biết của {subject}.",
+                f"Trước hết, hãy quan sát hình dáng và cách {subject} thích nghi với môi trường sống.",
+                f"Tập tính kiếm ăn của {subject} cũng hé lộ nhiều khả năng đáng chú ý.",
+                f"Khi gặp nguy hiểm, {subject} có những phản ứng sinh tồn rất đặc trưng.",
+                f"Mỗi đặc điểm cần được nhìn trong đúng môi trường tự nhiên của loài vật này.",
+                f"Nhờ vậy, chúng ta hiểu {subject} chính xác hơn thay vì chỉ dựa vào tên gọi.",
+                f"Bạn ấn tượng nhất với đặc điểm nào của {subject}?",
+                "Hãy để lại bình luận và theo dõi để khám phá thêm về thế giới động vật.",
+            ]
+        return [
+            f"How well do you really know {subject}?",
+            f"This video explores little-known characteristics of {subject}.",
+            f"First, notice how {subject} is built and adapted to its habitat.",
+            f"Its feeding behavior reveals more remarkable abilities.",
+            f"When danger appears, {subject} shows distinctive survival responses.",
+            f"Each trait makes more sense in the animal's natural environment.",
+            f"That context helps us understand {subject} beyond its name.",
+            f"Which characteristic of {subject} surprised you most?",
+            "Leave a comment and follow for more wildlife discoveries.",
+        ]
     if language == "vi":
         return [
             f"Bạn đang quan tâm đến {topic}?",
@@ -767,8 +831,34 @@ def _creator_narration_from_topic(topic: str, language: str) -> List[str]:
     ]
 
 
-def _creator_narration_text_from_topic(topic: str, language: str) -> str:
-    return "\n".join(_creator_narration_from_topic(topic, language))
+def _creator_narration_text_from_topic(topic: str, language: str, duration_seconds: int = 30) -> str:
+    duration = max(10, min(1200, int(duration_seconds or 30)))
+    target_words = max(25, round(duration * (2.35 if language == "vi" else 2.25)))
+    subject, _ = _creator_topic_subject(topic, language)
+    base = _creator_narration_from_topic(topic, language)
+    selected: List[str] = []
+    for line in base:
+        if selected and sum(len(item.split()) for item in selected) >= target_words * 0.95:
+            break
+        selected.append(line)
+    additions = (
+        [
+            f"Tiếp theo, hãy xem xét một khía cạnh khác của {subject} trong bối cảnh thực tế.",
+            f"Chi tiết này giúp chúng ta hiểu đầy đủ và chính xác hơn về {subject}.",
+            f"Khi ghép các đặc điểm lại với nhau, câu chuyện về {subject} trở nên rõ ràng hơn.",
+        ]
+        if language == "vi" else
+        [
+            f"Next, consider another aspect of {subject} in its real context.",
+            f"This detail gives us a fuller and more accurate understanding of {subject}.",
+            f"Together, these characteristics make the story of {subject} much clearer.",
+        ]
+    )
+    index = 0
+    while sum(len(item.split()) for item in selected) < target_words * 0.95:
+        selected.append(additions[index % len(additions)])
+        index += 1
+    return "\n".join(selected)
 
 
 def _available_gemini_models(api_key: str) -> List[str]:
@@ -808,8 +898,16 @@ def _select_gemini_models(api_key: str, configured: str) -> List[str]:
 
 
 def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False) -> tuple[str, int]:
-    duration = max(10, min(180, int(body.duration_seconds or 30)))
-    scene_count = max(4, min(12, round(duration / 4)))
+    duration = max(10, min(1200, int(body.duration_seconds or 30)))
+    # Short-form uses denser cuts; long-form stays practical at roughly one
+    # visual beat per 8 seconds. A 20-minute script therefore has 150 real
+    # scene briefs instead of being silently truncated to twelve.
+    seconds_per_scene = 5 if duration <= 60 else 8
+    scene_count = max(4, min(150, round(duration / seconds_per_scene)))
+    words_per_second = 2.35 if body.target_language == "vi" else 2.25
+    narration_word_target = max(25, round(duration * words_per_second))
+    narration_word_min = round(narration_word_target * 0.95)
+    narration_word_max = round(narration_word_target * 1.05)
     language_name = LANGUAGE_LABELS.get(body.target_language, body.target_language)
     search_instruction = (
         "BẮT BUỘC dùng Google Search để nghiên cứu search intent và các góc nội dung đang phù hợp."
@@ -832,8 +930,10 @@ riêng hoặc thuật ngữ không có bản dịch tự nhiên.
 
 Trả về đúng JSON theo schema. Yêu cầu:
 1. keywords: 12-18 keyword/long-tail keyword sát chủ đề, có search intent, không nhồi từ khóa, không bịa số liệu xu hướng.
+   Bắt buộc giữ nguyên nghĩa và loại của thực thể trong chủ đề. Không được tách một cụm danh từ riêng thành các từ khóa rời gây đa nghĩa, không tự đổi động vật thành cây, đồ vật, địa danh hoặc khái niệm khác. Ví dụ chủ đề "đặc điểm về con lửng mật" phải dùng các cụm như "động vật lửng mật", "đặc điểm lửng mật", tuyệt đối không dùng "cây lửng mật".
 2. visual_brief: đúng {scene_count} cảnh, mỗi phần tử phải có chủ thể cụ thể + hành động nhìn thấy được và có thể tìm hoặc tái tạo thành footage. Mỗi cảnh phải liên quan trực tiếp đến chủ đề; tránh mô tả trừu tượng, chữ/UI/logo. Không được tạo một phần tử chỉ nói về phong cách, màu sắc, góc máy hoặc thể loại phim.
-3. narration_lines: kịch bản hook → giá trị chính → CTA; mỗi phần tử là một câu nói tự nhiên. Tổng độ dài phải vừa khoảng {duration} giây khi đọc, không lặp ý, không tuyên bố thiếu căn cứ. Visual và lời thoại phải cùng một mạch nội dung.
+3. narration_lines: kịch bản hook → giá trị chính → CTA; mỗi phần tử là một câu nói tự nhiên. Toàn bộ kịch bản phải có {narration_word_min}-{narration_word_max} từ (mục tiêu {narration_word_target} từ) để giọng đọc tự nhiên lấp đầy khoảng {duration} giây. Không viết kịch bản ngắn rồi yêu cầu tăng tốc/giảm tốc, không lặp ý, không tuyên bố thiếu căn cứ. Visual và lời thoại phải cùng một mạch nội dung.
+QUY TẮC NHẤT QUÁN THỰC THỂ: quy tắc giữ nguyên nghĩa và loại thực thể ở mục 1 áp dụng cho cả visual_brief và narration_lines. Mọi cảnh và câu thoại phải nói đúng chủ thể trong chủ đề; nếu chủ đề nói "con lửng mật" thì đó luôn là động vật lửng mật, không bao giờ là cây, đồ vật hoặc một người đang thực hiện chủ đề.
 Chỉ xuất một JSON object hợp lệ có đúng ba key: keywords, visual_brief, narration_lines. Không dùng Markdown hay code fence.
 """
     return prompt, scene_count
@@ -886,14 +986,15 @@ def _ollama_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
         )
     prompt, scene_count = _creator_ai_prompt(body)
     response = requests.post(
-        f"{base_url}/api/chat", timeout=180,
+        f"{base_url}/api/chat",
+        timeout=max(180, min(900, int(body.duration_seconds or 30))),
         json={
             "model": model, "stream": False, "format": "json",
             "messages": [
                 {"role": "system", "content": "Chỉ trả về JSON hợp lệ, không thêm giải thích."},
                 {"role": "user", "content": prompt},
             ],
-            "options": {"temperature": 0.7},
+            "options": {"temperature": 0.7, "num_predict": 16384, "num_ctx": 32768},
         },
     )
     response.raise_for_status()
@@ -911,7 +1012,8 @@ def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, An
     requested_model = _env_first("OPENROUTER_MODEL") or "openrouter/free"
     prompt, scene_count = _creator_ai_prompt(body)
     response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions", timeout=120,
+        "https://openrouter.ai/api/v1/chat/completions",
+        timeout=max(120, min(600, int(body.duration_seconds or 30))),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": requested_model,
@@ -920,6 +1022,7 @@ def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, An
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.7,
+            "max_tokens": 16384,
         },
     )
     response.raise_for_status()
@@ -941,7 +1044,7 @@ def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     request_payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 16384},
     }
     response = None
     model = configured_model
@@ -951,7 +1054,8 @@ def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=request_payload, timeout=60,
+            json=request_payload,
+            timeout=max(60, min(600, int(body.duration_seconds or 30))),
         )
         if response.ok:
             break
@@ -976,29 +1080,97 @@ def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     )
 
 
-def _creator_keywords_from_topic(topic: str, language: str) -> List[str]:
-    text = topic.lower()
-    words = [
-        w for w in re.sub(r"[^\w\sÀ-ỹ]", " ", text, flags=re.UNICODE).split()
-        if len(w) >= 3
-    ]
-    stopwords = {
-        "của", "cho", "với", "một", "những", "các", "trong", "bạn", "này",
-        "the", "and", "for", "with", "from", "that", "this", "your",
-    }
-    core = []
-    for word in words:
-        if word not in stopwords and word not in core:
-            core.append(word)
-    # SEO keywords should be short search intents/tags, not sentence-length
-    # variants of the title. Topic words come first, then platform intents.
-    base = core[:6] + ["youtube", "shorts", "trending", "viral", "tutorial", "tips", "ai"]
+def _creator_keywords_from_topic(
+    topic: str, language: str, duration_seconds: Optional[int] = None,
+) -> List[str]:
+    subject, _ = _creator_topic_subject(topic, language)
+    if language == "vi":
+        base = [
+            subject, f"đặc điểm {subject}", f"sự thật về {subject}",
+            f"điều ít biết về {subject}", f"tập tính {subject}",
+            f"{subject} trong tự nhiên", f"khám phá {subject}",
+        ]
+    else:
+        base = [subject, f"facts about {subject}", f"{subject} characteristics", f"learn about {subject}"]
     result: List[str] = []
     for keyword in base:
-        keyword = keyword.strip().lower()[:24]
+        keyword = keyword.strip().lower()[:100]
         if keyword and keyword not in result:
             result.append(keyword)
     return result[:12]
+
+
+def _creator_topic_subject(topic: str, language: str) -> tuple[str, str]:
+    """Keep a topic's compound subject intact and retain its entity type."""
+    text = " ".join(re.sub(r"[^\w\sÀ-ỹ]", " ", topic.lower(), flags=re.UNICODE).split())
+    match = re.search(r"\b(?:về|của)\s+(.+)$", text)
+    raw_subject = (match.group(1) if match else text).strip()
+    animal = bool(re.match(r"^(?:con|loài)\s+", raw_subject))
+    if animal:
+        raw_subject = re.sub(r"^(?:con|loài)\s+", "", raw_subject).strip()
+    else:
+        raw_subject = re.sub(r"^(?:cái|chiếc|một)\s+", "", raw_subject).strip()
+    raw_subject = raw_subject[:80].strip() or text[:80].strip()
+    if animal:
+        return (f"động vật {raw_subject}" if language == "vi" else raw_subject), "animal"
+    return raw_subject, "unknown"
+
+
+def _enforce_creator_entity_consistency(
+    result: Dict[str, Any], topic: str, language: str,
+) -> Dict[str, Any]:
+    """Correct an explicit entity-type contradiction returned by a model."""
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    if entity_kind != "animal" or language != "vi":
+        return result
+    animal_name = re.sub(r"^động vật\s+", "", subject, flags=re.IGNORECASE)
+    wrong = re.compile(rf"\bcây\s+{re.escape(animal_name)}\b", flags=re.IGNORECASE)
+
+    def fix(value: Any) -> Any:
+        if isinstance(value, str):
+            return wrong.sub(subject, value)
+        if isinstance(value, list):
+            return [fix(item) for item in value]
+        return value
+
+    return {key: fix(value) for key, value in result.items()}
+
+
+def _annotate_creator_suggestion_timing(
+    result: Dict[str, Any], duration_seconds: int,
+) -> Dict[str, Any]:
+    annotated = dict(result)
+    narration = str(annotated.get("narration_script") or "")
+    visual = str(annotated.get("visual_brief") or annotated.get("script") or "")
+    annotated["duration_seconds"] = int(duration_seconds)
+    annotated["narration_word_count"] = len(narration.split())
+    annotated["scene_count"] = len([line for line in visual.splitlines() if line.strip()])
+    return annotated
+
+
+def _validate_creator_suggestion_timing(
+    result: Dict[str, Any], duration_seconds: int,
+) -> Dict[str, Any]:
+    """Reject an AI response that ignored the selected content duration."""
+    duration = max(10, min(1200, int(duration_seconds or 30)))
+    expected_scenes = max(4, min(150, round(duration / (5 if duration <= 60 else 8))))
+    visual = str(result.get("visual_brief") or result.get("script") or "")
+    scene_count = len([line for line in visual.splitlines() if line.strip()])
+    narration = str(result.get("narration_script") or "")
+    word_count = len(narration.split())
+    words_per_second = 2.35 if result.get("language", "vi") == "vi" else 2.25
+    target_words = max(25, round(duration * words_per_second))
+    minimum_words = round(target_words * 0.90)
+    maximum_words = round(target_words * 1.10)
+    if scene_count != expected_scenes:
+        raise RuntimeError(
+            f"AI ignored duration: expected {expected_scenes} scenes, received {scene_count}"
+        )
+    if not minimum_words <= word_count <= maximum_words:
+        raise RuntimeError(
+            f"AI ignored duration: expected {minimum_words}-{maximum_words} narration words, received {word_count}"
+        )
+    return result
 
 
 def _ascii_topic(value: str) -> str:
@@ -1143,8 +1315,21 @@ def _creator_image_story_prompts(
         f"Exact scene action: {visual}. Narration meaning: {aligned_narrations[i]}. {fallback_bible}"
         for i, visual in enumerate(visuals)
     ]
+    if scene_count > 24:
+        logger.info("Long-form storyboard has %s scenes; using deterministic continuity prompts", scene_count)
+        return fallback_bible, fallback_prompts
+    base_url = (_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
     try:
-        base_url = (_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        health = requests.get(f"{base_url}/api/tags", timeout=1.5)
+        if not health.ok:
+            logger.info("Ollama storyboard is unavailable (HTTP %s); using deterministic prompts", health.status_code)
+            return fallback_bible, fallback_prompts
+    except requests.RequestException:
+        # Ollama is an optional storyboard enhancer. A stopped local service
+        # is normal and must not emit a full traceback or fail creator jobs.
+        logger.info("Ollama storyboard is not running; using deterministic prompts")
+        return fallback_bible, fallback_prompts
+    try:
         model = _env_first("OLLAMA_MODEL") or "llama3:latest"
         scene_lines = "\n".join(
             f"Scene {i + 1}: visual={visual} | narration={aligned_narrations[i]}"
@@ -1193,9 +1378,71 @@ Only output valid JSON."""
     except requests.Timeout:
         logger.warning("Ollama storyboard timed out; using deterministic continuity prompts")
         return fallback_bible, fallback_prompts
+    except requests.RequestException as exc:
+        logger.warning("Ollama storyboard request failed (%s); using deterministic prompts", exc)
+        return fallback_bible, fallback_prompts
     except Exception:
         logger.exception("Could not create AI storyboard; using deterministic continuity prompts")
         return fallback_bible, fallback_prompts
+
+
+def _creator_video_backend() -> str:
+    """Choose LTX on large GPUs and isolated low-memory SVD otherwise."""
+    configured = (_env_first("CREATOR_VIDEO_BACKEND") or "auto").lower()
+    if configured not in ("auto", "svd", "ltx"):
+        raise HTTPException(503, "CREATOR_VIDEO_BACKEND chỉ nhận auto, svd hoặc ltx")
+    if configured != "auto":
+        return configured
+    import torch
+    if not torch.cuda.is_available():
+        return "svd"
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    ltx_min_vram_gb = max(8.0, float(_env_first("LTX_VIDEO_MIN_VRAM_GB") or "16"))
+    return "ltx" if total_vram_gb >= ltx_min_vram_gb else "svd"
+
+
+def _validate_creator_ai_runtime(image_provider: str) -> None:
+    """Fail before creating/charging a job when its AI runtime is incomplete."""
+    if image_provider not in ("ai", "cpu_ai", "ai_video"):
+        return
+    try:
+        import torch
+    except ImportError as exc:
+        raise HTTPException(503, "Thiếu PyTorch. Hãy cài requirements.txt và khởi động lại backend.") from exc
+    try:
+        import diffusers
+        import transformers
+        import accelerate
+        import safetensors
+        from diffusers import StableDiffusionPipeline
+    except (ImportError, RuntimeError, RecursionError) as exc:
+        raise HTTPException(
+            503,
+            "Môi trường AI ảnh chưa đầy đủ hoặc không tương thích "
+            f"({type(exc).__name__}: {exc}). Chạy: python -m pip install -r requirements.txt, "
+            "sau đó khởi động lại backend.",
+        ) from exc
+    if image_provider == "ai_video":
+        if not torch.cuda.is_available():
+            cuda_build = getattr(torch.version, "cuda", None)
+            if not cuda_build:
+                raise HTTPException(
+                    503,
+                    f"Đã phát hiện PyTorch {torch.__version__} bản CPU-only. GPU NVIDIA có thể vẫn hoạt động, "
+                    "nhưng cần cài lại PyTorch bản CUDA rồi khởi động lại web.",
+                )
+            raise HTTPException(
+                503,
+                f"PyTorch CUDA {cuda_build} chưa truy cập được GPU. Hãy kiểm tra driver NVIDIA rồi khởi động lại web.",
+            )
+        backend = _creator_video_backend()
+        try:
+            if backend == "ltx":
+                from diffusers import LTXImageToVideoPipeline
+            else:
+                from diffusers import StableVideoDiffusionPipeline
+        except (ImportError, RuntimeError, RecursionError) as exc:
+            raise HTTPException(503, f"Diffusers không hỗ trợ backend video {backend.upper()}: {exc}") from exc
 
 
 def _split_creator_script(topic: str, script: Optional[str], language: str) -> List[str]:
@@ -1216,7 +1463,7 @@ def _split_creator_script(topic: str, script: Optional[str], language: str) -> L
         ]
         if concrete_lines:
             lines = concrete_lines
-    return lines[:12] or _creator_scene_brief_from_topic(topic, language)
+    return lines[:150] or _creator_scene_brief_from_topic(topic, language)
 
 
 def _wrap_creator_text(text: str, max_chars: int = 28) -> str:
@@ -1347,6 +1594,7 @@ def _download_stock_media(media: Dict[str, str], dest: Path) -> Path:
 
 def _generate_ai_image(
     prompt: str, output_path: Path, aspect_ratio: str, story_seed: Optional[int] = None,
+    for_video: bool = False,
 ) -> Path:
     """Generate a scene image locally, automatically using CUDA when available."""
     global _IMAGE_AI_PIPELINE, _IMAGE_AI_DEVICE
@@ -1370,10 +1618,22 @@ def _generate_ai_image(
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Đã chọn CUDA nhưng PyTorch không nhận được GPU NVIDIA")
     device = "cuda" if (requested_device == "cuda" or (requested_device == "auto" and torch.cuda.is_available())) else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    precision = (_env_first("IMAGE_AI_PRECISION") or "auto").lower()
+    if precision not in ("auto", "fp16", "fp32"):
+        raise RuntimeError("IMAGE_AI_PRECISION chỉ nhận auto, fp16 hoặc fp32")
+    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else ""
+    # GTX 16-series cards can execute FP16 but SD-Turbo's VAE commonly
+    # overflows to NaN on them, producing a successfully saved all-black
+    # image. Default those cards to FP32; RTX cards retain the faster FP16.
+    fp16_safe = device == "cuda" and not re.search(r"\bGTX\s*16\d{2}\b", gpu_name, re.IGNORECASE)
+    use_fp16 = precision == "fp16" or (precision == "auto" and fp16_safe)
+    dtype = torch.float16 if use_fp16 else torch.float32
     with _IMAGE_AI_LOCK:
         if _IMAGE_AI_PIPELINE is None or _IMAGE_AI_DEVICE != device:
-            logger.info("Loading image model %s on %s (first run may download several GB)", model_id, device.upper())
+            logger.info(
+                "Loading image model %s on %s with %s (first run may download several GB)",
+                model_id, device.upper(), str(dtype).removeprefix("torch."),
+            )
             _IMAGE_AI_PIPELINE = StableDiffusionPipeline.from_pretrained(
                 model_id, torch_dtype=dtype, use_safetensors=True,
             )
@@ -1384,14 +1644,31 @@ def _generate_ai_image(
 
         # Keep CPU inference practical. FFmpeg scales/crops this image to the
         # final 1080p canvas later.
-        width, height = ((640, 384) if aspect_ratio == "16:9" else (384, 640))
-        steps = max(1, min(4, int(_env_first("IMAGE_AI_STEPS", "CPU_IMAGE_STEPS") or "1")))
+        if for_video:
+            width, height = ((768, 432) if aspect_ratio == "16:9" else (432, 768))
+            steps = max(1, min(4, int(_env_first("IMAGE_AI_VIDEO_STEPS") or "2")))
+        else:
+            width, height = ((640, 384) if aspect_ratio == "16:9" else (384, 640))
+            steps = max(1, min(4, int(_env_first("IMAGE_AI_STEPS", "CPU_IMAGE_STEPS") or "1")))
+        # CLIP truncates after 77 tokens. Keep the concrete scene at the front
+        # and leave enough room for the essential realism constraints.
+        scene_prompt = " ".join(prompt.split())
+        tokenizer = _IMAGE_AI_PIPELINE.tokenizer
+        scene_ids = tokenizer(
+            scene_prompt, add_special_tokens=False, truncation=True, max_length=42,
+        )["input_ids"]
+        scene_prompt = tokenizer.decode(scene_ids, skip_special_tokens=True).strip()
         full_prompt = (
-            f"{prompt}, RAW live-action documentary photograph, real camera frame, "
-            "physically accurate anatomy, lifelike skin fur and materials, natural unedited colors, clear main subject, "
-            "natural lighting, no illustration, no animation, no cartoon, no 3D render, no CGI, no text, no logo, no watermark, "
-            "do not add people unless the scene explicitly mentions a person"
+            f"{scene_prompt}. RAW live-action wildlife documentary photo, real camera, "
+            "accurate anatomy, lifelike fur, natural light and colors, no people, no illustration, no text, no logo"
         )
+        # A final tokenizer-level clamp is exact; word slicing is not because
+        # accented/compound words may consume several CLIP tokens.
+        final_ids = tokenizer(
+            full_prompt, add_special_tokens=False, truncation=True,
+            max_length=max(1, tokenizer.model_max_length - 2),
+        )["input_ids"]
+        full_prompt = tokenizer.decode(final_ids, skip_special_tokens=True).strip()
         seed = story_seed if story_seed is not None else int.from_bytes(
             full_prompt.encode("utf-8")[:8].ljust(8, b"0"), "little",
         ) % (2**31)
@@ -1494,6 +1771,39 @@ def _generate_ai_video(
     return output_path
 
 
+def _generate_svd_video_isolated(
+    image_path: Path,
+    output_path: Path,
+    aspect_ratio: str,
+    duration: float,
+    story_seed: int,
+) -> Path:
+    """Run low-VRAM SVD out-of-process so a CUDA/native crash cannot kill web."""
+    worker = _REPO_ROOT / "scripts" / "svd_worker.py"
+    timeout = max(180, int(_env_first("SVD_WORKER_TIMEOUT_SECONDS") or "1800"))
+    command = [
+        sys.executable, str(worker),
+        "--input", str(image_path.resolve()),
+        "--output", str(output_path.resolve()),
+        "--aspect-ratio", aspect_ratio,
+        "--duration", f"{duration:.3f}",
+        "--seed", str(story_seed),
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        command, cwd=str(_REPO_ROOT), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout,
+        creationflags=creationflags,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "SVD worker stopped unexpectedly")[-5000:]
+        raise RuntimeError(f"SVD worker exit={result.returncode}: {detail}")
+    if not output_path.exists() or output_path.stat().st_size < 4096:
+        raise RuntimeError("SVD worker không tạo được video hợp lệ")
+    logger.info("SVD worker completed: %s", (result.stdout or "").strip()[-1000:])
+    return output_path
+
+
 def _render_stock_clip(
     source_path: Path,
     source_type: str,
@@ -1506,7 +1816,7 @@ def _render_stock_clip(
     # Stock sources commonly mix 23.976/25/29.97 fps. xfade rejects mixed
     # or variable rates, so normalize every scene to a real CFR timeline.
     base_vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
         f"crop={width}:{height},fps=30,settb=AVTB,setpts=N/(30*TB),format=yuv420p"
     )
     effect = min(0.55, max(0.25, duration / 5))
@@ -1554,7 +1864,7 @@ def _render_stock_clip(
         cmd = [
             "ffmpeg", "-y", "-loop", "1", "-t", f"{duration:.3f}",
             "-i", str(source_path), "-vf", vf, "-an",
-            "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+            "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", str(WEB_RENDER_CRF),
             "-r", "30", "-fps_mode", "cfr",
             str(output_path),
         ]
@@ -1562,7 +1872,7 @@ def _render_stock_clip(
         cmd = [
             "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{duration:.3f}",
             "-i", str(source_path), "-vf", vf, "-an",
-            "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+            "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", str(WEB_RENDER_CRF),
             "-r", "30", "-fps_mode", "cfr",
             str(output_path),
         ]
@@ -1619,7 +1929,7 @@ def _render_creator_timeline(
     cmd = [
         "ffmpeg", "-y", *inputs, "-filter_complex", graph,
         "-map", "[vout]", "-t", f"{final_duration:.3f}", "-an",
-        "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+        "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", str(WEB_RENDER_CRF),
         "-r", "30", "-fps_mode", "cfr",
         "-movflags", "+faststart", str(output_path),
     ]
@@ -1820,27 +2130,28 @@ def _add_creator_voice_and_subtitles(
     video_path: Path, voice_path: Path, subtitles_path: Path,
     output_path: Path, duration: float,
 ) -> None:
-    # Job paths are generated internally and contain no filtergraph-special
-    # characters; quote the filename for FFmpeg's subtitles filter.
-    subtitle_filter = f"subtitles=filename='{subtitles_path.as_posix()}'"
-    voice_duration = _media_duration(voice_path)
-    audio_filters: List[str] = []
-    speed = voice_duration / duration if duration > 0 and voice_duration > duration else 1.0
-    while speed > 2.0:
-        audio_filters.append("atempo=2.0")
-        speed /= 2.0
-    if speed > 1.001:
-        audio_filters.append(f"atempo={speed:.5f}")
-    audio_filters.append("apad")
+    # On Windows, an absolute `D:/...` path inside a filtergraph is parsed as
+    # `filename=D` followed by a new `:` option. Run FFmpeg in the subtitle
+    # directory and pass only the generated relative filename instead. This
+    # also avoids fragile cross-platform escaping of drive letters/spaces.
+    subtitle_filter = f"subtitles=filename={subtitles_path.name}"
+    # Never time-compress or stretch narration. The selected duration drives
+    # script length; if real TTS happens to run longer, the visual timeline is
+    # extended before this function is called. A shorter voice gets silence at
+    # the end rather than an unnaturally slowed reading.
+    audio_filters = ["apad"]
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path), "-i", str(voice_path),
         "-vf", subtitle_filter, "-filter:a", ",".join(audio_filters),
         "-map", "0:v:0", "-map", "1:a:0", "-t", f"{duration:.3f}",
-        "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", "23",
+        "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", str(WEB_RENDER_CRF),
         "-r", "30", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+    result = subprocess.run(
+        cmd, cwd=str(subtitles_path.parent), capture_output=True, text=True,
+        check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "FFmpeg voice/subtitle render failed")[-4000:])
 
@@ -1857,11 +2168,32 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         scenes = _split_creator_script(body.topic, body.script, body.target_language)
         narration_scenes = _split_creator_script(
             body.topic,
-            body.narration_script or _creator_narration_text_from_topic(body.topic, body.target_language),
+            body.narration_script or _creator_narration_text_from_topic(
+                body.topic, body.target_language, body.duration_seconds,
+            ),
             body.target_language,
         )
-        total_duration = max(10, min(180, int(body.duration_seconds or 30)))
-        scene_duration = max(2.5, total_duration / len(scenes))
+        selected_duration = max(10, min(1200, int(body.duration_seconds or 30)))
+
+        # Measure natural speech before rendering visuals. This makes timing a
+        # real content constraint rather than changing speaking rate at the
+        # final FFmpeg step.
+        store.update_job(job_id, progress_note="Đang tạo giọng đọc tự nhiên để đo timeline...")
+        voice_path = output_dir / "narration.mp3"
+        cue_durations, cue_word_durations = _synthesize_creator_cues(
+            narration_scenes, output_dir, body.target_language, body.tts_voice, voice_path,
+        )
+        if not voice_path.exists() or voice_path.stat().st_size < 1024:
+            raise RuntimeError("TTS không tạo được file giọng đọc hợp lệ")
+        voice_duration = _media_duration(voice_path)
+        if voice_duration <= 0:
+            raise RuntimeError("Không đo được thời lượng giọng đọc")
+        final_duration = max(float(selected_duration), voice_duration)
+        scene_duration = max(2.5, final_duration / len(scenes))
+        logger.info(
+            "Creator natural timing: selected=%.2fs voice=%.2fs final=%.2fs scenes=%s scene=%.2fs",
+            selected_duration, voice_duration, final_duration, len(scenes), scene_duration,
+        )
         if body.aspect_ratio == "16:9":
             width, height = 1920, 1080
         else:
@@ -1874,7 +2206,9 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         translated_scenes = translated_stock_context[1:1 + len(scenes)]
         translated_narration = translated_stock_context[1 + len(scenes):]
         clip_paths: List[Path] = []
+        video_fallback_count = 0
         image_provider = body.image_provider.lower()
+        video_backend = _creator_video_backend() if image_provider == "ai_video" else None
         ai_scene_prompts: List[str] = []
         story_seed: Optional[int] = None
         if image_provider in ("ai", "cpu_ai", "ai_video"):
@@ -1895,7 +2229,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                 )
                 ai_keyframes.append(_generate_ai_image(
                     prompt, output_dir / f"keyframe_{idx:02d}.jpg",
-                    body.aspect_ratio, story_seed=story_seed,
+                    body.aspect_ratio, story_seed=story_seed, for_video=True,
                 ))
             _release_image_ai_pipeline()
         for idx, scene in enumerate(scenes):
@@ -1936,21 +2270,50 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                 try:
                     store.update_job(
                         job_id,
-                        progress_note=f"GPU đang sinh video cảnh {idx + 1}/{len(scenes)}...",
+                        progress_note=(
+                            f"GPU đang sinh video cảnh {idx + 1}/{len(scenes)} "
+                            f"bằng {str(video_backend).upper()}..."
+                        ),
                     )
-                    raw_video = _generate_ai_video(
-                        ai_keyframes[idx], ai_scene_prompts[idx],
-                        output_dir / f"ai_video_{idx:02d}.mp4",
-                        body.aspect_ratio, scene_duration, story_seed or 0,
-                    )
+                    raw_video_path = output_dir / f"ai_video_{idx:02d}.mp4"
+                    if video_backend == "svd":
+                        raw_video = _generate_svd_video_isolated(
+                            ai_keyframes[idx], raw_video_path,
+                            body.aspect_ratio, scene_duration, (story_seed or 0) + idx,
+                        )
+                    else:
+                        raw_video = _generate_ai_video(
+                            ai_keyframes[idx], ai_scene_prompts[idx], raw_video_path,
+                            body.aspect_ratio, scene_duration, (story_seed or 0) + idx,
+                        )
                     _render_stock_clip(
                         raw_video, "video", clip_path, width, height,
                         scene_duration, body.transition,
                     )
-                    media = {"type": "video", "url": str(raw_video), "provider": "AI Sinh Video (LTX)"}
+                    media = {
+                        "type": "video", "url": str(raw_video),
+                        "provider": f"AI Sinh Video ({str(video_backend).upper()})",
+                    }
                 except Exception as exc:
-                    logger.exception("AI video generation failed for scene=%s", scene)
-                    raise RuntimeError(f"AI không sinh được video cảnh {idx + 1}: {exc}") from exc
+                    # Low-memory video inference is experimental. Preserve a
+                    # complete usable job when one scene fails or its isolated
+                    # worker crashes by animating the already-generated frame.
+                    logger.exception(
+                        "AI video generation failed for scene=%s; using safe keyframe fallback", scene,
+                    )
+                    video_fallback_count += 1
+                    store.update_job(
+                        job_id,
+                        progress_note=f"SVD lỗi ở cảnh {idx + 1}; đang dùng chuyển động ảnh an toàn...",
+                    )
+                    _render_stock_clip(
+                        ai_keyframes[idx], "image", clip_path, width, height,
+                        scene_duration, body.transition if body.transition != "none" else "zoomin",
+                    )
+                    media = {
+                        "type": "image", "url": str(ai_keyframes[idx]),
+                        "provider": "AI sinh ảnh (fallback từ SVD)",
+                    }
             else:
                 for query in queries:
                     media = _search_stock_media(query, body.aspect_ratio)
@@ -1984,25 +2347,11 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         # Entrance/exit animation is already rendered into every scene.
         # A timestamp-safe concat avoids FFmpeg 7's broken multi-xfade path.
         _render_creator_timeline(
-            clip_paths, visual_path, scene_duration, total_duration, "none",
+            clip_paths, visual_path, scene_duration, final_duration, "none",
         )
-        store.update_job(job_id, progress_note="Đang tạo giọng đọc AI...")
-        voice_path = output_dir / "narration.mp3"
-        cue_durations, cue_word_durations = _synthesize_creator_cues(
-            narration_scenes, output_dir, body.target_language, body.tts_voice, voice_path,
-        )
-        if not voice_path.exists() or voice_path.stat().st_size < 1024:
-            raise RuntimeError("TTS không tạo được file giọng đọc hợp lệ")
 
-        # Build subtitle cues only after TTS exists. Their timeline follows
-        # the audible voice duration (or the time-compressed duration when
-        # narration is longer than the visual), rather than arbitrary equal
-        # scene slots that drift away from what is being spoken.
-        final_duration = scene_duration * len(scenes)
-        voice_duration = _media_duration(voice_path)
-        spoken_duration = final_duration if voice_duration > final_duration else voice_duration
-        if spoken_duration <= 0:
-            spoken_duration = final_duration
+        # Subtitle timing follows the untouched natural TTS exactly.
+        spoken_duration = voice_duration
         subtitles_path = output_dir / "subtitles.ass"
         segments, _ = _write_creator_subtitles(
             narration_scenes, subtitles_path, spoken_duration, cue_durations, width, height,
@@ -2016,7 +2365,11 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
             visual_path, voice_path, subtitles_path, output_path, final_duration,
         )
         store.update_job(
-            job_id, status="done", progress_note="Hoàn tất",
+            job_id, status="done",
+            progress_note=(
+                f"Hoàn tất · {video_fallback_count} cảnh dùng chuyển động ảnh fallback"
+                if video_fallback_count else "Hoàn tất"
+            ),
             final_video_path=str(output_path), title=body.topic.strip()[:80],
         )
     except Exception as exc:
@@ -2077,18 +2430,11 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
         raise HTTPException(400, "Tỷ lệ khung hình không hợp lệ")
     if body.transition not in CREATOR_TRANSITIONS:
         raise HTTPException(400, "Hiệu ứng chuyển cảnh không hợp lệ")
+    if not 10 <= int(body.duration_seconds or 0) <= 1200:
+        raise HTTPException(400, "Thời lượng video phải từ 10 giây đến 20 phút")
     if body.image_provider not in ("stock", "ai", "cpu_ai", "ai_video"):
         raise HTTPException(400, "Nguồn hình ảnh không hợp lệ")
-    if body.image_provider == "ai_video":
-        try:
-            import torch
-        except ImportError as exc:
-            raise HTTPException(503, "Máy chủ chưa cài PyTorch để chạy AI Sinh Video") from exc
-        if not torch.cuda.is_available():
-            raise HTTPException(
-                503,
-                "AI Sinh Video cần NVIDIA GPU/CUDA. Máy chủ hiện chưa nhận GPU; hãy kiểm tra driver và PyTorch CUDA.",
-            )
+    _validate_creator_ai_runtime(body.image_provider)
     if body.image_provider == "stock" and not _env_first("PEXELS_API_KEY", "PEXELS_KEY", "PIXABAY_API_KEY", "PIXABAY_KEY"):
         raise HTTPException(
             503,
@@ -2111,10 +2457,39 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
     return job.to_dict()
 
 
+@app.get("/api/creator/capabilities")
+def creator_capabilities(user_id: int = Depends(get_current_user_id)):
+    """Report machine-specific creator options so unsafe choices can be disabled."""
+    result = {
+        "ai_image": False, "ai_video": False,
+        "gpu_name": None, "vram_gb": 0.0, "ai_video_reason": None,
+        "ai_video_backend": None,
+    }
+    try:
+        _validate_creator_ai_runtime("cpu_ai")
+        result["ai_image"] = True
+        import torch
+        if torch.cuda.is_available():
+            gpu = torch.cuda.get_device_properties(0)
+            result["gpu_name"] = gpu.name
+            result["vram_gb"] = round(gpu.total_memory / (1024 ** 3), 1)
+        try:
+            _validate_creator_ai_runtime("ai_video")
+            result["ai_video"] = True
+            result["ai_video_backend"] = _creator_video_backend().upper()
+        except HTTPException as exc:
+            result["ai_video_reason"] = str(exc.detail)
+    except HTTPException as exc:
+        result["ai_video_reason"] = str(exc.detail)
+    return result
+
+
 @app.post("/api/creator/suggestions")
 def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_current_user_id)):
     if not body.topic.strip():
         raise HTTPException(400, "Thiếu chủ đề video")
+    if not 10 <= int(body.duration_seconds or 0) <= 1200:
+        raise HTTPException(400, "Thời lượng nội dung phải từ 10 giây đến 20 phút")
     topic = body.topic.strip()
     language = body.target_language or "vi"
     provider = (_env_first("CREATOR_AI_PROVIDER") or "auto").lower()
@@ -2140,6 +2515,11 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
             for provider_name, generate in providers:
                 try:
                     result = generate(body)
+                    result = _enforce_creator_entity_consistency(result, topic, language)
+                    # Search intent does not change merely because duration does.
+                    result["keywords"] = _creator_keywords_from_topic(topic, language)
+                    result = _validate_creator_suggestion_timing(result, body.duration_seconds)
+                    result = _annotate_creator_suggestion_timing(result, body.duration_seconds)
                     _CREATOR_AI_CACHE[cache_key] = (time.time(), dict(result))
                     return result
                 except Exception as exc:
@@ -2147,15 +2527,26 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
                     errors.append(f"{provider_name}: {exc}")
                     if provider != "auto":
                         break
-        raise HTTPException(502, "Không tạo được nội dung AI — " + " | ".join(errors))
-    return {
+        # Suggestions are editing aids, so an unavailable optional AI service
+        # must not make all three Generate buttons unusable.
+        result = {
+            "keywords": _creator_keywords_from_topic(topic, language),
+            "visual_brief": _creator_script_text_from_topic(topic, language, body.duration_seconds),
+            "script": _creator_script_text_from_topic(topic, language, body.duration_seconds),
+            "narration_script": _creator_narration_text_from_topic(topic, language, body.duration_seconds),
+            "generator": "template", "model": None,
+            "warning": "AI tạm thời không phản hồi; đang dùng nội dung local. " + " | ".join(errors),
+        }
+        return _annotate_creator_suggestion_timing(result, body.duration_seconds)
+    result = {
         "keywords": _creator_keywords_from_topic(topic, language),
-        "visual_brief": _creator_script_text_from_topic(topic, language),
-        "script": _creator_script_text_from_topic(topic, language),
-        "narration_script": _creator_narration_text_from_topic(topic, language),
+        "visual_brief": _creator_script_text_from_topic(topic, language, body.duration_seconds),
+        "script": _creator_script_text_from_topic(topic, language, body.duration_seconds),
+        "narration_script": _creator_narration_text_from_topic(topic, language, body.duration_seconds),
         "generator": "template", "model": None,
         "warning": "AI chưa được cấu hình hoặc tạm thời không phản hồi; đang dùng nội dung mẫu local.",
     }
+    return _annotate_creator_suggestion_timing(result, body.duration_seconds)
 
 
 @app.post("/api/upload-logo")

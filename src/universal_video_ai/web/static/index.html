@@ -413,6 +413,13 @@
           <option value="30">30 giây</option>
           <option value="45">45 giây</option>
           <option value="60">60 giây</option>
+          <option value="120">2 phút</option>
+          <option value="180">3 phút</option>
+          <option value="300">5 phút</option>
+          <option value="480">8 phút</option>
+          <option value="600">10 phút</option>
+          <option value="900">15 phút</option>
+          <option value="1200">20 phút</option>
         </select>
       </div>
       <div class="field">
@@ -439,6 +446,7 @@
           <option value="cpu_ai">AI Sinh Ảnh</option>
           <option value="ai_video">AI Sinh Video (GPU)</option>
         </select>
+        <div id="creator-image-provider-help" style="font-size:11px;color:var(--text-dim);margin-top:5px"></div>
       </div>
     </div>
     <div class="field">
@@ -1007,6 +1015,7 @@ async function loadLanguages() {
     $("#source-lang-select").value = "auto";
     loadVoices();
     loadCreatorVoices();
+    loadCreatorCapabilities();
   } catch (e) { /* keep whatever was already in the selects if this fails */ }
 }
 
@@ -1030,6 +1039,28 @@ async function loadCreatorVoices() {
   } catch {
     $("#creator-voice-select").innerHTML = `<option value="">Mặc định theo ngôn ngữ</option>`;
     $("#creator-voice-help").textContent = "Không tải được danh sách giọng đọc";
+  }
+}
+
+async function loadCreatorCapabilities() {
+  const select = $("#creator-image-provider");
+  const help = $("#creator-image-provider-help");
+  try {
+    const data = await api("/api/creator/capabilities");
+    const videoOption = select.querySelector('option[value="ai_video"]');
+    if (videoOption) {
+      videoOption.disabled = !data.ai_video;
+      videoOption.textContent = data.ai_video
+        ? `AI Sinh Video (${data.ai_video_backend || "GPU"})`
+        : "AI Sinh Video (GPU không đủ VRAM)";
+    }
+    if (!data.ai_video && select.value === "ai_video") select.value = "cpu_ai";
+    help.textContent = data.gpu_name
+      ? `${data.gpu_name} · ${data.vram_gb} GB VRAM${data.ai_video ? ` · Video: ${data.ai_video_backend}` : " · Chỉ hỗ trợ AI Sinh Ảnh"}`
+      : "Không phát hiện GPU CUDA; AI Sinh Ảnh sẽ dùng CPU.";
+    help.title = data.ai_video_reason || "";
+  } catch (e) {
+    help.textContent = "Không kiểm tra được khả năng AI của máy chủ.";
   }
 }
 $("#creator-lang-select").addEventListener("change", async () => {
@@ -1160,10 +1191,21 @@ async function loadCreatorSuggestions() {
 }
 
 function creatorGeneratorMessage(data, successText) {
-  if (data.warning) return data.warning;
+  const timing = data.duration_seconds
+    ? ` · ${data.duration_seconds}s · ${data.scene_count || 0} cảnh · ${data.narration_word_count || 0} từ voice`
+    : "";
+  if (data.warning) return `${data.warning}${timing}`;
   const searched = (data.search_queries || []).slice(0, 2).join(" · ");
   const grounding = data.grounded ? " + Google Search" : "";
-  return `${successText} bằng ${data.model || "AI"}${grounding}${data.cached ? " (cache)" : ""}${searched ? ` (${searched})` : ""}.`;
+  return `${successText} bằng ${data.model || "AI"}${grounding}${data.cached ? " (cache)" : ""}${searched ? ` (${searched})` : ""}.${timing}`;
+}
+
+function ensureCreatorSuggestionCurrent(data) {
+  const selectedDuration = parseInt($("#creator-duration").value, 10);
+  if (data.duration_seconds && Number(data.duration_seconds) !== selectedDuration) {
+    throw new Error("Thời lượng đã thay đổi trong lúc đang gen. Hãy gen lại nội dung mới.");
+  }
+  return data;
 }
 
 const creatorGenerateButtons = [
@@ -1259,13 +1301,25 @@ function showCreatorProgress(job) {
   $(`#${id}`).addEventListener("input", updateCreatorSubmitState);
 });
 
+$("#creator-duration").addEventListener("change", () => {
+  window._creatorSuggestionCache = null;
+  window._creatorSuggestionPending = null;
+  $("#creator-script").value = "";
+  $("#creator-narration").value = "";
+  const seconds = parseInt($("#creator-duration").value, 10);
+  const label = seconds >= 60 ? `${seconds / 60} phút` : `${seconds} giây`;
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = `Đã đổi thời lượng thành ${label}. Hãy gen lại visual brief và kịch bản voice.`;
+  updateCreatorSubmitState();
+});
+
 $("#creator-keywords-generate").onclick = async () => {
   const button = $("#creator-keywords-generate");
   setCreatorGenerationLoading(button, true, "Đang gen keyword...");
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "Đang gen keyword...";
   try {
-    const data = await loadCreatorSuggestions();
+    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
     $("#creator-keywords").value = data.keywords.join(", ");
     $("#creator-error").style.color = "var(--ok)";
     $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen keyword");
@@ -1298,7 +1352,7 @@ $("#creator-script-generate").onclick = async () => {
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "Đang gen visual brief...";
   try {
-    const data = await loadCreatorSuggestions();
+    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
     $("#creator-script").value = data.visual_brief || data.script;
     if (!$("#creator-keywords").value.trim()) $("#creator-keywords").value = data.keywords.join(", ");
     $("#creator-error").style.color = "var(--ok)";
@@ -1318,7 +1372,7 @@ $("#creator-narration-generate").onclick = async () => {
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "Đang gen kịch bản voice...";
   try {
-    const data = await loadCreatorSuggestions();
+    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
     $("#creator-narration").value = data.narration_script;
     $("#creator-error").style.color = "var(--ok)";
     $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen kịch bản voice");
@@ -1334,7 +1388,7 @@ $("#creator-narration-generate").onclick = async () => {
 $("#creator-topic").addEventListener("blur", async () => {
   if (!$("#creator-topic").value.trim() || $("#creator-keywords").value.trim()) return;
   try {
-    const data = await loadCreatorSuggestions();
+    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
     $("#creator-keywords").value = data.keywords.join(", ");
   } catch { /* non-critical convenience */ }
   finally { updateCreatorSubmitState(); }
@@ -1675,12 +1729,39 @@ function openPreview(jobId) {
   $("#prepublish-result").classList.add("hidden");
   $("#prepublish-result").innerHTML = "";
   $("#preview-modal").classList.remove("hidden");
+  $("#preview-close").focus();
 }
-$("#preview-close").onclick = () => {
+
+function closePreview() {
   $("#preview-modal").classList.add("hidden");
   $("#preview-video").pause();
   $("#preview-video").src = "";
-};
+}
+
+$("#preview-close").onclick = closePreview;
+$("#preview-modal").addEventListener("click", ev => {
+  if (ev.target === $("#preview-modal")) closePreview();
+});
+
+document.addEventListener("keydown", ev => {
+  const modal = $("#preview-modal");
+  if (modal.classList.contains("hidden")) return;
+  const target = ev.target;
+  const isEditing = target && (
+    target.matches?.("input, textarea, select") || target.isContentEditable
+  );
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closePreview();
+    return;
+  }
+  if ((ev.code === "Space" || ev.key === " ") && !isEditing) {
+    ev.preventDefault();
+    const video = $("#preview-video");
+    if (video.paused || video.ended) video.play();
+    else video.pause();
+  }
+});
 
 $("#prepublish-check-btn").onclick = async () => {
   const box = $("#prepublish-result");
@@ -1706,7 +1787,7 @@ $("#prepublish-check-btn").onclick = async () => {
 };
 
 $("#preview-publish-btn").onclick = () => {
-  $("#preview-modal").classList.add("hidden");
+  closePreview();
   openPublish(currentJobId);
 };
 
