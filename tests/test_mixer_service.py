@@ -2,7 +2,9 @@
 from pathlib import Path
 import pytest
 
-from universal_video_ai.mixer.service import MixerService, MixerConfig, AudioMix
+from universal_video_ai.mixer.service import (
+    MixerService, MixerConfig, AudioMix, DubbedBackgroundMix,
+)
 
 
 def test_mixer_no_secondary_returns_primary(tmp_path: Path):
@@ -31,3 +33,53 @@ def test_mixer_with_secondary_requires_ffmpeg(tmp_path: Path, monkeypatch):
 
     with pytest.raises(RuntimeError):
         service.mix(spec, tmp_path / "output.wav")
+
+
+def test_mix_dub_with_background_loops_and_ducks_music(tmp_path: Path, monkeypatch) -> None:
+    voice = tmp_path / "voice.wav"
+    music = tmp_path / "music.mp3"
+    output = tmp_path / "safe.wav"
+    voice.write_bytes(b"voice")
+    music.write_bytes(b"music")
+
+    service = MixerService()
+    monkeypatch.setattr(service, "_ffmpeg_available", True)
+    captured = {}
+
+    def fake_run(cmd, op_name):
+        captured["cmd"] = cmd
+        captured["op_name"] = op_name
+        output.write_bytes(b"mixed")
+
+    monkeypatch.setattr(service, "_run_ffmpeg", fake_run)
+    result = service.mix_dub_with_background(
+        DubbedBackgroundMix(
+            voice_audio=voice,
+            background_audio=music,
+            total_duration=12.0,
+        ),
+        output,
+    )
+
+    command = captured["cmd"]
+    filter_graph = command[command.index("-filter_complex") + 1]
+    assert result == output.resolve()
+    assert "-stream_loop" in command
+    assert "sidechaincompress" in filter_graph
+    assert "alimiter" in filter_graph
+
+
+def test_mix_dub_with_background_rejects_invalid_volume(tmp_path: Path, monkeypatch) -> None:
+    service = MixerService()
+    monkeypatch.setattr(service, "_ffmpeg_available", True)
+
+    with pytest.raises(ValueError, match="background_volume"):
+        service.mix_dub_with_background(
+            DubbedBackgroundMix(
+                voice_audio=tmp_path / "voice.wav",
+                background_audio=tmp_path / "music.mp3",
+                total_duration=10.0,
+                background_volume=1.5,
+            ),
+            tmp_path / "output.wav",
+        )

@@ -16,6 +16,20 @@ from .ytdlp_downloader import YTDLPDownloader
 logger = logging.getLogger(__name__)
 
 
+def _safe_video_filename(title: str, video_id: str, max_bytes: int = 200) -> str:
+    """Return a portable, byte-bounded filename for a Douyin video."""
+    cleaned = re.sub(r'[\\/\x00-\x1f\x7f]+', "_", title).strip(" .")
+    if not cleaned:
+        cleaned = "douyin"
+
+    suffix = f"_{video_id}.mp4"
+    byte_budget = max(1, max_bytes - len(suffix.encode("utf-8")))
+    encoded = cleaned.encode("utf-8")[:byte_budget]
+    # A byte slice may end in the middle of a multi-byte character.
+    cleaned = encoded.decode("utf-8", errors="ignore").rstrip(" .") or "douyin"
+    return f"{cleaned}{suffix}"
+
+
 class DouyinDownloader(BaseDownloader):
 
     def __init__(self):
@@ -148,7 +162,7 @@ class DouyinDownloader(BaseDownloader):
                 return None
 
             # 5. Download video
-            output_path = output_dir / f"{title}.mp4"
+            output_path = output_dir / _safe_video_filename(title, video_id)
             logger.info(f"📥 Downloading video to: {output_path}")
             
             video_response = requests.get(video_url, headers=headers, stream=True, timeout=120)

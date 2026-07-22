@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 import logging
 from typing import Optional, Protocol
 
@@ -126,33 +127,107 @@ class TranslatorFactory:
         # Placeholder: attempt dynamic backends here (optional). If not available, raise descriptive error.
         if provider == "google":
             try:
-                # Try to import googletrans lazily
-                from googletrans import Translator as GoogleTrans  # type: ignore
+                import httpx  # noqa: F401
             except Exception as exc:
                 raise ValueError(
-                    "Google provider requested but googletrans is not available. Install googletrans or choose another provider."
+                    "Google provider requested but httpx is not available. Install httpx or choose another provider."
                 ) from exc
 
             class _GoogleTranslator:
                 def __init__(self, cfg: TranslatorConfig, logger: logging.Logger) -> None:
                     self.cfg = cfg
                     self.logger = logger
-                    self.client = GoogleTrans()
+                    self._direct_client = None
+
+                async def _translate_direct(self, text: str, src: Optional[str], dest: str) -> str:
+                    """Use Google's lightweight JSON endpoint.
+
+                    googletrans' web UI endpoint is comparatively fragile and
+                    was repeatedly timing out even while Google's public
+                    translate host remained reachable. This endpoint returns
+                    the translated chunks as a small JSON response.
+                    """
+                    import httpx
+
+                    if self._direct_client is None:
+                        timeout = httpx.Timeout(30.0, connect=12.0)
+                        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+                        self._direct_client = httpx.AsyncClient(timeout=timeout, limits=limits)
+                    response = await self._direct_client.get(
+                        "https://translate.googleapis.com/translate_a/single",
+                        params={
+                            "client": "gtx",
+                            "sl": src or "auto",
+                            "tl": dest,
+                            "dt": "t",
+                            "q": text,
+                        },
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    chunks = payload[0] if isinstance(payload, list) and payload else []
+                    translated = "".join(
+                        str(chunk[0]) for chunk in chunks
+                        if isinstance(chunk, list) and chunk and chunk[0] is not None
+                    )
+                    if not translated:
+                        raise TranslationError("Google returned an empty translation")
+                    return translated
 
                 async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
                     dest = dest_lang or self.cfg.dest_lang or "en"
                     src = src_lang or self.cfg.src_lang or None
-                    try:
-                        result = self.client.translate(text, src=src, dest=dest)
-                        # Handle both sync and async versions of googletrans
-                        import asyncio
-                        if asyncio.iscoroutine(result):
-                            res = await result
-                        else:
-                            res = result
-                        return getattr(res, "text", str(res))
-                    except Exception as exc:  # pragma: no cover - depends on external lib
-                        raise TranslationError(f"Google translation failed: {exc}") from exc
+                    last_error: Optional[Exception] = None
+                    for attempt in range(3):
+                        try:
+                            return await self._translate_direct(text, src, dest)
+                        except Exception as exc:  # pragma: no cover - external service
+                            last_error = exc
+                            self.logger.warning(
+                                "Google translation attempt %d/3 failed: %s",
+                                attempt + 1, type(exc).__name__,
+                            )
+                            if attempt < 2:
+                                await asyncio.sleep(0.5 * (2 ** attempt))
+                    raise TranslationError(
+                        f"Google translation failed after 3 attempts: {last_error}"
+                    ) from last_error
+
+                async def translate_batch(
+                    self, texts: list[str], src_lang: Optional[str] = None,
+                    dest_lang: Optional[str] = None,
+                ) -> list[str]:
+                    """Translate many short segments with a few sequential requests."""
+                    if not texts:
+                        return []
+                    separator = "\n[[[UVAI_SEG_BREAK]]]\n"
+                    results: list[str] = []
+                    batch: list[str] = []
+                    batch_chars = 0
+
+                    async def flush() -> None:
+                        nonlocal batch, batch_chars
+                        translated = await self.translate(
+                            separator.join(batch), src_lang, dest_lang
+                        )
+                        parts = translated.split("[[[UVAI_SEG_BREAK]]]")
+                        if len(parts) != len(batch):
+                            raise TranslationError(
+                                f"Google changed batch separators ({len(parts)}/{len(batch)})"
+                            )
+                        results.extend(part.strip() for part in parts)
+                        batch = []
+                        batch_chars = 0
+
+                    for text in texts:
+                        extra = len(text) + (len(separator) if batch else 0)
+                        if batch and (len(batch) >= 25 or batch_chars + extra > 3000):
+                            await flush()
+                        batch.append(text)
+                        batch_chars += extra
+                    if batch:
+                        await flush()
+                    return results
 
             return _GoogleTranslator(cfg, log)
 

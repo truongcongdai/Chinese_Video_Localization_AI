@@ -15,6 +15,7 @@ from universal_video_ai.mixer.service import MixerService, MixerConfig
 from universal_video_ai.render.renderer import Renderer, RenderConfig
 from universal_video_ai.render.text_detector import OnScreenTextDetector
 from universal_video_ai.render import ocr_language_map
+from universal_video_ai.audio.background_music import BackgroundMusicConfig, BackgroundMusicLibrary
 from .service import LocalizationService, LocalizationConfig
 
 __all__ = ["create_localization_service"]
@@ -33,6 +34,9 @@ def create_localization_service(
         tts_voice: Optional[str] = None,
         generate_subtitles: bool = False,
         mix_audio: bool = False,
+        replace_source_audio: bool = False,
+        background_music_dir: Optional[Path] = None,
+        replacement_music_volume: float = 0.16,
         render_video: bool = False,
         render_config: Optional[RenderConfig] = None,
         enable_text_cover: bool = True,
@@ -114,6 +118,9 @@ def create_localization_service(
 
     # Mixer service
     mixer = MixerService(config=MixerConfig(), logger=logger)
+    background_music_library = BackgroundMusicLibrary(
+        BackgroundMusicConfig(library_dir=background_music_dir), logger=logger,
+    ) if replace_source_audio else None
 
     # Renderer service (optional)
     renderer = Renderer(config=render_config or RenderConfig(), logger=logger) if render_video else None
@@ -151,6 +158,8 @@ def create_localization_service(
         tts_voice=tts_voice,
         generate_subtitles=generate_subtitles,
         mix_audio=mix_audio,
+        replace_source_audio=replace_source_audio,
+        replacement_music_volume=replacement_music_volume,
         render_video=render_video,
         render_config=render_config,
         enable_text_cover=enable_text_cover,
@@ -165,6 +174,7 @@ def create_localization_service(
         tts_service=tts_service,
         timeline=timeline,
         mixer=mixer,
+        background_music_library=background_music_library,
         renderer=renderer,
         text_detector=text_detector,
         config=config,

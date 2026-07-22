@@ -41,3 +41,15 @@ class TranslatorBackend:
         except Exception as exc:
             self.logger.exception("TranslatorBackend failed: %s", exc)
             raise TranslationFailed("Translation backend failed", cause=exc) from exc
+
+    async def translate_batch(
+        self, texts: list[str], source_lang: str, target_lang: str
+    ) -> list[str]:
+        try:
+            method = getattr(self._translator, "translate_batch")
+            return await method(texts, source_lang, target_lang)
+        except TranslationFailed:
+            raise
+        except Exception as exc:
+            self.logger.exception("TranslatorBackend batch failed: %s", exc)
+            raise TranslationFailed("Translation backend batch failed", cause=exc) from exc

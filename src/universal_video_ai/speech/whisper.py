@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import threading
 from typing import List, Optional
 
 from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
@@ -11,6 +12,22 @@ from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
 __all__ = ["WhisperTranscriber", "WhisperConfig"]
 
 _logger = logging.getLogger(__name__)
+_MODEL_CACHE: dict[tuple[str, Optional[str]], object] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str]):
+    """Load each Whisper model once per process instead of once per video."""
+    key = (model_name, device)
+    model = _MODEL_CACHE.get(key)
+    if model is not None:
+        return model
+    with _MODEL_CACHE_LOCK:
+        model = _MODEL_CACHE.get(key)
+        if model is None:
+            model = whisper_module.load_model(model_name, device=device)
+            _MODEL_CACHE[key] = model
+    return model
 
 
 @dataclass
@@ -128,7 +145,7 @@ class WhisperTranscriber:
         try:
             # Load model (this can be heavy; caller is responsible for environment)
             self.logger.debug("Loading whisper model %s (device=%s)", self.config.model, self.config.device)
-            model = whisper.load_model(self.config.model, device=self.config.device)  # type: ignore[attr-defined]
+            model = _cached_whisper_model(whisper, self.config.model, self.config.device)
             self.logger.debug("Model loaded, starting transcription for %s", audio_path)
 
             # whisper.transcribe accepts language and task

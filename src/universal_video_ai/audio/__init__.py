@@ -12,6 +12,7 @@ from .extractor import AudioExtractor, AudioConfig
 from .pipeline import AudioPipeline, AudioPipelineConfig, AudioPipelineResult
 from .factory import create_audio_pipeline
 from .demucs import DemucsProcessor, DemucsConfig, DemucsOutput, DEMUCS_AVAILABLE
+from .background_music import BackgroundMusicConfig, BackgroundMusicLibrary
 
 __all__ = [
     "AudioResult",
@@ -25,4 +26,6 @@ __all__ = [
     "DemucsConfig",
     "DemucsOutput",
     "DEMUCS_AVAILABLE",
+    "BackgroundMusicConfig",
+    "BackgroundMusicLibrary",
 ]
