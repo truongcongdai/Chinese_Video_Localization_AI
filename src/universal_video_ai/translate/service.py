@@ -22,6 +22,7 @@ class TranslateService:
     backend: Optional[TranslateBackend] = None
     cache: Optional[object] = None  # RedisCache
     logger: Optional[logging.Logger] = None
+    max_concurrency: int = 5
 
     def __post_init__(self) -> None:
         if self.logger is None:
@@ -97,9 +98,33 @@ class TranslateService:
             len(segments), source_lang, target_lang,
         )
 
-        translated_texts = await asyncio.gather(
-            *(self.translate(seg.text, source_lang, target_lang) for seg in segments)
-        )
+        batch_method = getattr(self.backend, "translate_batch", None)
+        if callable(batch_method):
+            self.logger.info(
+                "TranslateService: using batched translation for %d segments", len(segments)
+            )
+            translated_texts = await batch_method(
+                [segment.text for segment in segments], source_lang, target_lang
+            )
+            if len(translated_texts) != len(segments):
+                raise TranslationFailed(
+                    f"Translation backend returned {len(translated_texts)} results for {len(segments)} segments"
+                )
+            return [
+                TranscriptSegment(start=seg.start, end=seg.end, text=translated_text)
+                for seg, translated_text in zip(segments, translated_texts)
+            ]
+
+        # Remote translation clients have small connection pools and some are
+        # not safe under hundreds of simultaneous requests. Keep useful
+        # parallelism without flooding the provider.
+        semaphore = asyncio.Semaphore(max(1, self.max_concurrency))
+
+        async def translate_one(segment: TranscriptSegment) -> str:
+            async with semaphore:
+                return await self.translate(segment.text, source_lang, target_lang)
+
+        translated_texts = await asyncio.gather(*(translate_one(seg) for seg in segments))
 
         return [
             TranscriptSegment(start=seg.start, end=seg.end, text=translated_text)

@@ -6,6 +6,7 @@ Usage: python scripts/run_bot.py --admin 123456789
 
 import argparse
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -77,6 +78,9 @@ def main() -> None:
         run_tts=True,
         generate_subtitles=True,
         mix_audio=True,
+        replace_source_audio=True,
+        background_music_dir=Path(os.getenv("LICENSED_MUSIC_DIR", "./local_data/music")),
+        replacement_music_volume=float(os.getenv("REPLACEMENT_MUSIC_VOLUME", "0.16")),
         render_video=True,
         render_config=render_config,
         # Detect the burned-in Chinese subtitle region via OCR (easyocr) for

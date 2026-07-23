@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -12,11 +14,14 @@ from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.audio.factory import create_audio_pipeline
 from universal_video_ai.audio.pipeline import AudioPipelineResult
 from universal_video_ai.audio.audio_result import AudioResult
+from universal_video_ai.audio.background_music import BackgroundMusicLibrary
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.timeline.service import TimelineService, TimelineConfig, TimelineSegment
-from universal_video_ai.mixer.service import MixerService, MixerConfig, AudioMix, TimedAudioClip
+from universal_video_ai.mixer.service import (
+    MixerService, MixerConfig, AudioMix, TimedAudioClip, DubbedBackgroundMix,
+)
 from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverlay
 from universal_video_ai.render.text_detector import OnScreenTextDetector
 from universal_video_ai.render import ocr_language_map
@@ -27,6 +32,13 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+# Pipeline-level concurrency: network download and FFmpeg can overlap with the
+# single CPU-heavy Whisper stage. Running several Whisper-small inferences at
+# once on a 16 GB CPU host causes thread oversubscription and swapping.
+_DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "3"))))
+_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "1"))))
+_RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
 
 
 @dataclass(frozen=True)
@@ -68,6 +80,10 @@ class LocalizationConfig:
     # the dubbed voice needs to be clearly audible over the original
     # dialogue, with the original kept only as low ambience/music under it.
     dub_mix_level_primary: float = 0.18
+    # Copyright-safe mode never mixes the downloaded source audio into the
+    # localized render. This avoids re-introducing source music after TTS.
+    replace_source_audio: bool = False
+    replacement_music_volume: float = 0.16
 
     # Rendering
     render_video: bool = False
@@ -246,6 +262,7 @@ class LocalizationService:
             tts_service: Optional[TTSService] = None,
             timeline: Optional[TimelineService] = None,
             mixer: Optional[MixerService] = None,
+            background_music_library: Optional[BackgroundMusicLibrary] = None,
             renderer: Optional[Renderer] = None,
             text_detector: Optional[OnScreenTextDetector] = None,
             config: Optional[LocalizationConfig] = None,
@@ -257,6 +274,7 @@ class LocalizationService:
         self.tts_service = tts_service
         self.timeline = timeline or TimelineService()
         self.mixer = mixer or MixerService()
+        self.background_music_library = background_music_library
         self.renderer = renderer or Renderer()
         self.text_detector = text_detector
         self.config = config or LocalizationConfig()
@@ -348,7 +366,8 @@ class LocalizationService:
         # Step 1: Download video
         self._progress(5, "Đang tải video nguồn")
         self.logger.info("LocalizationService: downloading video")
-        download_result = self.downloader.download(url, output_dir)
+        async with _DOWNLOAD_SLOTS:
+            download_result = await asyncio.to_thread(self.downloader.download, url, output_dir)
 
         if not download_result.success:
             raise ValueError(f"Download failed for {url}")
@@ -365,7 +384,10 @@ class LocalizationService:
             demucs_output_dir=self.config.demucs_output_dir,
             logger=self.logger,
         )
-        audio_result = pipeline.process(download_result, output_dir=output_dir / "audio")
+        async with _TRANSCRIPTION_SLOTS:
+            audio_result = await asyncio.to_thread(
+                pipeline.process, download_result, output_dir=output_dir / "audio"
+            )
         self.logger.info("LocalizationService: audio processing complete")
         self._progress(40, "Đã tách âm thanh và nhận diện lời nói")
 
@@ -421,8 +443,11 @@ class LocalizationService:
                     self._progress(58, "Đã dịch nội dung")
                 except Exception as exc:
                     self.logger.error("Translation failed: %s", exc)
-                    translated_text = None
-                    translated_segments = None
+                    # A localized video with untranslated source-language
+                    # subtitles is a corrupt result, not a successful fallback.
+                    # Fail the job so it can be retried once the provider is
+                    # reachable instead of silently rendering the wrong output.
+                    raise
 
         return PreparedLocalization(
             download_result=download_result,
@@ -466,7 +491,8 @@ class LocalizationService:
             else:
                 try:
                     if translated_segments:
-                        tts_audio_path = self._synthesize_timed_track(
+                        tts_audio_path = await asyncio.to_thread(
+                            self._synthesize_timed_track,
                             translated_segments,
                             total_duration=audio_result.audio_result.duration,
                             output_dir=output_dir,
@@ -476,7 +502,8 @@ class LocalizationService:
                     else:
                         self.logger.info("LocalizationService: synthesizing TTS (whole-text fallback)")
                         tts_audio_path = output_dir / "tts_audio.wav"
-                        self.tts_service.synthesize(
+                        await asyncio.to_thread(
+                            self.tts_service.synthesize,
                             translated_text,
                             output_path=tts_audio_path,
                             language=effective_target_language,
@@ -572,20 +599,47 @@ class LocalizationService:
                     for o in text_overlays
                 ]
 
-        # Step 7: Mix audio (original + TTS)
+        # Step 7: Mix audio. In copyright-safe mode the downloaded source
+        # audio is never reintroduced; only the dub and a separately licensed
+        # replacement track are used.
         mixed_audio_path: Optional[Path] = None
         if self.config.mix_audio and tts_audio_path:
             self._progress(83, "Đang phối âm thanh")
             self.logger.info("LocalizationService: mixing audio streams")
-            mixed_audio_path = output_dir / "audio_mixed.wav"
-            self.mixer.mix(
-                AudioMix(
-                    primary_audio=audio_result.audio_result.audio_path,
-                    secondary_audio=tts_audio_path,
-                    mix_level=self.config.dub_mix_level_primary,
-                ),
-                mixed_audio_path
-            )
+            if self.config.replace_source_audio:
+                replacement_track = (
+                    self.background_music_library.select(str(download_result.video_path))
+                    if self.background_music_library is not None else None
+                )
+                if replacement_track is not None:
+                    mixed_audio_path = output_dir / "audio_safe_mix.wav"
+                    self.mixer.mix_dub_with_background(
+                        DubbedBackgroundMix(
+                            voice_audio=tts_audio_path,
+                            background_audio=replacement_track,
+                            total_duration=audio_result.audio_result.duration,
+                            background_volume=self.config.replacement_music_volume,
+                        ),
+                        mixed_audio_path,
+                    )
+                else:
+                    # Failing closed is intentional: an empty licensed library
+                    # yields clean TTS, never a fallback to claimed source audio.
+                    mixed_audio_path = tts_audio_path
+                    self.logger.warning(
+                        "Copyright-safe audio enabled but no licensed replacement track is available; "
+                        "rendering clean TTS without source audio"
+                    )
+            else:
+                mixed_audio_path = output_dir / "audio_mixed.wav"
+                self.mixer.mix(
+                    AudioMix(
+                        primary_audio=audio_result.audio_result.audio_path,
+                        secondary_audio=tts_audio_path,
+                        mix_level=self.config.dub_mix_level_primary,
+                    ),
+                    mixed_audio_path
+                )
             self.logger.info("LocalizationService: audio mix complete: %s", mixed_audio_path)
             self._progress(87, "Đã phối âm thanh")
 
@@ -661,13 +715,15 @@ class LocalizationService:
                             subtitles_for_render = None
 
                     final_video_path = output_dir / "output_final.mp4"
-                    self.renderer.render(
-                        video_path=download_result.video_path,
-                        audio_path=audio_for_render,
-                        subtitles=subtitles_for_render,
-                        output_path=final_video_path,
-                        text_overlays=text_overlays,
-                    )
+                    async with _RENDER_SLOTS:
+                        await asyncio.to_thread(
+                            self.renderer.render,
+                            video_path=download_result.video_path,
+                            audio_path=audio_for_render,
+                            subtitles=subtitles_for_render,
+                            output_path=final_video_path,
+                            text_overlays=text_overlays,
+                        )
                     self._progress(98, "Đã render, đang kiểm tra video")
                     self.logger.info("LocalizationService: render complete: %s", final_video_path)
                 except Exception as exc:

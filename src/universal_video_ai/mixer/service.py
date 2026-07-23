@@ -9,7 +9,7 @@ from typing import Optional, List
 import subprocess
 import shutil
 
-__all__ = ["MixerService", "MixerConfig", "AudioMix", "TimedAudioClip"]
+__all__ = ["MixerService", "MixerConfig", "AudioMix", "TimedAudioClip", "DubbedBackgroundMix"]
 
 _logger = logging.getLogger(__name__)
 
@@ -55,6 +55,17 @@ class TimedAudioClip:
     start: float
     end: float
     audio_path: Path
+
+
+@dataclass(frozen=True)
+class DubbedBackgroundMix:
+    """A clean dub mixed with a separately licensed background track."""
+
+    voice_audio: Path
+    background_audio: Path
+    total_duration: float
+    background_volume: float = 0.16
+    fade_seconds: float = 0.75
 
 
 @dataclass
@@ -142,6 +153,49 @@ class MixerService:
         except Exception as exc:
             self.logger.exception("Unexpected error during mix: %s", exc)
             raise RuntimeError(f"Audio mix failed: {exc}") from exc
+
+    def mix_dub_with_background(self, spec: DubbedBackgroundMix, output_path: Path) -> Path:
+        """Loop licensed music under a dub and duck it whenever speech is active."""
+        if not self._ffmpeg_available:
+            raise RuntimeError("FFmpeg not available in PATH")
+        if not 0.0 <= spec.background_volume <= 1.0:
+            raise ValueError("background_volume must be between 0 and 1")
+
+        output_path = Path(output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        duration = max(0.01, spec.total_duration)
+        fade = max(0.0, min(spec.fade_seconds, duration / 2.0))
+        fade_out_start = max(0.0, duration - fade)
+        music_filters = [
+            f"atrim=duration={duration:.3f}",
+            "asetpts=PTS-STARTPTS",
+            f"volume={spec.background_volume:.4f}",
+        ]
+        if fade > 0:
+            music_filters.extend([
+                f"afade=t=in:st=0:d={fade:.3f}",
+                f"afade=t=out:st={fade_out_start:.3f}:d={fade:.3f}",
+            ])
+
+        filter_complex = (
+            f"[0:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS,"
+            "asplit=2[voice][sidechain];"
+            f"[1:a]{','.join(music_filters)}[music];"
+            "[music][sidechain]sidechaincompress="
+            "threshold=0.025:ratio=10:attack=20:release=450[ducked];"
+            "[voice][ducked]amix=inputs=2:duration=first:normalize=0,"
+            "alimiter=limit=0.95:attack=5:release=50[out]"
+        )
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(spec.voice_audio),
+            "-stream_loop", "-1", "-i", str(spec.background_audio),
+            "-filter_complex", filter_complex,
+            "-map", "[out]", "-t", f"{duration:.3f}",
+            "-ar", str(self.config.sample_rate), "-y", str(output_path),
+        ]
+        self._run_ffmpeg(cmd, "mix_dub_with_background")
+        return output_path
 
     def _probe_duration(self, audio_path: Path) -> float:
         """Return duration in seconds of `audio_path` via ffprobe, or 0.0 if unknown."""

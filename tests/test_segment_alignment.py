@@ -91,6 +91,28 @@ def test_translate_segments_preserves_timestamps():
     assert result[1].text == "[vi] World"
 
 
+def test_translate_segments_limits_concurrency():
+    class CountingBackend:
+        def __init__(self):
+            self.active = 0
+            self.peak = 0
+
+        async def translate(self, text, source_lang, target_lang):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(0.001)
+            self.active -= 1
+            return text
+
+    backend = CountingBackend()
+    svc = TranslateService(backend=backend, max_concurrency=3)
+    segments = [TranscriptSegment(start=i, end=i + 1, text=str(i)) for i in range(20)]
+
+    asyncio.run(svc.translate_segments(segments, source_lang="zh-cn", target_lang="vi"))
+
+    assert backend.peak <= 3
+
+
 def test_timeline_from_segments_uses_real_timestamps_not_even_split():
     """This is the exact bug report: subtitles must NOT be evenly re-split."""
     service = TimelineService()

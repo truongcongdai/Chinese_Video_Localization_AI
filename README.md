@@ -12,6 +12,11 @@ End-to-end video localization platform: download → transcribe → translate �
 - **Text-to-Speech**: Speech synthesis using Edge TTS
 - **Subtitles**: Automatic subtitle generation (SRT/VTT formats)
 - **Audio Mixing**: Blend original audio with TTS/translated audio
+- **Copyright-safe audio**: Automatically replace the downloaded soundtrack
+  with licensed local music, loop it to the video duration, and duck it under
+  translated speech. Put licensed tracks in `local_data/music` and configure
+  `COPYRIGHT_SAFE_AUDIO`, `LICENSED_MUSIC_DIR`, and
+  `REPLACEMENT_MUSIC_VOLUME` in `.env`.
 - **End-to-End Orchestration**: Full pipeline in one command
 
 ## Installation
