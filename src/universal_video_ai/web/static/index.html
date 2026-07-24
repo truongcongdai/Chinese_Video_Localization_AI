@@ -6,59 +6,127 @@
 <title>Video Localization AI</title>
 <style>
   :root {
-    --bg: #0f1115;
-    --panel: #171a21;
-    --panel-2: #1f232c;
-    --border: #2a2f3a;
-    --text: #e7e9ee;
-    --text-dim: #9aa1ae;
-    --accent: #5b8cff;
-    --accent-2: #3f6bd8;
-    --ok: #3ecf8e;
-    --err: #ff6b6b;
-    --warn: #f5b74e;
-    --radius: 12px;
+    --bg: #0a0c10;
+    --panel: #12151e;
+    --panel-2: #1a1f2a;
+    --border: #2a3040;
+    --text: #f0f2f5;
+    --text-dim: #8b9bb4;
+    --accent: #6366f1;
+    --accent-2: #4f46e5;
+    --accent-glow: rgba(99, 102, 241, 0.4);
+    --ok: #10b981;
+    --err: #ef4444;
+    --warn: #f59e0b;
+    --radius: 16px;
+    --radius-sm: 10px;
+    --shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4);
+    --gradient-1: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    --gradient-2: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    --gradient-3: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; color: var(--text); min-height: 100vh;
     background:
-      radial-gradient(circle at 12% 0%, rgba(91,140,255,.14), transparent 32rem),
-      radial-gradient(circle at 95% 20%, rgba(62,207,142,.08), transparent 28rem),
+      radial-gradient(ellipse at 10% 0%, rgba(99, 102, 241, 0.15) 0%, transparent 50%),
+      radial-gradient(ellipse at 90% 10%, rgba(16, 185, 129, 0.1) 0%, transparent 40%),
+      radial-gradient(ellipse at 50% 100%, rgba(245, 158, 11, 0.08) 0%, transparent 50%),
       var(--bg);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
   .ui-language-picker {
     position: fixed; bottom: 24px; left: 24px; z-index: 100;
-    display: flex; align-items: center; gap: 7px; padding: 7px 10px;
-    background: rgba(23,26,33,.94); border: 1px solid var(--border);
-    border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.25);
-    backdrop-filter: blur(12px);
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+    background: rgba(18, 21, 30, .95); border: 1px solid var(--border);
+    border-radius: 12px; box-shadow: var(--shadow-lg);
+    backdrop-filter: blur(16px);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
   }
-  .ui-language-picker span { font-size: 16px; }
-  .ui-language-picker select { width: auto; min-width: 142px; padding: 6px 30px 6px 9px; }
-  .wrap { width: min(96vw, 1560px); max-width: none; margin: 0 auto; padding: 24px 0 80px; }
+  .ui-language-picker:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 48px rgba(99, 102, 241, 0.3);
+  }
+  .ui-language-picker span { font-size: 18px; }
+  .ui-language-picker select { 
+    width: auto; min-width: 150px; padding: 8px 32px 8px 10px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-size: 13px;
+    cursor: pointer;
+  }
+  .wrap { width: min(96vw, 1600px); max-width: none; margin: 0 auto; padding: 32px 0 100px; }
   header {
-    position: sticky; top: 12px; z-index: 30; display: flex; align-items: center;
-    justify-content: space-between; margin-bottom: 24px; padding: 14px 18px;
-    background: rgba(23,26,33,.88); border: 1px solid var(--border); border-radius: 14px;
-    backdrop-filter: blur(14px); box-shadow: 0 12px 36px rgba(0,0,0,.22);
+    position: sticky; top: 16px; z-index: 30; display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 28px; padding: 16px 24px;
+    background: rgba(18, 21, 30, .92); border: 1px solid var(--border); border-radius: var(--radius);
+    backdrop-filter: blur(20px); box-shadow: var(--shadow-lg);
+    transition: all 0.3s ease;
   }
-  header h1 { font-size: 20px; font-weight: 600; margin: 0; }
-  header .sub { color: var(--text-dim); font-size: 13px; }
-  #userbar { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--text-dim); }
-  button { cursor: pointer; font-family: inherit; }
+  header:hover {
+    border-color: rgba(99, 102, 241, 0.3);
+    box-shadow: 0 12px 48px rgba(99, 102, 241, 0.15);
+  }
+  header h1 { 
+    font-size: 22px; font-weight: 700; margin: 0;
+    background: var(--gradient-1);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  header .sub { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
+  #userbar { display: flex; align-items: center; gap: 14px; font-size: 14px; color: var(--text-dim); }
+  button { cursor: pointer; font-family: inherit; transition: all 0.2s ease; }
   .btn {
-    background: var(--accent); color: white; border: none; border-radius: 8px;
-    padding: 10px 18px; font-size: 14px; font-weight: 600; transition: background .15s;
+    background: var(--accent); color: white; border: none; border-radius: var(--radius-sm);
+    padding: 12px 20px; font-size: 14px; font-weight: 600;
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+    position: relative; overflow: hidden;
   }
-  .btn:hover { background: var(--accent-2); }
-  .btn:disabled { opacity: .5; cursor: not-allowed; }
-  .btn.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
-  .btn.secondary:hover { background: #262b35; }
-  .btn.danger { background: #c83f49; color: #fff; border: 1px solid #df5962; }
-  .btn.danger:hover { background: #a92f39; }
-  .btn.small { padding: 6px 12px; font-size: 13px; }
+  .btn::before {
+    content: '';
+    position: absolute; top: 0; left: -100%;
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+    transition: left 0.5s ease;
+  }
+  .btn:hover::before { left: 100%; }
+  .btn:hover { 
+    background: var(--accent-2); 
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
+  }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; box-shadow: none; }
+  .btn.secondary { 
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  }
+  .btn.secondary:hover { 
+    background: #252a36; 
+    border-color: var(--accent);
+    transform: translateY(-2px);
+  }
+  .btn.danger { 
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    color: #fff; border: none;
+    box-shadow: 0 4px  12px rgba(239, 68, 68, 0.3);
+  }
+  .btn.danger:hover { 
+    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
+  }
+  .btn.small { padding: 8px 14px; font-size: 13px; }
+  .btn.gradient {
+    background: var(--gradient-1);
+    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+  }
+  .btn.gradient:hover {
+    background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+    box-shadow: 0 6px 25px rgba(102, 126, 234, 0.5);
+  }
   .btn .loading-spinner {
     width: 14px; height: 14px; display: inline-block; flex: 0 0 14px;
     border: 2px solid rgba(255,255,255,.28); border-top-color: currentColor;
@@ -66,25 +134,71 @@
   }
   .btn.is-loading { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
   @keyframes button-spin { to { transform: rotate(360deg); } }
-  .creator-progress { margin-top: 12px; padding: 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; }
-  .creator-progress-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 7px; font-size: 13px; }
-  .progress-track { height: 8px; overflow: hidden; background: rgba(255,255,255,.08); border-radius: 999px; }
-  .progress-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), #62d6a8); border-radius: inherit; transition: width .45s ease; }
-  .job-progress { margin-top: 7px; max-width: 520px; }
-  .job-progress .progress-track { height: 5px; }
-  .job-progress-label { color: var(--text-dim); font-size: 11px; margin-top: 3px; text-align: right; }
-  .card {
-    background: linear-gradient(145deg, rgba(31,35,44,.76), rgba(23,26,33,.96));
-    border: 1px solid var(--border); border-radius: 16px; padding: 22px; margin-bottom: 20px;
-    box-shadow: 0 10px 30px rgba(0,0,0,.16);
+  .creator-progress { 
+    margin-top: 16px; padding: 16px; 
+    background: var(--panel-2); border: 1px solid var(--border); 
+    border-radius: var(--radius-sm);
+    box-shadow: inset 0 2px 8px rgba(0,0,0,0.2);
   }
+  .creator-progress-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; font-size: 13px; font-weight: 600; }
+  .progress-track { 
+    height: 10px; overflow: hidden; 
+    background: rgba(255,255,255,.06); 
+    border-radius: 999px;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);
+  }
+  .progress-fill { 
+    height: 100%; width: 0; 
+    background: linear-gradient(90deg, var(--accent), #10b981, #3b82f6);
+    background-size: 200% 100%;
+    border-radius: inherit; 
+    transition: width .45s ease;
+    animation: progress-shine 2s ease-in-out infinite;
+  }
+  @keyframes progress-shine {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  .job-progress { margin-top: 10px; max-width: 520px; }
+  .job-progress .progress-track { height: 6px; }
+  .job-progress-label { color: var(--text-dim); font-size: 11px; margin-top: 4px; text-align: right; }
+  .card {
+    background: linear-gradient(145deg, rgba(26, 31, 42, .85), rgba(18, 21, 30, .95));
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px;
+    box-shadow: var(--shadow);
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .card::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.3), transparent);
+    opacity: 0; transition: opacity 0.3s ease;
+  }
+  .card:hover {
+    border-color: rgba(99, 102, 241, 0.3);
+    box-shadow: var(--shadow-lg);
+    transform: translateY(-2px);
+  }
+  .card:hover::before { opacity: 1; }
   input, select, textarea {
     width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
-    border-radius: 8px; padding: 10px 12px; font-size: 14px; font-family: inherit;
+    border-radius: var(--radius-sm); padding: 12px 14px; font-size: 14px; font-family: inherit;
+    transition: all 0.2s ease;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
   }
-  label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 6px; }
-  .field { margin-bottom: 14px; }
-  .row { display: flex; gap: 14px; }
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15), inset 0 1px 3px rgba(0,0,0,0.2);
+  }
+  input:hover, select:hover, textarea:hover {
+    border-color: rgba(99, 102, 241, 0.4);
+  }
+  label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 8px; font-weight: 500; }
+  .field { margin-bottom: 16px; }
+  .row { display: flex; gap: 16px; }
   .row > * { flex: 1; }
   .reup-language-row .reup-language-field label {
     min-height: 32px; display: flex; align-items: flex-end;
@@ -108,77 +222,167 @@
   .job .job-url.playable:hover { color: #91b6ff; }
   .job .job-meta { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
   .badge {
-    font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase;
+    font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 999px; text-transform: uppercase;
     letter-spacing: .03em;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    transition: all 0.2s ease;
   }
-  .badge.queued { background: #3a3f4c; color: var(--text-dim); }
-  .badge.running { background: #2b3a5c; color: var(--accent); }
-  .badge.review { background: #3a331c; color: var(--warn); }
-  .badge.done { background: #17352a; color: var(--ok); }
-  .badge.error { background: #3a2323; color: var(--err); }
+  .badge:hover { transform: scale(1.05); }
+  .badge.queued { 
+    background: linear-gradient(135deg, #4b5563 0%, #374151 100%); 
+    color: var(--text-dim); 
+  }
+  .badge.running { 
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); 
+    color: white;
+    animation: pulse-badge 2s ease-in-out infinite;
+  }
+  @keyframes pulse-badge {
+    0%, 100% { box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3); }
+    50% { box-shadow: 0 4px 16px rgba(59, 130, 246, 0.5); }
+  }
+  .badge.review { 
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); 
+    color: white; 
+  }
+  .badge.done { 
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%); 
+    color: white; 
+  }
+  .badge.error { 
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); 
+    color: white; 
+  }
   .job-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .job-delete { grid-column: 3; grid-row: 1; min-width: 62px; height: 100%; }
   #empty-history { color: var(--text-dim); font-size: 14px; padding: 20px 0; text-align: center; }
 
   .modal-backdrop {
-    position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+    position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex;
     align-items: center; justify-content: center; z-index: 50; padding: 20px;
+    backdrop-filter: blur(8px);
+    animation: fade-in 0.2s ease;
   }
-  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
-    max-width: 640px; width: 100%; max-height: 88vh; overflow-y: auto; padding: 22px; }
-  .modal h3 { margin-top: 0; }
-  .modal video { width: 100%; border-radius: 8px; background: #000; }
-  .modal-close { float: right; background: none; border: none; color: var(--text-dim); font-size: 20px; }
-  .chip-row { display: flex; gap: 10px; margin-bottom: 14px; }
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .modal { 
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    max-width: 640px; width: 100%; max-height: 88vh; overflow-y: auto; padding: 28px;
+    box-shadow: var(--shadow-lg);
+    animation: slide-up 0.3s ease;
+  }
+  @keyframes slide-up {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .modal h3 { margin-top: 0; font-size: 18px; font-weight: 700; }
+  .modal video { width: 100%; border-radius: var(--radius-sm); background: #000; box-shadow: var(--shadow); }
+  .modal-close { 
+    float: right; background: none; border: none; color: var(--text-dim); font-size: 24px;
+    cursor: pointer; transition: all 0.2s ease; padding: 4px;
+  }
+  .modal-close:hover { color: var(--text); transform: rotate(90deg); }
+  .chip-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .chip {
-    border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 13px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 16px; font-size: 13px;
     background: var(--panel-2); color: var(--text-dim); cursor: pointer;
+    transition: all 0.2s ease; font-weight: 500;
   }
-  .chip.active { border-color: var(--accent); color: var(--accent); background: #16233f; }
+  .chip:hover { 
+    border-color: var(--accent); 
+    color: var(--accent); 
+    background: rgba(99, 102, 241, 0.1);
+    transform: translateY(-2px);
+  }
+  .chip.active { 
+    border-color: var(--accent); 
+    color: var(--accent); 
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+  }
   .publish-result { font-size: 13px; padding: 8px 10px; border-radius: 6px; margin-top: 6px; }
   .publish-result.ok { background: #17352a; color: var(--ok); }
   .publish-result.fail { background: #3a2323; color: var(--err); }
 
   .credits-badge {
-    background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
-    padding: 4px 12px; font-size: 13px; font-weight: 700; color: var(--warn);
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(245, 158, 11, 0.1));
+    border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 999px;
+    padding: 6px 14px; font-size: 13px; font-weight: 700; color: var(--warn);
+    box-shadow: 0 2px 8px rgba(245, 158, 11, 0.2);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .credits-badge::before {
+    content: '💎';
+    font-size: 14px;
   }
 
   /* auth tabs + social login */
-  .auth-tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+  .auth-tabs { display: flex; gap: 10px; margin-bottom: 20px; }
   .auth-tab {
-    flex: 1; text-align: center; padding: 9px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    flex: 1; text-align: center; padding: 12px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600;
     background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border);
+    transition: all 0.2s ease; cursor: pointer;
   }
-  .auth-tab.active { background: #16233f; color: var(--accent); border-color: var(--accent); }
-  .social-row { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+  .auth-tab:hover { border-color: var(--accent); color: var(--accent); }
+  .auth-tab.active { 
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
+    color: var(--accent); border-color: var(--accent);
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+  }
+  .social-row { display: flex; flex-direction: column; gap: 12px; margin-top: 20px; }
   .btn.social {
-    display: flex; align-items: center; justify-content: center; gap: 10px;
+    display: flex; align-items: center; justify-content: center; gap: 12px;
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border); width: 100%;
+    padding: 12px 16px; font-size: 14px;
   }
-  .btn.social:hover { background: #262b35; }
-  .btn.social:disabled { opacity: .4; cursor: not-allowed; }
-  .auth-divider { display: flex; align-items: center; gap: 10px; margin: 16px 0; color: var(--text-dim); font-size: 12px; }
+  .btn.social:hover { 
+    background: #252a36; 
+    border-color: var(--accent);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .btn.social:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  .auth-divider { display: flex; align-items: center; gap: 12px; margin: 20px 0; color: var(--text-dim); font-size: 12px; }
   .auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 
   /* logo overlay panel */
-  .corner-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .corner-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .corner-opt {
-    border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 12px; text-align: center;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; font-size: 12px; text-align: center;
     background: var(--panel-2); color: var(--text-dim); cursor: pointer;
+    transition: all 0.2s ease; font-weight: 500;
   }
-  .corner-opt.active { border-color: var(--accent); color: var(--accent); background: #16233f; }
-  #logo-preview-box { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
-  #logo-preview-box img { width: 48px; height: 48px; object-fit: contain; background: #fff; border-radius: 6px; padding: 4px; }
+  .corner-opt:hover { border-color: var(--accent); color: var(--accent); }
+  .corner-opt.active { 
+    border-color: var(--accent); 
+    color: var(--accent); 
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+  }
+  #logo-preview-box { display: flex; align-items: center; gap: 12px; margin-top: 12px; padding: 12px; background: var(--panel-2); border-radius: var(--radius-sm); }
+  #logo-preview-box img { width: 56px; height: 56px; object-fit: contain; background: #fff; border-radius: 8px; padding: 4px; box-shadow: var(--shadow); }
 
   /* history search/filter/delete */
-  .history-toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+  .history-toolbar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
   .history-toolbar input[type="date"] { flex: none; width: 150px; }
+  .history-toolbar input[type="text"] { flex: 1; min-width: 200px; }
 
   /* floating feedback button */
   #feedback-fab {
     position: fixed; right: 24px; bottom: 24px; z-index: 50;
-    border-radius: 999px; padding: 12px 18px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+    border-radius: 999px; padding: 14px 20px; 
+    background: var(--gradient-1);
+    color: white;
+    box-shadow: 0 6px 24px rgba(102, 126, 234, 0.4);
+    border: none;
+    font-weight: 600;
+    transition: all 0.3s ease;
+  }
+  #feedback-fab:hover {
+    transform: translateY(-4px) scale(1.05);
+    box-shadow: 0 8px 32px rgba(102, 126, 234, 0.5);
   }
 
   /* subtitle review editor */
@@ -205,10 +409,28 @@
 
   /* admin */
   #admin-view { max-width: 1000px; }
-  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; margin-bottom: 8px; }
-  .stat-box { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
-  .stat-box .num { font-size: 22px; font-weight: 800; }
-  .stat-box .label { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 16px; margin-bottom: 16px; }
+  .stat-box { 
+    background: linear-gradient(145deg, rgba(26, 31, 42, .8), rgba(18, 21, 30, .9));
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 18px;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-box::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--gradient-1);
+    opacity: 0; transition: opacity 0.3s ease;
+  }
+  .stat-box:hover {
+    border-color: rgba(99, 102, 241, 0.3);
+    transform: translateY(-4px);
+    box-shadow: var(--shadow);
+  }
+  .stat-box:hover::before { opacity: 1; }
+  .stat-box .num { font-size: 28px; font-weight: 800; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .stat-box .label { font-size: 13px; color: var(--text-dim); margin-top: 4px; font-weight: 500; }
   .referral-row {
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
     border-top: 1px solid var(--border); padding-top: 14px; margin-top: 4px;
@@ -220,33 +442,113 @@
   }
   .hashtag-chip:hover { border-color: var(--accent); }
   table.admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  table.admin-table th, table.admin-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  table.admin-table th { color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; }
-  .credit-adjust { display: flex; gap: 6px; align-items: center; }
-  .credit-adjust input { width: 70px; padding: 6px 8px; }
-  .topup-packages { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 10px; margin-bottom: 14px; }
-  .topup-package {
-    border: 1px solid var(--border); border-radius: 8px; padding: 12px;
-    background: var(--panel-2); cursor: pointer;
+  table.admin-table th, table.admin-table td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  table.admin-table th { 
+    color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: uppercase;
+    background: rgba(26, 31, 42, 0.5);
   }
-  .topup-package.active { border-color: var(--accent); background: #16233f; }
-  .topup-package .credits { font-weight: 800; font-size: 18px; }
-  .topup-package .price { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
-  .payment-box { border: 1px solid var(--border); background: var(--panel-2); border-radius: 10px; padding: 14px; margin: 14px 0; }
-  .payment-box img { display: block; width: min(260px, 100%); margin: 12px auto; border-radius: 10px; background: white; }
-  .payment-line { display:flex; justify-content:space-between; gap:12px; margin:7px 0; font-size:13px; }
-  .status-pending { color: var(--warn); }
-  .status-approved { color: var(--ok); }
-  .status-rejected { color: var(--err); }
-  .section-title { margin: 0 0 12px; font-size: 16px; }
+  table.admin-table tr:hover td { background: rgba(99, 102, 241, 0.05); }
+  .credit-adjust { display: flex; gap: 8px; align-items: center; }
+  .credit-adjust input { width: 80px; padding: 8px 10px; }
+  .topup-packages { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 12px; margin-bottom: 16px; }
+  .topup-package {
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px;
+    background: var(--panel-2); cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .topup-package:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .topup-package.active { 
+    border-color: var(--accent); 
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+  }
+  .topup-package .credits { font-weight: 800; font-size: 20px; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .topup-package .price { color: var(--text-dim); font-size: 14px; margin-top: 6px; }
+  .payment-box { border: 1px solid var(--border); background: var(--panel-2); border-radius: var(--radius-sm); padding: 18px; margin: 16px 0; }
+  .payment-box img { display: block; width: min(280px, 100%); margin: 16px auto; border-radius: var(--radius-sm); background: white; box-shadow: var(--shadow); }
+  .payment-line { display:flex; justify-content:space-between; gap:12px; margin:8px 0; font-size:14px; }
+  .status-pending { color: var(--warn); font-weight: 600; }
+  .status-approved { color: var(--ok); font-weight: 600; }
+  .status-rejected { color: var(--err); font-weight: 600; }
+  
+  /* Onboarding Wizard */
+  .onboarding-overlay {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(10, 12, 16, 0.9); z-index: 1000;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(8px);
+  }
+  .onboarding-modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 32px;
+    max-width: 500px; width: 90%;
+    box-shadow: var(--shadow-lg);
+    animation: slideUp 0.3s ease;
+  }
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .onboarding-step { display: none; }
+  .onboarding-step.active { display: block; }
+  .onboarding-title {
+    font-size: 24px; font-weight: 700; margin: 0 0 16px;
+    background: var(--gradient-1); -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .onboarding-content {
+    color: var(--text-dim); line-height: 1.6; margin-bottom: 24px;
+  }
+  .onboarding-content ul {
+    margin: 12px 0; padding-left: 20px;
+  }
+  .onboarding-content li {
+    margin: 8px 0;
+  }
+  .onboarding-progress {
+    display: flex; gap: 8px; margin-bottom: 24px;
+  }
+  .onboarding-progress-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--border); transition: all 0.3s ease;
+  }
+  .onboarding-progress-dot.active {
+    background: var(--accent); box-shadow: 0 0 8px var(--accent);
+  }
+  .onboarding-progress-dot.completed {
+    background: var(--ok);
+  }
+  .onboarding-buttons {
+    display: flex; gap: 12px; justify-content: flex-end;
+  }
+  .onboarding-skip {
+    background: transparent; border: none; color: var(--text-dim);
+    padding: 10px 16px; cursor: pointer; font-size: 14px;
+    transition: color 0.2s ease;
+  }
+  .onboarding-skip:hover { color: var(--text); }
+  
+  .section-title { 
+    margin: 0 0 16px; font-size: 18px; font-weight: 700;
+    background: var(--gradient-1);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
   .dashboard-grid {
     display:grid; grid-template-columns:minmax(680px, 1.45fr) minmax(440px, .85fr);
-    gap:24px; align-items:start;
+    gap:28px; align-items:start;
   }
   .tool-column, .result-column { min-width:0; }
-  .result-column { position:sticky; top:100px; max-height:calc(100vh - 112px); overflow:auto; padding-right:3px; }
-  .latest-result video { width:100%; max-height:52vh; background:#000; border-radius:10px; object-fit:contain; }
-  .latest-result-title { font-size:13px; color:var(--text-dim); margin:8px 0 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .result-column { position:sticky; top:100px; max-height:calc(100vh - 112px); overflow:auto; padding-right:4px; }
+  .latest-result video { 
+    width:100%; max-height:52vh; background:#000; 
+    border-radius: var(--radius-sm); object-fit:contain;
+    box-shadow: var(--shadow);
+    transition: all 0.3s ease;
+  }
+  .latest-result video:hover { box-shadow: var(--shadow-lg); }
+  .latest-result-title { font-size:14px; color:var(--text-dim); margin:10px 0 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight: 500; }
   @media (max-width: 760px) {
     .ui-language-picker { bottom: 10px; left: 10px; }
     .wrap { width:auto; padding:12px 12px 60px; }
@@ -275,6 +577,95 @@
 </head>
 <body>
 
+<!-- Onboarding Wizard -->
+<div id="onboarding-overlay" class="onboarding-overlay hidden">
+  <div class="onboarding-modal">
+    <div class="onboarding-progress" id="onboarding-progress">
+      <div class="onboarding-progress-dot active"></div>
+      <div class="onboarding-progress-dot"></div>
+      <div class="onboarding-progress-dot"></div>
+      <div class="onboarding-progress-dot"></div>
+    </div>
+    
+    <!-- Step 1: Welcome -->
+    <div class="onboarding-step active" data-step="1">
+      <h2 class="onboarding-title">🎉 Chào mừng đến với Video Localization AI!</h2>
+      <div class="onboarding-content">
+        <p>Hệ thống giúp bạn:</p>
+        <ul>
+          <li>🎥 Tự động dịch và lồng tiếng video</li>
+          <li>🤖 Tạo kịch bản bằng AI (Gemini, OpenAI, Ollama)</li>
+          <li>🎬 Thêm hiệu ứng phụ đề động</li>
+          <li>🎨 Áp dụng template video chuyên nghiệp</li>
+          <li>📦 Xử lý hàng loạt với queue management</li>
+        </ul>
+        <p>Hệ thống chạy hoàn toàn nội bộ, dữ liệu của bạn luôn an toàn.</p>
+      </div>
+      <div class="onboarding-buttons">
+        <button class="onboarding-skip" onclick="skipOnboarding()">Bỏ qua</button>
+        <button class="btn gradient" onclick="nextOnboardingStep()">Tiếp theo →</button>
+      </div>
+    </div>
+    
+    <!-- Step 2: Quick Start -->
+    <div class="onboarding-step" data-step="2">
+      <h2 class="onboarding-title">🚀 Bắt đầu nhanh</h2>
+      <div class="onboarding-content">
+        <p>Để tạo video đầu tiên:</p>
+        <ol>
+          <li>Nhập link video (YouTube, TikTok, v.v.)</li>
+          <li>Chọn ngôn ngữ đích (ví dụ: Tiếng Việt)</li>
+          <li>Nhấn "Tạo job" và chờ xử lý</li>
+          <li>Tải video đã dịch về máy</li>
+        </ol>
+        <p>💡 Mẹo: Bạn có thể nhập nhiều link cùng lúc để xử lý hàng loạt!</p>
+      </div>
+      <div class="onboarding-buttons">
+        <button class="onboarding-skip" onclick="prevOnboardingStep()">← Quay lại</button>
+        <button class="btn gradient" onclick="nextOnboardingStep()">Tiếp theo →</button>
+      </div>
+    </div>
+    
+    <!-- Step 3: Advanced Features -->
+    <div class="onboarding-step" data-step="3">
+      <h2 class="onboarding-title">⚡ Tính năng nâng cao</h2>
+      <div class="onboarding-content">
+        <p>Khám phá các tính năng nâng cao:</p>
+        <ul>
+          <li><strong>AI Script Generation:</strong> Tạo kịch bản video ngắn với nhiều style khác nhau</li>
+          <li><strong>Animated Subtitles:</strong> 8 hiệu ứng phụ đề động (karaoke, glow, gradient...)</li>
+          <li><strong>Video Templates:</strong> Template với color grading và audio filters</li>
+          <li><strong>Video Presets:</strong> Lưu và tải lại cấu hình video</li>
+        </ul>
+        <p>🎨 Mở panel "Tùy chọn nâng cao" để truy cập các tính năng này.</p>
+      </div>
+      <div class="onboarding-buttons">
+        <button class="onboarding-skip" onclick="prevOnboardingStep()">← Quay lại</button>
+        <button class="btn gradient" onclick="nextOnboardingStep()">Tiếp theo →</button>
+      </div>
+    </div>
+    
+    <!-- Step 4: Ready -->
+    <div class="onboarding-step" data-step="4">
+      <h2 class="onboarding-title">✅ Sẵn sàng!</h2>
+      <div class="onboarding-content">
+        <p>Bạn đã sẵn sàng sử dụng Video Localization AI!</p>
+        <p>Nếu cần hỗ trợ:</p>
+        <ul>
+          <li>📖 Xem README.md trong thư mục dự án</li>
+          <li>🔍 Kiểm tra API docs tại /api/version</li>
+          <li>📧 Liên hệ hỗ trợ nếu gặp lỗi</li>
+        </ul>
+        <p>🎊 Chúc bạn tạo ra những video tuyệt vời!</p>
+      </div>
+      <div class="onboarding-buttons">
+        <button class="onboarding-skip" onclick="prevOnboardingStep()">← Quay lại</button>
+        <button class="btn gradient" onclick="finishOnboarding()">Bắt đầu sử dụng 🚀</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <label class="ui-language-picker" title="Ngôn ngữ giao diện">
   <span aria-hidden="true">🌐</span>
   <select id="ui-language-select" aria-label="Ngôn ngữ giao diện">
@@ -301,14 +692,14 @@
         <input id="login-identifier" autocomplete="username" required>
       </div>
       <div class="field"><label>Mật khẩu</label><input id="login-password" type="password" autocomplete="current-password" required></div>
-      <button class="btn" type="submit" style="width:100%">Đăng nhập</button>
+      <button class="btn gradient" type="submit" style="width:100%">🔐 Đăng nhập</button>
     </form>
     <form id="register-form" class="hidden">
       <div class="field"><label>Email / Số điện thoại</label><input id="register-contact" autocomplete="email" required></div>
       <div class="field"><label>Tên đăng nhập</label><input id="register-username" autocomplete="username" required></div>
       <div class="field"><label>Mật khẩu</label><input id="register-password" type="password" autocomplete="new-password" required></div>
       <div class="field"><label>Mã giới thiệu (nếu có)</label><input id="register-referral-code" placeholder="VD: 6QNRHSW"></div>
-      <button class="btn" type="submit" style="width:100%">Đăng ký</button>
+      <button class="btn gradient" type="submit" style="width:100%">📝 Đăng ký</button>
     </form>
     <div id="auth-error"></div>
 
@@ -330,10 +721,10 @@
     <div id="userbar">
       <span id="userbar-credits" class="credits-badge" title="Credit còn lại"></span>
       <span id="userbar-name"></span>
-      <button class="btn secondary small" id="topup-btn">Nạp token</button>
-      <button class="btn secondary small hidden" id="feedback-header-btn" title="Gửi phản hồi, góp ý hoặc báo lỗi">💬 Phản hồi / Góp ý</button>
-      <button class="btn secondary small hidden" id="admin-btn">Quản trị</button>
-      <button class="btn secondary small" id="logout-btn">Đăng xuất</button>
+      <button class="btn secondary small" id="topup-btn">💰 Nạp token</button>
+      <button class="btn secondary small hidden" id="feedback-header-btn" title="Gửi phản hồi, góp ý hoặc báo lỗi">💬 Phản hồi</button>
+      <button class="btn secondary small hidden" id="admin-btn">⚙️ Quản trị</button>
+      <button class="btn secondary small" id="logout-btn">🚪 Đăng xuất</button>
     </div>
   </header>
 
@@ -344,7 +735,7 @@
         <div style="font-size:13px;color:var(--text-dim)">Mời bạn bè — cả 2 nhận <b id="referral-bonus-amount">20</b> credit khi họ đăng ký</div>
         <div style="font-size:13px;margin-top:4px">Link mời: <code id="referral-link"></code></div>
       </div>
-      <button class="btn secondary small" id="referral-copy-btn">Sao chép link</button>
+      <button class="btn secondary small" id="referral-copy-btn">📋 Sao chép link</button>
     </div>
   </div>
 
@@ -384,6 +775,124 @@
 
     <div class="field">
       <label>
+        <input type="checkbox" id="queue-priority-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Ưu tiên xử lý hàng loạt này (high priority) ⚡
+      </label>
+    </div>
+    
+    <div class="field">
+      <label>Số lượng job chạy đồng thời tối đa</label>
+      <select id="max-concurrent-jobs">
+        <option value="1">1 (chậm, ít lỗi)</option>
+        <option value="2" selected>2 (khuyên dùng)</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5 (nhanh, có thể nặng)</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label>
+        <input type="checkbox" id="youtube-tools-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Công cụ YouTube 📺
+      </label>
+    </div>
+    <div id="youtube-tools-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+      <div class="field">
+        <label title="URL video YouTube">URL YouTube ℹ️</label>
+        <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." style="width:100%;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);">
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+        <button onclick="downloadYouTubeVideo()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">📥 Download Video</button>
+        <button onclick="extractYouTubeAudio()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">🎵 Extract Audio</button>
+        <button onclick="downloadYouTubeSubtitles()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">� subs Download Subtitles</button>
+        <button onclick="downloadYouTubeThumbnail()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">🖼️ Download Thumbnail</button>
+        <button onclick="getYouTubeMetadata()" style="padding:8px 16px;background:var(--accent-2);color:white;border:none;border-radius:8px;cursor:pointer;">ℹ️ Get Metadata</button>
+      </div>
+      <div id="youtube-result" style="margin-top:12px;padding:12px;background:var(--bg);border-radius:8px;border:1px solid var(--border);display:none;"></div>
+    </div>
+
+    <div class="field">
+      <label>
+        <input type="checkbox" id="video-template-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Sử dụng template video có sẵn 🎨
+      </label>
+    </div>
+    <div id="video-template-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+      <div class="field">
+        <label title="Chọn preset video với các cài đặt màu sắc và hiệu ứng được tối ưu hóa sẵn">Chọn template ℹ️</label>
+        <select id="video-template-select">
+          <option value="none">Không dùng template</option>
+          <option value="minimal">Minimal (tối giản, hiện đại)</option>
+          <option value="cinematic">Cinematic (điện ảnh, dramatic)</option>
+          <option value="vibrant">Vibrant (sôi động, màu sắc)</option>
+          <option value="professional">Professional (chuyên nghiệp, business)</option>
+          <option value="social">Social Media (tối ưu cho TikTok/Reels)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label title="Hiệu ứng chuyển cảnh giữa các phân cảnh video">Hiệu ứng chuyển cảnh ℹ️</label>
+        <select id="template-transition">
+          <option value="fade">Mờ dần (fade)</option>
+          <option value="slide">Trượt (slide)</option>
+          <option value="zoom">Zoom (phóng/thu)</option>
+          <option value="wipe">Wipe (quét)</option>
+          <option value="none">Không hiệu ứng</option>
+        </select>
+      </div>
+      <div class="field">
+        <label title="Hiệu ứng màu sắc (color grading) để thay đổi mood của video">Hiệu ứng màu sắc ℹ️</label>
+        <select id="template-color-effect">
+          <option value="none">Không hiệu ứng</option>
+          <option value="warm">Ấm (warm)</option>
+          <option value="cool">Mát (cool)</option>
+          <option value="vintage">Cổ điển (vintage)</option>
+          <option value="high_contrast">Độ tương phản cao</option>
+        </select>
+      </div>
+      <div class="field">
+        <label title="Chất lượng render video - cao hơn sẽ nét hơn nhưng file lớn hơn và render lâu hơn">Chất lượng video ℹ️</label>
+        <select id="template-video-quality">
+          <option value="low">Thấp (nhanh, file nhỏ)</option>
+          <option value="medium" selected>Trung bình (cân bằng)</option>
+          <option value="high">Cao (rất nét)</option>
+          <option value="ultra">Ultra (tối ưu nhất)</option>
+        </select>
+      </div>
+      
+      <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+        <label style="font-weight: 600; margin-bottom: 8px; display: block;">🎵 Audio Filters</label>
+        <div class="field">
+          <label style="display: flex; align-items: center;" title="Tự động chuẩn hóa âm lượng để đảm bảo độ nghe đồng nhất">
+            <input type="checkbox" id="audio-normalize-checkbox" style="width: auto; margin-right: 8px;">
+            Chuẩn hóa âm lượng (normalize) ℹ️
+          </label>
+        </div>
+        <div class="field">
+          <label title="Tăng/giảm tần số bass thấp để làm dày âm thanh">Equalizer - Bass ℹ️</label>
+          <input type="range" id="audio-eq-bass" min="-10" max="10" value="0" step="1" style="width: 100%;">
+          <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim);">
+            <span>-10</span><span id="audio-eq-bass-value">0</span><span>+10</span>
+          </div>
+        </div>
+        <div class="field">
+          <label title="Tăng/giảm tần số treble cao để làm sáng âm thanh">Equalizer - Treble ℹ️</label>
+          <input type="range" id="audio-eq-treble" min="-10" max="10" value="0" step="1" style="width: 100%;">
+          <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim);">
+            <span>-10</span><span id="audio-eq-treble-value">0</span><span>+10</span>
+          </div>
+        </div>
+        <div class="field">
+          <label style="display: flex; align-items: center;" title="Nén dải động âm thanh để làm đều mức độ nghe">
+            <input type="checkbox" id="audio-compressor-checkbox" style="width: auto; margin-right: 8px;">
+            Compressor (nén âm thanh) ℹ️
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>
         <input type="checkbox" id="logo-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
         Chèn logo riêng vào video
       </label>
@@ -411,7 +920,54 @@
       </div>
     </div>
 
-    <button class="btn" id="submit-btn">Bắt đầu xử lý</button>
+    <div class="field">
+      <label>
+        <input type="checkbox" id="animated-subtitle-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Bật hiệu ứng phụ đề động 🎬
+      </label>
+    </div>
+    <div id="animated-subtitle-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+      <div class="row">
+        <div class="field">
+          <label>Hiệu ứng</label>
+          <select id="subtitle-effect-select">
+            <option value="none">Không hiệu ứng</option>
+            <option value="fade_in">Fade In (mờ dần hiện)</option>
+            <option value="fade_out">Fade Out (mờ dần ẩn)</option>
+            <option value="karaoke">Karaoke (tô màu từng ký tự)</option>
+            <option value="glow">Glow (phát sáng)</option>
+            <option value="gradient">Gradient (nhiều màu)</option>
+            <option value="bounce">Bounce (nảy)</option>
+            <option value="typewriter">Typewriter (gõ từng ký tự)</option>
+            <option value="wave">Wave (sóng)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Kích thước font (px)</label>
+          <input type="number" id="subtitle-font-size" value="24" min="12" max="72">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Màu chữ</label>
+          <input type="color" id="subtitle-font-color" value="#ffffff" style="height: 40px; padding: 2px;">
+        </div>
+        <div class="field">
+          <label>Màu nền (hex)</label>
+          <input type="text" id="subtitle-bg-color" value="#00000080" placeholder="#00000080">
+        </div>
+      </div>
+      <div class="field">
+        <label>Màu glow (cho hiệu ứng Glow)</label>
+        <input type="color" id="subtitle-glow-color" value="#ffff00" style="height: 40px; padding: 2px;">
+      </div>
+      <div class="field">
+        <label>Màu gradient (cách nhau bằng dấu |, ví dụ: red|blue|green)</label>
+        <input type="text" id="subtitle-gradient-colors" value="red|blue|green" placeholder="red|blue|green">
+      </div>
+    </div>
+
+    <button class="btn gradient" id="submit-btn">🚀 Bắt đầu xử lý</button>
     <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
 
@@ -475,25 +1031,83 @@
       <label>Video keyword</label>
       <textarea id="creator-keywords" rows="3" placeholder="Keyword sẽ được tự gen từ chủ đề, dùng cho tìm footage và đăng video."></textarea>
       <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn secondary small" id="creator-keywords-generate" type="button">Gen keyword</button>
-        <button class="btn secondary small" id="creator-keywords-copy" type="button">Copy keyword</button>
+        <button class="btn secondary small" id="creator-keywords-generate" type="button">✨ Gen keyword</button>
+        <button class="btn secondary small" id="creator-keywords-copy" type="button">📋 Copy keyword</button>
       </div>
     </div>
     <div class="field">
       <label>Visual brief / ý tưởng cảnh quay (không bắt buộc, mỗi dòng là một cảnh)</label>
       <textarea id="creator-script" rows="4" placeholder="VD: Người làm việc với laptop trong văn phòng hiện đại&#10;Cận cảnh màn hình đang tạo slide bằng AI&#10;Điện thoại hiển thị video social media đã hoàn thành"></textarea>
       <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn secondary small" id="creator-script-generate" type="button">Gen visual brief từ chủ đề</button>
+        <button class="btn secondary small" id="creator-script-generate" type="button">🎬 Gen visual brief từ chủ đề</button>
+      </div>
+    </div>
+    
+    <div class="field">
+      <label>
+        <input type="checkbox" id="advanced-script-options-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Tùy chọn nâng cao cho kịch bản AI ⚙️
+      </label>
+    </div>
+    <div id="advanced-script-options-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+      <div class="row">
+        <div class="field">
+          <label>Phong cách nội dung</label>
+          <select id="script-style-select">
+            <option value="general">Chung</option>
+            <option value="entertaining">Giải trí / Vui vẻ</option>
+            <option value="educational">Giáo dục / Học thuật</option>
+            <option value="storytelling">Kể chuyện</option>
+            <option value="tutorial">Hướng dẫn / Tutorial</option>
+            <option value="review">Review / Đánh giá</option>
+            <option value="news">Tin tức / Thông tin</option>
+            <option value="motivational">Truyền cảm hứng</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Giọng văn</label>
+          <select id="script-tone-select">
+            <option value="neutral">Trung tính</option>
+            <option value="casual">Thân thiện / Gần gũi</option>
+            <option value="formal">Trang trọng / Chuyên nghiệp</option>
+            <option value="humorous">Hài hước</option>
+            <option value="inspiring">Truyền cảm hứng</option>
+            <option value="urgent">Cấp bách</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Độ dài câu trung bình</label>
+          <select id="script-sentence-length">
+            <option value="short">Ngắn (8-12 từ)</option>
+            <option value="medium" selected>Trung bình (12-18 từ)</option>
+            <option value="long">Dài (18-25 từ)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Mức độ chi tiết</label>
+          <select id="script-detail-level">
+            <option value="minimal">Tối thiểu</option>
+            <option value="standard" selected>Chuẩn</option>
+            <option value="detailed">Chi tiết</option>
+            <option value="comprehensive">Rất chi tiết</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Ghi chú thêm cho AI (tùy chọn)</label>
+        <textarea id="script-custom-instructions" rows="2" placeholder="VD: Tập trung vào lợi ích thực tế, thêm ví dụ cụ thể, tránh thuật ngữ chuyên môn..."></textarea>
       </div>
     </div>
     <div class="field">
       <label>Kịch bản voice &amp; subtitle (mỗi dòng là một câu thoại)</label>
       <textarea id="creator-narration" rows="5" placeholder="Đây mới là nội dung được đọc và hiển thị subtitle. Visual brief phía trên chỉ dùng để tìm cảnh."></textarea>
       <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn secondary small" id="creator-narration-generate" type="button">Gen kịch bản voice</button>
+        <button class="btn secondary small" id="creator-narration-generate" type="button">🎙️ Gen kịch bản voice</button>
       </div>
     </div>
-    <button class="btn" id="creator-submit-btn" disabled>Tạo video AI</button>
+    <button class="btn gradient" id="creator-submit-btn" disabled>🎨 Tạo video AI</button>
     <div class="creator-progress hidden" id="creator-progress" aria-live="polite">
       <div class="creator-progress-head"><span id="creator-progress-label">Đang chuẩn bị...</span><strong id="creator-progress-percent">0%</strong></div>
       <div class="progress-track"><div class="progress-fill" id="creator-progress-fill"></div></div>
@@ -510,16 +1124,61 @@
   </div>
 
   <div class="card">
+    <h3 class="section-title">📊 Thống kê</h3>
+    <div class="stat-grid" id="stats-grid">
+      <div class="stat-box">
+        <div class="num" id="stat-total">0</div>
+        <div class="label">Tổng video</div>
+      </div>
+      <div class="stat-box">
+        <div class="num" id="stat-completed">0</div>
+        <div class="label">Hoàn thành</div>
+      </div>
+      <div class="stat-box">
+        <div class="num" id="stat-processing">0</div>
+        <div class="label">Đang xử lý</div>
+      </div>
+      <div class="stat-box">
+        <div class="num" id="stat-error">0</div>
+        <div class="label">Lỗi</div>
+      </div>
+      <div class="stat-box">
+        <div class="num" id="stat-duration">0</div>
+        <div class="label">Tổng thời lượng (phút)</div>
+      </div>
+      <div class="stat-box">
+        <div class="num" id="stat-credits">0</div>
+        <div class="label">Credit còn lại</div>
+      </div>
+    </div>
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
+      <div style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;">Phân bố theo trạng thái</div>
+      <div style="display: flex; gap: 8px; height: 8px; border-radius: 4px; overflow: hidden;">
+        <div id="bar-done" style="flex: 1; background: var(--ok); transition: flex 0.3s;"></div>
+        <div id="bar-running" style="flex: 1; background: var(--accent); transition: flex 0.3s;"></div>
+        <div id="bar-queued" style="flex: 1; background: var(--warn); transition: flex 0.3s;"></div>
+        <div id="bar-error" style="flex: 1; background: var(--err); transition: flex 0.3s;"></div>
+      </div>
+      <div style="display: flex; gap: 12px; margin-top: 8px; font-size: 11px; color: var(--text-dim);">
+        <span>✓ Hoàn thành: <strong id="label-done">0</strong></span>
+        <span>▶ Đang chạy: <strong id="label-running">0</strong></span>
+        <span>⏳ Đợi: <strong id="label-queued">0</strong></span>
+        <span>✗ Lỗi: <strong id="label-error">0</strong></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <h3 style="margin-top:0">Lịch sử</h3>
     <div class="history-toolbar">
       <input id="history-search" placeholder="Tìm theo tên hoặc link...">
       <div><label>Từ ngày</label><input type="date" id="history-date-from"></div>
       <div><label>Đến ngày</label><input type="date" id="history-date-to"></div>
-      <button class="btn secondary small" id="history-clear-btn">Xoá lọc</button>
+      <button class="btn secondary small" id="history-clear-btn">🔄 Xoá lọc</button>
     </div>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
       <label style="margin:0"><input type="checkbox" id="history-select-all" style="width:auto"> Chọn tất cả</label>
-      <button class="btn danger small" id="history-bulk-delete" disabled>Xoá mục đã chọn</button>
+      <button class="btn danger small" id="history-bulk-delete" disabled>🗑️ Xoá mục đã chọn</button>
       <span id="history-selected-count" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
     <div id="job-list"></div>
@@ -537,8 +1196,8 @@
     <h3 id="confirm-title" style="margin-top:0">Xác nhận</h3>
     <p id="confirm-message" style="color:var(--text-dim);line-height:1.6"></p>
     <div class="row" style="margin-top:20px;gap:10px">
-      <button class="btn secondary" id="confirm-cancel">Hủy</button>
-      <button class="btn danger" id="confirm-accept">Xóa</button>
+      <button class="btn secondary" id="confirm-cancel">❌ Hủy</button>
+      <button class="btn danger" id="confirm-accept">🗑️ Xóa</button>
     </div>
   </div>
 </div>
@@ -551,8 +1210,8 @@
     <video id="review-source-video" controls preload="metadata"></video>
     <div id="review-segments-list"></div>
     <div class="row" style="margin-top:14px;gap:10px">
-      <button class="btn secondary" id="review-save-btn" style="flex:1">Lưu thay đổi</button>
-      <button class="btn" id="review-render-btn" style="flex:1">Lưu &amp; Render</button>
+      <button class="btn secondary" id="review-save-btn" style="flex:1">💾 Lưu thay đổi</button>
+      <button class="btn gradient" id="review-render-btn" style="flex:1">🎬 Lưu &amp; Render</button>
     </div>
     <div id="review-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
@@ -564,7 +1223,7 @@
     <h3>Góp ý / Báo lỗi</h3>
     <p class="sub" style="margin-top:-8px">Gặp lỗi hay có ý tưởng cải thiện? Cho chúng tôi biết.</p>
     <div class="field"><textarea id="feedback-message" rows="5" placeholder="Mô tả vấn đề hoặc góp ý của bạn..."></textarea></div>
-    <button class="btn" id="feedback-submit-btn">Gửi góp ý</button>
+    <button class="btn gradient" id="feedback-submit-btn">📤 Gửi góp ý</button>
     <div id="feedback-status" style="font-size: 13px; margin-top: 8px;"></div>
   </div>
 </div>
@@ -581,7 +1240,7 @@
       <label>Ghi chú thanh toán</label>
       <textarea id="topup-note" rows="3" placeholder="VD: đã chuyển khoản, mã giao dịch, số điện thoại..."></textarea>
     </div>
-    <button class="btn" id="topup-submit">Gửi yêu cầu nạp</button>
+    <button class="btn gradient" id="topup-submit">💳 Gửi yêu cầu nạp</button>
     <div id="topup-status" style="font-size:13px;margin-top:8px"></div>
     <h3 style="margin-top:22px">Lịch sử nạp</h3>
     <table class="admin-table">
@@ -598,9 +1257,9 @@
     <video id="preview-video" controls></video>
     <div id="prepublish-result" class="hidden" style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:8px"></div>
     <div style="margin-top: 14px; display:flex; gap:10px;">
-      <a class="btn" id="preview-download">Tải xuống</a>
-      <button class="btn secondary" id="prepublish-check-btn">Kiểm tra trước đăng</button>
-      <button class="btn secondary" id="preview-publish-btn">Đăng lên mạng xã hội</button>
+      <a class="btn" id="preview-download">📥 Tải xuống</a>
+      <button class="btn secondary" id="prepublish-check-btn">🔍 Kiểm tra trước đăng</button>
+      <button class="btn gradient" id="preview-publish-btn">📱 Đăng lên mạng xã hội</button>
     </div>
   </div>
 </div>
@@ -626,8 +1285,8 @@
     </div>
     <div class="field"><label>Hẹn giờ đăng (theo giờ trên thiết bị)</label><input type="datetime-local" id="publish-scheduled-at"></div>
     <div style="display:flex;gap:10px">
-      <button class="btn" id="publish-submit">Đăng ngay</button>
-      <button class="btn secondary" id="publish-schedule">Hẹn giờ đăng</button>
+      <button class="btn gradient" id="publish-submit">🚀 Đăng ngay</button>
+      <button class="btn secondary" id="publish-schedule">⏰ Hẹn giờ đăng</button>
     </div>
     <div id="scheduled-posts" style="margin-top:12px"></div>
     <div id="publish-results"></div>
@@ -640,7 +1299,7 @@
       <h1>Quản trị</h1>
       <div class="sub">Người dùng, credit, và thống kê hệ thống</div>
     </div>
-    <button class="btn secondary small" id="admin-back-btn">← Quay lại</button>
+    <button class="btn secondary small" id="admin-back-btn">🔙 Quay lại</button>
   </header>
 
   <div class="card">
@@ -655,7 +1314,7 @@
       <div class="field"><label>Mật khẩu</label><input id="new-user-password" type="password"></div>
       <div class="field" style="flex:.5"><label>Credit ban đầu</label><input id="new-user-credits" type="number" value="10"></div>
     </div>
-    <button class="btn" id="new-user-submit">Tạo tài khoản</button>
+    <button class="btn gradient" id="new-user-submit">➕ Tạo tài khoản</button>
     <div id="new-user-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
 
@@ -1266,6 +1925,7 @@ async function refreshMe() {
   try {
     const me = await api("/api/me");
     $("#userbar-credits").textContent = `💳 ${me.credits}`;
+    $("#stat-credits").textContent = me.credits;
   } catch (e) { /* session likely expired; next job/history poll will surface it */ }
 }
 
@@ -1476,6 +2136,352 @@ $("#logo-file-input").onchange = async (ev) => {
   }
 };
 
+// ---------------- animated subtitles ----------------
+$("#animated-subtitle-checkbox").onchange = (ev) => {
+  $("#animated-subtitle-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+function getAnimatedSubtitleConfig() {
+  if (!$("#animated-subtitle-checkbox").checked) {
+    return null;
+  }
+  return {
+    enabled: true,
+    effect: $("#subtitle-effect-select").value,
+    style: {
+      font_size: parseInt($("#subtitle-font-size").value, 10),
+      font_color: $("#subtitle-font-color").value,
+      background_color: $("#subtitle-bg-color").value,
+    },
+    effect_params: {
+      glow_color: $("#subtitle-glow-color").value,
+      gradient_colors: $("#subtitle-gradient-colors").value,
+    },
+  };
+}
+
+// ---------------- advanced script options ----------------
+$("#advanced-script-options-checkbox").onchange = (ev) => {
+  $("#advanced-script-options-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+function getAdvancedScriptOptions() {
+  if (!$("#advanced-script-options-checkbox").checked) {
+    return null;
+  }
+  return {
+    style: $("#script-style-select").value,
+    tone: $("#script-tone-select").value,
+    sentence_length: $("#script-sentence-length").value,
+    detail_level: $("#script-detail-level").value,
+    custom_instructions: $("#script-custom-instructions").value.trim() || null,
+  };
+}
+
+// ---------------- youtube tools ----------------
+$("#youtube-tools-checkbox").onchange = (ev) => {
+  $("#youtube-tools-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+async function downloadYouTubeVideo() {
+  const url = $("#youtube-url").value.trim();
+  if (!url) {
+    alert("Vui lòng nhập URL YouTube");
+    return;
+  }
+  
+  const resultDiv = $("#youtube-result");
+  resultDiv.style.display = "block";
+  resultDiv.innerHTML = "Đang tải video...";
+  
+  try {
+    const response = await fetch("/api/youtube/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, format: "best" }),
+    });
+    const data = await response.json();
+    
+    if (data.ok) {
+      resultDiv.innerHTML = `
+        <div style="color:var(--ok)">✓ Download thành công!</div>
+        <div style="margin-top:8px"><strong>Tên file:</strong> ${data.filename}</div>
+        <div><strong>Tiêu đề:</strong> ${data.title}</div>
+        <div><strong>Thời lượng:</strong> ${data.duration}s</div>
+      `;
+    } else {
+      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Download thất bại"}</div>`;
+    }
+  } catch (err) {
+    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
+  }
+}
+
+async function extractYouTubeAudio() {
+  const url = $("#youtube-url").value.trim();
+  if (!url) {
+    alert("Vui lòng nhập URL YouTube");
+    return;
+  }
+  
+  const resultDiv = $("#youtube-result");
+  resultDiv.style.display = "block";
+  resultDiv.innerHTML = "Đang extract audio...";
+  
+  try {
+    const response = await fetch("/api/youtube/audio", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await response.json();
+    
+    if (data.ok) {
+      resultDiv.innerHTML = `
+        <div style="color:var(--ok)">✓ Extract audio thành công!</div>
+        <div style="margin-top:8px"><strong>Tên file:</strong> ${data.filename}</div>
+        <div><strong>Tiêu đề:</strong> ${data.title}</div>
+        <div><strong>Thời lượng:</strong> ${data.duration}s</div>
+      `;
+    } else {
+      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Extract audio thất bại"}</div>`;
+    }
+  } catch (err) {
+    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
+  }
+}
+
+async function downloadYouTubeSubtitles() {
+  const url = $("#youtube-url").value.trim();
+  if (!url) {
+    alert("Vui lòng nhập URL YouTube");
+    return;
+  }
+  
+  const resultDiv = $("#youtube-result");
+  resultDiv.style.display = "block";
+  resultDiv.innerHTML = "Đang tải subtitles...";
+  
+  try {
+    const response = await fetch("/api/youtube/subtitles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await response.json();
+    
+    if (data.ok) {
+      const subsList = data.subtitles.map(s => 
+        `<div>• ${s.language}: <a href="${s.url}" target="_blank" style="color:var(--accent)">Download</a></div>`
+      ).join("");
+      resultDiv.innerHTML = `
+        <div style="color:var(--ok)">✓ Tìm thấy ${data.subtitles.length} subtitles!</div>
+        <div style="margin-top:8px"><strong>Tiêu đề:</strong> ${data.title}</div>
+        <div style="margin-top:8px">${subsList}</div>
+      `;
+    } else {
+      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Download subtitles thất bại"}</div>`;
+    }
+  } catch (err) {
+    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
+  }
+}
+
+async function downloadYouTubeThumbnail() {
+  const url = $("#youtube-url").value.trim();
+  if (!url) {
+    alert("Vui lòng nhập URL YouTube");
+    return;
+  }
+  
+  const resultDiv = $("#youtube-result");
+  resultDiv.style.display = "block";
+  resultDiv.innerHTML = "Đang tải thumbnail...";
+  
+  try {
+    const response = await fetch("/api/youtube/thumbnail", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await response.json();
+    
+    if (data.ok) {
+      resultDiv.innerHTML = `
+        <div style="color:var(--ok)">✓ Download thumbnail thành công!</div>
+        <div style="margin-top:8px"><strong>Tên file:</strong> ${data.filename}</div>
+        <div><strong>URL:</strong> <a href="${data.url}" target="_blank" style="color:var(--accent)">${data.url}</a></div>
+      `;
+    } else {
+      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Download thumbnail thất bại"}</div>`;
+    }
+  } catch (err) {
+    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
+  }
+}
+
+async function getYouTubeMetadata() {
+  const url = $("#youtube-url").value.trim();
+  if (!url) {
+    alert("Vui lòng nhập URL YouTube");
+    return;
+  }
+  
+  const resultDiv = $("#youtube-result");
+  resultDiv.style.display = "block";
+  resultDiv.innerHTML = "Đang lấy metadata...";
+  
+  try {
+    const response = await fetch("/api/youtube/metadata", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await response.json();
+    
+    if (data.title) {
+      resultDiv.innerHTML = `
+        <div style="color:var(--ok)">✓ Metadata:</div>
+        <div style="margin-top:8px"><strong>Tiêu đề:</strong> ${data.title}</div>
+        <div><strong>Uploader:</strong> ${data.uploader}</div>
+        <div><strong>Thời lượng:</strong> ${data.duration}s</div>
+        <div><strong>Lượt xem:</strong> ${data.view_count}</div>
+        <div><strong>Upload date:</strong> ${data.upload_date}</div>
+        <div><strong>Tags:</strong> ${data.tags.slice(0, 10).join(", ")}</div>
+        <div style="margin-top:8px"><strong>Thumbnail:</strong> <a href="${data.thumbnail}" target="_blank" style="color:var(--accent)">Xem</a></div>
+      `;
+    } else {
+      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: Không lấy được metadata</div>`;
+    }
+  } catch (err) {
+    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
+  }
+}
+
+// ---------------- video templates ----------------
+$("#video-template-checkbox").onchange = (ev) => {
+  $("#video-template-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+// Audio filter range sliders
+$("#audio-eq-bass").oninput = (ev) => {
+  $("#audio-eq-bass-value").textContent = ev.target.value;
+};
+
+$("#audio-eq-treble").oninput = (ev) => {
+  $("#audio-eq-treble-value").textContent = ev.target.value;
+};
+
+function getVideoTemplateConfig() {
+  if (!$("#video-template-checkbox").checked) {
+    return null;
+  }
+  
+  const audio_filters = {};
+  
+  // Equalizer
+  const bass = parseInt($("#audio-eq-bass").value);
+  const treble = parseInt($("#audio-eq-treble").value);
+  if (bass !== 0 || treble !== 0) {
+    audio_filters.equalizer = {};
+    if (bass !== 0) audio_filters.equalizer.bass = bass;
+    if (treble !== 0) audio_filters.equalizer.treble = treble;
+  }
+  
+  // Normalize
+  if ($("#audio-normalize-checkbox").checked) {
+    audio_filters.normalize = true;
+  }
+  
+  // Compressor
+  if ($("#audio-compressor-checkbox").checked) {
+    audio_filters.compressor = {
+      threshold: -20,
+      ratio: 4,
+      attack: 20,
+      release: 250
+    };
+  }
+  
+  return {
+    enabled: true,
+    template: $("#video-template-select").value,
+    transition: $("#template-transition").value,
+    color_effect: $("#template-color-effect").value,
+    video_quality: $("#template-video-quality").value,
+    audio_filters: audio_filters,
+  };
+}
+
+// ---------------- onboarding wizard ----------------
+let currentOnboardingStep = 1;
+const totalOnboardingSteps = 4;
+
+function showOnboardingStep(step) {
+  // Hide all steps
+  document.querySelectorAll('.onboarding-step').forEach(el => {
+    el.classList.remove('active');
+  });
+  
+  // Show current step
+  const stepEl = document.querySelector(`.onboarding-step[data-step="${step}"]`);
+  if (stepEl) {
+    stepEl.classList.add('active');
+  }
+  
+  // Update progress dots
+  const dots = document.querySelectorAll('.onboarding-progress-dot');
+  dots.forEach((dot, index) => {
+    dot.classList.remove('active', 'completed');
+    if (index + 1 === step) {
+      dot.classList.add('active');
+    } else if (index + 1 < step) {
+      dot.classList.add('completed');
+    }
+  });
+  
+  currentOnboardingStep = step;
+}
+
+function nextOnboardingStep() {
+  if (currentOnboardingStep < totalOnboardingSteps) {
+    showOnboardingStep(currentOnboardingStep + 1);
+  }
+}
+
+function prevOnboardingStep() {
+  if (currentOnboardingStep > 1) {
+    showOnboardingStep(currentOnboardingStep - 1);
+  }
+}
+
+function skipOnboarding() {
+  const overlay = document.getElementById('onboarding-overlay');
+  if (overlay) {
+    overlay.classList.add('hidden');
+  }
+  localStorage.setItem('onboarding_completed', 'true');
+}
+
+function finishOnboarding() {
+  skipOnboarding();
+}
+
+function checkOnboarding() {
+  const completed = localStorage.getItem('onboarding_completed');
+  if (!completed) {
+    const overlay = document.getElementById('onboarding-overlay');
+    if (overlay) {
+      overlay.classList.remove('hidden');
+    }
+  }
+}
+
+// Check onboarding on page load
+document.addEventListener('DOMContentLoaded', () => {
+  checkOnboarding();
+});
+
 // ---------------- jobs ----------------
 $("#submit-btn").onclick = async () => {
   $("#submit-error").textContent = "";
@@ -1500,6 +2506,10 @@ $("#submit-btn").onclick = async () => {
     logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
     logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
     review_before_render: reviewMode,
+    animated_subtitle_config: getAnimatedSubtitleConfig(),
+    priority: $("#queue-priority-checkbox").checked ? "high" : "normal",
+    max_concurrent: parseInt($("#max-concurrent-jobs").value, 10) || 2,
+    video_template_config: getVideoTemplateConfig(),
   };
 
   $("#submit-btn").disabled = true;
@@ -1531,6 +2541,7 @@ async function loadCreatorSuggestions() {
     aspect_ratio: $("#creator-aspect").value,
     duration_seconds: parseInt($("#creator-duration").value, 10),
     transition: $("#creator-transition").value,
+    advanced_options: getAdvancedScriptOptions(),
   };
   const cacheKey = JSON.stringify(requestBody);
   if (window._creatorSuggestionCache && window._creatorSuggestionCache.key === cacheKey) {
@@ -1807,6 +2818,52 @@ function _dateToUnix(dateStr, endOfDay) {
   return d.getTime() / 1000;
 }
 
+function updateStats(jobs) {
+  const total = jobs.length;
+  const completed = jobs.filter(j => j.status === "done").length;
+  const running = jobs.filter(j => j.status === "running").length;
+  const queued = jobs.filter(j => j.status === "queued").length;
+  const error = jobs.filter(j => j.status === "error").length;
+  const processing = running + queued;
+  
+  // Calculate total duration (in minutes)
+  const totalDuration = jobs.reduce((sum, job) => {
+    const duration = job.duration_seconds || 0;
+    return sum + duration;
+  }, 0) / 60;
+  
+  // Update stat boxes
+  $("#stat-total").textContent = total;
+  $("#stat-completed").textContent = completed;
+  $("#stat-processing").textContent = processing;
+  $("#stat-error").textContent = error;
+  $("#stat-duration").textContent = Math.round(totalDuration);
+  
+  // Update progress bar
+  if (total > 0) {
+    const donePercent = (completed / total) * 100;
+    const runningPercent = (running / total) * 100;
+    const queuedPercent = (queued / total) * 100;
+    const errorPercent = (error / total) * 100;
+    
+    $("#bar-done").style.flex = `${donePercent}`;
+    $("#bar-running").style.flex = `${runningPercent}`;
+    $("#bar-queued").style.flex = `${queuedPercent}`;
+    $("#bar-error").style.flex = `${errorPercent}`;
+  } else {
+    $("#bar-done").style.flex = "0";
+    $("#bar-running").style.flex = "0";
+    $("#bar-queued").style.flex = "0";
+    $("#bar-error").style.flex = "0";
+  }
+  
+  // Update labels
+  $("#label-done").textContent = completed;
+  $("#label-running").textContent = running;
+  $("#label-queued").textContent = queued;
+  $("#label-error").textContent = error;
+}
+
 async function refreshJobs() {
   const q = $("#history-search").value.trim();
   const dateFrom = _dateToUnix($("#history-date-from").value, false);
@@ -1818,6 +2875,9 @@ async function refreshJobs() {
   const qs = params.toString();
 
   const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
+  
+  // Update statistics
+  updateStats(jobs);
   if (!activeCreatorJobId) {
     const runningCreator = jobs.find(job =>
       String(job.source_url || "").startsWith("creator:") &&

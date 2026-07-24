@@ -10,8 +10,13 @@ import time
 from typing import List, Optional, Tuple
 
 from universal_video_ai.config import TEMP_DIR
+from universal_video_ai.render.animated_subtitles import (
+    AnimatedSubtitleGenerator,
+    SubtitleEffect,
+    SubtitleStyle,
+)
 
-__all__ = ["Renderer", "RenderConfig", "TextOverlay"]
+__all__ = ["Renderer", "RenderConfig", "TextOverlay", "AnimatedSubtitleConfig", "VideoTemplateConfig"]
 
 _logger = logging.getLogger(__name__)
 
@@ -112,6 +117,54 @@ class TextOverlay:
 
 
 @dataclass(frozen=True)
+class AnimatedSubtitleConfig:
+    """
+    Configuration for animated subtitle effects.
+    
+    Attributes:
+        enabled: Whether animated subtitles are enabled
+        effect: The animation effect to apply (SubtitleEffect enum)
+        style: Subtitle styling configuration
+        effect_params: Additional parameters for the specific effect
+    """
+    enabled: bool = False
+    effect: SubtitleEffect = SubtitleEffect.NONE
+    style: Optional[SubtitleStyle] = None
+    effect_params: dict = None
+    
+    def __post_init__(self):
+        if self.style is None:
+            object.__setattr__(self, 'style', SubtitleStyle())
+        if self.effect_params is None:
+            object.__setattr__(self, 'effect_params', {})
+
+
+@dataclass(frozen=True)
+class VideoTemplateConfig:
+    """
+    Configuration for video template effects.
+    
+    Attributes:
+        enabled: Whether video template is enabled
+        template: Template preset name (minimal, cinematic, vibrant, professional, social)
+        transition: Transition effect between scenes (fade, slide, dissolve, wipe, zoom)
+        color_effect: Color grading effect (none, warm, cool, vintage, high_contrast)
+        audio_filters: Audio filter settings (equalizer, compressor, etc.)
+        video_quality: Video quality preset (low, medium, high, ultra)
+    """
+    enabled: bool = False
+    template: str = "minimal"
+    transition: str = "fade"
+    color_effect: str = "none"
+    audio_filters: dict = None
+    video_quality: str = "medium"
+    
+    def __post_init__(self):
+        if self.audio_filters is None:
+            object.__setattr__(self, 'audio_filters', {})
+
+
+@dataclass(frozen=True)
 class RenderConfig:
     """
     Configuration for rendering final video with FFmpeg.
@@ -136,6 +189,7 @@ class RenderConfig:
                   don't specify their own `font_path`. Should point to a
                   Unicode-capable TTF (e.g. NotoSans, DejaVuSans) so
                   Vietnamese/other diacritics render correctly.
+        animated_subtitle_config: Configuration for animated subtitle effects.
     """
 
     video_codec: str = "libx264"
@@ -148,6 +202,8 @@ class RenderConfig:
     blur_text: bool = False
     blur_box: Optional[str] = None
     default_overlay_font_path: Optional[str] = None
+    animated_subtitle_config: Optional[AnimatedSubtitleConfig] = None
+    video_template_config: Optional[VideoTemplateConfig] = None
     # Static region to permanently blur for the ENTIRE video, regardless of
     # blur_text/text_overlays — intended for a platform watermark (e.g. the
     # TikTok/Douyin logo + @username + reup title baked into the corner of
@@ -187,6 +243,7 @@ class Renderer:
     def __init__(self, config: Optional[RenderConfig] = None, logger: Optional[logging.Logger] = None) -> None:
         self.config = config or RenderConfig()
         self.logger = logger or _logger
+        self.subtitle_generator = AnimatedSubtitleGenerator(logger=self.logger)
 
         if not _check_ffmpeg_available():
             self.logger.warning("FFmpeg not found in PATH; rendering may fail at runtime")
@@ -303,6 +360,112 @@ class Renderer:
                 )
         return filters
 
+    def _build_animated_subtitle_filters(
+        self, subtitle_segments: List[dict]
+    ) -> List[str]:
+        """
+        Build animated subtitle filters from subtitle segments.
+        
+        Args:
+            subtitle_segments: List of dicts with keys: text, start, end
+            
+        Returns:
+            List of FFmpeg filter strings for animated subtitles
+        """
+        if not self.config.animated_subtitle_config or not self.config.animated_subtitle_config.enabled:
+            return []
+        
+        anim_config = self.config.animated_subtitle_config
+        filters = []
+        
+        for segment in subtitle_segments:
+            text = segment.get("text", "")
+            start = segment.get("start", 0.0)
+            end = segment.get("end", 0.0)
+            
+            if not text or end <= start:
+                continue
+            
+            filter_str = self.subtitle_generator.generate_filter(
+                text=text,
+                start=start,
+                end=end,
+                effect=anim_config.effect,
+                style=anim_config.style,
+                **anim_config.effect_params
+            )
+            filters.append(filter_str)
+        
+        return filters
+
+    def _build_video_template_filters(self) -> List[str]:
+        """
+        Build video template filters (color grading, transitions, etc.).
+        
+        Returns:
+            List of FFmpeg filter strings for video template effects
+        """
+        if not self.config.video_template_config or not self.config.video_template_config.enabled:
+            return []
+        
+        template_config = self.config.video_template_config
+        filters = []
+        
+        # Color grading effects
+        color_effect = template_config.color_effect
+        if color_effect == "warm":
+            filters.append("eq=contrast=1.1:saturation=1.2:brightness=0.05")
+        elif color_effect == "cool":
+            filters.append("eq=contrast=1.05:saturation=0.9:brightness=-0.05")
+        elif color_effect == "vintage":
+            filters.append("eq=saturation=0.8:contrast=1.15")
+            filters.append("curves=all='0/0 0.2/0.3 0.5/0.5 0.8/0.7 1/1'")
+        elif color_effect == "high_contrast":
+            filters.append("eq=contrast=1.3:saturation=1.1")
+        
+        # Video quality adjustments
+        quality = template_config.video_quality
+        if quality == "low":
+            filters.append("scale=iw:ih:flags=lanczos")
+        elif quality == "high":
+            filters.append("scale=iw*1.1:ih*1.1:flags=lanczos,crop=iw:ih")
+        elif quality == "ultra":
+            filters.append("scale=iw*1.2:ih*1.2:flags=lanczos,crop=iw:ih")
+        
+        return filters
+
+    def _build_audio_template_filters(self) -> List[str]:
+        """
+        Build audio template filters (equalizer, compressor, etc.).
+        
+        Returns:
+            List of FFmpeg filter strings for audio template effects
+        """
+        if not self.config.video_template_config or not self.config.video_template_config.enabled:
+            return []
+        
+        audio_filters = self.config.video_template_config.audio_filters or {}
+        filters = []
+        
+        # Audio equalizer
+        if audio_filters.get("equalizer"):
+            eq = audio_filters["equalizer"]
+            if eq.get("bass"):
+                filters.append(f"equalizer=f=100:width_type=h:width=100:g={eq['bass']}")
+            if eq.get("treble"):
+                filters.append(f"equalizer=f=10000:width_type=h:width=1000:g={eq['treble']}")
+        
+        # Audio compressor
+        if audio_filters.get("compressor"):
+            comp = audio_filters["compressor"]
+            filters.append(f"acompressor=threshold={comp.get('threshold', -20)}dB:ratio={comp.get('ratio', 4)}:attack={comp.get('attack', 20)}:release={comp.get('release', 250)}")
+        
+        # Volume normalization
+        if audio_filters.get("normalize", False):
+            filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+        
+        return filters
+
     def _get_video_dimensions(self, video_path: Path) -> Optional[Tuple[int, int]]:
         """Return (width, height) of the video via ffprobe, or None if unavailable."""
         cmd = [
@@ -339,6 +502,7 @@ class Renderer:
         output: Path,
         subtitles: Optional[Path] = None,
         text_overlays: Optional[List[TextOverlay]] = None,
+        subtitle_segments: Optional[List[dict]] = None,
     ) -> List[str]:
         """
         Build ffmpeg command list based on configuration and presence of subtitles
@@ -373,6 +537,7 @@ class Renderer:
             cmd.extend(["-loop", "1", "-i", str(self.config.logo_path)])
 
         text_overlays = text_overlays or []
+        subtitle_segments = subtitle_segments or []
 
         # Determine if we need video filters (subtitles, overlays, or blur)
         needs_reencode = (
@@ -381,6 +546,8 @@ class Renderer:
             or bool(text_overlays)
             or self.config.watermark_box_fractional is not None
             or logo_configured
+            or (self.config.animated_subtitle_config and self.config.animated_subtitle_config.enabled and bool(subtitle_segments))
+            or (self.config.video_template_config and self.config.video_template_config.enabled)
         )
 
         if text_overlays and not self.config.default_overlay_font_path and not any(
@@ -471,6 +638,12 @@ class Renderer:
             # only active during its own [start, end) window.
             filters.extend(self._build_text_overlay_filters(text_overlays, frame_w=frame_w))
 
+            # Add animated subtitle filters if enabled
+            filters.extend(self._build_animated_subtitle_filters(subtitle_segments))
+
+            # Add video template filters if enabled
+            filters.extend(self._build_video_template_filters())
+
             # Add subtitles filter if provided. The `subtitles=` filter option
             # value is itself parsed as filename[:key=value...], so a raw path
             # containing a colon (a Windows drive letter, or just a folder
@@ -516,6 +689,12 @@ class Renderer:
                 vf = ",".join(filters) if filters else None
                 if vf:
                     cmd.extend(["-vf", vf])
+
+            # Build audio filter chain
+            audio_filters = self._build_audio_template_filters()
+            if audio_filters:
+                af = ",".join(audio_filters)
+                cmd.extend(["-af", af])
 
             cmd.extend(
                 [
@@ -568,6 +747,7 @@ class Renderer:
         subtitles: Optional[Path] = None,
         output_path: Optional[Path] = None,
         text_overlays: Optional[List[TextOverlay]] = None,
+        subtitle_segments: Optional[List[dict]] = None,
     ) -> Path:
         """
         Render the final video.
@@ -581,6 +761,8 @@ class Renderer:
             translated text in its place, each shown only during its own
             time window. Build these from `render.text_detector.OnScreenTextDetector`
             output combined with translated `TimelineSegment`s.
+        :param subtitle_segments: Optional list of subtitle segments for animated effects.
+            Each segment should be a dict with keys: text, start, end.
         :raises FileNotFoundError: when inputs missing or not files
         :raises RuntimeError: when ffmpeg fails or output not created
         :return: Path to rendered video
@@ -604,11 +786,11 @@ class Renderer:
         output = output.resolve()
 
         # Construct ffmpeg command
-        cmd = self._build_command(video_path, audio_path, output, subtitles, text_overlays)
+        cmd = self._build_command(video_path, audio_path, output, subtitles, text_overlays, subtitle_segments)
 
         self.logger.info(
-            "Rendering output %s from video=%s audio=%s subtitles=%s text_overlays=%d",
-            output, video_path, audio_path, subtitles, len(text_overlays or []),
+            "Rendering output %s from video=%s audio=%s subtitles=%s text_overlays=%d subtitle_segments=%d",
+            output, video_path, audio_path, subtitles, len(text_overlays or []), len(subtitle_segments or []),
         )
         self.logger.debug("FFmpeg command: %s", " ".join(cmd))
 

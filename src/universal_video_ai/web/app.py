@@ -28,9 +28,13 @@ import gc
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
 import requests
-import numpy as np
-import numpy.dtypes  # eagerly initialize dtype namespace before worker threads
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
@@ -41,7 +45,8 @@ from universal_video_ai.orchestrator.factory import create_localization_service
 from universal_video_ai.orchestrator.service import (
     prepared_localization_to_dict, prepared_localization_from_dict,
 )
-from universal_video_ai.render.renderer import RenderConfig
+from universal_video_ai.render.renderer import RenderConfig, AnimatedSubtitleConfig, VideoTemplateConfig
+from universal_video_ai.render.animated_subtitles import SubtitleEffect, SubtitleStyle
 from universal_video_ai.render import ocr_language_map
 from universal_video_ai.render.quality_check import analyze_output_quality
 from universal_video_ai.render.prepublish import inspect_for_publish, prepublish_report_to_dict
@@ -53,6 +58,7 @@ from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
 from universal_video_ai.config import TEMP_DIR
 from universal_video_ai.social import get_uploader
+from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
 
 from .store import Store
 from .auth import (
@@ -69,6 +75,34 @@ app = FastAPI(title="Video Localization AI")
 _CREATOR_AI_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
 _CREATOR_AI_LOCK = threading.Lock()
 _CREATOR_AI_CACHE_TTL_SECONDS = 3600
+_CREATOR_AI_CACHE_MAX_SIZE = 100  # Maximum number of cached entries
+
+
+def _evict_old_cache_entries():
+    """Remove expired and oldest entries if cache exceeds max size."""
+    now = time.time()
+    
+    # First, remove expired entries
+    expired_keys = [
+        key for key, (timestamp, _) in _CREATOR_AI_CACHE.items()
+        if now - timestamp > _CREATOR_AI_CACHE_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        del _CREATOR_AI_CACHE[key]
+    
+    # If still over limit, remove oldest entries (LRU)
+    if len(_CREATOR_AI_CACHE) > _CREATOR_AI_CACHE_MAX_SIZE:
+        # Sort by timestamp (oldest first)
+        sorted_entries = sorted(
+            _CREATOR_AI_CACHE.items(),
+            key=lambda x: x[1][0]  # timestamp
+        )
+        # Remove oldest entries until under limit
+        num_to_remove = len(_CREATOR_AI_CACHE) - _CREATOR_AI_CACHE_MAX_SIZE
+        for key, _ in sorted_entries[:num_to_remove]:
+            del _CREATOR_AI_CACHE[key]
+
+
 _IMAGE_AI_PIPELINE: Any = None
 _IMAGE_AI_DEVICE: Optional[str] = None
 _IMAGE_AI_LOCK = threading.Lock()
@@ -185,6 +219,13 @@ class NewJobBody(BaseModel):
     # instead of rendering straight through, so the person can edit the
     # translated text first via PUT .../segments then POST .../render.
     review_before_render: bool = False
+    # Animated subtitle configuration
+    animated_subtitle_config: Optional[Dict[str, Any]] = None
+    # Queue management
+    priority: str = "normal"  # normal | high
+    max_concurrent: int = 2
+    # Video template configuration
+    video_template_config: Optional[Dict[str, Any]] = None
 
 
 class CreatorJobBody(BaseModel):
@@ -205,6 +246,8 @@ class CreatorSuggestionBody(BaseModel):
     aspect_ratio: str = "9:16"
     duration_seconds: int = 30
     transition: str = "fade"
+    advanced_options: Optional[Dict[str, Any]] = None
+    provider: str = "gemini"  # gemini | openai | ollama | openrouter
 
 
 class BulkDeleteBody(BaseModel):
@@ -231,6 +274,24 @@ class TopUpRequestBody(BaseModel):
     amount_vnd: int
     payment_method: str = "bank_transfer"
     note: Optional[str] = None
+
+
+class TTSSynthesizeBody(BaseModel):
+    text: str
+    language: str = "vi"
+    voice: Optional[str] = None
+    rate: str = "+0%"
+    pitch: str = "+0Hz"
+
+
+class VideoPresetBody(BaseModel):
+    name: str
+    template: str
+    transition: str
+    color_effect: str
+    audio_filters: Optional[Dict[str, Any]] = None
+    video_quality: Optional[str] = None
+    is_default: bool = False
 
 
 class TopUpDecisionBody(BaseModel):
@@ -322,6 +383,26 @@ def _classify_identifier(identifier: str) -> tuple[str, str]:
     if _PHONE_RE.match(value):
         return "phone", digits_only
     return "username", value
+
+
+def _unique_username_from(base: str) -> str:
+    """Generate a unique username from a base string by appending a number if needed."""
+    # Normalize the base username
+    username = base.strip().lower()
+    # Remove invalid characters
+    username = re.sub(r"[^a-z0-9_]", "_", username)
+    # Ensure it's not empty
+    if not username:
+        username = "user"
+    
+    # Check if username exists and append number if needed
+    counter = 1
+    unique_username = username
+    while store.get_user_by_username(unique_username):
+        unique_username = f"{username}{counter}"
+        counter += 1
+    
+    return unique_username
 
 
 def _login_response(user_id: int) -> JSONResponse:
@@ -568,6 +649,47 @@ def _build_service_for_job(job):
         preset=WEB_RENDER_PRESET,
         timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
     )
+    
+    # Build animated subtitle config if provided
+    animated_subtitle_config = None
+    if job.animated_subtitle_config and job.animated_subtitle_config.get("enabled"):
+        try:
+            effect_name = job.animated_subtitle_config.get("effect", "none")
+            effect = SubtitleEffect(effect_name) if effect_name else SubtitleEffect.NONE
+            
+            style_data = job.animated_subtitle_config.get("style", {})
+            style = SubtitleStyle(
+                font_size=style_data.get("font_size", 24),
+                font_color=style_data.get("font_color", "white"),
+                background_color=style_data.get("background_color", "black@0.5"),
+            )
+            
+            effect_params = job.animated_subtitle_config.get("effect_params", {})
+            
+            animated_subtitle_config = AnimatedSubtitleConfig(
+                enabled=True,
+                effect=effect,
+                style=style,
+                effect_params=effect_params,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to parse animated_subtitle_config: {e}")
+    
+    # Build video template config if provided
+    video_template_config = None
+    if job.video_template_config and job.video_template_config.get("enabled"):
+        try:
+            video_template_config = VideoTemplateConfig(
+                enabled=True,
+                template=job.video_template_config.get("template", "minimal"),
+                transition=job.video_template_config.get("transition", "fade"),
+                color_effect=job.video_template_config.get("color_effect", "none"),
+                audio_filters=job.video_template_config.get("audio_filters", {}),
+                video_quality=job.video_template_config.get("video_quality", "medium"),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to parse video_template_config: {e}")
+    
     if job.logo_path and Path(job.logo_path).exists():
         render_config = RenderConfig(
             preset=WEB_RENDER_PRESET,
@@ -575,6 +697,15 @@ def _build_service_for_job(job):
             logo_path=job.logo_path,
             logo_corner=job.logo_corner or "bottom_right",
             logo_size_px=job.logo_size_px or 120,
+            animated_subtitle_config=animated_subtitle_config,
+            video_template_config=video_template_config,
+        )
+    else:
+        render_config = RenderConfig(
+            preset=WEB_RENDER_PRESET,
+            timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
+            animated_subtitle_config=animated_subtitle_config,
+            video_template_config=video_template_config,
         )
 
     return create_localization_service(
@@ -917,6 +1048,73 @@ def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False
         if require_search else
         "Tạo nội dung SEO sát search intent; không bịa số liệu xu hướng hoặc tuyên bố đã tìm kiếm web."
     )
+    
+    # Process advanced options if provided
+    advanced_options = body.advanced_options or {}
+    style = advanced_options.get("style", "general")
+    tone = advanced_options.get("tone", "neutral")
+    sentence_length = advanced_options.get("sentence_length", "medium")
+    detail_level = advanced_options.get("detail_level", "standard")
+    custom_instructions = advanced_options.get("custom_instructions", "")
+    
+    # Map style to Vietnamese descriptions
+    style_map = {
+        "general": "chung",
+        "entertaining": "giải trí, vui vẻ, hấp dẫn",
+        "educational": "giáo dục, học thuật, chia sẻ kiến thức",
+        "storytelling": "kể chuyện, có cốt truyện",
+        "tutorial": "hướng dẫn, tutorial, step-by-step",
+        "review": "review, đánh giá, so sánh",
+        "news": "tin tức, thông tin, cập nhật",
+        "motivational": "truyền cảm hứng, động viên",
+    }
+    
+    # Map tone to Vietnamese descriptions
+    tone_map = {
+        "neutral": "trung tính, khách quan",
+        "casual": "thân thiện, gần gũi, tự nhiên",
+        "formal": "trang trọng, chuyên nghiệp",
+        "humorous": "hài hước, vui nhộn",
+        "inspiring": "truyền cảm hứng, tích cực",
+        "urgent": "cấp bách, khẩn trương",
+    }
+    
+    # Map sentence length to word ranges
+    sentence_length_map = {
+        "short": (8, 12),
+        "medium": (12, 18),
+        "long": (18, 25),
+    }
+    
+    # Map detail level to descriptions
+    detail_map = {
+        "minimal": "tối thiểu, tập trung vào điểm chính",
+        "standard": "chuẩn, cân bằng",
+        "detailed": "chi tiết, có ví dụ cụ thể",
+        "comprehensive": "rất chi tiết, đầy đủ thông tin",
+    }
+    
+    style_desc = style_map.get(style, "chung")
+    tone_desc = tone_map.get(tone, "trung tính")
+    sentence_range = sentence_length_map.get(sentence_length, (12, 18))
+    detail_desc = detail_map.get(detail_level, "chuẩn")
+    
+    # Adjust word count based on detail level
+    if detail_level == "minimal":
+        narration_word_target = round(narration_word_target * 0.8)
+        narration_word_min = round(narration_word_min * 0.8)
+        narration_word_max = round(narration_word_max * 0.8)
+    elif detail_level == "detailed":
+        narration_word_target = round(narration_word_target * 1.15)
+        narration_word_min = round(narration_word_min * 1.15)
+        narration_word_max = round(narration_word_max * 1.15)
+    elif detail_level == "comprehensive":
+        narration_word_target = round(narration_word_target * 1.3)
+        narration_word_min = round(narration_word_min * 1.3)
+        narration_word_max = round(narration_word_max * 1.3)
+    
+    custom_instruction_text = f"\nYÊU CẦU ĐẶC BIỆT: {custom_instructions}" if custom_instructions else ""
+    
     prompt = f"""Bạn là biên kịch video ngắn và chuyên gia SEO YouTube/TikTok.
 {search_instruction}
 Hãy lập nội dung cho video với thông số bắt buộc:
@@ -925,6 +1123,11 @@ Hãy lập nội dung cho video với thông số bắt buộc:
 - Tỷ lệ khung hình: {body.aspect_ratio}
 - Thời lượng: {duration} giây
 - Hiệu ứng hình: {body.transition}
+- Phong cách nội dung: {style_desc}
+- Giọng văn: {tone_desc}
+- Độ dài câu trung bình: {sentence_range[0]}-{sentence_range[1]} từ
+- Mức độ chi tiết: {detail_desc}
+{custom_instruction_text}
 
 QUY TẮC NGÔN NGỮ TUYỆT ĐỐI: mọi chuỗi trong cả keywords, visual_brief và
 narration_lines phải viết duy nhất bằng {language_name}. Ngôn ngữ của chủ đề
@@ -935,7 +1138,7 @@ Trả về đúng JSON theo schema. Yêu cầu:
 1. keywords: 12-18 keyword/long-tail keyword sát chủ đề, có search intent, không nhồi từ khóa, không bịa số liệu xu hướng.
    Bắt buộc giữ nguyên nghĩa và loại của thực thể trong chủ đề. Không được tách một cụm danh từ riêng thành các từ khóa rời gây đa nghĩa, không tự đổi động vật thành cây, đồ vật, địa danh hoặc khái niệm khác. Ví dụ chủ đề "đặc điểm về con lửng mật" phải dùng các cụm như "động vật lửng mật", "đặc điểm lửng mật", tuyệt đối không dùng "cây lửng mật".
 2. visual_brief: đúng {scene_count} cảnh, mỗi phần tử phải có chủ thể cụ thể + hành động nhìn thấy được và có thể tìm hoặc tái tạo thành footage. Mỗi cảnh phải liên quan trực tiếp đến chủ đề; tránh mô tả trừu tượng, chữ/UI/logo. Không được tạo một phần tử chỉ nói về phong cách, màu sắc, góc máy hoặc thể loại phim.
-3. narration_lines: kịch bản hook → giá trị chính → CTA; mỗi phần tử là một câu nói tự nhiên. Toàn bộ kịch bản phải có {narration_word_min}-{narration_word_max} từ (mục tiêu {narration_word_target} từ) để giọng đọc tự nhiên lấp đầy khoảng {duration} giây. Không viết kịch bản ngắn rồi yêu cầu tăng tốc/giảm tốc, không lặp ý, không tuyên bố thiếu căn cứ. Visual và lời thoại phải cùng một mạch nội dung.
+3. narration_lines: kịch bản hook → giá trị chính → CTA; mỗi phần tử là một câu nói tự nhiên với độ dài {sentence_range[0]}-{sentence_range[1]} từ. Toàn bộ kịch bản phải có {narration_word_min}-{narration_word_max} từ (mục tiêu {narration_word_target} từ) để giọng đọc tự nhiên lấp đầy khoảng {duration} giây. Không viết kịch bản ngắn rồi yêu cầu tăng tốc/giảm tốc, không lặp ý, không tuyên bố thiếu căn cứ. Visual và lời thoại phải cùng một mạch nội dung. Giọng văn phải {tone_desc}.
 QUY TẮC NHẤT QUÁN THỰC THỂ: quy tắc giữ nguyên nghĩa và loại thực thể ở mục 1 áp dụng cho cả visual_brief và narration_lines. Mọi cảnh và câu thoại phải nói đúng chủ thể trong chủ đề; nếu chủ đề nói "con lửng mật" thì đó luôn là động vật lửng mật, không bao giờ là cây, đồ vật hoặc một người đang thực hiện chủ đề.
 Chỉ xuất một JSON object hợp lệ có đúng ba key: keywords, visual_brief, narration_lines. Không dùng Markdown hay code fence.
 """
@@ -1036,6 +1239,39 @@ def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, An
         raw, scene_count, generator="openrouter", model=actual_model,
         target_language=body.target_language,
     )
+
+
+def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
+    """Generate script suggestions using OpenAI API (GPT-4, GPT-3.5, etc.)."""
+    if not OPENAI_AVAILABLE:
+        raise RuntimeError("OpenAI library chưa được cài đặt. Chạy: pip install openai")
+    
+    api_key = _env_first("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Chưa cấu hình OPENAI_API_KEY")
+    
+    configured_model = _env_first("OPENAI_MODEL") or "gpt-4o"
+    prompt, scene_count = _creator_ai_prompt(body, require_search=False)
+    
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=configured_model,
+            messages=[
+                {"role": "system", "content": "Return only one valid JSON object with no markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=16384,
+        )
+        raw = response.choices[0].message.content or ""
+        actual_model = response.model
+        return _parse_creator_ai_result(
+            raw, scene_count, generator="openai", model=actual_model,
+            target_language=body.target_language,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI API error: {exc}")
 
 
 def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
@@ -1595,11 +1831,116 @@ def _download_stock_media(media: Dict[str, str], dest: Path) -> Path:
     return output
 
 
+def _generate_huggingface_image(
+    prompt: str, output_path: Path, aspect_ratio: str,
+) -> Path:
+    """Generate image using Hugging Face Inference API (free)."""
+    hf_api_key = _env_first("HUGGINGFACE_API_KEY")
+    if not hf_api_key:
+        raise RuntimeError("HUGGINGFACE_API_KEY not configured in .env file")
+    
+    # Extract keywords from prompt
+    keywords = " ".join(prompt.split()[:15])
+    
+    # Use Stable Diffusion XL for better quality
+    model_id = _env_first("HF_IMAGE_MODEL") or "stabilityai/stable-diffusion-xl-base-1.0"
+    
+    # Determine dimensions based on aspect ratio
+    if aspect_ratio == "16:9":
+        width, height = 1024, 576
+    elif aspect_ratio == "9:16":
+        width, height = 576, 1024
+    else:
+        width, height = 768, 768
+    
+    try:
+        import requests
+        
+        api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+        headers = {
+            "Authorization": f"Bearer {hf_api_key}",
+        }
+        payload = {
+            "inputs": keywords,
+            "parameters": {
+                "width": width,
+                "height": height,
+                "num_inference_steps": 30,
+                "guidance_scale": 7.5,
+            },
+        }
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        # Save image
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        
+        logger.info(f"Generated image using Hugging Face: {keywords}")
+        return output_path
+        
+    except Exception as exc:
+        logger.warning(f"Failed to generate image with Hugging Face: {exc}")
+        raise RuntimeError(f"Không thể sinh ảnh với Hugging Face: {exc}") from exc
+
+
+def _generate_dalle_image(
+    prompt: str, output_path: Path, aspect_ratio: str,
+) -> Path:
+    """Generate image using DALL-E API for better quality."""
+    if not OPENAI_AVAILABLE:
+        raise RuntimeError("OpenAI library not available")
+    
+    openai_api_key = _env_first("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY not configured in .env file")
+    
+    # Extract keywords from prompt
+    keywords = " ".join(prompt.split()[:10])
+    
+    # Determine size based on aspect ratio
+    size = "1024x1024"  # Default square
+    if aspect_ratio == "16:9":
+        size = "1792x1024"  # Landscape
+    elif aspect_ratio == "9:16":
+        size = "1024x1792"  # Portrait
+    
+    try:
+        client = openai.OpenAI(api_key=openai_api_key)
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=keywords,
+            size=size,
+            quality="standard",
+            n=1,
+        )
+        
+        image_url = response.data[0].url
+        
+        # Download image
+        img_response = requests.get(image_url, timeout=30)
+        img_response.raise_for_status()
+        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(img_response.content)
+        
+        logger.info(f"Generated image using DALL-E: {keywords}")
+        return output_path
+        
+    except Exception as exc:
+        logger.warning(f"Failed to generate image with DALL-E: {exc}")
+        raise RuntimeError(f"Không thể sinh ảnh với DALL-E: {exc}") from exc
+
+
 def _generate_ai_image(
     prompt: str, output_path: Path, aspect_ratio: str, story_seed: Optional[int] = None,
     for_video: bool = False,
 ) -> Path:
     """Generate a scene image locally, automatically using CUDA when available."""
+    import re
     global _IMAGE_AI_PIPELINE, _IMAGE_AI_DEVICE
     # Diffusers exposes several lazy modules; importing AutoPipeline from
     # two creator worker threads at the same time can recurse through its
@@ -1662,8 +2003,8 @@ def _generate_ai_image(
         )["input_ids"]
         scene_prompt = tokenizer.decode(scene_ids, skip_special_tokens=True).strip()
         full_prompt = (
-            f"{scene_prompt}. RAW live-action wildlife documentary photo, real camera, "
-            "accurate anatomy, lifelike fur, natural light and colors, no people, no illustration, no text, no logo"
+            f"{scene_prompt}. professional photography, high quality, realistic, "
+            "natural lighting, no text, no watermark, no logo"
         )
         # A final tokenizer-level clamp is exact; word slicing is not because
         # accented/compound words may consume several CLIP tokens.
@@ -2257,10 +2598,42 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                         job_id,
                         progress_note=f"AI đang sinh khung hình {idx + 1}/{len(scenes)}...",
                     )
-                    ai_path = _generate_ai_image(
-                        ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
-                        body.aspect_ratio, story_seed=story_seed,
-                    )
+                    # Priority: Hugging Face (free) > DALL-E (paid) > Local SD-Turbo (free)
+                    hf_api_key = _env_first("HUGGINGFACE_API_KEY")
+                    use_dalle = _env_first("USE_DALLE_IMAGES", "false").lower() == "true"
+                    
+                    if hf_api_key:
+                        # Use Hugging Face Inference API (free)
+                        try:
+                            ai_path = _generate_huggingface_image(
+                                ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
+                                body.aspect_ratio,
+                            )
+                        except Exception as hf_exc:
+                            logger.warning(f"Hugging Face failed, falling back to local SD-Turbo: {hf_exc}")
+                            ai_path = _generate_ai_image(
+                                ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
+                                body.aspect_ratio, story_seed=story_seed,
+                            )
+                    elif use_dalle and OPENAI_AVAILABLE:
+                        # Use DALL-E (paid, better quality)
+                        try:
+                            ai_path = _generate_dalle_image(
+                                ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
+                                body.aspect_ratio,
+                            )
+                        except Exception as dalle_exc:
+                            logger.warning(f"DALL-E failed, falling back to local SD-Turbo: {dalle_exc}")
+                            ai_path = _generate_ai_image(
+                                ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
+                                body.aspect_ratio, story_seed=story_seed,
+                            )
+                    else:
+                        # Use local SD-Turbo (free, lower quality)
+                        ai_path = _generate_ai_image(
+                            ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
+                            body.aspect_ratio, story_seed=story_seed,
+                        )
                     _render_stock_clip(
                         ai_path, "image", clip_path, width, height,
                         scene_duration, body.transition,
@@ -2495,7 +2868,10 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
         raise HTTPException(400, "Thời lượng nội dung phải từ 10 giây đến 20 phút")
     topic = body.topic.strip()
     language = body.target_language or "vi"
-    provider = (_env_first("CREATOR_AI_PROVIDER") or "auto").lower()
+    
+    # Use provider from request body, fallback to env var, then auto
+    provider = (body.provider or _env_first("CREATOR_AI_PROVIDER") or "auto").lower()
+    
     providers = []
     if provider in ("auto", "ollama"):
         providers.append(("Ollama", _ollama_creator_suggestions))
@@ -2503,12 +2879,18 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
         providers.append(("OpenRouter", _openrouter_creator_suggestions))
     if provider in ("auto", "gemini") and _env_first("GEMINI_API_KEY", "GOOGLE_AI_API_KEY"):
         providers.append(("Gemini", _creator_ai_suggestions))
+    if provider in ("auto", "openai") and _env_first("OPENAI_API_KEY"):
+        providers.append(("OpenAI", _openai_creator_suggestions))
     if providers:
         cache_key = (
             provider, topic.lower(), language, body.aspect_ratio,
             int(body.duration_seconds or 30), body.transition,
+            str(body.advanced_options),
         )
         with _CREATOR_AI_LOCK:
+            # Evict old entries before checking cache
+            _evict_old_cache_entries()
+            
             cached = _CREATOR_AI_CACHE.get(cache_key)
             if cached and time.time() - cached[0] < _CREATOR_AI_CACHE_TTL_SECONDS:
                 result = dict(cached[1])
@@ -2607,6 +2989,109 @@ def list_voices(language: str = "vi"):
         "language_label": LANGUAGE_LABELS.get(language, language),
         "default_voice": voice_for_language(language),
     }
+
+
+@app.post("/api/tts/synthesize")
+async def tts_synthesize(body: TTSSynthesizeBody, user_id: int = Depends(get_current_user_id)):
+    """Synthesize text to speech using EdgeTTS. Returns audio file."""
+    if not body.text.strip():
+        raise HTTPException(400, "Thiếu văn bản cần chuyển đổi")
+    
+    import edge_tts
+    
+    # Determine voice
+    preset = body.voice or voice_for_language(body.language)
+    preset_parts = preset.split("|") if preset else []
+    effective_voice = preset_parts[0] if preset_parts else voice_for_language(body.language)
+    
+    # Create temporary file for audio
+    temp_dir = Path(TEMP_DIR) / "tts_temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    output_path = temp_dir / f"tts_{uuid.uuid4().hex}.mp3"
+    
+    try:
+        # Synthesize using EdgeTTS
+        communicate = edge_tts.Communicate(
+            body.text.replace("\n", " "),
+            effective_voice,
+            rate=body.rate,
+            pitch=body.pitch,
+        )
+        await communicate.save(str(output_path))
+        
+        if not output_path.exists() or output_path.stat().st_size < 1024:
+            raise RuntimeError("TTS không tạo được file âm thanh hợp lệ")
+        
+        return FileResponse(
+            output_path,
+            media_type="audio/mpeg",
+            filename=f"tts_{uuid.uuid4().hex}.mp3",
+        )
+    except Exception as exc:
+        logger.error("TTS synthesis error: %s", exc)
+        raise HTTPException(500, f"Lỗi khi tạo giọng nói: {str(exc)}")
+
+
+@app.get("/api/presets")
+def list_video_presets(user_id: int = Depends(get_current_user_id)):
+    """List all video presets for the current user."""
+    presets = store.list_video_presets(user_id)
+    return {"presets": presets}
+
+
+@app.post("/api/presets")
+def create_video_preset(body: VideoPresetBody, user_id: int = Depends(get_current_user_id)):
+    """Create a new video preset."""
+    if not body.name.strip():
+        raise HTTPException(400, "Thiếu tên preset")
+    preset_id = store.create_video_preset(
+        user_id,
+        body.name,
+        body.template,
+        body.transition,
+        body.color_effect,
+        body.audio_filters,
+        body.video_quality,
+        body.is_default,
+    )
+    return {"ok": True, "preset_id": preset_id}
+
+
+@app.get("/api/presets/{preset_id}")
+def get_video_preset(preset_id: int, user_id: int = Depends(get_current_user_id)):
+    """Get a specific video preset."""
+    preset = store.get_video_preset(preset_id, user_id)
+    if not preset:
+        raise HTTPException(404, "Preset không tồn tại")
+    return preset
+
+
+@app.put("/api/presets/{preset_id}")
+def update_video_preset(preset_id: int, body: VideoPresetBody, user_id: int = Depends(get_current_user_id)):
+    """Update a video preset."""
+    success = store.update_video_preset(
+        preset_id,
+        user_id,
+        name=body.name,
+        template=body.template,
+        transition=body.transition,
+        color_effect=body.color_effect,
+        audio_filters=body.audio_filters,
+        video_quality=body.video_quality,
+        is_default=body.is_default,
+    )
+    if not success:
+        raise HTTPException(404, "Preset không tồn tại")
+    return {"ok": True}
+
+
+@app.delete("/api/presets/{preset_id}")
+def delete_video_preset(preset_id: int, user_id: int = Depends(get_current_user_id)):
+    """Delete a video preset."""
+    success = store.delete_video_preset(preset_id, user_id)
+    if not success:
+        raise HTTPException(404, "Preset không tồn tại")
+    return {"ok": True}
 
 
 @app.get("/api/jobs")
@@ -2896,6 +3381,74 @@ async def stop_scheduled_publish_worker() -> None:
         task.cancel()
 
 
+# Version info
+APP_VERSION = "1.0.0"
+GITHUB_REPO = "truongcongdai/Chinese_Video_Localization_AI"
+
+
+@app.get("/api/version")
+def get_version():
+    """Get current application version."""
+    return {
+        "version": APP_VERSION,
+        "features": {
+            "animated_subtitles": True,
+            "ai_script_generation": True,
+            "video_templates": True,
+            "queue_management": True,
+            "video_presets": True,
+            "advanced_audio_filters": True,
+            "openai_integration": OPENAI_AVAILABLE,
+        }
+    }
+
+
+@app.get("/api/updates/check")
+async def check_updates():
+    """Check for available updates from GitHub releases."""
+    try:
+        response = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            timeout=10
+        )
+        if response.status_code == 200:
+            release = response.json()
+            latest_version = release.get("tag_name", "").lstrip("v")
+            current_version = APP_VERSION
+            
+            # Simple version comparison
+            latest_parts = [int(x) for x in latest_version.split(".") if x.isdigit()]
+            current_parts = [int(x) for x in current_version.split(".") if x.isdigit()]
+            
+            has_update = False
+            if len(latest_parts) >= len(current_parts):
+                for i in range(len(current_parts)):
+                    if latest_parts[i] > current_parts[i]:
+                        has_update = True
+                        break
+            
+            return {
+                "current_version": current_version,
+                "latest_version": latest_version,
+                "has_update": has_update,
+                "release_notes": release.get("body", ""),
+                "download_url": release.get("html_url", ""),
+                "published_at": release.get("published_at", ""),
+            }
+        else:
+            return {
+                "current_version": APP_VERSION,
+                "error": "Could not check for updates",
+                "status_code": response.status_code
+            }
+    except Exception as exc:
+        return {
+            "current_version": APP_VERSION,
+            "error": str(exc),
+            "has_update": False
+        }
+
+
 def _resolve_publish_credentials(user_id: int, platform: str) -> tuple[Optional[str], Optional[str]]:
     """Look up the logged-in user's own connected account for this platform
     (see `/api/social/connect/*`). Shared env credentials are only considered
@@ -3006,6 +3559,68 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
 def disconnect_social(platform: str, user_id: int = Depends(get_current_user_id)):
     store.delete_social_account(user_id, platform)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ yt-dlp YouTube tools --
+
+@app.post("/api/youtube/download")
+def download_youtube_video(body: YouTubeDownloadBody, user_id: int = Depends(get_current_user_id)):
+    """Download video from YouTube using yt-dlp."""
+    try:
+        tools = YouTubeTools(user_id)
+        result = tools.download_video(body.url, body.format)
+        return result
+    except Exception as exc:
+        logger.exception("YouTube download failed: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/youtube/audio")
+def extract_youtube_audio(body: YouTubeDownloadBody, user_id: int = Depends(get_current_user_id)):
+    """Extract audio from YouTube video."""
+    try:
+        tools = YouTubeTools(user_id)
+        result = tools.extract_audio(body.url)
+        return result
+    except Exception as exc:
+        logger.exception("YouTube audio extraction failed: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/youtube/subtitles")
+def download_youtube_subtitles(body: YouTubeDownloadBody, user_id: int = Depends(get_current_user_id)):
+    """Download subtitles from YouTube video."""
+    try:
+        tools = YouTubeTools(user_id)
+        result = tools.download_subtitles(body.url)
+        return result
+    except Exception as exc:
+        logger.exception("YouTube subtitle download failed: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/youtube/thumbnail")
+def download_youtube_thumbnail(body: YouTubeDownloadBody, user_id: int = Depends(get_current_user_id)):
+    """Download thumbnail from YouTube video."""
+    try:
+        tools = YouTubeTools(user_id)
+        result = tools.download_thumbnail(body.url)
+        return result
+    except Exception as exc:
+        logger.exception("YouTube thumbnail download failed: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/youtube/metadata", response_model=YouTubeMetadataResponse)
+def get_youtube_metadata(body: YouTubeDownloadBody):
+    """Extract metadata from YouTube video."""
+    try:
+        tools = YouTubeTools(0)  # user_id not needed for metadata
+        result = tools.get_metadata(body.url)
+        return YouTubeMetadataResponse(**result)
+    except Exception as exc:
+        logger.exception("YouTube metadata extraction failed: %s", exc)
+        raise HTTPException(500, str(exc))
 
 
 # ------------------------------------------------------------------ admin --

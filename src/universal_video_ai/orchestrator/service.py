@@ -715,6 +715,15 @@ class LocalizationService:
                             subtitles_for_render = None
 
                     final_video_path = output_dir / "output_final.mp4"
+                    
+                    # Prepare subtitle segments for animated effects if enabled
+                    subtitle_segments_for_render = None
+                    if self.renderer.config.animated_subtitle_config and self.renderer.config.animated_subtitle_config.enabled:
+                        subtitle_segments_for_render = [
+                            {"text": seg.text, "start": seg.start, "end": seg.end}
+                            for seg in subtitle_segments
+                        ] if subtitle_segments else None
+                    
                     async with _RENDER_SLOTS:
                         await asyncio.to_thread(
                             self.renderer.render,
@@ -723,6 +732,7 @@ class LocalizationService:
                             subtitles=subtitles_for_render,
                             output_path=final_video_path,
                             text_overlays=text_overlays,
+                            subtitle_segments=subtitle_segments_for_render,
                         )
                     self._progress(98, "Đã render, đang kiểm tra video")
                     self.logger.info("LocalizationService: render complete: %s", final_video_path)

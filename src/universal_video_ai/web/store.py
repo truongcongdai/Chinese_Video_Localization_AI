@@ -144,6 +144,21 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS video_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    template TEXT NOT NULL,
+    transition TEXT NOT NULL,
+    color_effect TEXT NOT NULL,
+    audio_filters_json TEXT,
+    video_quality TEXT,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, name)
+);
 """
 
 _MIGRATIONS = [
@@ -867,6 +882,129 @@ class Store:
             if row:
                 conn.execute("DELETE FROM identity_oauth_states WHERE state = ?", (state,))
             return row
+
+    # ---- video presets ----
+    def create_video_preset(
+        self,
+        user_id: int,
+        name: str,
+        template: str,
+        transition: str,
+        color_effect: str,
+        audio_filters: Optional[Dict[str, Any]] = None,
+        video_quality: Optional[str] = None,
+        is_default: bool = False,
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            # If setting as default, remove default flag from other presets
+            if is_default:
+                conn.execute("UPDATE video_presets SET is_default = 0 WHERE user_id = ?", (user_id,))
+            cursor = conn.execute(
+                """INSERT INTO video_presets 
+                   (user_id, name, template, transition, color_effect, audio_filters_json, video_quality, is_default, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, name, template, transition, color_effect, json.dumps(audio_filters) if audio_filters else None, video_quality, 1 if is_default else 0, now, now),
+            )
+            return cursor.lastrowid
+
+    def list_video_presets(self, user_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM video_presets WHERE user_id = ? ORDER BY is_default DESC, created_at DESC",
+                (user_id,),
+            ).fetchall()
+            presets = []
+            for row in rows:
+                preset = dict(row)
+                if preset["audio_filters_json"]:
+                    preset["audio_filters"] = json.loads(preset["audio_filters_json"])
+                del preset["audio_filters_json"]
+                preset["is_default"] = bool(preset["is_default"])
+                presets.append(preset)
+            return presets
+
+    def get_video_preset(self, preset_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM video_presets WHERE id = ? AND user_id = ?",
+                (preset_id, user_id),
+            ).fetchone()
+            if row:
+                preset = dict(row)
+                if preset["audio_filters_json"]:
+                    preset["audio_filters"] = json.loads(preset["audio_filters_json"])
+                del preset["audio_filters_json"]
+                preset["is_default"] = bool(preset["is_default"])
+                return preset
+            return None
+
+    def update_video_preset(
+        self,
+        preset_id: int,
+        user_id: int,
+        name: Optional[str] = None,
+        template: Optional[str] = None,
+        transition: Optional[str] = None,
+        color_effect: Optional[str] = None,
+        audio_filters: Optional[Dict[str, Any]] = None,
+        video_quality: Optional[str] = None,
+        is_default: Optional[bool] = None,
+    ) -> bool:
+        now = time.time()
+        with self._connect() as conn:
+            # Check ownership
+            existing = conn.execute(
+                "SELECT id FROM video_presets WHERE id = ? AND user_id = ?",
+                (preset_id, user_id),
+            ).fetchone()
+            if not existing:
+                return False
+            
+            # Build update query
+            updates = []
+            params = []
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name)
+            if template is not None:
+                updates.append("template = ?")
+                params.append(template)
+            if transition is not None:
+                updates.append("transition = ?")
+                params.append(transition)
+            if color_effect is not None:
+                updates.append("color_effect = ?")
+                params.append(color_effect)
+            if audio_filters is not None:
+                updates.append("audio_filters_json = ?")
+                params.append(json.dumps(audio_filters))
+            if video_quality is not None:
+                updates.append("video_quality = ?")
+                params.append(video_quality)
+            if is_default is not None:
+                if is_default:
+                    conn.execute("UPDATE video_presets SET is_default = 0 WHERE user_id = ?", (user_id,))
+                updates.append("is_default = ?")
+                params.append(1 if is_default else 0)
+            
+            if updates:
+                updates.append("updated_at = ?")
+                params.append(now)
+                params.extend([preset_id, user_id])
+                conn.execute(
+                    f"UPDATE video_presets SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+                    params,
+                )
+            return True
+
+    def delete_video_preset(self, preset_id: int, user_id: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM video_presets WHERE id = ? AND user_id = ?",
+                (preset_id, user_id),
+            )
+            return cursor.rowcount > 0
 
     # ---- admin / stats ----
     def admin_stats(self) -> Dict[str, Any]:
