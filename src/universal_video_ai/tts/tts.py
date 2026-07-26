@@ -4,14 +4,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import random
 import shutil
 import subprocess
+import threading
 import time
 from typing import Optional, Protocol
 
 __all__ = ["TTS", "TTSConfig", "TTSFactory", "NoOpTTS", "EdgeTTS", "voice_for_language"]
 
 _logger = logging.getLogger(__name__)
+
+# Serialize Edge TTS calls inside this process. Multiple concurrent websocket
+# requests are a common cause of transient NoAudioReceived failures.
+_EDGE_TTS_LOCK = threading.Lock()
 
 # Maps an ISO-639-1 (or ISO-639-1 + region) language code to a sensible
 # default Edge neural voice for that language. This matters because Edge's
@@ -131,6 +137,63 @@ def _check_edge_tts_available() -> bool:
     return shutil.which("edge-tts") is not None
 
 
+def _validate_audio_file(audio_path: Path, logger: logging.Logger) -> float:
+    """
+    Validate a generated audio file and return its duration in seconds.
+
+    ffprobe is preferred because valid very-short speech can be smaller than
+    any arbitrary byte threshold. When ffprobe is unavailable, the function
+    falls back to checking that the file exists and is non-empty.
+    """
+    if not audio_path.exists():
+        raise RuntimeError(f"audio output file is missing: {audio_path}")
+
+    file_size = audio_path.stat().st_size
+    if file_size <= 0:
+        raise RuntimeError(f"audio output file is empty: {audio_path}")
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        logger.warning(
+            "ffprobe is not available; validating Edge TTS output by file size only: %s bytes",
+            file_size,
+        )
+        return 0.0
+
+    probe = subprocess.run(
+        [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    if probe.returncode != 0:
+        error = (probe.stderr or probe.stdout or "unknown ffprobe error").strip()
+        raise RuntimeError(f"ffprobe rejected generated audio: {error}")
+
+    raw_duration = probe.stdout.strip()
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"ffprobe returned an invalid audio duration: {raw_duration!r}"
+        ) from exc
+
+    if duration <= 0:
+        raise RuntimeError(
+            f"generated audio has invalid duration {duration}: {audio_path}"
+        )
+
+    return duration
+
+
 class EdgeTTS:
     """
     Wrapper around the 'edge-tts' command-line tool.
@@ -142,11 +205,11 @@ class EdgeTTS:
     """
 
     def __init__(
-        self,
-        config: Optional[TTSConfig] = None,
-        logger: Optional[logging.Logger] = None,
-        max_retries: int = 3,
-        retry_backoff_seconds: float = 1.5,
+            self,
+            config: Optional[TTSConfig] = None,
+            logger: Optional[logging.Logger] = None,
+            max_retries: int = 5,
+            retry_backoff_seconds: float = 2.0,
     ) -> None:
         self.config = config or TTSConfig(provider="edge")
         self.logger = logger or _logger
@@ -157,91 +220,151 @@ class EdgeTTS:
         self.logger.debug("EdgeTTS initialized with config=%s", self.config)
 
     def synthesize(
-        self, text: str, output_path: Path, voice: Optional[str] = None,
-        rate: Optional[str] = None, pitch: Optional[str] = None,
+            self, text: str, output_path: Path, voice: Optional[str] = None,
+            rate: Optional[str] = None, pitch: Optional[str] = None,
     ) -> Path:
         """
-        Synthesize `text` to `output_path`.
+        Synthesize ``text`` to ``output_path`` with guarded retries.
 
-        :param voice: optional per-call voice override (e.g. the voice
-            matching the target language of this specific synthesis
-            request). Falls back to `self.config.voice` when omitted.
-            Passing the wrong-locale voice for the text's language is the
-            most common cause of edge-tts silently failing with
-            `NoAudioReceived`, so callers that know the target language of
-            `text` should always pass a matching voice here.
+        The implementation serializes Edge TTS calls within the current
+        process, validates input/output, retries transient failures with
+        exponential backoff plus jitter, and falls back to another Vietnamese
+        voice when the primary Vietnamese voice repeatedly fails.
         """
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+
+        cleaned_text = " ".join(text.split()).strip()
+        if not cleaned_text:
             raise ValueError("text must be a non-empty string")
+        if not any(char.isalnum() for char in cleaned_text):
+            raise ValueError(f"text contains no speakable characters: {cleaned_text!r}")
 
         output_path = output_path.resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        effective_voice = voice or self.config.voice
+        primary_voice = voice or self.config.voice
+        voices = [primary_voice]
+        if primary_voice == "vi-VN-HoaiMyNeural":
+            voices.append("vi-VN-NamMinhNeural")
+        elif primary_voice == "vi-VN-NamMinhNeural":
+            voices.append("vi-VN-HoaiMyNeural")
 
-        # Build command (edge-tts CLI flags)
-        # Use --voice and --write-media options; pass text via --text argument.
-        cmd = [
-            "edge-tts",
-            "--voice", effective_voice,
-            "--write-media", str(output_path),
-            "--text", text,
-        ]
-        if rate:
-            cmd.append(f"--rate={rate}")
-        if pitch:
-            cmd.append(f"--pitch={pitch}")
-
-        self.logger.info("EdgeTTS synthesizing to %s using voice=%s", output_path, effective_voice)
-        self.logger.debug("Running command: %s", " ".join(cmd))
+        self.logger.info(
+            "EdgeTTS request: chars=%d voice=%s output=%s text=%r",
+            len(cleaned_text),
+            primary_voice,
+            output_path,
+            cleaned_text[:150],
+        )
 
         last_error: Optional[str] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
-                if result.returncode != 0:
-                    last_error = result.stderr or result.stdout or "unknown error"
-                    self.logger.warning(
-                        "edge-tts failed (attempt %d/%d): %s", attempt, self.max_retries, last_error
+
+        # Keep one Edge websocket request active at a time in this Python process.
+        with _EDGE_TTS_LOCK:
+            for effective_voice in voices:
+                self.logger.info(
+                    "EdgeTTS synthesizing to %s using voice=%s",
+                    output_path,
+                    effective_voice,
+                )
+
+                for attempt in range(1, self.max_retries + 1):
+                    output_path.unlink(missing_ok=True)
+                    temp_output = output_path.with_name(
+                        f"{output_path.stem}.part{output_path.suffix}"
                     )
-                    # "NoAudioReceived" and similar errors from Microsoft's
-                    # backend are frequently transient (rate limiting /
-                    # dropped websocket) rather than a real parameter
-                    # problem, so retry with backoff before giving up.
+                    temp_output.unlink(missing_ok=True)
+
+                    cmd = [
+                        "edge-tts",
+                        "--voice", effective_voice,
+                        "--write-media", str(temp_output),
+                        "--text", cleaned_text,
+                    ]
+                    if rate:
+                        cmd.append(f"--rate={rate}")
+                    if pitch:
+                        cmd.append(f"--pitch={pitch}")
+
+                    self.logger.debug("Running command: %s", " ".join(cmd))
+
+                    try:
+                        result = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=120,
+                        )
+
+                        if result.returncode != 0:
+                            last_error = (
+                                (result.stderr or result.stdout or "unknown error").strip()
+                            )
+                            raise RuntimeError(last_error)
+
+                        duration = _validate_audio_file(temp_output, self.logger)
+                        output_size = temp_output.stat().st_size
+
+                        temp_output.replace(output_path)
+                        self.logger.info(
+                            "EdgeTTS synthesis complete: %s (%d bytes, %.3fs)",
+                            output_path,
+                            output_size,
+                            duration,
+                        )
+                        return output_path
+
+                    except subprocess.TimeoutExpired:
+                        last_error = "edge-tts synthesis timed out after 120 seconds"
+                    except FileNotFoundError as exc:
+                        self.logger.error("edge-tts not found: %s", exc)
+                        raise RuntimeError(
+                            "edge-tts CLI not installed or not in PATH"
+                        ) from exc
+                    except RuntimeError as exc:
+                        last_error = str(exc)
+                    except Exception as exc:
+                        last_error = f"unexpected edge-tts error: {exc}"
+                        self.logger.exception("%s", last_error)
+
+                    temp_output.unlink(missing_ok=True)
+                    output_path.unlink(missing_ok=True)
+
                     if attempt < self.max_retries:
-                        time.sleep(self.retry_backoff_seconds * attempt)
-                        continue
-                    raise RuntimeError(f"edge-tts synthesis failed: {last_error}")
+                        delay = (
+                                self.retry_backoff_seconds * (2 ** (attempt - 1))
+                                + random.uniform(0.0, 1.0)
+                        )
+                        self.logger.warning(
+                            "edge-tts failed (voice=%s, attempt %d/%d): %s; "
+                            "retrying in %.1fs",
+                            effective_voice,
+                            attempt,
+                            self.max_retries,
+                            last_error,
+                            delay,
+                        )
+                        time.sleep(delay)
+                    else:
+                        self.logger.error(
+                            "edge-tts exhausted retries for voice=%s: %s",
+                            effective_voice,
+                            last_error,
+                        )
 
-                if not output_path.exists():
-                    last_error = "edge-tts completed but output file missing"
-                    self.logger.warning("%s (attempt %d/%d): %s", last_error, attempt, self.max_retries, output_path)
-                    if attempt < self.max_retries:
-                        time.sleep(self.retry_backoff_seconds * attempt)
-                        continue
-                    raise RuntimeError(f"edge-tts did not produce output file: {output_path}")
+                if len(voices) > 1 and effective_voice != voices[-1]:
+                    self.logger.warning(
+                        "Falling back from voice=%s to voice=%s",
+                        effective_voice,
+                        voices[-1],
+                    )
 
-                self.logger.info("EdgeTTS synthesis complete: %s", output_path)
-                return output_path
-
-            except subprocess.TimeoutExpired:
-                last_error = "edge-tts synthesis timed out"
-                self.logger.warning("%s (attempt %d/%d)", last_error, attempt, self.max_retries)
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_backoff_seconds * attempt)
-                    continue
-                raise RuntimeError(last_error)
-            except FileNotFoundError as exc:
-                self.logger.error("edge-tts not found: %s", exc)
-                raise RuntimeError("edge-tts CLI not installed or not in PATH") from exc
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                self.logger.exception("Unexpected error during edge-tts synthesis: %s", exc)
-                raise RuntimeError(f"TTS synthesis failed: {exc}") from exc
-
-        # Should be unreachable, but keep a defensive final error.
-        raise RuntimeError(f"edge-tts synthesis failed after {self.max_retries} attempts: {last_error}")
+        raise RuntimeError(
+            f"edge-tts synthesis failed after trying {len(voices)} voice(s): "
+            f"{last_error}"
+        )
 
 
 class TTSFactory:
@@ -260,7 +383,7 @@ class TTSFactory:
             return NoOpTTS(config=cfg, logger=logger)
         if provider == "edge":
             return EdgeTTS(config=cfg, logger=logger)
-        
+
         # Azure TTS
         if provider == "azure":
             try:
@@ -270,10 +393,10 @@ class TTSFactory:
                     "Azure provider requested but azure-cognitiveservices-speech is not available. "
                     "Install azure-cognitiveservices-speech or choose another provider."
                 ) from exc
-            
+
             if not cfg.api_key:
                 raise ValueError("Azure provider requires api_key in TTSConfig")
-            
+
             class _AzureTTS:
                 def __init__(self, cfg: TTSConfig, logger: logging.Logger) -> None:
                     self.cfg = cfg
@@ -286,27 +409,27 @@ class TTSFactory:
                     self.speech_config.set_speech_synthesis_output_format(
                         speechsdk.SpeechSynthesisOutputFormat.Audio16Khz128KBitRateMonoMp3
                     )
-                
+
                 def synthesize(self, text: str, output_path: Path) -> Path:
                     output_path = output_path.resolve()
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    
+
                     synthesizer = speechsdk.SpeechSynthesizer(
                         speech_config=self.speech_config,
                         audio_config=speechsdk.audio.AudioOutputConfig(str(output_path))
                     )
-                    
+
                     self.logger.info("Azure TTS synthesizing to %s", output_path)
                     result = synthesizer.speak_text_async(text).get()
-                    
+
                     if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                         self.logger.info("Azure TTS synthesis complete: %s", output_path)
                         return output_path
                     else:
                         raise RuntimeError(f"Azure TTS failed: {result.reason}")
-            
+
             return _AzureTTS(cfg, logger)
-        
+
         # Google TTS
         if provider == "google":
             try:
@@ -316,23 +439,23 @@ class TTSFactory:
                     "Google provider requested but gTTS is not available. "
                     "Install gTTS or choose another provider."
                 ) from exc
-            
+
             class _GoogleTTS:
                 def __init__(self, cfg: TTSConfig, logger: logging.Logger) -> None:
                     self.cfg = cfg
                     self.logger = logger
-                
+
                 def synthesize(self, text: str, output_path: Path) -> Path:
                     output_path = output_path.resolve()
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    
+
                     self.logger.info("Google TTS synthesizing to %s", output_path)
                     tts = gTTS(text=text, lang=self.cfg.voice[:2] if self.cfg.voice else "en")
                     tts.save(str(output_path))
-                    
+
                     self.logger.info("Google TTS synthesis complete: %s", output_path)
                     return output_path
-            
+
             return _GoogleTTS(cfg, logger)
 
         raise ValueError(f"Unknown TTS provider: {cfg.provider!r}")
