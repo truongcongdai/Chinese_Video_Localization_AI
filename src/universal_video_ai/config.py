@@ -51,3 +51,38 @@ for directory in (
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 cache = RedisCache(url=REDIS_URL, fallback=True)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+YOUTUBE_RESEARCH_ENABLED = _env_bool("YOUTUBE_RESEARCH_ENABLED", False)
+YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS = _env_int(
+    "YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS", 1, minimum=1,
+)
+YOUTUBE_RESEARCH_MAX_RESULTS = _env_int("YOUTUBE_RESEARCH_MAX_RESULTS", 50, minimum=1)
+YOUTUBE_RESEARCH_MAX_COMMENTS = _env_int("YOUTUBE_RESEARCH_MAX_COMMENTS", 100, minimum=0)
+YOUTUBE_RESEARCH_HTTP_TIMEOUT = _env_int("YOUTUBE_RESEARCH_HTTP_TIMEOUT", 20, minimum=1)
+YOUTUBE_RESEARCH_CACHE_TTL = _env_int("YOUTUBE_RESEARCH_CACHE_TTL", 21600, minimum=0)
+YOUTUBE_RESEARCH_ENABLE_AI = _env_bool("YOUTUBE_RESEARCH_ENABLE_AI", False)
+YOUTUBE_RESEARCH_ENABLE_LOCAL_EMBEDDINGS = _env_bool(
+    "YOUTUBE_RESEARCH_ENABLE_LOCAL_EMBEDDINGS", False,
+)
+YOUTUBE_RESEARCH_ENABLE_OCR = _env_bool("YOUTUBE_RESEARCH_ENABLE_OCR", False)
+YOUTUBE_RESEARCH_ENABLE_THUMBNAIL_FACE_DETECTION = _env_bool(
+    "YOUTUBE_RESEARCH_ENABLE_THUMBNAIL_FACE_DETECTION", False,
+)

@@ -1,12 +1,21 @@
 from universal_video_ai.web.app import (
+    AffiliateReviewBody,
     CreatorSuggestionBody,
+    _affiliate_product_ad_creative,
     _creator_ai_prompt,
+    _harden_creator_image_prompt,
     _creator_keywords_from_topic,
     _creator_narration_from_topic,
     _creator_narration_text_from_topic,
+    _creator_seo_keywords_from_topic,
     _creator_scene_brief_from_topic,
     _creator_script_text_from_topic,
+    _creator_stock_queries,
     _enforce_creator_entity_consistency,
+    _postprocess_creator_suggestion_quality,
+    _product_media_animation_for_scene,
+    _scene_requires_model_context,
+    _scene_prefers_product_media,
     _split_creator_script,
     _validate_creator_suggestion_timing,
 )
@@ -75,6 +84,130 @@ def test_keywords_do_not_change_with_duration():
     assert _creator_keywords_from_topic(TOPIC, "vi", 30) == _creator_keywords_from_topic(
         TOPIC, "vi", 60,
     )
+
+
+def test_seo_keywords_add_search_intent_without_losing_subject():
+    keywords = _creator_seo_keywords_from_topic("python automation for creators", "vi", 30)
+
+    joined = " | ".join(keywords).lower()
+    assert keywords[0] == "python automation for creators"
+    assert "cho nguoi moi" in joined
+    assert "sai lam" in joined
+    assert "review" in joined
+
+
+def test_creator_quality_postprocess_replaces_weak_hook_and_visuals():
+    result = {
+        "keywords": ["python automation"],
+        "visual_brief": "intro\nb-roll\nscene",
+        "script": "intro\nb-roll\nscene",
+        "narration_script": "Trong video nay, chung ta se tim hieu python automation.\nNo giup creator tiet kiem thoi gian.",
+    }
+
+    upgraded = _postprocess_creator_suggestion_quality(
+        result, "python automation for creators", "vi", 30,
+    )
+
+    assert upgraded["narration_script"].splitlines()[0].startswith("Nếu bạn")
+    assert len(upgraded["narration_script"].split()) >= round(30 * 2.35 * 0.92)
+    assert len(upgraded["visual_brief"].splitlines()) == 6
+    assert "python automation for creators" in upgraded["visual_brief"].lower()
+    assert upgraded["quality_notes"]
+
+
+def test_creator_ai_prompt_requires_retention_hook_and_seo_intent():
+    body = CreatorSuggestionBody(
+        topic="python automation for creators",
+        target_language="vi",
+        aspect_ratio="9:16",
+        duration_seconds=30,
+        transition="fade",
+    )
+
+    prompt, _ = _creator_ai_prompt(body)
+
+    assert "RETENTION + SEO QUALITY BAR" in prompt
+    assert "first narration line must be a sharp viewer-facing hook" in prompt
+    assert "full Vietnamese diacritics" in prompt
+    assert "mistakes/pain points" in prompt
+
+
+def test_affiliate_review_has_purchase_hook_and_proof_broll():
+    body = AffiliateReviewBody(
+        product_name="may hut bui mini cam tay",
+        real_experience="toi da dung tren ban lam viec va thay hut bui nho kha nhanh",
+        audience="nguoi lam viec trong phong nho",
+        model_prompt="nu creator trong phong lam viec nho dang don ban",
+        duration_seconds=30,
+        platform="tiktok_shop",
+    )
+
+    result = _affiliate_product_ad_creative(body)
+
+    assert result["generator"] == "product_ad_template"
+    assert result["narration_script"].splitlines()[0].startswith("Nếu bạn đang định mua")
+    assert "có đáng mua không" in result["title"].lower()
+    assert "HERO PRODUCT MEDIA" in result["broll_plan"]
+    assert "MODEL USE SCENE" in result["broll_plan"]
+    assert "nu creator trong phong lam viec nho" in result["broll_plan"]
+    assert "hoa hồng" not in result["narration_script"].lower()
+    assert "codangmuakhong" in result["hashtags"]
+
+
+def test_affiliate_product_ad_supports_demo_proof_format():
+    body = AffiliateReviewBody(
+        product_name="den livestream mini",
+        real_experience="toi da test khi quay ban dem va anh sang mat sang hon nhung khong bi choi",
+        audience="creator quay video tai nha",
+        duration_seconds=60,
+        platform="shorts",
+        creative_format="demo_proof",
+    )
+
+    result = _affiliate_product_ad_creative(body)
+
+    assert result["creative_format"] == "demo_proof"
+    assert "demo thật" in result["title"].lower()
+    assert len(result["broll_plan"].splitlines()) == 10
+    assert "Product media should be uploaded" in " ".join(result["quality_notes"])
+
+
+def test_product_media_is_used_only_for_product_ad_beats():
+    assert _scene_prefers_product_media(
+        "9-13s | PRODUCT REVEAL: cận cảnh sản phẩm thật, bao bì, kích thước",
+    )
+    assert not _scene_prefers_product_media(
+        "13-17s | MODEL USE SCENE + DEMO PROOF: người mẫu dùng sản phẩm",
+    )
+    assert _scene_requires_model_context(
+        "13-17s | MODEL USE SCENE + DEMO PROOF: người mẫu dùng sản phẩm",
+    )
+    assert not _scene_prefers_product_media(
+        "4-9s | PROBLEM SHOT: người thuộc nhóm creator gặp đúng vấn đề trước khi dùng sản phẩm",
+    )
+    assert _product_media_animation_for_scene("PRODUCT REVEAL", 0) == "zoomin"
+
+
+def test_product_ad_stock_queries_are_action_specific():
+    queries = _creator_stock_queries(
+        "Product ad: handheld vacuum",
+        "13-17s | MODEL USE SCENE + DEMO PROOF: female creator uses handheld vacuum on a desk",
+        "The strongest reason to consider it is cleaning crumbs from a desk",
+    )
+
+    joined = " | ".join(queries)
+    assert "handheld vacuum" in joined or "cleaning desk crumbs keyboard" in joined
+    assert "creator product review" not in queries[0]
+
+
+def test_image_prompt_hardening_preserves_scene_and_blocks_anatomy_errors():
+    prompt = _harden_creator_image_prompt(
+        "A creator opens a Python automation dashboard and compares the output with their content calendar",
+    )
+
+    assert "Python automation dashboard" in prompt
+    assert "anatomically correct body proportions" in prompt
+    assert "avoid close-up fingers" in prompt
 
 
 def test_ai_suggestion_must_match_selected_duration():

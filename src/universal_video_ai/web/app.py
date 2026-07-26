@@ -1,4 +1,4 @@
-# src/universal_video_ai/web/app.py
+﻿# src/universal_video_ai/web/app.py
 """
 Web UI/API replacing the Telegram bot as the primary way to use this
 localization pipeline: paste a link, pick a language, watch progress,
@@ -50,13 +50,16 @@ from universal_video_ai.render.animated_subtitles import SubtitleEffect, Subtitl
 from universal_video_ai.render import ocr_language_map
 from universal_video_ai.render.quality_check import analyze_output_quality
 from universal_video_ai.render.prepublish import inspect_for_publish, prepublish_report_to_dict
+from universal_video_ai.render.video_review import review_finished_video, video_review_report_to_dict
+from universal_video_ai.render.voice_director import direct_voice_cue
+from universal_video_ai.render.visual_director import direct_visual_scene
 from universal_video_ai.tts.tts import DEFAULT_VOICES_BY_LANGUAGE
 from universal_video_ai.tts.tts import voice_for_language
 from universal_video_ai.tts.voices import voices_for_language
 from universal_video_ai.tts.backend import EdgeTTSBackend
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
-from universal_video_ai.config import TEMP_DIR
+from universal_video_ai.config import REDIS_URL, TEMP_DIR
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
 
@@ -71,6 +74,16 @@ from . import identity_oauth
 logger = logging.getLogger("universal_video_ai.web")
 
 app = FastAPI(title="Video Localization AI")
+
+def _redact_redis_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.password:
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        user = parsed.username or ""
+        netloc = f"{user}:***@{host}{port}" if user else f"***@{host}{port}"
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    return url
 
 _CREATOR_AI_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
 _CREATOR_AI_LOCK = threading.Lock()
@@ -118,7 +131,7 @@ _OUTPUT_BASE_DIR = TEMP_DIR / "output"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Credits consumed per submitted job. Purely a usage-limiting knob (there's
-# no billing/payment wired up) — an admin tops up a user's balance from the
+# no billing/payment wired up) â€” an admin tops up a user's balance from the
 # admin dashboard. Set to 0 to disable the whole credits gate.
 JOB_COST_CREDITS = int(os.environ.get("JOB_COST_CREDITS", "1"))
 WEB_RENDER_PRESET = os.environ.get("WEB_RENDER_PRESET", "fast")
@@ -169,11 +182,11 @@ _PRODUCT_MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # whatever TTS actually has a voice for (DEFAULT_VOICES_BY_LANGUAGE) so the
 # list never silently drifts out of sync with what actually works.
 LANGUAGE_LABELS = {
-    "vi": "Tiếng Việt", "en": "Tiếng Anh", "zh": "Tiếng Trung (giản thể)",
-    "zh-tw": "Tiếng Trung (phồn thể)", "ja": "Tiếng Nhật", "ko": "Tiếng Hàn",
-    "fr": "Tiếng Pháp", "de": "Tiếng Đức", "es": "Tiếng Tây Ban Nha",
-    "pt": "Tiếng Bồ Đào Nha", "ru": "Tiếng Nga", "th": "Tiếng Thái",
-    "id": "Tiếng Indonesia", "ar": "Tiếng Ả Rập", "hi": "Tiếng Hindi",
+    "vi": "Tiáº¿ng Viá»‡t", "en": "Tiáº¿ng Anh", "zh": "Tiáº¿ng Trung (giáº£n thá»ƒ)",
+    "zh-tw": "Tiáº¿ng Trung (phá»“n thá»ƒ)", "ja": "Tiáº¿ng Nháº­t", "ko": "Tiáº¿ng HÃ n",
+    "fr": "Tiáº¿ng PhÃ¡p", "de": "Tiáº¿ng Äá»©c", "es": "Tiáº¿ng TÃ¢y Ban Nha",
+    "pt": "Tiáº¿ng Bá»“ ÄÃ o Nha", "ru": "Tiáº¿ng Nga", "th": "Tiáº¿ng ThÃ¡i",
+    "id": "Tiáº¿ng Indonesia", "ar": "Tiáº¿ng áº¢ Ráº­p", "hi": "Tiáº¿ng Hindi",
 }
 
 # In-memory guard against double-submitting the same job id concurrently;
@@ -185,14 +198,14 @@ _running_tasks: dict[str, asyncio.Task] = {}
 def require_admin_user_id(user_id: int = Depends(get_current_user_id)) -> int:
     user = store.get_user_by_id(user_id)
     if not user or not user["is_admin"]:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Yêu cầu quyền admin")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "YÃªu cáº§u quyá»n admin")
     return user_id
 
 
 # ---------------------------------------------------------------- schemas --
 
 class LoginBody(BaseModel):
-    identifier: str  # username, email, or phone number — whichever the account was created with
+    identifier: str  # username, email, or phone number â€” whichever the account was created with
     password: str
 
 
@@ -215,7 +228,7 @@ class NewJobBody(BaseModel):
     logo_corner: str = "bottom_right"  # top_left | top_right | bottom_left | bottom_right
     logo_size_px: int = 120
     # Explicit Edge-TTS voice id from GET /api/voices, e.g.
-    # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
+    # "vi-VN-NamMinhNeural" â€” None uses the target language's default voice.
     tts_voice: Optional[str] = None
     # When True, the job stops right after translation (status="review")
     # instead of rendering straight through, so the person can edit the
@@ -261,9 +274,11 @@ class AffiliateReviewBody(BaseModel):
     cons: str = ""
     audience: str = ""
     real_experience: str
+    model_prompt: str = ""
     target_language: str = "vi"
     duration_seconds: int = 30
     platform: str = "tiktok_shop"  # tiktok_shop | reels | shorts
+    creative_format: str = "ugc_problem_solution"  # ugc_problem_solution | demo_proof | before_after
     provider: str = "auto"
 
 
@@ -391,7 +406,7 @@ _PHONE_RE = re.compile(r"^\+?\d[\d\s.-]{7,14}\d$")
 
 def _classify_identifier(identifier: str) -> tuple[str, str]:
     """Return (kind, normalized_value) where kind is 'email', 'phone', or
-    'username' — lets one input box on the login/register form accept any
+    'username' â€” lets one input box on the login/register form accept any
     of the three, and tells the register endpoint which DB column to use."""
     value = identifier.strip()
     if _EMAIL_RE.match(value):
@@ -433,7 +448,7 @@ def register(body: RegisterBody):
     """
     Self-service registration via email or phone number + password.
 
-    The very FIRST account ever created on this server (by any method —
+    The very FIRST account ever created on this server (by any method â€”
     this form, or a "Sign in with ..." button) becomes the admin. After
     that, further self-registration is allowed by default (see
     OPEN_REGISTRATION) so multiple people can sign up on their own;
@@ -444,24 +459,24 @@ def register(body: RegisterBody):
     if not is_first_user and not OPEN_REGISTRATION:
         raise HTTPException(
             403,
-            "Đăng ký đang bị khoá bởi quản trị viên. Liên hệ admin để được cấp tài khoản.",
+            "ÄÄƒng kÃ½ Ä‘ang bá»‹ khoÃ¡ bá»Ÿi quáº£n trá»‹ viÃªn. LiÃªn há»‡ admin Ä‘á»ƒ Ä‘Æ°á»£c cáº¥p tÃ i khoáº£n.",
         )
     if len(body.password) < 8:
-        raise HTTPException(400, "Mật khẩu cần tối thiểu 8 ký tự")
+        raise HTTPException(400, "Máº­t kháº©u cáº§n tá»‘i thiá»ƒu 8 kÃ½ tá»±")
 
     username = body.username.strip()
     if len(username) < 3:
-        raise HTTPException(400, "Tên đăng nhập cần tối thiểu 3 ký tự")
+        raise HTTPException(400, "TÃªn Ä‘Äƒng nháº­p cáº§n tá»‘i thiá»ƒu 3 kÃ½ tá»±")
     if _classify_identifier(username)[0] != "username":
-        raise HTTPException(400, "Tên đăng nhập không được là email hoặc số điện thoại")
+        raise HTTPException(400, "TÃªn Ä‘Äƒng nháº­p khÃ´ng Ä‘Æ°á»£c lÃ  email hoáº·c sá»‘ Ä‘iá»‡n thoáº¡i")
     if store.get_user_by_identifier(username):
-        raise HTTPException(409, "Tên đăng nhập này đã được sử dụng")
+        raise HTTPException(409, "TÃªn Ä‘Äƒng nháº­p nÃ y Ä‘Ã£ Ä‘Æ°á»£c sá»­ dá»¥ng")
 
     kind, value = _classify_identifier(body.contact_identifier)
     if kind not in ("email", "phone"):
-        raise HTTPException(400, "Vui lòng nhập đúng email hoặc số điện thoại")
+        raise HTTPException(400, "Vui lÃ²ng nháº­p Ä‘Ãºng email hoáº·c sá»‘ Ä‘iá»‡n thoáº¡i")
     if store.get_user_by_identifier(value):
-        raise HTTPException(409, "Email/số điện thoại này đã được đăng ký")
+        raise HTTPException(409, "Email/sá»‘ Ä‘iá»‡n thoáº¡i nÃ y Ä‘Ã£ Ä‘Æ°á»£c Ä‘Äƒng kÃ½")
     email = value if kind == "email" else None
     phone = value if kind == "phone" else None
 
@@ -469,7 +484,7 @@ def register(body: RegisterBody):
     if body.referral_code and body.referral_code.strip():
         referrer = store.get_user_by_referral_code(body.referral_code.strip())
         if referrer is None:
-            raise HTTPException(400, "Mã giới thiệu không hợp lệ")
+            raise HTTPException(400, "MÃ£ giá»›i thiá»‡u khÃ´ng há»£p lá»‡")
 
     user_id = store.create_user(
         username, hash_password(body.password),
@@ -478,7 +493,7 @@ def register(body: RegisterBody):
         referred_by_user_id=referrer["id"] if referrer else None,
     )
     if referrer is not None:
-        # Both sides get a bonus — the invitee starts with extra credit
+        # Both sides get a bonus â€” the invitee starts with extra credit
         # instead of the usual 10, and the person who invited them gets
         # rewarded too, same moment their friend actually signs up (not
         # requiring the friend to do anything further first).
@@ -507,7 +522,7 @@ def login(body: LoginBody):
     _kind, identifier = _classify_identifier(body.identifier)
     user = store.get_user_by_identifier(identifier)
     if not user or not user["password_hash"] or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(401, "Sai thông tin đăng nhập hoặc mật khẩu")
+        raise HTTPException(401, "Sai thÃ´ng tin Ä‘Äƒng nháº­p hoáº·c máº­t kháº©u")
     return _login_response(user["id"])
 
 
@@ -532,7 +547,7 @@ def me(user_id: int = Depends(get_current_user_id)):
 
 @app.get("/api/stats/me")
 def stats_me(user_id: int = Depends(get_current_user_id)):
-    """Personal usage stats for the logged-in user — powers the small
+    """Personal usage stats for the logged-in user â€” powers the small
     stats widget above their own history (not the admin-only site-wide
     stats at /api/admin/stats)."""
     return store.user_stats(user_id)
@@ -541,7 +556,7 @@ def stats_me(user_id: int = Depends(get_current_user_id)):
 @app.post("/api/top-up-requests")
 def create_top_up_request(body: TopUpRequestBody, user_id: int = Depends(get_current_user_id)):
     if TOP_UP_PACKAGES.get(body.credits) != body.amount_vnd:
-        raise HTTPException(400, "Gói nạp không hợp lệ")
+        raise HTTPException(400, "GÃ³i náº¡p khÃ´ng há»£p lá»‡")
     request_id = store.create_top_up_request(
         user_id,
         body.credits,
@@ -588,7 +603,7 @@ def identity_login(provider: str, request: Request):
     try:
         client = identity_oauth.get_identity_oauth_client(provider)
     except ValueError:
-        raise HTTPException(404, "Nhà cung cấp đăng nhập không được hỗ trợ")
+        raise HTTPException(404, "NhÃ  cung cáº¥p Ä‘Äƒng nháº­p khÃ´ng Ä‘Æ°á»£c há»— trá»£")
     if not client.is_configured():
         raise HTTPException(400, client.not_configured_message())
 
@@ -603,7 +618,7 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
     """
     Browser lands here after approving (or denying) sign-in on the
     provider's own consent screen. Finds-or-creates the local account and
-    sets the session cookie, then redirects back to the app's home page —
+    sets the session cookie, then redirects back to the app's home page â€”
     unlike `/api/social/callback/...` (which closes a popup window), this
     IS the main tab, since signing in is the primary action, not a
     secondary "connect while already using the app" one.
@@ -625,7 +640,7 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
     user = store.get_user_by_oauth(provider, result.provider_user_id)
     if user is None and result.email:
         # Someone who already has a password account with this email signs
-        # in with Google/etc. for the first time — link it to the same
+        # in with Google/etc. for the first time â€” link it to the same
         # account rather than creating a confusing duplicate.
         user = store.get_user_by_email(result.email)
     if user is None:
@@ -649,7 +664,7 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
 
 def _build_service_for_job(job):
     """Shared service-construction logic for both the normal (straight-
-    through) job path and the resume-after-review render path — both need
+    through) job path and the resume-after-review render path â€” both need
     the exact same source/OCR-language and logo/voice settings."""
     # source_language "auto" -> both transcription_language=None (Whisper
     # auto-detects the spoken language) and ocr_languages left at the
@@ -753,7 +768,7 @@ async def _run_job(job_id: str) -> None:
     if job is None:
         return
     try:
-        store.update_job(job_id, status="running", progress_note="Đang tải video...")
+        store.update_job(job_id, status="running", progress_note="Äang táº£i video...")
         service = _build_service_for_job(job)
         job_output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
 
@@ -761,7 +776,7 @@ async def _run_job(job_id: str) -> None:
             # Stop after translation and wait for the person to review/edit
             # the translated sentences via PUT .../segments, then
             # POST .../render (-> _run_render_from_review) to continue.
-            store.update_job(job_id, progress_note="Đang dịch phụ đề để bạn xem trước...")
+            store.update_job(job_id, progress_note="Äang dá»‹ch phá»¥ Ä‘á» Ä‘á»ƒ báº¡n xem trÆ°á»›c...")
             prepared = await service.prepare_for_review(
                 job.source_url, job_output_dir, target_language=job.target_language
             )
@@ -776,11 +791,11 @@ async def _run_job(job_id: str) -> None:
             store.set_job_review_state(job_id, prepared_localization_to_dict(prepared))
             store.update_job(
                 job_id, status="review",
-                progress_note="Đã dịch xong — chỉnh sửa phụ đề rồi bấm Render",
+                progress_note="ÄÃ£ dá»‹ch xong â€” chá»‰nh sá»­a phá»¥ Ä‘á» rá»“i báº¥m Render",
             )
             return
 
-        store.update_job(job_id, progress_note="Đang xử lý (dịch, lồng tiếng, render)...")
+        store.update_job(job_id, progress_note="Äang xá»­ lÃ½ (dá»‹ch, lá»“ng tiáº¿ng, render)...")
         result = await service.localize(job.source_url, job_output_dir, target_language=job.target_language)
         _finish_job_from_result(job_id, job, result)
     except Exception as exc:
@@ -795,11 +810,11 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
     if result.final_video_path and Path(result.final_video_path).exists():
         title = (result.translated_text or job.source_url)[:80]
         store.update_job(
-            job_id, status="done", progress_note="Hoàn tất",
+            job_id, status="done", progress_note="HoÃ n táº¥t",
             final_video_path=str(result.final_video_path), title=title,
         )
         # Best-effort automated sanity check (quiet audio, wrong duration).
-        # Never fails the job over this — it's an informational warning
+        # Never fails the job over this â€” it's an informational warning
         # badge in the UI, not a hard gate on publishing.
         try:
             source_duration = None
@@ -811,20 +826,20 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         except Exception:
             logger.exception("Quality check failed for job %s (non-fatal)", job_id)
     else:
-        store.update_job(job_id, status="error", error="Không tạo được video đầu ra (final_video_path rỗng)")
+        store.update_job(job_id, status="error", error="KhÃ´ng táº¡o Ä‘Æ°á»£c video Ä‘áº§u ra (final_video_path rá»—ng)")
         _refund_job_credits(job)
 
 
 async def _run_render_from_review(job_id: str) -> None:
     """Resume a job sitting at status='review': re-hydrate what
     prepare_for_review() produced, and render using whatever's currently in
-    segments_json (the person's edits, if they made any — otherwise still
+    segments_json (the person's edits, if they made any â€” otherwise still
     the original machine translation, unedited)."""
     job = store.get_job(job_id)
     if job is None:
         return
     try:
-        store.update_job(job_id, status="running", progress_note="Đang lồng tiếng và render...")
+        store.update_job(job_id, status="running", progress_note="Äang lá»“ng tiáº¿ng vÃ  render...")
         service = _build_service_for_job(job)
 
         review_state = json.loads(job.review_state_json)
@@ -846,7 +861,7 @@ async def _run_render_from_review(job_id: str) -> None:
 
 
 def _refund_job_credits(job) -> None:
-    """A job that errors out shouldn't cost the user credit — refund it."""
+    """A job that errors out shouldn't cost the user credit â€” refund it."""
     if JOB_COST_CREDITS > 0:
         try:
             store.adjust_credits(job.user_id, JOB_COST_CREDITS)
@@ -860,16 +875,16 @@ def _creator_scene_brief_from_topic(topic: str, language: str) -> List[str]:
     if entity_kind == "animal":
         if language == "vi":
             return [
-                f"Toàn cảnh {subject} trong môi trường sống tự nhiên",
-                f"Cận cảnh khuôn mặt và đặc điểm cơ thể của {subject}",
-                f"{subject.capitalize()} di chuyển trong tự nhiên",
-                f"{subject.capitalize()} tìm kiếm thức ăn",
-                f"Cận cảnh tập tính tự nhiên nổi bật của {subject}",
-                f"{subject.capitalize()} phản ứng với một mối đe dọa trong tự nhiên",
-                f"{subject.capitalize()} tương tác với môi trường sống xung quanh",
-                f"Góc rộng theo chân {subject} trong môi trường hoang dã",
-                f"Cận cảnh một đặc điểm ít người biết của {subject}",
-                f"Cảnh kết thúc với {subject} rời đi trong tự nhiên",
+                f"ToÃ n cáº£nh {subject} trong mÃ´i trÆ°á»ng sá»‘ng tá»± nhiÃªn",
+                f"Cáº­n cáº£nh khuÃ´n máº·t vÃ  Ä‘áº·c Ä‘iá»ƒm cÆ¡ thá»ƒ cá»§a {subject}",
+                f"{subject.capitalize()} di chuyá»ƒn trong tá»± nhiÃªn",
+                f"{subject.capitalize()} tÃ¬m kiáº¿m thá»©c Äƒn",
+                f"Cáº­n cáº£nh táº­p tÃ­nh tá»± nhiÃªn ná»•i báº­t cá»§a {subject}",
+                f"{subject.capitalize()} pháº£n á»©ng vá»›i má»™t má»‘i Ä‘e dá»a trong tá»± nhiÃªn",
+                f"{subject.capitalize()} tÆ°Æ¡ng tÃ¡c vá»›i mÃ´i trÆ°á»ng sá»‘ng xung quanh",
+                f"GÃ³c rá»™ng theo chÃ¢n {subject} trong mÃ´i trÆ°á»ng hoang dÃ£",
+                f"Cáº­n cáº£nh má»™t Ä‘áº·c Ä‘iá»ƒm Ã­t ngÆ°á»i biáº¿t cá»§a {subject}",
+                f"Cáº£nh káº¿t thÃºc vá»›i {subject} rá»i Ä‘i trong tá»± nhiÃªn",
             ]
         return [
             f"Wide shot of {subject} in its natural habitat",
@@ -887,25 +902,25 @@ def _creator_scene_brief_from_topic(topic: str, language: str) -> List[str]:
     if profile["category"] == "beauty":
         if language == "vi":
             return [
-                f"Chân dung người phụ nữ với làn da tự nhiên, ánh sáng mềm, chủ đề {topic}",
-                "Cận cảnh quy trình chăm sóc da, thoa serum lên khuôn mặt sạch",
-                "Các sản phẩm mỹ phẩm và skincare được sắp xếp đẹp trên bàn trang điểm",
-                "Chuyên viên trang điểm đang sử dụng cọ và mỹ phẩm cho khách hàng",
-                "Người phụ nữ rửa mặt và thực hiện routine dưỡng da buổi sáng",
-                "Cận cảnh làn da khỏe, lớp makeup tự nhiên và nụ cười tự tin",
-                "Không gian spa hoặc beauty salon sạch sẽ, thư giãn và sang trọng",
-                "Cận cảnh son môi, phấn nền, mascara và dụng cụ trang điểm",
-                "Người dùng soi gương sau khi hoàn thành quy trình làm đẹp",
-                "Kết quả trước và sau khi chăm sóc da, phong thái tự tin, rạng rỡ",
+                f"ChÃ¢n dung ngÆ°á»i phá»¥ ná»¯ vá»›i lÃ n da tá»± nhiÃªn, Ã¡nh sÃ¡ng má»m, chá»§ Ä‘á» {topic}",
+                "Cáº­n cáº£nh quy trÃ¬nh chÄƒm sÃ³c da, thoa serum lÃªn khuÃ´n máº·t sáº¡ch",
+                "CÃ¡c sáº£n pháº©m má»¹ pháº©m vÃ  skincare Ä‘Æ°á»£c sáº¯p xáº¿p Ä‘áº¹p trÃªn bÃ n trang Ä‘iá»ƒm",
+                "ChuyÃªn viÃªn trang Ä‘iá»ƒm Ä‘ang sá»­ dá»¥ng cá» vÃ  má»¹ pháº©m cho khÃ¡ch hÃ ng",
+                "NgÆ°á»i phá»¥ ná»¯ rá»­a máº·t vÃ  thá»±c hiá»‡n routine dÆ°á»¡ng da buá»•i sÃ¡ng",
+                "Cáº­n cáº£nh lÃ n da khá»e, lá»›p makeup tá»± nhiÃªn vÃ  ná»¥ cÆ°á»i tá»± tin",
+                "KhÃ´ng gian spa hoáº·c beauty salon sáº¡ch sáº½, thÆ° giÃ£n vÃ  sang trá»ng",
+                "Cáº­n cáº£nh son mÃ´i, pháº¥n ná»n, mascara vÃ  dá»¥ng cá»¥ trang Ä‘iá»ƒm",
+                "NgÆ°á»i dÃ¹ng soi gÆ°Æ¡ng sau khi hoÃ n thÃ nh quy trÃ¬nh lÃ m Ä‘áº¹p",
+                "Káº¿t quáº£ trÆ°á»›c vÃ  sau khi chÄƒm sÃ³c da, phong thÃ¡i tá»± tin, ráº¡ng rá»¡",
             ]
         return [f"Natural beauty portrait in soft light, topic {topic}", *profile["queries"][1:]]
     if language == "vi":
         return [
-            f"Toàn cảnh giới thiệu trực quan về {topic}", f"Cận cảnh chi tiết quan trọng nhất của {topic}",
-            f"Một người đang trực tiếp trải nghiệm hoặc thực hiện {topic}", f"Các công cụ và vật dụng liên quan đến {topic}",
-            f"Quy trình thực hiện {topic} theo từng bước", f"Góc quay cận cảnh thể hiện chất liệu và chi tiết của {topic}",
-            f"Bối cảnh đời thực nơi {topic} thường diễn ra", f"Kết quả trước và sau khi áp dụng {topic}",
-            f"Người dùng hài lòng với kết quả của {topic}", f"Cảnh kết thúc đẹp và tích cực liên quan trực tiếp đến {topic}",
+            f"ToÃ n cáº£nh giá»›i thiá»‡u trá»±c quan vá» {topic}", f"Cáº­n cáº£nh chi tiáº¿t quan trá»ng nháº¥t cá»§a {topic}",
+            f"Má»™t ngÆ°á»i Ä‘ang trá»±c tiáº¿p tráº£i nghiá»‡m hoáº·c thá»±c hiá»‡n {topic}", f"CÃ¡c cÃ´ng cá»¥ vÃ  váº­t dá»¥ng liÃªn quan Ä‘áº¿n {topic}",
+            f"Quy trÃ¬nh thá»±c hiá»‡n {topic} theo tá»«ng bÆ°á»›c", f"GÃ³c quay cáº­n cáº£nh thá»ƒ hiá»‡n cháº¥t liá»‡u vÃ  chi tiáº¿t cá»§a {topic}",
+            f"Bá»‘i cáº£nh Ä‘á»i thá»±c nÆ¡i {topic} thÆ°á»ng diá»…n ra", f"Káº¿t quáº£ trÆ°á»›c vÃ  sau khi Ã¡p dá»¥ng {topic}",
+            f"NgÆ°á»i dÃ¹ng hÃ i lÃ²ng vá»›i káº¿t quáº£ cá»§a {topic}", f"Cáº£nh káº¿t thÃºc Ä‘áº¹p vÃ  tÃ­ch cá»±c liÃªn quan trá»±c tiáº¿p Ä‘áº¿n {topic}",
         ]
     return [
         f"Wide establishing shot visually introducing {topic}", f"Close-up of the most important detail of {topic}",
@@ -924,7 +939,7 @@ def _creator_script_text_from_topic(topic: str, language: str, duration_seconds:
     scenes = list(base[:scene_count])
     while len(scenes) < scene_count:
         source = base[len(scenes) % len(base)]
-        prefix = "Cảnh bổ sung" if language == "vi" else "Additional scene"
+        prefix = "Cáº£nh bá»• sung" if language == "vi" else "Additional scene"
         scenes.append(f"{prefix} {len(scenes) + 1}: {source}")
     return "\n".join(scenes)
 
@@ -935,15 +950,15 @@ def _creator_narration_from_topic(topic: str, language: str) -> List[str]:
     if entity_kind == "animal":
         if language == "vi":
             return [
-                f"Bạn nghĩ mình đã biết rõ về {subject} chưa?",
-                f"Video này sẽ khám phá những đặc điểm ít người biết của {subject}.",
-                f"Trước hết, hãy quan sát hình dáng và cách {subject} thích nghi với môi trường sống.",
-                f"Tập tính kiếm ăn của {subject} cũng hé lộ nhiều khả năng đáng chú ý.",
-                f"Khi gặp nguy hiểm, {subject} có những phản ứng sinh tồn rất đặc trưng.",
-                f"Mỗi đặc điểm cần được nhìn trong đúng môi trường tự nhiên của loài vật này.",
-                f"Nhờ vậy, chúng ta hiểu {subject} chính xác hơn thay vì chỉ dựa vào tên gọi.",
-                f"Bạn ấn tượng nhất với đặc điểm nào của {subject}?",
-                "Hãy để lại bình luận và theo dõi để khám phá thêm về thế giới động vật.",
+                f"Báº¡n nghÄ© mÃ¬nh Ä‘Ã£ biáº¿t rÃµ vá» {subject} chÆ°a?",
+                f"Video nÃ y sáº½ khÃ¡m phÃ¡ nhá»¯ng Ä‘áº·c Ä‘iá»ƒm Ã­t ngÆ°á»i biáº¿t cá»§a {subject}.",
+                f"TrÆ°á»›c háº¿t, hÃ£y quan sÃ¡t hÃ¬nh dÃ¡ng vÃ  cÃ¡ch {subject} thÃ­ch nghi vá»›i mÃ´i trÆ°á»ng sá»‘ng.",
+                f"Táº­p tÃ­nh kiáº¿m Äƒn cá»§a {subject} cÅ©ng hÃ© lá»™ nhiá»u kháº£ nÄƒng Ä‘Ã¡ng chÃº Ã½.",
+                f"Khi gáº·p nguy hiá»ƒm, {subject} cÃ³ nhá»¯ng pháº£n á»©ng sinh tá»“n ráº¥t Ä‘áº·c trÆ°ng.",
+                f"Má»—i Ä‘áº·c Ä‘iá»ƒm cáº§n Ä‘Æ°á»£c nhÃ¬n trong Ä‘Ãºng mÃ´i trÆ°á»ng tá»± nhiÃªn cá»§a loÃ i váº­t nÃ y.",
+                f"Nhá» váº­y, chÃºng ta hiá»ƒu {subject} chÃ­nh xÃ¡c hÆ¡n thay vÃ¬ chá»‰ dá»±a vÃ o tÃªn gá»i.",
+                f"Báº¡n áº¥n tÆ°á»£ng nháº¥t vá»›i Ä‘áº·c Ä‘iá»ƒm nÃ o cá»§a {subject}?",
+                "HÃ£y Ä‘á»ƒ láº¡i bÃ¬nh luáº­n vÃ  theo dÃµi Ä‘á»ƒ khÃ¡m phÃ¡ thÃªm vá» tháº¿ giá»›i Ä‘á»™ng váº­t.",
             ]
         return [
             f"How well do you really know {subject}?",
@@ -958,16 +973,16 @@ def _creator_narration_from_topic(topic: str, language: str) -> List[str]:
         ]
     if language == "vi":
         return [
-            f"Bạn đang quan tâm đến {topic}?",
-            f"Trong video này, chúng ta sẽ tìm hiểu nhanh về {topic}.",
-            "Điều quan trọng đầu tiên là xác định mục tiêu bạn thực sự muốn đạt được.",
-            "Tiếp theo, hãy chia mục tiêu lớn thành những bước nhỏ và dễ thực hiện.",
-            "Bạn nên ưu tiên các công cụ đơn giản, phù hợp với nhu cầu của mình.",
-            "Hãy thử nghiệm từng bước và ghi lại kết quả để biết điều gì hiệu quả.",
-            "Đừng quên kiểm tra nguồn thông tin trước khi đưa ra quyết định.",
-            "Khi đã quen, bạn có thể tối ưu quy trình để tiết kiệm nhiều thời gian hơn.",
-            f"Chỉ cần bắt đầu từ một bước nhỏ, {topic} sẽ trở nên dễ tiếp cận hơn.",
-            "Nếu thấy nội dung hữu ích, hãy lưu video và theo dõi để xem thêm.",
+            f"Báº¡n Ä‘ang quan tÃ¢m Ä‘áº¿n {topic}?",
+            f"Trong video nÃ y, chÃºng ta sáº½ tÃ¬m hiá»ƒu nhanh vá» {topic}.",
+            "Äiá»u quan trá»ng Ä‘áº§u tiÃªn lÃ  xÃ¡c Ä‘á»‹nh má»¥c tiÃªu báº¡n thá»±c sá»± muá»‘n Ä‘áº¡t Ä‘Æ°á»£c.",
+            "Tiáº¿p theo, hÃ£y chia má»¥c tiÃªu lá»›n thÃ nh nhá»¯ng bÆ°á»›c nhá» vÃ  dá»… thá»±c hiá»‡n.",
+            "Báº¡n nÃªn Æ°u tiÃªn cÃ¡c cÃ´ng cá»¥ Ä‘Æ¡n giáº£n, phÃ¹ há»£p vá»›i nhu cáº§u cá»§a mÃ¬nh.",
+            "HÃ£y thá»­ nghiá»‡m tá»«ng bÆ°á»›c vÃ  ghi láº¡i káº¿t quáº£ Ä‘á»ƒ biáº¿t Ä‘iá»u gÃ¬ hiá»‡u quáº£.",
+            "Äá»«ng quÃªn kiá»ƒm tra nguá»“n thÃ´ng tin trÆ°á»›c khi Ä‘Æ°a ra quyáº¿t Ä‘á»‹nh.",
+            "Khi Ä‘Ã£ quen, báº¡n cÃ³ thá»ƒ tá»‘i Æ°u quy trÃ¬nh Ä‘á»ƒ tiáº¿t kiá»‡m nhiá»u thá»i gian hÆ¡n.",
+            f"Chá»‰ cáº§n báº¯t Ä‘áº§u tá»« má»™t bÆ°á»›c nhá», {topic} sáº½ trá»Ÿ nÃªn dá»… tiáº¿p cáº­n hÆ¡n.",
+            "Náº¿u tháº¥y ná»™i dung há»¯u Ã­ch, hÃ£y lÆ°u video vÃ  theo dÃµi Ä‘á»ƒ xem thÃªm.",
         ]
     return [
         f"Are you interested in {topic}?", f"Here is a quick introduction to {topic}.",
@@ -994,9 +1009,9 @@ def _creator_narration_text_from_topic(topic: str, language: str, duration_secon
         selected.append(line)
     additions = (
         [
-            f"Tiếp theo, hãy xem xét một khía cạnh khác của {subject} trong bối cảnh thực tế.",
-            f"Chi tiết này giúp chúng ta hiểu đầy đủ và chính xác hơn về {subject}.",
-            f"Khi ghép các đặc điểm lại với nhau, câu chuyện về {subject} trở nên rõ ràng hơn.",
+            f"Tiáº¿p theo, hÃ£y xem xÃ©t má»™t khÃ­a cáº¡nh khÃ¡c cá»§a {subject} trong bá»‘i cáº£nh thá»±c táº¿.",
+            f"Chi tiáº¿t nÃ y giÃºp chÃºng ta hiá»ƒu Ä‘áº§y Ä‘á»§ vÃ  chÃ­nh xÃ¡c hÆ¡n vá» {subject}.",
+            f"Khi ghÃ©p cÃ¡c Ä‘áº·c Ä‘iá»ƒm láº¡i vá»›i nhau, cÃ¢u chuyá»‡n vá» {subject} trá»Ÿ nÃªn rÃµ rÃ ng hÆ¡n.",
         ]
         if language == "vi" else
         [
@@ -1010,6 +1025,241 @@ def _creator_narration_text_from_topic(topic: str, language: str, duration_secon
         selected.append(additions[index % len(additions)])
         index += 1
     return "\n".join(selected)
+
+
+def _dedupe_clean_terms(terms: List[str], limit: int = 18) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for term in terms:
+        cleaned = re.sub(r"\s+", " ", str(term or "").strip().strip("#,.;:"))
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned[:100])
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _ascii_fold(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower().replace("Ä‘", "d"))
+    return normalized.encode("ascii", "ignore").decode("ascii")
+
+
+def _creator_seo_keywords_from_topic(
+    topic: str,
+    language: str,
+    duration_seconds: int = 30,
+    existing: Optional[List[str]] = None,
+) -> List[str]:
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    legacy_base = _creator_keywords_from_topic(topic, language, duration_seconds)
+    base = legacy_base if entity_kind == "animal" else [subject]
+    if language == "vi":
+        if entity_kind == "animal":
+            seo_terms = [
+                f"{subject}",
+                f"{subject} la con gi",
+                f"dac diem {subject}",
+                f"{subject} song o dau",
+                f"{subject} an gi",
+                f"su that ve {subject}",
+                f"{subject} co nguy hiem khong",
+                f"nhung dieu it biet ve {subject}",
+                f"{subject} ngoai tu nhien",
+                f"video giai thich ve {subject}",
+            ]
+        else:
+            seo_terms = [
+                f"cach {subject}",
+                f"{subject} cho nguoi moi",
+                f"{subject} tung buoc",
+                f"sai lam khi {subject}",
+                f"meo {subject}",
+                f"huong dan {subject}",
+                f"review {subject}",
+                f"so sanh {subject}",
+                f"{subject} co dang lam khong",
+                f"{subject} nhanh va de hieu",
+                f"{subject} cho TikTok",
+                f"{subject} cho YouTube Shorts",
+            ]
+    else:
+        if entity_kind == "animal":
+            seo_terms = [
+                subject,
+                f"what is {subject}",
+                f"{subject} facts",
+                f"{subject} habitat",
+                f"what does {subject} eat",
+                f"little known facts about {subject}",
+                f"is {subject} dangerous",
+                f"{subject} explained",
+            ]
+        else:
+            seo_terms = [
+                f"how to {subject}",
+                f"{subject} for beginners",
+                f"{subject} step by step",
+                f"{subject} mistakes",
+                f"{subject} tips",
+                f"{subject} tutorial",
+                f"{subject} review",
+                f"{subject} comparison",
+                f"is {subject} worth it",
+                f"{subject} for TikTok",
+                f"{subject} for YouTube Shorts",
+            ]
+    return _dedupe_clean_terms([*(existing or []), *base, *seo_terms], 18)
+
+
+def _creator_hook_line(topic: str, language: str) -> str:
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    if language == "vi":
+        if entity_kind == "animal":
+            return f"Bạn có chắc mình đã hiểu đúng về {subject} không?"
+        return f"Nếu bạn đang muốn làm {subject}, đừng bắt đầu trước khi biết điểm này."
+    if entity_kind == "animal":
+        return f"Do you really know what makes {subject} different?"
+    return f"If you want to do {subject}, do not start before you know this."
+
+
+def _is_weak_creator_hook(line: str, language: str) -> bool:
+    text = re.sub(r"\s+", " ", _ascii_fold(line).strip())
+    if not text:
+        return True
+    weak_starts = [
+        "trong video nay", "hom nay", "xin chao", "chung ta se", "ban dang quan tam",
+        "in this video", "today we", "hello", "here is a quick introduction", "are you interested",
+    ]
+    return any(text.startswith(start) for start in weak_starts)
+
+
+def _creator_target_narration_words(language: str, duration_seconds: int) -> int:
+    duration = max(10, min(1200, int(duration_seconds or 30)))
+    return max(25, round(duration * (2.35 if language == "vi" else 2.25)))
+
+
+def _creator_narration_padding_lines(topic: str, language: str) -> List[str]:
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    if language == "vi":
+        if entity_kind == "animal":
+            return [
+                f"Äiá»ƒm Ä‘Ã¡ng chÃº Ã½ lÃ  {subject} chá»‰ tháº­t sá»± dá»… hiá»ƒu khi nhÃ¬n trong mÃ´i trÆ°á»ng sá»‘ng tá»± nhiÃªn.",
+                f"Chi tiáº¿t nÃ y giÃºp ngÆ°á»i xem phÃ¢n biá»‡t {subject} vá»›i nhá»¯ng loÃ i hoáº·c khÃ¡i niá»‡m dá»… bá»‹ nháº§m láº«n.",
+                f"Náº¿u báº¡n tháº¥y pháº§n nÃ y há»¯u Ã­ch, hÃ£y lÆ°u láº¡i Ä‘á»ƒ xem tiáº¿p cÃ¡c Ä‘áº·c Ä‘iá»ƒm cÃ²n láº¡i rÃµ hÆ¡n.",
+            ]
+        return [
+            f"Äiá»ƒm quan trá»ng lÃ  hÃ£y báº¯t Ä‘áº§u tá»« má»™t bÆ°á»›c nhá» cá»§a {subject}, rá»“i Ä‘o káº¿t quáº£ tháº­t.",
+            f"Khi lÃ m Ä‘Ãºng trÃ¬nh tá»±, báº¡n sáº½ tháº¥y pháº§n khÃ³ nháº¥t thÆ°á»ng náº±m á»Ÿ cÃ¡ch chuáº©n bá»‹, khÃ´ng pháº£i cÃ´ng cá»¥.",
+            f"Náº¿u muá»‘n Ã¡p dá»¥ng ngay, hÃ£y lÆ°u video nÃ y vÃ  thá»­ láº¡i vá»›i workflow cá»§a chÃ­nh báº¡n.",
+        ]
+    if entity_kind == "animal":
+        return [
+            f"The key detail is easier to understand when {subject} is shown in its real habitat.",
+            f"This context helps viewers separate {subject} from similar names or misleading assumptions.",
+            "Save this video if you want the next traits explained with the same clarity.",
+        ]
+    return [
+        f"The practical move is to start with one small part of {subject}, then measure the real result.",
+        "When the order is clear, the hard part is usually preparation rather than the tool itself.",
+        "Save this video and test the workflow on your own process.",
+    ]
+
+
+def _postprocess_creator_narration(
+    narration_script: str, topic: str, language: str, duration_seconds: int,
+) -> str:
+    lines = [line.strip() for line in str(narration_script or "").splitlines() if line.strip()]
+    hook = _creator_hook_line(topic, language)
+    if not lines:
+        lines = [hook]
+    if _is_weak_creator_hook(lines[0], language):
+        lines[0] = hook
+    target_words = _creator_target_narration_words(language, duration_seconds)
+    minimum_words = round(target_words * 0.92)
+    padding = _creator_narration_padding_lines(topic, language)
+    index = 0
+    while len(" ".join(lines).split()) < minimum_words:
+        lines.append(padding[index % len(padding)])
+        index += 1
+    return "\n".join(lines)
+
+
+def _postprocess_creator_visual_brief(
+    visual_brief: str,
+    topic: str,
+    language: str,
+    duration_seconds: int,
+    narration_script: str,
+) -> str:
+    expected = max(4, min(150, round(max(10, min(1200, int(duration_seconds or 30))) / (5 if int(duration_seconds or 30) <= 60 else 8))))
+    subject, entity_kind = _creator_topic_subject(topic, language)
+    raw_lines = [line.strip() for line in str(visual_brief or "").splitlines() if line.strip()]
+    fallback_lines = _creator_scene_brief_from_topic(topic, language)
+    narration_lines = [line.strip() for line in str(narration_script or "").splitlines() if line.strip()]
+    enhanced: List[str] = []
+    for index in range(expected):
+        source = raw_lines[index] if index < len(raw_lines) else fallback_lines[index % len(fallback_lines)]
+        narration_hint = narration_lines[index] if index < len(narration_lines) else narration_lines[-1] if narration_lines else topic
+        lower = source.lower()
+        folded = _ascii_fold(source)
+        generic_patterns = (
+            "gioi thieu truc quan", "chi tiet quan trong", "boi canh doi thuc",
+            "canh ket thuc dep", "positive cinematic", "visually introducing",
+            "important detail", "real-life environment", "cinematic closing",
+        )
+        too_generic = (
+            len(source.split()) < 6
+            or lower in {"intro", "opening", "b-roll", "canh", "scene"}
+            or any(pattern in folded for pattern in generic_patterns)
+        )
+        if too_generic or subject.lower() not in lower:
+            if language == "vi":
+                if entity_kind == "animal":
+                    source = f"Cáº£nh {index + 1}: quay rÃµ {subject} trong mÃ´i trÆ°á»ng tá»± nhiÃªn, bÃ¡m vÃ o Ã½: {narration_hint}"
+                else:
+                    source = f"Cáº£nh {index + 1}: má»™t ngÆ°á»i thá»±c hiá»‡n {subject} vá»›i thao tÃ¡c nhÃ¬n tháº¥y rÃµ, bÃ¡m vÃ o Ã½: {narration_hint}"
+            else:
+                if entity_kind == "animal":
+                    source = f"Scene {index + 1}: clear shot of {subject} in its natural habitat, matching this narration: {narration_hint}"
+                else:
+                    source = f"Scene {index + 1}: a person visibly doing {subject}, matching this narration: {narration_hint}"
+        enhanced.append(source)
+    return "\n".join(enhanced)
+
+
+def _postprocess_creator_suggestion_quality(
+    result: Dict[str, Any],
+    topic: str,
+    language: str,
+    duration_seconds: int,
+) -> Dict[str, Any]:
+    upgraded = dict(result)
+    existing_keywords = upgraded.get("keywords") if isinstance(upgraded.get("keywords"), list) else []
+    upgraded["keywords"] = _creator_seo_keywords_from_topic(topic, language, duration_seconds, existing_keywords)
+    narration = _postprocess_creator_narration(
+        str(upgraded.get("narration_script") or ""), topic, language, duration_seconds,
+    )
+    visual = _postprocess_creator_visual_brief(
+        str(upgraded.get("visual_brief") or upgraded.get("script") or ""),
+        topic,
+        language,
+        duration_seconds,
+        narration,
+    )
+    upgraded["narration_script"] = narration
+    upgraded["visual_brief"] = visual
+    upgraded["script"] = visual
+    upgraded["quality_notes"] = [
+        "Added retention hook to the opening line.",
+        "Expanded keywords with search-intent long-tail terms.",
+        "Tightened visual brief into concrete footage prompts tied to the narration.",
+    ]
+    return upgraded
 
 
 def _available_gemini_models(api_key: str) -> List[str]:
@@ -1042,7 +1292,7 @@ def _select_gemini_models(api_key: str, configured: str) -> List[str]:
         selected.extend(name for name in available if name not in selected and "flash" in name.lower())
         if selected:
             return selected
-        raise RuntimeError("API key không có model Gemini hỗ trợ generateContent")
+        raise RuntimeError("API key khÃ´ng cÃ³ model Gemini há»— trá»£ generateContent")
     except Exception as exc:
         logger.warning("Could not list Gemini models; trying known model names: %s", exc)
         return list(dict.fromkeys(name for name in preferred if name))
@@ -1061,9 +1311,9 @@ def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False
     narration_word_max = round(narration_word_target * 1.05)
     language_name = LANGUAGE_LABELS.get(body.target_language, body.target_language)
     search_instruction = (
-        "BẮT BUỘC dùng Google Search để nghiên cứu search intent và các góc nội dung đang phù hợp."
+        "Báº®T BUá»˜C dÃ¹ng Google Search Ä‘á»ƒ nghiÃªn cá»©u search intent vÃ  cÃ¡c gÃ³c ná»™i dung Ä‘ang phÃ¹ há»£p."
         if require_search else
-        "Tạo nội dung SEO sát search intent; không bịa số liệu xu hướng hoặc tuyên bố đã tìm kiếm web."
+        "Táº¡o ná»™i dung SEO sÃ¡t search intent; khÃ´ng bá»‹a sá»‘ liá»‡u xu hÆ°á»›ng hoáº·c tuyÃªn bá»‘ Ä‘Ã£ tÃ¬m kiáº¿m web."
     )
     
     # Process advanced options if provided
@@ -1077,23 +1327,23 @@ def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False
     # Map style to Vietnamese descriptions
     style_map = {
         "general": "chung",
-        "entertaining": "giải trí, vui vẻ, hấp dẫn",
-        "educational": "giáo dục, học thuật, chia sẻ kiến thức",
-        "storytelling": "kể chuyện, có cốt truyện",
-        "tutorial": "hướng dẫn, tutorial, step-by-step",
-        "review": "review, đánh giá, so sánh",
-        "news": "tin tức, thông tin, cập nhật",
-        "motivational": "truyền cảm hứng, động viên",
+        "entertaining": "giáº£i trÃ­, vui váº», háº¥p dáº«n",
+        "educational": "giÃ¡o dá»¥c, há»c thuáº­t, chia sáº» kiáº¿n thá»©c",
+        "storytelling": "ká»ƒ chuyá»‡n, cÃ³ cá»‘t truyá»‡n",
+        "tutorial": "hÆ°á»›ng dáº«n, tutorial, step-by-step",
+        "review": "review, Ä‘Ã¡nh giÃ¡, so sÃ¡nh",
+        "news": "tin tá»©c, thÃ´ng tin, cáº­p nháº­t",
+        "motivational": "truyá»n cáº£m há»©ng, Ä‘á»™ng viÃªn",
     }
     
     # Map tone to Vietnamese descriptions
     tone_map = {
-        "neutral": "trung tính, khách quan",
-        "casual": "thân thiện, gần gũi, tự nhiên",
-        "formal": "trang trọng, chuyên nghiệp",
-        "humorous": "hài hước, vui nhộn",
-        "inspiring": "truyền cảm hứng, tích cực",
-        "urgent": "cấp bách, khẩn trương",
+        "neutral": "trung tÃ­nh, khÃ¡ch quan",
+        "casual": "thÃ¢n thiá»‡n, gáº§n gÅ©i, tá»± nhiÃªn",
+        "formal": "trang trá»ng, chuyÃªn nghiá»‡p",
+        "humorous": "hÃ i hÆ°á»›c, vui nhá»™n",
+        "inspiring": "truyá»n cáº£m há»©ng, tÃ­ch cá»±c",
+        "urgent": "cáº¥p bÃ¡ch, kháº©n trÆ°Æ¡ng",
     }
     
     # Map sentence length to word ranges
@@ -1105,16 +1355,16 @@ def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False
     
     # Map detail level to descriptions
     detail_map = {
-        "minimal": "tối thiểu, tập trung vào điểm chính",
-        "standard": "chuẩn, cân bằng",
-        "detailed": "chi tiết, có ví dụ cụ thể",
-        "comprehensive": "rất chi tiết, đầy đủ thông tin",
+        "minimal": "tá»‘i thiá»ƒu, táº­p trung vÃ o Ä‘iá»ƒm chÃ­nh",
+        "standard": "chuáº©n, cÃ¢n báº±ng",
+        "detailed": "chi tiáº¿t, cÃ³ vÃ­ dá»¥ cá»¥ thá»ƒ",
+        "comprehensive": "ráº¥t chi tiáº¿t, Ä‘áº§y Ä‘á»§ thÃ´ng tin",
     }
     
     style_desc = style_map.get(style, "chung")
-    tone_desc = tone_map.get(tone, "trung tính")
+    tone_desc = tone_map.get(tone, "trung tÃ­nh")
     sentence_range = sentence_length_map.get(sentence_length, (12, 18))
-    detail_desc = detail_map.get(detail_level, "chuẩn")
+    detail_desc = detail_map.get(detail_level, "chuáº©n")
     
     # Adjust word count based on detail level
     if detail_level == "minimal":
@@ -1130,35 +1380,51 @@ def _creator_ai_prompt(body: CreatorSuggestionBody, require_search: bool = False
         narration_word_min = round(narration_word_min * 1.3)
         narration_word_max = round(narration_word_max * 1.3)
     
-    custom_instruction_text = f"\nYÊU CẦU ĐẶC BIỆT: {custom_instructions}" if custom_instructions else ""
+    custom_instruction_text = f"\nYÃŠU Cáº¦U Äáº¶C BIá»†T: {custom_instructions}" if custom_instructions else ""
     
-    prompt = f"""Bạn là biên kịch video ngắn và chuyên gia SEO YouTube/TikTok.
+    prompt = f"""Báº¡n lÃ  biÃªn ká»‹ch video ngáº¯n vÃ  chuyÃªn gia SEO YouTube/TikTok.
 {search_instruction}
-Hãy lập nội dung cho video với thông số bắt buộc:
-- Chủ đề: {body.topic.strip()}
-- Ngôn ngữ đầu ra: {language_name}
-- Tỷ lệ khung hình: {body.aspect_ratio}
-- Thời lượng: {duration} giây
-- Hiệu ứng hình: {body.transition}
-- Phong cách nội dung: {style_desc}
-- Giọng văn: {tone_desc}
-- Độ dài câu trung bình: {sentence_range[0]}-{sentence_range[1]} từ
-- Mức độ chi tiết: {detail_desc}
+HÃ£y láº­p ná»™i dung cho video vá»›i thÃ´ng sá»‘ báº¯t buá»™c:
+- Chá»§ Ä‘á»: {body.topic.strip()}
+- NgÃ´n ngá»¯ Ä‘áº§u ra: {language_name}
+- Tá»· lá»‡ khung hÃ¬nh: {body.aspect_ratio}
+- Thá»i lÆ°á»£ng: {duration} giÃ¢y
+- Hiá»‡u á»©ng hÃ¬nh: {body.transition}
+- Phong cÃ¡ch ná»™i dung: {style_desc}
+- Giá»ng vÄƒn: {tone_desc}
+- Äá»™ dÃ i cÃ¢u trung bÃ¬nh: {sentence_range[0]}-{sentence_range[1]} tá»«
+- Má»©c Ä‘á»™ chi tiáº¿t: {detail_desc}
 {custom_instruction_text}
 
-QUY TẮC NGÔN NGỮ TUYỆT ĐỐI: mọi chuỗi trong cả keywords, visual_brief và
-narration_lines phải viết duy nhất bằng {language_name}. Ngôn ngữ của chủ đề
-đầu vào không được làm thay đổi ngôn ngữ đầu ra. Không xen tiếng Anh, trừ tên
-riêng hoặc thuật ngữ không có bản dịch tự nhiên.
+QUY Táº®C NGÃ”N NGá»® TUYá»†T Äá»I: má»i chuá»—i trong cáº£ keywords, visual_brief vÃ 
+narration_lines pháº£i viáº¿t duy nháº¥t báº±ng {language_name}. NgÃ´n ngá»¯ cá»§a chá»§ Ä‘á»
+Ä‘áº§u vÃ o khÃ´ng Ä‘Æ°á»£c lÃ m thay Ä‘á»•i ngÃ´n ngá»¯ Ä‘áº§u ra. KhÃ´ng xen tiáº¿ng Anh, trá»« tÃªn
+riÃªng hoáº·c thuáº­t ngá»¯ khÃ´ng cÃ³ báº£n dá»‹ch tá»± nhiÃªn.
 
-Trả về đúng JSON theo schema. Yêu cầu:
-1. keywords: 12-18 keyword/long-tail keyword sát chủ đề, có search intent, không nhồi từ khóa, không bịa số liệu xu hướng.
-   Bắt buộc giữ nguyên nghĩa và loại của thực thể trong chủ đề. Không được tách một cụm danh từ riêng thành các từ khóa rời gây đa nghĩa, không tự đổi động vật thành cây, đồ vật, địa danh hoặc khái niệm khác. Ví dụ chủ đề "đặc điểm về con lửng mật" phải dùng các cụm như "động vật lửng mật", "đặc điểm lửng mật", tuyệt đối không dùng "cây lửng mật".
-2. visual_brief: đúng {scene_count} cảnh, mỗi phần tử phải có chủ thể cụ thể + hành động nhìn thấy được và có thể tìm hoặc tái tạo thành footage. Mỗi cảnh phải liên quan trực tiếp đến chủ đề; tránh mô tả trừu tượng, chữ/UI/logo. Không được tạo một phần tử chỉ nói về phong cách, màu sắc, góc máy hoặc thể loại phim.
-3. narration_lines: kịch bản hook → giá trị chính → CTA; mỗi phần tử là một câu nói tự nhiên với độ dài {sentence_range[0]}-{sentence_range[1]} từ. Toàn bộ kịch bản phải có {narration_word_min}-{narration_word_max} từ (mục tiêu {narration_word_target} từ) để giọng đọc tự nhiên lấp đầy khoảng {duration} giây. Không viết kịch bản ngắn rồi yêu cầu tăng tốc/giảm tốc, không lặp ý, không tuyên bố thiếu căn cứ. Visual và lời thoại phải cùng một mạch nội dung. Giọng văn phải {tone_desc}.
-QUY TẮC NHẤT QUÁN THỰC THỂ: quy tắc giữ nguyên nghĩa và loại thực thể ở mục 1 áp dụng cho cả visual_brief và narration_lines. Mọi cảnh và câu thoại phải nói đúng chủ thể trong chủ đề; nếu chủ đề nói "con lửng mật" thì đó luôn là động vật lửng mật, không bao giờ là cây, đồ vật hoặc một người đang thực hiện chủ đề.
-Chỉ xuất một JSON object hợp lệ có đúng ba key: keywords, visual_brief, narration_lines. Không dùng Markdown hay code fence.
+Tráº£ vá» Ä‘Ãºng JSON theo schema. YÃªu cáº§u:
+1. keywords: 12-18 keyword/long-tail keyword sÃ¡t chá»§ Ä‘á», cÃ³ search intent, khÃ´ng nhá»“i tá»« khÃ³a, khÃ´ng bá»‹a sá»‘ liá»‡u xu hÆ°á»›ng.
+   Báº¯t buá»™c giá»¯ nguyÃªn nghÄ©a vÃ  loáº¡i cá»§a thá»±c thá»ƒ trong chá»§ Ä‘á». KhÃ´ng Ä‘Æ°á»£c tÃ¡ch má»™t cá»¥m danh tá»« riÃªng thÃ nh cÃ¡c tá»« khÃ³a rá»i gÃ¢y Ä‘a nghÄ©a, khÃ´ng tá»± Ä‘á»•i Ä‘á»™ng váº­t thÃ nh cÃ¢y, Ä‘á»“ váº­t, Ä‘á»‹a danh hoáº·c khÃ¡i niá»‡m khÃ¡c. VÃ­ dá»¥ chá»§ Ä‘á» "Ä‘áº·c Ä‘iá»ƒm vá» con lá»­ng máº­t" pháº£i dÃ¹ng cÃ¡c cá»¥m nhÆ° "Ä‘á»™ng váº­t lá»­ng máº­t", "Ä‘áº·c Ä‘iá»ƒm lá»­ng máº­t", tuyá»‡t Ä‘á»‘i khÃ´ng dÃ¹ng "cÃ¢y lá»­ng máº­t".
+2. visual_brief: Ä‘Ãºng {scene_count} cáº£nh, má»—i pháº§n tá»­ pháº£i cÃ³ chá»§ thá»ƒ cá»¥ thá»ƒ + hÃ nh Ä‘á»™ng nhÃ¬n tháº¥y Ä‘Æ°á»£c vÃ  cÃ³ thá»ƒ tÃ¬m hoáº·c tÃ¡i táº¡o thÃ nh footage. Má»—i cáº£nh pháº£i liÃªn quan trá»±c tiáº¿p Ä‘áº¿n chá»§ Ä‘á»; trÃ¡nh mÃ´ táº£ trá»«u tÆ°á»£ng, chá»¯/UI/logo. KhÃ´ng Ä‘Æ°á»£c táº¡o má»™t pháº§n tá»­ chá»‰ nÃ³i vá» phong cÃ¡ch, mÃ u sáº¯c, gÃ³c mÃ¡y hoáº·c thá»ƒ loáº¡i phim.
+3. narration_lines: ká»‹ch báº£n hook â†’ giÃ¡ trá»‹ chÃ­nh â†’ CTA; má»—i pháº§n tá»­ lÃ  má»™t cÃ¢u nÃ³i tá»± nhiÃªn vá»›i Ä‘á»™ dÃ i {sentence_range[0]}-{sentence_range[1]} tá»«. ToÃ n bá»™ ká»‹ch báº£n pháº£i cÃ³ {narration_word_min}-{narration_word_max} tá»« (má»¥c tiÃªu {narration_word_target} tá»«) Ä‘á»ƒ giá»ng Ä‘á»c tá»± nhiÃªn láº¥p Ä‘áº§y khoáº£ng {duration} giÃ¢y. KhÃ´ng viáº¿t ká»‹ch báº£n ngáº¯n rá»“i yÃªu cáº§u tÄƒng tá»‘c/giáº£m tá»‘c, khÃ´ng láº·p Ã½, khÃ´ng tuyÃªn bá»‘ thiáº¿u cÄƒn cá»©. Visual vÃ  lá»i thoáº¡i pháº£i cÃ¹ng má»™t máº¡ch ná»™i dung. Giá»ng vÄƒn pháº£i {tone_desc}.
+QUY Táº®C NHáº¤T QUÃN THá»°C THá»‚: quy táº¯c giá»¯ nguyÃªn nghÄ©a vÃ  loáº¡i thá»±c thá»ƒ á»Ÿ má»¥c 1 Ã¡p dá»¥ng cho cáº£ visual_brief vÃ  narration_lines. Má»i cáº£nh vÃ  cÃ¢u thoáº¡i pháº£i nÃ³i Ä‘Ãºng chá»§ thá»ƒ trong chá»§ Ä‘á»; náº¿u chá»§ Ä‘á» nÃ³i "con lá»­ng máº­t" thÃ¬ Ä‘Ã³ luÃ´n lÃ  Ä‘á»™ng váº­t lá»­ng máº­t, khÃ´ng bao giá» lÃ  cÃ¢y, Ä‘á»“ váº­t hoáº·c má»™t ngÆ°á»i Ä‘ang thá»±c hiá»‡n chá»§ Ä‘á».
+Chá»‰ xuáº¥t má»™t JSON object há»£p lá»‡ cÃ³ Ä‘Ãºng ba key: keywords, visual_brief, narration_lines. KhÃ´ng dÃ¹ng Markdown hay code fence.
 """
+    prompt += f"""
+
+RETENTION + SEO QUALITY BAR:
+- The first narration line must be a sharp viewer-facing hook, not a greeting and not "in this video/today we".
+- If the output language is Vietnamese, every Vietnamese sentence must use full Vietnamese diacritics. Never output ASCII-only Vietnamese such as "Neu ban", "Dung mua", "khong dau", or "hay luu video".
+- The narration must be complete for {duration} seconds. Do not return a short outline; write enough spoken lines to reach {narration_word_min}-{narration_word_max} words.
+- Keywords must cover direct search terms, beginner/how-to intent, mistakes/pain points, review/comparison intent, and short-video platform intent.
+- Visual brief lines must read like searchable footage or AI-image prompts: visible subject, action, setting, and the reason that shot supports the matching narration beat.
+- Avoid generic filler such as "intro scene", "nice cinematic shot", "show the topic", or abstract concepts that cannot be filmed.
+- For AI-generated visuals, avoid unnecessary close-ups of hands, fingers, faces, teeth, or eyes. Prefer over-the-shoulder, product-on-table, screen workflow, object detail, and wide documentary shots unless a human close-up is required.
+- The final narration line should give a natural CTA that fits the topic.
+"""
+    prompt += (
+        f"\nTIMING CHECK: {duration} giây; mục tiêu {narration_word_target} từ; "
+        f"khoảng hợp lệ {narration_word_min}-{narration_word_max} từ.\n"
+    )
     return prompt, scene_count
 
 
@@ -1173,7 +1439,7 @@ def _parse_creator_ai_result(
     visuals = [str(item).strip() for item in data.get("visual_brief", []) if str(item).strip()][:scene_count]
     narration = [str(item).strip() for item in data.get("narration_lines", []) if str(item).strip()]
     if not keywords or not visuals or not narration:
-        raise RuntimeError(f"{model} trả về nội dung không đầy đủ")
+        raise RuntimeError(f"{model} tráº£ vá» ná»™i dung khÃ´ng Ä‘áº§y Ä‘á»§")
     # Small local models occasionally ignore the requested language for one
     # JSON field. Translate every field as a final normalization pass so the
     # three editor boxes can never intentionally target different languages.
@@ -1200,7 +1466,7 @@ def _ollama_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     tags.raise_for_status()
     names = [str(item.get("name", "")) for item in tags.json().get("models", []) if item.get("name")]
     if not names:
-        raise RuntimeError("Ollama chưa có model; hãy chạy: ollama pull qwen3:8b")
+        raise RuntimeError("Ollama chÆ°a cÃ³ model; hÃ£y cháº¡y: ollama pull qwen3:8b")
     model = configured_model if configured_model in names else names[0]
     if configured_model and configured_model not in names:
         logger.warning(
@@ -1214,7 +1480,7 @@ def _ollama_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
         json={
             "model": model, "stream": False, "format": "json",
             "messages": [
-                {"role": "system", "content": "Chỉ trả về JSON hợp lệ, không thêm giải thích."},
+                {"role": "system", "content": "Chá»‰ tráº£ vá» JSON há»£p lá»‡, khÃ´ng thÃªm giáº£i thÃ­ch."},
                 {"role": "user", "content": prompt},
             ],
             "options": {"temperature": 0.7, "num_predict": 16384, "num_ctx": 32768},
@@ -1231,7 +1497,7 @@ def _ollama_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
 def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     api_key = _env_first("OPENROUTER_API_KEY")
     if not api_key:
-        raise RuntimeError("Chưa cấu hình OPENROUTER_API_KEY")
+        raise RuntimeError("ChÆ°a cáº¥u hÃ¬nh OPENROUTER_API_KEY")
     requested_model = _env_first("OPENROUTER_MODEL") or "openrouter/free"
     prompt, scene_count = _creator_ai_prompt(body)
     response = requests.post(
@@ -1261,11 +1527,11 @@ def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, An
 def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     """Generate script suggestions using OpenAI API (GPT-4, GPT-3.5, etc.)."""
     if not OPENAI_AVAILABLE:
-        raise RuntimeError("OpenAI library chưa được cài đặt. Chạy: pip install openai")
+        raise RuntimeError("OpenAI library chÆ°a Ä‘Æ°á»£c cÃ i Ä‘áº·t. Cháº¡y: pip install openai")
     
     api_key = _env_first("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("Chưa cấu hình OPENAI_API_KEY")
+        raise RuntimeError("ChÆ°a cáº¥u hÃ¬nh OPENAI_API_KEY")
     
     configured_model = _env_first("OPENAI_MODEL") or "gpt-4o"
     prompt, scene_count = _creator_ai_prompt(body, require_search=False)
@@ -1294,7 +1560,7 @@ def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
 def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     api_key = _env_first("GEMINI_API_KEY", "GOOGLE_AI_API_KEY")
     if not api_key:
-        raise RuntimeError("Chưa cấu hình GEMINI_API_KEY")
+        raise RuntimeError("ChÆ°a cáº¥u hÃ¬nh GEMINI_API_KEY")
     configured_model = _env_first("GEMINI_MODEL") or "gemini-3.1-flash-lite"
     prompt, scene_count = _creator_ai_prompt(body, require_search=True)
     request_payload = {
@@ -1320,7 +1586,7 @@ def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
         if response.status_code not in (404, 429):
             break
     if response is None or not response.ok:
-        raise RuntimeError("; ".join(attempted_errors) or "Không gọi được Gemini API")
+        raise RuntimeError("; ".join(attempted_errors) or "KhÃ´ng gá»i Ä‘Æ°á»£c Gemini API")
     payload = response.json()
     candidate = payload.get("candidates", [{}])[0]
     parts = candidate.get("content", {}).get("parts", [])
@@ -1328,7 +1594,7 @@ def _creator_ai_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     grounding = candidate.get("groundingMetadata") or {}
     search_queries = grounding.get("webSearchQueries") or []
     if not search_queries:
-        raise RuntimeError("Gemini không thực hiện Google Search grounding")
+        raise RuntimeError("Gemini khÃ´ng thá»±c hiá»‡n Google Search grounding")
     return _parse_creator_ai_result(
         raw, scene_count, generator="gemini", model=model,
         target_language=body.target_language,
@@ -1342,9 +1608,9 @@ def _creator_keywords_from_topic(
     subject, _ = _creator_topic_subject(topic, language)
     if language == "vi":
         base = [
-            subject, f"đặc điểm {subject}", f"sự thật về {subject}",
-            f"điều ít biết về {subject}", f"tập tính {subject}",
-            f"{subject} trong tự nhiên", f"khám phá {subject}",
+            subject, f"Ä‘áº·c Ä‘iá»ƒm {subject}", f"sá»± tháº­t vá» {subject}",
+            f"Ä‘iá»u Ã­t biáº¿t vá» {subject}", f"táº­p tÃ­nh {subject}",
+            f"{subject} trong tá»± nhiÃªn", f"khÃ¡m phÃ¡ {subject}",
         ]
     else:
         base = [subject, f"facts about {subject}", f"{subject} characteristics", f"learn about {subject}"]
@@ -1358,14 +1624,22 @@ def _creator_keywords_from_topic(
 
 def _creator_topic_subject(topic: str, language: str) -> tuple[str, str]:
     """Keep a topic's compound subject intact and retain its entity type."""
-    text = " ".join(re.sub(r"[^\w\sÀ-ỹ]", " ", topic.lower(), flags=re.UNICODE).split())
-    match = re.search(r"\b(?:về|của)\s+(.+)$", text)
-    raw_subject = (match.group(1) if match else text).strip()
-    animal = bool(re.match(r"^(?:con|loài)\s+", raw_subject))
-    if animal:
-        raw_subject = re.sub(r"^(?:con|loài)\s+", "", raw_subject).strip()
+    text = " ".join(re.sub(r"[^\w\s]", " ", topic.lower(), flags=re.UNICODE).split())
+    folded = _ascii_fold(text)
+    match = re.search(r"\b(?:ve|cua)\s+(.+)$", folded)
+    if match:
+        prefix_words = len(folded[:match.start(1)].split())
+        raw_subject = " ".join(text.split()[prefix_words:])
     else:
-        raw_subject = re.sub(r"^(?:cái|chiếc|một)\s+", "", raw_subject).strip()
+        raw_subject = text
+    raw_subject = raw_subject.strip()
+    raw_folded = _ascii_fold(raw_subject)
+    animal = bool(re.match(r"^(?:con|loai)\s+", raw_folded))
+    if animal:
+        raw_subject = re.sub(r"^\S+\s+", "", raw_subject).strip()
+    else:
+        if re.match(r"^(?:cai|chiec|mot)\s+", raw_folded):
+            raw_subject = re.sub(r"^\S+\s+", "", raw_subject).strip()
     raw_subject = raw_subject[:80].strip() or text[:80].strip()
     if animal:
         return (f"động vật {raw_subject}" if language == "vi" else raw_subject), "animal"
@@ -1430,7 +1704,7 @@ def _validate_creator_suggestion_timing(
 
 
 def _ascii_topic(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value.lower().replace("đ", "d"))
+    normalized = unicodedata.normalize("NFKD", value.lower().replace("Ä‘", "d"))
     return " ".join(re.findall(r"[a-z0-9]+", normalized.encode("ascii", "ignore").decode("ascii")))
 
 
@@ -1533,6 +1807,71 @@ def _disambiguate_stock_terms(source_text: str, terms: str) -> str:
     return terms
 
 
+def _product_kind_stock_terms(text: str) -> tuple[str, str]:
+    folded = _ascii_fold(text)
+    if any(token in folded for token in ("hut bui", "vacuum", "cleaner")):
+        return "handheld vacuum", "cleaning desk crumbs keyboard"
+    if any(token in folded for token in ("den livestream", "ring light", "livestream light", "studio light")):
+        return "ring light", "creator filming video at desk"
+    if any(token in folded for token in ("may say", "hair dryer", "dryer")):
+        return "hair dryer", "woman drying hair bathroom"
+    if any(token in folded for token in ("serum", "skincare", "kem duong", "my pham", "cosmetic")):
+        return "skincare product", "woman skincare routine bathroom mirror"
+    if any(token in folded for token in ("tai nghe", "earbuds", "headphones")):
+        return "wireless earbuds", "person using earbuds working desk"
+    if any(token in folded for token in ("ban phim", "keyboard")):
+        return "keyboard", "desk setup typing keyboard"
+    return "product", "creator product review at home"
+
+
+def _product_ad_stock_queries(
+    translated_topic: str, translated_visual: str, translated_narration: str,
+) -> List[str]:
+    text = f"{translated_topic} {translated_visual} {translated_narration}"
+    folded = _ascii_fold(text)
+    if not any(marker in folded for marker in ("product ad", "model problem", "model use", "demo proof", "objection shot", "lifestyle shot")):
+        return []
+    product_term, action_term = _product_kind_stock_terms(text)
+    if "model problem" in folded or "problem shot" in folded:
+        if product_term == "handheld vacuum":
+            queries = [
+                "messy desk crumbs keyboard",
+                "woman frustrated messy desk",
+                "home office desk cleaning problem",
+            ]
+        else:
+            queries = [
+                f"person problem before using {product_term}",
+                "creator frustrated at home desk",
+                "home lifestyle problem scene",
+            ]
+    elif "model use" in folded or "demo proof" in folded:
+        queries = [
+            f"woman {action_term}",
+            f"person using {product_term}",
+            f"creator demonstrating {product_term}",
+        ]
+    elif "objection" in folded:
+        queries = [
+            f"person checking {product_term} details",
+            "customer comparing product reviews phone",
+            "person reading product reviews",
+        ]
+    elif "lifestyle" in folded:
+        queries = [
+            f"{action_term} lifestyle",
+            f"creator using {product_term} at home",
+            "natural ugc creator home",
+        ]
+    else:
+        queries = [
+            f"creator product review {product_term}",
+            f"person using {product_term}",
+            action_term,
+        ]
+    return [_compact_stock_terms(query, 8) for query in queries if _compact_stock_terms(query, 8)]
+
+
 def _creator_stock_queries(
     translated_topic: str, translated_visual: str, translated_narration: str,
 ) -> List[str]:
@@ -1542,12 +1881,18 @@ def _creator_stock_queries(
     exact moment. Visual brief is the second choice, while the broad topic is
     only a last resort and cannot drown out concrete subjects/actions.
     """
+    product_ad_queries = _product_ad_stock_queries(
+        translated_topic, translated_visual, translated_narration,
+    )
+    if product_ad_queries:
+        return list(dict.fromkeys(product_ad_queries))
+    directed = direct_visual_scene(translated_topic, translated_visual, translated_narration)
     narration = _disambiguate_stock_terms(
         translated_narration, _compact_stock_terms(translated_narration, 6),
     )
     visual = _compact_stock_terms(translated_visual, 7)
     topic = _compact_stock_terms(translated_topic, 5)
-    candidates = [narration, visual]
+    candidates = [*directed.stock_queries, narration, visual]
     if narration and visual:
         candidates.insert(1, _compact_stock_terms(f"{narration} {visual}", 8))
     candidates.append(topic)
@@ -1568,7 +1913,7 @@ def _creator_image_story_prompts(
         "same appearance and location logic, realistic anatomy, natural light, real camera footage"
     )
     fallback_prompts = [
-        f"Exact scene action: {visual}. Narration meaning: {aligned_narrations[i]}. {fallback_bible}"
+        f"{direct_visual_scene(topic, visual, aligned_narrations[i]).ai_prompt} Continuity: {fallback_bible}"
         for i, visual in enumerate(visuals)
     ]
     if scene_count > 24:
@@ -1627,8 +1972,9 @@ Only output valid JSON."""
         for i, visual in enumerate(visuals):
             visual_short = " ".join(visual.split()[:18])
             director_short = " ".join(prompts[i].split()[:22])
+            matched_prompt = direct_visual_scene(topic, visual, aligned_narrations[i]).ai_prompt
             final_prompts.append(
-                f"{visual_short}. Continuity: {bible_short}. Scene direction: {director_short}"
+                f"{visual_short}. {matched_prompt}. Continuity: {bible_short}. Scene direction: {director_short}"
             )
         return story_bible, final_prompts
     except requests.Timeout:
@@ -1646,7 +1992,7 @@ def _creator_video_backend() -> str:
     """Choose LTX on large GPUs and isolated low-memory SVD otherwise."""
     configured = (_env_first("CREATOR_VIDEO_BACKEND") or "auto").lower()
     if configured not in ("auto", "svd", "ltx"):
-        raise HTTPException(503, "CREATOR_VIDEO_BACKEND chỉ nhận auto, svd hoặc ltx")
+        raise HTTPException(503, "CREATOR_VIDEO_BACKEND chá»‰ nháº­n auto, svd hoáº·c ltx")
     if configured != "auto":
         return configured
     import torch
@@ -1657,14 +2003,44 @@ def _creator_video_backend() -> str:
     return "ltx" if total_vram_gb >= ltx_min_vram_gb else "svd"
 
 
+def _remote_creator_image_available() -> bool:
+    if _env_first("HUGGINGFACE_API_KEY"):
+        return True
+    return bool(
+        _env_first("USE_DALLE_IMAGES", "false").lower() == "true"
+        and OPENAI_AVAILABLE
+        and _env_first("OPENAI_API_KEY")
+    )
+
+
+def _local_creator_image_runtime_available() -> tuple[bool, str]:
+    try:
+        import torch  # noqa: F401
+        import diffusers  # noqa: F401
+        import transformers  # noqa: F401
+        import accelerate  # noqa: F401
+        import safetensors  # noqa: F401
+        from diffusers import StableDiffusionPipeline  # noqa: F401
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def _validate_creator_ai_runtime(image_provider: str) -> None:
     """Fail before creating/charging a job when its AI runtime is incomplete."""
     if image_provider not in ("ai", "cpu_ai", "ai_video"):
         return
+    if image_provider in ("ai", "cpu_ai") and _remote_creator_image_available():
+        return
     try:
         import torch
-    except ImportError as exc:
-        raise HTTPException(503, "Thiếu PyTorch. Hãy cài requirements.txt và khởi động lại backend.") from exc
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "Môi trường AI ảnh/video đang lỗi khi import PyTorch/Numpy "
+            f"({type(exc).__name__}: {exc}). Hãy sửa/cài lại numpy/torch trong .venv, "
+            "hoặc chọn Stock/Product media thay vì AI Image.",
+        ) from exc
     try:
         import diffusers
         import transformers
@@ -1707,10 +2083,10 @@ def _split_creator_script(topic: str, script: Optional[str], language: str) -> L
         return _creator_scene_brief_from_topic(topic, language)
     lines = [line.strip(" -\t") for line in raw.splitlines() if line.strip()]
     if len(lines) <= 1:
-        lines = [s.strip() for s in re.split(r"(?<=[.!?。！？])\s+", raw) if s.strip()]
+        lines = [s.strip() for s in re.split(r"(?<=[.!?ã€‚ï¼ï¼Ÿ])\s+", raw) if s.strip()]
     if len(lines) > 1:
         style_only_prefixes = (
-            "phong cách", "màu sắc", "tông màu", "góc máy", "thể loại",
+            "phong cÃ¡ch", "mÃ u sáº¯c", "tÃ´ng mÃ u", "gÃ³c mÃ¡y", "thá»ƒ loáº¡i",
             "style", "color palette", "colour palette", "camera style", "genre",
         )
         concrete_lines = [
@@ -1840,12 +2216,32 @@ def _download_stock_media(media: Dict[str, str], dest: Path) -> Path:
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "").lower()
         if "text/html" in content_type:
-            raise RuntimeError("Nhà cung cấp media trả về HTML thay vì ảnh/video")
+            raise RuntimeError("NhÃ  cung cáº¥p media tráº£ vá» HTML thay vÃ¬ áº£nh/video")
         with output.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
     return output
+
+
+def _creator_image_negative_prompt() -> str:
+    return (
+        "deformed anatomy, disfigured face, misaligned face, detached head, extra fingers, missing fingers, "
+        "fused fingers, twisted hands, broken wrists, duplicated hands, malformed hands, long fingers, "
+        "crossed eyes, asymmetric eyes, warped body, disconnected limbs, floating limbs, bad proportions, "
+        "cartoon, anime, illustration, CGI, 3D render, text, logo, watermark, blurry, low quality"
+    )
+
+
+def _harden_creator_image_prompt(prompt: str, max_words: int = 120) -> str:
+    scene = " ".join(str(prompt or "").split())
+    scene = " ".join(scene.split()[:max_words])
+    return (
+        f"{scene}. Live-action documentary photography, realistic real-world scene, stable subject identity, "
+        "anatomically correct body proportions, face attached naturally to the body, natural hands only if hands are required, "
+        "avoid close-up fingers, avoid distorted faces, prefer over-the-shoulder or medium shot for people, "
+        "clear subject-action-background match, natural light, no text, no watermark, no logo."
+    )
 
 
 def _generate_huggingface_image(
@@ -1856,8 +2252,8 @@ def _generate_huggingface_image(
     if not hf_api_key:
         raise RuntimeError("HUGGINGFACE_API_KEY not configured in .env file")
     
-    # Extract keywords from prompt
-    keywords = " ".join(prompt.split()[:15])
+    image_prompt = _harden_creator_image_prompt(prompt, max_words=120)
+    negative_prompt = _creator_image_negative_prompt()
     
     # Use Stable Diffusion XL for better quality
     model_id = _env_first("HF_IMAGE_MODEL") or "stabilityai/stable-diffusion-xl-base-1.0"
@@ -1878,12 +2274,13 @@ def _generate_huggingface_image(
             "Authorization": f"Bearer {hf_api_key}",
         }
         payload = {
-            "inputs": keywords,
+            "inputs": image_prompt,
             "parameters": {
                 "width": width,
                 "height": height,
                 "num_inference_steps": 30,
                 "guidance_scale": 7.5,
+                "negative_prompt": negative_prompt,
             },
         }
         
@@ -1895,12 +2292,12 @@ def _generate_huggingface_image(
         with open(output_path, "wb") as f:
             f.write(response.content)
         
-        logger.info(f"Generated image using Hugging Face: {keywords}")
+        logger.info(f"Generated image using Hugging Face: {image_prompt[:180]}")
         return output_path
         
     except Exception as exc:
         logger.warning(f"Failed to generate image with Hugging Face: {exc}")
-        raise RuntimeError(f"Không thể sinh ảnh với Hugging Face: {exc}") from exc
+        raise RuntimeError(f"KhÃ´ng thá»ƒ sinh áº£nh vá»›i Hugging Face: {exc}") from exc
 
 
 def _generate_dalle_image(
@@ -1914,8 +2311,7 @@ def _generate_dalle_image(
     if not openai_api_key:
         raise RuntimeError("OPENAI_API_KEY not configured in .env file")
     
-    # Extract keywords from prompt
-    keywords = " ".join(prompt.split()[:10])
+    image_prompt = _harden_creator_image_prompt(prompt, max_words=220)
     
     # Determine size based on aspect ratio
     size = "1024x1024"  # Default square
@@ -1928,7 +2324,7 @@ def _generate_dalle_image(
         client = openai.OpenAI(api_key=openai_api_key)
         response = client.images.generate(
             model="dall-e-3",
-            prompt=keywords,
+            prompt=image_prompt,
             size=size,
             quality="standard",
             n=1,
@@ -1944,12 +2340,12 @@ def _generate_dalle_image(
         with open(output_path, "wb") as f:
             f.write(img_response.content)
         
-        logger.info(f"Generated image using DALL-E: {keywords}")
+        logger.info(f"Generated image using DALL-E: {image_prompt[:180]}")
         return output_path
         
     except Exception as exc:
         logger.warning(f"Failed to generate image with DALL-E: {exc}")
-        raise RuntimeError(f"Không thể sinh ảnh với DALL-E: {exc}") from exc
+        raise RuntimeError(f"KhÃ´ng thá»ƒ sinh áº£nh vá»›i DALL-E: {exc}") from exc
 
 
 def _generate_ai_image(
@@ -1969,19 +2365,19 @@ def _generate_ai_image(
             from diffusers import StableDiffusionPipeline
         except (ImportError, RuntimeError, RecursionError) as exc:
             raise RuntimeError(
-                "Không khởi tạo được thư viện AI ảnh; hãy restart backend rồi thử lại"
+                "KhÃ´ng khá»Ÿi táº¡o Ä‘Æ°á»£c thÆ° viá»‡n AI áº£nh; hÃ£y restart backend rá»“i thá»­ láº¡i"
             ) from exc
 
-    model_id = _env_first("IMAGE_AI_MODEL", "CPU_IMAGE_MODEL") or "stabilityai/sd-turbo"
+    model_id = _local_ai_image_model_id()
     requested_device = (_env_first("IMAGE_AI_DEVICE") or "auto").lower()
     if requested_device not in ("auto", "cpu", "cuda"):
-        raise RuntimeError("IMAGE_AI_DEVICE chỉ nhận auto, cpu hoặc cuda")
+        raise RuntimeError("IMAGE_AI_DEVICE chá»‰ nháº­n auto, cpu hoáº·c cuda")
     if requested_device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("Đã chọn CUDA nhưng PyTorch không nhận được GPU NVIDIA")
+        raise RuntimeError("ÄÃ£ chá»n CUDA nhÆ°ng PyTorch khÃ´ng nháº­n Ä‘Æ°á»£c GPU NVIDIA")
     device = "cuda" if (requested_device == "cuda" or (requested_device == "auto" and torch.cuda.is_available())) else "cpu"
     precision = (_env_first("IMAGE_AI_PRECISION") or "auto").lower()
     if precision not in ("auto", "fp16", "fp32"):
-        raise RuntimeError("IMAGE_AI_PRECISION chỉ nhận auto, fp16 hoặc fp32")
+        raise RuntimeError("IMAGE_AI_PRECISION chá»‰ nháº­n auto, fp16 hoáº·c fp32")
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else ""
     # GTX 16-series cards can execute FP16 but SD-Turbo's VAE commonly
     # overflows to NaN on them, producing a successfully saved all-black
@@ -2013,7 +2409,7 @@ def _generate_ai_image(
             steps = max(1, min(4, int(_env_first("IMAGE_AI_STEPS", "CPU_IMAGE_STEPS") or "1")))
         # CLIP truncates after 77 tokens. Keep the concrete scene at the front
         # and leave enough room for the essential realism constraints.
-        scene_prompt = " ".join(prompt.split())
+        scene_prompt = _harden_creator_image_prompt(prompt, max_words=90)
         tokenizer = _IMAGE_AI_PIPELINE.tokenizer
         scene_ids = tokenizer(
             scene_prompt, add_special_tokens=False, truncation=True, max_length=42,
@@ -2034,9 +2430,11 @@ def _generate_ai_image(
             full_prompt.encode("utf-8")[:8].ljust(8, b"0"), "little",
         ) % (2**31)
         generator = torch.Generator(device=device).manual_seed(seed)
+        guidance_scale = float(_env_first("IMAGE_AI_GUIDANCE_SCALE") or "1.0")
         result = _IMAGE_AI_PIPELINE(
             prompt=full_prompt, width=width, height=height,
-            num_inference_steps=steps, guidance_scale=0.0, generator=generator,
+            negative_prompt=_creator_image_negative_prompt(),
+            num_inference_steps=steps, guidance_scale=guidance_scale, generator=generator,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         result.images[0].save(output_path, format="JPEG", quality=92)
@@ -2074,9 +2472,9 @@ def _generate_ai_video(
         from diffusers import LTXImageToVideoPipeline
         from diffusers.utils import export_to_video
     except (ImportError, RuntimeError, RecursionError) as exc:
-        raise RuntimeError("Không khởi tạo được LTX-Video; hãy kiểm tra diffusers/transformers") from exc
+        raise RuntimeError("KhÃ´ng khá»Ÿi táº¡o Ä‘Æ°á»£c LTX-Video; hÃ£y kiá»ƒm tra diffusers/transformers") from exc
     if not torch.cuda.is_available():
-        raise RuntimeError("AI Sinh Video cần NVIDIA GPU/CUDA nhưng PyTorch hiện không nhận GPU")
+        raise RuntimeError("AI Sinh Video cáº§n NVIDIA GPU/CUDA nhÆ°ng PyTorch hiá»‡n khÃ´ng nháº­n GPU")
 
     model_id = _env_first("LTX_VIDEO_MODEL") or "Lightricks/LTX-Video-0.9.5"
     # LTX requires dimensions divisible by 32 and frame counts in the form 8n+1.
@@ -2106,14 +2504,14 @@ def _generate_ai_video(
 
         image = Image.open(image_path).convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
         negative_prompt = (
-            "cartoon, animation, illustration, CGI, 3D render, deformed anatomy, "
-            "identity change, flicker, jitter, text, logo, watermark, blurry"
+            f"{_creator_image_negative_prompt()}, identity change, flicker, jitter, unnatural motion, "
+            "face drifting away from body, hands detached from arms"
         )
         generator = torch.Generator(device="cuda").manual_seed(story_seed)
         frames = _VIDEO_AI_PIPELINE(
             image=image,
             prompt=(
-                f"{prompt}. Live-action cinematic documentary footage, natural realistic motion, "
+                f"{_harden_creator_image_prompt(prompt, max_words=90)}. Live-action cinematic documentary footage, natural realistic motion, "
                 "physically accurate movement, stable subject identity, coherent camera movement, no scene cut."
             ),
             negative_prompt=negative_prompt,
@@ -2160,7 +2558,7 @@ def _generate_svd_video_isolated(
         detail = (result.stderr or result.stdout or "SVD worker stopped unexpectedly")[-5000:]
         raise RuntimeError(f"SVD worker exit={result.returncode}: {detail}")
     if not output_path.exists() or output_path.stat().st_size < 4096:
-        raise RuntimeError("SVD worker không tạo được video hợp lệ")
+        raise RuntimeError("SVD worker khÃ´ng táº¡o Ä‘Æ°á»£c video há»£p lá»‡")
     logger.info("SVD worker completed: %s", (result.stdout or "").strip()[-1000:])
     return output_path
 
@@ -2240,6 +2638,71 @@ def _render_stock_clip(
     result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout or "FFmpeg stock clip render failed")
+
+
+def _render_product_ad_clip(
+    source_path: Path,
+    source_type: str,
+    output_path: Path,
+    width: int,
+    height: int,
+    duration: float,
+    scene: str,
+    index: int,
+) -> None:
+    """Render uploaded product media as an ad mockup, not a plain slideshow.
+
+    This keeps the real product visible while adding a blurred brand-style
+    background, foreground motion, and beat-specific composition. It is a
+    deterministic replacement for unavailable image-to-image reference models.
+    """
+    folded = _ascii_fold(scene)
+    fg_width = int(width * (0.74 if "detail shot" not in folded else 0.84))
+    if "cta shot" in folded or "final frame" in folded:
+        fg_width = int(width * 0.66)
+    y_ratio = 0.16
+    if "product reveal" in folded or "detail shot" in folded:
+        y_ratio = 0.11
+    elif "cta shot" in folded or "final frame" in folded:
+        y_ratio = 0.2
+    x_motion = "sin(t*1.4)*10"
+    y_motion = "sin(t*1.8)*16"
+    bg = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{height},boxblur=24:2,eq=brightness=-0.08:saturation=1.15,"
+        "format=yuv420p"
+    )
+    fg = (
+        f"scale={fg_width}:-2:force_original_aspect_ratio=decrease:flags=lanczos,"
+        "format=rgba,"
+        "pad=iw+48:ih+48:24:24:color=black@0,"
+        "drawbox=x=8:y=8:w=iw-16:h=ih-16:color=white@0.22:t=6"
+    )
+    overlay = (
+        f"overlay=x='(W-w)/2+{x_motion}':y='{height * y_ratio:.1f}+{y_motion}':"
+        "format=auto"
+    )
+    grade = "eq=contrast=1.08:saturation=1.12,format=yuv420p"
+    filter_complex = f"[0:v]split=2[rawbg][rawfg];[rawbg]{bg}[bg];[rawfg]{fg}[fg];[bg][fg]{overlay},{grade}[v]"
+    if source_type == "image":
+        cmd = [
+            "ffmpeg", "-y", "-loop", "1", "-t", f"{duration:.3f}",
+            "-i", str(source_path), "-filter_complex", filter_complex,
+            "-map", "[v]", "-an", "-c:v", "libx264", "-preset", WEB_RENDER_PRESET,
+            "-crf", str(WEB_RENDER_CRF), "-r", "30", "-fps_mode", "cfr",
+            str(output_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{duration:.3f}",
+            "-i", str(source_path), "-filter_complex", filter_complex,
+            "-map", "[v]", "-an", "-c:v", "libx264", "-preset", WEB_RENDER_PRESET,
+            "-crf", str(WEB_RENDER_CRF), "-r", "30", "-fps_mode", "cfr",
+            str(output_path),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout or "FFmpeg product ad clip render failed")
 
 
 CREATOR_TRANSITIONS = {
@@ -2492,6 +2955,58 @@ def _validated_product_media_paths(user_id: int, media_ids: List[str]) -> List[s
     return paths
 
 
+def _scene_prefers_product_media(scene: str) -> bool:
+    """Use real product media only for ad beats where the product must be seen."""
+    folded = _ascii_fold(scene)
+    product_markers = (
+        "hero product media", "product reveal", "demo proof", "result shot",
+        "detail shot", "final frame", "cta shot", "san pham that", "quay thao tac dung that",
+        "can canh san pham", "bao bi", "kich thuoc", "phu kien", "chat lieu",
+    )
+    context_markers = (
+        "problem shot", "model problem scene", "model use scene", "model lifestyle shot",
+        "objection shot", "lifestyle shot", "nguoi thuoc nhom",
+        "gap dung van de", "diem han che", "boi canh that",
+    )
+    if any(marker in folded for marker in context_markers):
+        return False
+    return any(marker in folded for marker in product_markers)
+
+
+def _scene_requires_model_context(scene: str) -> bool:
+    folded = _ascii_fold(scene)
+    return any(
+        marker in folded
+        for marker in ("model problem scene", "model use scene", "model lifestyle shot")
+    )
+
+
+def _product_video_media_for_model_scene(product_media_paths: List[Path], scene_index: int) -> Optional[Path]:
+    video_paths = [path for path in product_media_paths if _uploaded_product_media_kind(path) == "video"]
+    if not video_paths:
+        return None
+    return video_paths[scene_index % len(video_paths)]
+
+
+def _local_ai_image_model_id() -> str:
+    return _env_first("IMAGE_AI_MODEL", "CPU_IMAGE_MODEL") or "stabilityai/sd-turbo"
+
+
+def _local_ai_model_is_low_quality_for_people() -> bool:
+    return "sd-turbo" in _local_ai_image_model_id().lower()
+
+
+def _product_media_animation_for_scene(scene: str, index: int) -> str:
+    folded = _ascii_fold(scene)
+    if "product reveal" in folded or "detail shot" in folded or "can canh" in folded:
+        return "zoomin"
+    if "result shot" in folded or "before" in folded or "after" in folded:
+        return "slideleft"
+    if "cta shot" in folded or "final frame" in folded:
+        return "zoomout"
+    return ("zoomin", "slideleft", "zoomout", "slideright")[index % 4]
+
+
 def _synthesize_creator_cues(
     scenes: List[str], output_dir: Path, language: str, voice: Optional[str], output_path: Path,
 ) -> tuple[List[float], List[List[int]]]:
@@ -2512,10 +3027,12 @@ def _synthesize_creator_cues(
     durations: List[float] = []
     word_durations: List[List[int]] = []
     for index, cue in enumerate(cues):
+        directed_cue = direct_voice_cue(cue, index, len(cues), language)
         cue_path = cue_dir / f"cue_{index:03d}.mp3"
         communicate = edge_tts.Communicate(
-            cue.replace("\n", " "), effective_voice,
-            rate=options.get("rate", "+0%"), pitch=options.get("pitch", "+0Hz"),
+            directed_cue.text.replace("\n", " "), effective_voice,
+            rate=directed_cue.rate or options.get("rate", "+0%"),
+            pitch=directed_cue.pitch or options.get("pitch", "+0Hz"),
             boundary="WordBoundary",
         )
         measured_boundaries: List[tuple[int, int]] = []
@@ -2527,7 +3044,7 @@ def _synthesize_creator_cues(
                     measured_boundaries.append((event["offset"], event["duration"]))
         duration = _media_duration(cue_path)
         if duration <= 0:
-            raise RuntimeError(f"Không đo được thời lượng voice đoạn {index + 1}")
+            raise RuntimeError(f"KhÃ´ng Ä‘o Ä‘Æ°á»£c thá»i lÆ°á»£ng voice Ä‘oáº¡n {index + 1}")
         paths.append(cue_path)
         durations.append(duration)
         # Karaoke tags are sequential. Use the distance between Edge's real
@@ -2548,7 +3065,7 @@ def _synthesize_creator_cues(
         capture_output=True, text=True, check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "Không ghép được các đoạn voice")[-4000:])
+        raise RuntimeError((result.stderr or result.stdout or "KhÃ´ng ghÃ©p Ä‘Æ°á»£c cÃ¡c Ä‘oáº¡n voice")[-4000:])
     return durations, word_durations
 
 
@@ -2587,7 +3104,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
     if job is None:
         return
     try:
-        store.update_job(job_id, status="running", progress_note="Đang dựng video từ ý tưởng...")
+        store.update_job(job_id, status="running", progress_note="Äang dá»±ng video tá»« Ã½ tÆ°á»Ÿng...")
         output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2604,16 +3121,16 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         # Measure natural speech before rendering visuals. This makes timing a
         # real content constraint rather than changing speaking rate at the
         # final FFmpeg step.
-        store.update_job(job_id, progress_note="Đang tạo giọng đọc tự nhiên để đo timeline...")
+        store.update_job(job_id, progress_note="Äang táº¡o giá»ng Ä‘á»c tá»± nhiÃªn Ä‘á»ƒ Ä‘o timeline...")
         voice_path = output_dir / "narration.mp3"
         cue_durations, cue_word_durations = _synthesize_creator_cues(
             narration_scenes, output_dir, body.target_language, body.tts_voice, voice_path,
         )
         if not voice_path.exists() or voice_path.stat().st_size < 1024:
-            raise RuntimeError("TTS không tạo được file giọng đọc hợp lệ")
+            raise RuntimeError("TTS khÃ´ng táº¡o Ä‘Æ°á»£c file giá»ng Ä‘á»c há»£p lá»‡")
         voice_duration = _media_duration(voice_path)
         if voice_duration <= 0:
-            raise RuntimeError("Không đo được thời lượng giọng đọc")
+            raise RuntimeError("KhÃ´ng Ä‘o Ä‘Æ°á»£c thá»i lÆ°á»£ng giá»ng Ä‘á»c")
         final_duration = max(float(selected_duration), voice_duration)
         scene_duration = max(2.5, final_duration / len(scenes))
         logger.info(
@@ -2642,7 +3159,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         ai_scene_prompts: List[str] = []
         story_seed: Optional[int] = None
         if image_provider in ("ai", "cpu_ai", "ai_video"):
-            store.update_job(job_id, progress_note="AI đang lập storyboard và mạch hình ảnh...")
+            store.update_job(job_id, progress_note="AI Ä‘ang láº­p storyboard vÃ  máº¡ch hÃ¬nh áº£nh...")
             story_bible, ai_scene_prompts = _creator_image_story_prompts(
                 translated_topic, translated_scenes, translated_narration,
             )
@@ -2655,7 +3172,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
             for idx, prompt in enumerate(ai_scene_prompts):
                 store.update_job(
                     job_id,
-                    progress_note=f"AI đang tạo storyboard {idx + 1}/{len(ai_scene_prompts)}...",
+                    progress_note=f"AI Ä‘ang táº¡o storyboard {idx + 1}/{len(ai_scene_prompts)}...",
                 )
                 ai_keyframes.append(_generate_ai_image(
                     prompt, output_dir / f"keyframe_{idx:02d}.jpg",
@@ -2678,12 +3195,29 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
             )
             logger.info("Creator scene %s/%s stock queries: %s", idx + 1, len(scenes), queries)
             media = None
-            if product_media_paths:
+            model_product_video = (
+                _product_video_media_for_model_scene(product_media_paths, idx)
+                if _scene_requires_model_context(scene) else None
+            )
+            if model_product_video:
+                _render_product_ad_clip(
+                    model_product_video, "video", clip_path, width, height,
+                    scene_duration, scene, idx,
+                )
+                media = {
+                    "type": "video", "url": str(model_product_video),
+                    "provider": "Uploaded product demo video",
+                }
+                store.update_job(
+                    job_id,
+                    progress_note=f"Da dung video demo that cho canh nguoi mau {idx + 1}/{len(scenes)}...",
+                )
+            elif product_media_paths and _scene_prefers_product_media(scene):
                 source_path = product_media_paths[idx % len(product_media_paths)]
                 media_type = _uploaded_product_media_kind(source_path)
-                _render_stock_clip(
+                _render_product_ad_clip(
                     source_path, media_type, clip_path, width, height,
-                    scene_duration, body.transition,
+                    scene_duration, scene, idx,
                 )
                 media = {
                     "type": media_type, "url": str(source_path),
@@ -2695,9 +3229,14 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                 )
             elif image_provider in ("ai", "cpu_ai"):
                 try:
+                    if _scene_requires_model_context(scene) and _local_ai_model_is_low_quality_for_people() and not _remote_creator_image_available():
+                        raise RuntimeError(
+                            "Local AI dang dung sd-turbo, khong du chat luong de tao canh nguoi mau cam/dung san pham that. "
+                            "Hay upload video demo that cua san pham, chon Stock voi Pexels/Pixabay, hoac cau hinh HUGGINGFACE_API_KEY / DALL-E."
+                        )
                     store.update_job(
                         job_id,
-                        progress_note=f"AI đang sinh khung hình {idx + 1}/{len(scenes)}...",
+                        progress_note=f"AI Ä‘ang sinh khung hÃ¬nh {idx + 1}/{len(scenes)}...",
                     )
                     # Priority: Hugging Face (free) > DALL-E (paid) > Local SD-Turbo (free)
                     hf_api_key = _env_first("HUGGINGFACE_API_KEY")
@@ -2712,6 +3251,11 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                             )
                         except Exception as hf_exc:
                             logger.warning(f"Hugging Face failed, falling back to local SD-Turbo: {hf_exc}")
+                            local_ok, local_reason = _local_creator_image_runtime_available()
+                            if not local_ok:
+                                raise RuntimeError(
+                                    f"Hugging Face lỗi và local AI image chưa dùng được ({local_reason})"
+                                ) from hf_exc
                             ai_path = _generate_ai_image(
                                 ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
                                 body.aspect_ratio, story_seed=story_seed,
@@ -2725,12 +3269,22 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                             )
                         except Exception as dalle_exc:
                             logger.warning(f"DALL-E failed, falling back to local SD-Turbo: {dalle_exc}")
+                            local_ok, local_reason = _local_creator_image_runtime_available()
+                            if not local_ok:
+                                raise RuntimeError(
+                                    f"DALL-E lỗi và local AI image chưa dùng được ({local_reason})"
+                                ) from dalle_exc
                             ai_path = _generate_ai_image(
                                 ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
                                 body.aspect_ratio, story_seed=story_seed,
                             )
                     else:
                         # Use local SD-Turbo (free, lower quality)
+                        if _scene_requires_model_context(scene) and _local_ai_model_is_low_quality_for_people():
+                            raise RuntimeError(
+                                "Local sd-turbo bi chan cho canh nguoi mau/product-in-hand vi thuong tao tay/mat/san pham sai. "
+                                "Dung video demo upload, Stock, HuggingFace, hoac DALL-E cho canh nay."
+                            )
                         ai_path = _generate_ai_image(
                             ai_scene_prompts[idx], output_dir / f"ai_{idx:02d}.jpg",
                             body.aspect_ratio, story_seed=story_seed,
@@ -2739,17 +3293,17 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                         ai_path, "image", clip_path, width, height,
                         scene_duration, body.transition,
                     )
-                    media = {"type": "image", "url": str(ai_path), "provider": f"AI sinh ảnh ({_IMAGE_AI_DEVICE})"}
+                    media = {"type": "image", "url": str(ai_path), "provider": f"AI sinh áº£nh ({_IMAGE_AI_DEVICE})"}
                 except Exception as exc:
                     logger.exception("AI image generation failed for scene=%s", scene)
-                    raise RuntimeError(f"AI không sinh được khung hình {idx + 1}: {exc}") from exc
+                    raise RuntimeError(f"AI khÃ´ng sinh Ä‘Æ°á»£c khung hÃ¬nh {idx + 1}: {exc}") from exc
             elif image_provider == "ai_video":
                 try:
                     store.update_job(
                         job_id,
                         progress_note=(
-                            f"GPU đang sinh video cảnh {idx + 1}/{len(scenes)} "
-                            f"bằng {str(video_backend).upper()}..."
+                            f"GPU Ä‘ang sinh video cáº£nh {idx + 1}/{len(scenes)} "
+                            f"báº±ng {str(video_backend).upper()}..."
                         ),
                     )
                     raw_video_path = output_dir / f"ai_video_{idx:02d}.mp4"
@@ -2781,7 +3335,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                     video_fallback_count += 1
                     store.update_job(
                         job_id,
-                        progress_note=f"SVD lỗi ở cảnh {idx + 1}; đang dùng chuyển động ảnh an toàn...",
+                        progress_note=f"SVD lá»—i á»Ÿ cáº£nh {idx + 1}; Ä‘ang dÃ¹ng chuyá»ƒn Ä‘á»™ng áº£nh an toÃ n...",
                     )
                     _render_stock_clip(
                         ai_keyframes[idx], "image", clip_path, width, height,
@@ -2789,14 +3343,14 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                     )
                     media = {
                         "type": "image", "url": str(ai_keyframes[idx]),
-                        "provider": "AI sinh ảnh (fallback từ SVD)",
+                        "provider": "AI sinh áº£nh (fallback tá»« SVD)",
                     }
             else:
                 for query in queries:
                     media = _search_stock_media(query, body.aspect_ratio)
                     if media:
                         break
-            if media and not media["provider"].startswith(("AI sinh ảnh", "AI Sinh Video", "Product media")):
+            if media and not media["provider"].startswith(("AI sinh áº£nh", "AI Sinh Video", "Product media")):
                 try:
                     source_path = _download_stock_media(media, output_dir / f"stock_{idx:02d}")
                     _render_stock_clip(
@@ -2805,22 +3359,45 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                     )
                     store.update_job(
                         job_id,
-                        progress_note=f"Đã lấy cảnh {idx + 1}/{len(scenes)} từ {media['provider']}...",
+                        progress_note=f"ÄÃ£ láº¥y cáº£nh {idx + 1}/{len(scenes)} tá»« {media['provider']}...",
                     )
                 except Exception:
                     logger.exception("Stock media render failed for scene=%s", scene)
                     media = None
 
+            if not media and _scene_requires_model_context(scene):
+                raise RuntimeError(
+                    "Cảnh người mẫu cần Stock footage hoặc AI Image thật. Hiện không tạo được cảnh người mẫu, "
+                    "nên hệ thống đã dừng thay vì fallback thành ảnh sản phẩm chạy qua lại. "
+                    "Hãy cấu hình PEXELS_API_KEY/PIXABAY_API_KEY, hoặc bật DALL-E/HuggingFace image provider."
+                )
+
+            if not media and product_media_paths:
+                source_path = product_media_paths[idx % len(product_media_paths)]
+                media_type = _uploaded_product_media_kind(source_path)
+                _render_product_ad_clip(
+                    source_path, media_type, clip_path, width, height,
+                    scene_duration, scene, idx,
+                )
+                media = {
+                    "type": media_type, "url": str(source_path),
+                    "provider": "Product media fallback",
+                }
+                store.update_job(
+                    job_id,
+                    progress_note=f"Không có stock phù hợp; dùng product media fallback cho cảnh {idx + 1}/{len(scenes)}...",
+                )
+
             if not media:
                 raise RuntimeError(
-                    "Không lấy được ảnh/video stock. Hãy kiểm tra PEXELS_API_KEY trong .env "
-                    "và khởi động lại web; hệ thống không tạo video nền chữ thay thế nữa."
+                    "KhÃ´ng láº¥y Ä‘Æ°á»£c áº£nh/video stock. HÃ£y kiá»ƒm tra PEXELS_API_KEY trong .env "
+                    "vÃ  khá»Ÿi Ä‘á»™ng láº¡i web; há»‡ thá»‘ng khÃ´ng táº¡o video ná»n chá»¯ thay tháº¿ ná»¯a."
                 )
             clip_paths.append(clip_path)
-            store.update_job(job_id, progress_note=f"Đã dựng {idx + 1}/{len(scenes)} cảnh...")
+            store.update_job(job_id, progress_note=f"ÄÃ£ dá»±ng {idx + 1}/{len(scenes)} cáº£nh...")
 
         visual_path = output_dir / "visual_timeline.mp4"
-        store.update_job(job_id, progress_note="Đang ghép và tạo hiệu ứng chuyển cảnh...")
+        store.update_job(job_id, progress_note="Äang ghÃ©p vÃ  táº¡o hiá»‡u á»©ng chuyá»ƒn cáº£nh...")
         # Entrance/exit animation is already rendered into every scene.
         # A timestamp-safe concat avoids FFmpeg 7's broken multi-xfade path.
         _render_creator_timeline(
@@ -2836,7 +3413,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         )
         store.set_job_segments(job_id, segments)
 
-        store.update_job(job_id, progress_note="Đang ghép voice và đóng subtitle...")
+        store.update_job(job_id, progress_note="Äang ghÃ©p voice vÃ  Ä‘Ã³ng subtitle...")
         output_path = output_dir / "output_generated.mp4"
         _add_creator_voice_and_subtitles(
             visual_path, voice_path, subtitles_path, output_path, final_duration,
@@ -2844,8 +3421,8 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         store.update_job(
             job_id, status="done",
             progress_note=(
-                f"Hoàn tất · {video_fallback_count} cảnh dùng chuyển động ảnh fallback"
-                if video_fallback_count else "Hoàn tất"
+                f"HoÃ n táº¥t Â· {video_fallback_count} cáº£nh dÃ¹ng chuyá»ƒn Ä‘á»™ng áº£nh fallback"
+                if video_fallback_count else "HoÃ n táº¥t"
             ),
             final_video_path=str(output_path), title=body.topic.strip()[:80],
         )
@@ -2860,20 +3437,20 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
 @app.post("/api/jobs")
 async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_id)):
     if not body.url.strip():
-        raise HTTPException(400, "Thiếu đường link video")
+        raise HTTPException(400, "Thiáº¿u Ä‘Æ°á»ng link video")
 
     user = store.get_user_by_id(user_id)
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
         raise HTTPException(
             402,
-            f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS}). "
-            "Liên hệ admin để được cấp thêm.",
+            f"KhÃ´ng Ä‘á»§ credit (cÃ²n {user['credits']}, cáº§n {JOB_COST_CREDITS}). "
+            "LiÃªn há»‡ admin Ä‘á»ƒ Ä‘Æ°á»£c cáº¥p thÃªm.",
         )
 
     logo_path = None
     if body.logo_path:
         # body.logo_path is actually the opaque id POST /api/upload-logo
-        # returned — resolve it back to a real file path scoped to this
+        # returned â€” resolve it back to a real file path scoped to this
         # user, so one user can't reference another's uploaded logo file
         # just by guessing/reusing an id.
         candidate = _LOGO_UPLOAD_DIR / f"{user_id}_{body.logo_path}"
@@ -2902,27 +3479,27 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
 @app.post("/api/creator/jobs")
 async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_current_user_id)):
     if not body.topic.strip():
-        raise HTTPException(400, "Thiếu chủ đề video")
+        raise HTTPException(400, "Thiáº¿u chá»§ Ä‘á» video")
     if body.aspect_ratio not in ("9:16", "16:9"):
-        raise HTTPException(400, "Tỷ lệ khung hình không hợp lệ")
+        raise HTTPException(400, "Tá»· lá»‡ khung hÃ¬nh khÃ´ng há»£p lá»‡")
     if body.transition not in CREATOR_TRANSITIONS:
-        raise HTTPException(400, "Hiệu ứng chuyển cảnh không hợp lệ")
+        raise HTTPException(400, "Hiá»‡u á»©ng chuyá»ƒn cáº£nh khÃ´ng há»£p lá»‡")
     if not 10 <= int(body.duration_seconds or 0) <= 1200:
-        raise HTTPException(400, "Thời lượng video phải từ 10 giây đến 20 phút")
+        raise HTTPException(400, "Thá»i lÆ°á»£ng video pháº£i tá»« 10 giÃ¢y Ä‘áº¿n 20 phÃºt")
     if body.image_provider not in ("stock", "ai", "cpu_ai", "ai_video"):
-        raise HTTPException(400, "Nguồn hình ảnh không hợp lệ")
+        raise HTTPException(400, "Nguá»“n hÃ¬nh áº£nh khÃ´ng há»£p lá»‡")
     product_media_paths = _validated_product_media_paths(user_id, body.product_media_paths or [])
     body.product_media_paths = product_media_paths
-    if not product_media_paths:
+    if body.image_provider in ("ai", "cpu_ai", "ai_video"):
         _validate_creator_ai_runtime(body.image_provider)
     if body.image_provider == "stock" and not product_media_paths and not _env_first("PEXELS_API_KEY", "PEXELS_KEY", "PIXABAY_API_KEY", "PIXABAY_KEY"):
         raise HTTPException(
             503,
-            "Chưa cấu hình kho ảnh. Thêm PEXELS_API_KEY vào file .env rồi khởi động lại web.",
+            "ChÆ°a cáº¥u hÃ¬nh kho áº£nh. ThÃªm PEXELS_API_KEY vÃ o file .env rá»“i khá»Ÿi Ä‘á»™ng láº¡i web.",
         )
     user = store.get_user_by_id(user_id)
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
-        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
+        raise HTTPException(402, f"KhÃ´ng Ä‘á»§ credit (cÃ²n {user['credits']}, cáº§n {JOB_COST_CREDITS})")
 
     job = store.create_job(
         user_id,
@@ -2967,9 +3544,9 @@ def creator_capabilities(user_id: int = Depends(get_current_user_id)):
 @app.post("/api/creator/suggestions")
 def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_current_user_id)):
     if not body.topic.strip():
-        raise HTTPException(400, "Thiếu chủ đề video")
+        raise HTTPException(400, "Thiáº¿u chá»§ Ä‘á» video")
     if not 10 <= int(body.duration_seconds or 0) <= 1200:
-        raise HTTPException(400, "Thời lượng nội dung phải từ 10 giây đến 20 phút")
+        raise HTTPException(400, "Thá»i lÆ°á»£ng ná»™i dung pháº£i tá»« 10 giÃ¢y Ä‘áº¿n 20 phÃºt")
     topic = body.topic.strip()
     language = body.target_language or "vi"
     
@@ -3005,8 +3582,8 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
                 try:
                     result = generate(body)
                     result = _enforce_creator_entity_consistency(result, topic, language)
-                    # Search intent does not change merely because duration does.
-                    result["keywords"] = _creator_keywords_from_topic(topic, language)
+                    result = _postprocess_creator_suggestion_quality(result, topic, language, body.duration_seconds)
+                    result = _enforce_creator_entity_consistency(result, topic, language)
                     result = _validate_creator_suggestion_timing(result, body.duration_seconds)
                     result = _annotate_creator_suggestion_timing(result, body.duration_seconds)
                     _CREATOR_AI_CACHE[cache_key] = (time.time(), dict(result))
@@ -3019,22 +3596,26 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
         # Suggestions are editing aids, so an unavailable optional AI service
         # must not make all three Generate buttons unusable.
         result = {
-            "keywords": _creator_keywords_from_topic(topic, language),
+            "keywords": _creator_seo_keywords_from_topic(topic, language, body.duration_seconds),
             "visual_brief": _creator_script_text_from_topic(topic, language, body.duration_seconds),
             "script": _creator_script_text_from_topic(topic, language, body.duration_seconds),
             "narration_script": _creator_narration_text_from_topic(topic, language, body.duration_seconds),
             "generator": "template", "model": None,
-            "warning": "AI tạm thời không phản hồi; đang dùng nội dung local. " + " | ".join(errors),
+            "warning": "AI táº¡m thá»i khÃ´ng pháº£n há»“i; Ä‘ang dÃ¹ng ná»™i dung local. " + " | ".join(errors),
         }
+        result = _postprocess_creator_suggestion_quality(result, topic, language, body.duration_seconds)
+        result = _enforce_creator_entity_consistency(result, topic, language)
         return _annotate_creator_suggestion_timing(result, body.duration_seconds)
     result = {
-        "keywords": _creator_keywords_from_topic(topic, language),
+        "keywords": _creator_seo_keywords_from_topic(topic, language, body.duration_seconds),
         "visual_brief": _creator_script_text_from_topic(topic, language, body.duration_seconds),
         "script": _creator_script_text_from_topic(topic, language, body.duration_seconds),
         "narration_script": _creator_narration_text_from_topic(topic, language, body.duration_seconds),
         "generator": "template", "model": None,
-        "warning": "AI chưa được cấu hình hoặc tạm thời không phản hồi; đang dùng nội dung mẫu local.",
+        "warning": "AI chÆ°a Ä‘Æ°á»£c cáº¥u hÃ¬nh hoáº·c táº¡m thá»i khÃ´ng pháº£n há»“i; Ä‘ang dÃ¹ng ná»™i dung máº«u local.",
     }
+    result = _postprocess_creator_suggestion_quality(result, topic, language, body.duration_seconds)
+    result = _enforce_creator_entity_consistency(result, topic, language)
     return _annotate_creator_suggestion_timing(result, body.duration_seconds)
 
 
@@ -3060,18 +3641,18 @@ def _affiliate_fragment(value: str) -> str:
 
 def _affiliate_expressive_line(text: str) -> str:
     text = " ".join(str(text or "").split())
-    text = re.sub(r"^nhưng\b", "Nhưng,", text, flags=re.I)
-    text = re.sub(r"\bnếu bạn\b", "Nếu bạn", text, flags=re.I)
+    text = re.sub(r"^nhÆ°ng\b", "NhÆ°ng,", text, flags=re.I)
+    text = re.sub(r"\bnáº¿u báº¡n\b", "Náº¿u báº¡n", text, flags=re.I)
     return text
 
 
 def _affiliate_product_voice_name(product: str) -> str:
     """Use a short spoken product name; keep the full name for title/caption."""
     text = " ".join(str(product or "").split())
-    text = re.sub(r"^(?:chai|lọ|lo|hộp|hop|túi|tui|gói|goi|bộ|bo)\s+", "", text, flags=re.I)
-    text = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|gram|chai|túi|goi|gói)\b", "", text, flags=re.I)
+    text = re.sub(r"^(?:chai|lá»|lo|há»™p|hop|tÃºi|tui|gÃ³i|goi|bá»™|bo)\s+", "", text, flags=re.I)
+    text = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|gram|chai|tÃºi|goi|gÃ³i)\b", "", text, flags=re.I)
     text = re.split(
-        r"\b(?:giữ|giu|lưu|luu|thơm|thom|trên|tren|cho|dành|danh|phù hợp|phu hop|hương thơm|huong thom)\b",
+        r"\b(?:giá»¯|giu|lÆ°u|luu|thÆ¡m|thom|trÃªn|tren|cho|dÃ nh|danh|phÃ¹ há»£p|phu hop|hÆ°Æ¡ng thÆ¡m|huong thom)\b",
         text,
         maxsplit=1,
         flags=re.I,
@@ -3125,7 +3706,7 @@ def _affiliate_compliance_warnings(body: AffiliateReviewBody) -> List[str]:
         body.product_name, body.product_claims, body.pros, body.cons,
         body.audience, body.real_experience,
     ])
-    normalized = unicodedata.normalize("NFKD", haystack.lower().replace("đ", "d"))
+    normalized = unicodedata.normalize("NFKD", haystack.lower().replace("Ä‘", "d"))
     normalized = normalized.encode("ascii", "ignore").decode("ascii")
     warnings: List[str] = []
     for pattern, message in _AFFILIATE_RISK_PATTERNS:
@@ -3136,6 +3717,292 @@ def _affiliate_compliance_warnings(body: AffiliateReviewBody) -> List[str]:
     return warnings
 
 
+def _affiliate_seo_tags(product: str, platform: str, language: str) -> List[str]:
+    compact_product = re.sub(r"[^0-9A-Za-z]+", "", unicodedata.normalize("NFKD", product).encode("ascii", "ignore").decode("ascii")).lower()[:30]
+    platform_tag = re.sub(r"[^0-9A-Za-z]+", "", platform or "").lower()[:24]
+    if language == "vi":
+        base = [
+            "reviewthat", "codangmuakhong", "truockhimuahang", "kinhnghiemmuasam",
+            "muasamthongminh", "tiktokshop", "affiliate",
+        ]
+    else:
+        base = [
+            "honestreview", "worthbuying", "beforeyoubuy", "shoppingtips",
+            "productreview", "affiliate",
+        ]
+    return _dedupe_clean_terms([compact_product, platform_tag, *base], 12)
+
+
+def _affiliate_creative_format(body: AffiliateReviewBody) -> str:
+    value = (body.creative_format or "ugc_problem_solution").strip().lower()
+    if value not in {"ugc_problem_solution", "demo_proof", "before_after"}:
+        return "ugc_problem_solution"
+    return value
+
+
+def _affiliate_model_prompt(body: AffiliateReviewBody, language: str) -> str:
+    prompt = " ".join(str(body.model_prompt or "").split())
+    if prompt:
+        return prompt[:220]
+    audience = body.audience.strip()
+    if language == "vi":
+        if audience:
+            return f"người mẫu thuộc nhóm {audience}, phong cách UGC tự nhiên, đang dùng sản phẩm trong bối cảnh đời thật"
+        return "người mẫu UGC tự nhiên, ánh sáng rõ, biểu cảm tin cậy, đang dùng sản phẩm trong bối cảnh đời thật"
+    if audience:
+        return f"UGC model matching {audience}, natural real-life setting, using the product"
+    return "natural UGC model, clear light, trustworthy expression, using the product in a real-life setting"
+
+
+def _product_ad_timecodes(duration: int, scene_count: int) -> List[str]:
+    duration = max(15, min(60, int(duration or 30)))
+    step = duration / scene_count
+    ranges = []
+    for index in range(scene_count):
+        start = round(index * step)
+        end = round((index + 1) * step)
+        if index == 0:
+            start = 0
+        if index == scene_count - 1:
+            end = duration
+        ranges.append(f"{start}-{end}s")
+    return ranges
+
+
+def _affiliate_product_ad_creative(body: AffiliateReviewBody) -> Dict[str, Any]:
+    language = body.target_language or "vi"
+    product = body.product_name.strip()
+    spoken_product = _affiliate_product_voice_name(product)
+    duration = max(15, min(60, int(body.duration_seconds or 30)))
+    creative = _affiliate_creative_format(body)
+    claims, pros, cons = _infer_affiliate_points(body, language)
+    audience = body.audience.strip()
+    experience = body.real_experience.strip()
+    model_prompt = _affiliate_model_prompt(body, language)
+    disclosure = (
+        "Có gắn link sản phẩm trong phần mô tả."
+        if language == "vi" else
+        "Product link is included in the description."
+    )
+    if language != "vi":
+        return _affiliate_product_ad_creative_en(
+            body, product, spoken_product, duration, creative, claims, pros, cons, audience, experience, disclosure,
+        )
+
+    audience_text = audience or "người đang cân nhắc sản phẩm này"
+    pro = _affiliate_fragment(pros[0])
+    con = _affiliate_fragment(cons[0])
+    claim = _affiliate_fragment(claims[0])
+    if creative == "demo_proof":
+        hook = f"Tôi test thật {spoken_product} trong 30 giây, đây là phần đáng xem nhất."
+        angle = "demo thật"
+        middle = [
+            f"Đừng nhìn quảng cáo trước, hãy nhìn cách nó xử lý đúng nhu cầu của {audience_text}.",
+            f"Trong lúc dùng thử, điểm tôi thấy rõ nhất là {pro}.",
+            f"Tôi cũng không bỏ qua điểm cần cân nhắc: {con}.",
+        ]
+    elif creative == "before_after":
+        hook = f"Trước và sau khi dùng {spoken_product}, khác biệt nằm ở chi tiết này."
+        angle = "trước sau"
+        middle = [
+            f"Trước đó, vấn đề của {audience_text} thường là mất thời gian vì cách xử lý cũ.",
+            f"Khi đưa sản phẩm vào tình huống thật, điểm nổi bật là {pro}.",
+            f"Nhưng nếu bạn kỳ vọng sản phẩm hoàn hảo tuyệt đối, hãy nhớ {con}.",
+        ]
+    else:
+        hook = f"Nếu bạn đang định mua {spoken_product}, xem đoạn test này trước đã."
+        angle = "UGC review"
+        middle = [
+            f"Vấn đề không phải sản phẩm nghe hay thế nào, mà là nó có hợp với {audience_text} không.",
+            f"Trải nghiệm thật của tôi: {_affiliate_expressive_line(experience)}.",
+            f"Điểm đáng tiền nhất là {pro}.",
+            f"Điểm cần tỉnh táo là {con}.",
+        ]
+
+    if duration <= 15:
+        narration_lines = [
+            hook,
+            middle[0],
+            f"Nếu bạn cần {claim}, đây là món đáng cân nhắc nhưng vẫn nên kiểm tra giá và đổi trả.",
+        ]
+        scene_count = 5
+    elif duration >= 60:
+        narration_lines = [
+            hook,
+            middle[0],
+            middle[1],
+            middle[2],
+            "Tôi muốn người xem thấy thao tác thật, bề mặt thật, kích thước thật, không chỉ một góc quay đẹp.",
+            f"Nếu bạn thuộc nhóm {audience_text}, sản phẩm này có lý do để xem tiếp.",
+            "Còn nếu nhu cầu của bạn khác, hãy so sánh thêm vài lựa chọn trước khi chốt đơn.",
+            "Kiểm tra giá hiện tại, bảo hành, đánh giá mới nhất và điều kiện đổi trả trước khi quyết định.",
+        ]
+        scene_count = 10
+    else:
+        narration_lines = [
+            hook,
+            *middle,
+            f"Nếu bạn là {audience_text}, hãy xem giá hiện tại và điều kiện đổi trả trước khi quyết định.",
+        ]
+        scene_count = 7
+
+    timecodes = _product_ad_timecodes(duration, scene_count)
+    visual_lines = [
+        f"{timecodes[0]} | HERO PRODUCT MEDIA: đặt {product} trên bàn sạch, ánh sáng rõ, khung dọc 9:16, subtitle hook xuất hiện từ voice.",
+        f"{timecodes[1]} | MODEL PROBLEM SCENE: {model_prompt}; gặp đúng vấn đề trước khi dùng sản phẩm.",
+        f"{timecodes[2]} | PRODUCT REVEAL: cận cảnh sản phẩm thật, bao bì, kích thước, phụ kiện, chất liệu, không dùng ảnh AI vẽ lại sản phẩm.",
+        f"{timecodes[3]} | MODEL USE SCENE + DEMO PROOF: {model_prompt}; người mẫu dùng {product} trong bối cảnh thật, sản phẩm và kết quả cùng xuất hiện trong khung hình.",
+        f"{timecodes[4]} | RESULT SHOT: so sánh trước/sau hoặc đặt kết quả cạnh cách làm cũ để người xem tự đánh giá.",
+    ]
+    if scene_count >= 7:
+        visual_lines.extend([
+            f"{timecodes[5]} | OBJECTION SHOT: quay điểm hạn chế hoặc điều cần kiểm tra: {cons[0]}.",
+            f"{timecodes[6]} | CTA SHOT: trang sản phẩm, giá hiện tại, bảo hành/đổi trả và disclosure affiliate rõ ràng.",
+        ])
+    if scene_count >= 10:
+        visual_lines.extend([
+            f"{timecodes[7]} | MODEL LIFESTYLE SHOT: {model_prompt}; sản phẩm nằm trong bối cảnh thật, không tạo cảm giác stock chung chung.",
+            f"{timecodes[8]} | DETAIL SHOT: macro vào chi tiết chứng minh claim: {claims[0]}.",
+            f"{timecodes[9]} | FINAL FRAME: sản phẩm thật ở trung tâm, nền gọn, giữ khung ổn định cho CTA cuối.",
+        ])
+
+    title = f"{product}: {angle} có đáng mua không cho {audience_text}?"
+    caption = (
+        f"{angle.capitalize()} {product}: test thật, điểm nên mua, điểm cần cân nhắc và checklist trước khi chốt đơn. "
+        f"{disclosure} #reviewthat #codangmuakhong #tiktokshop"
+    )
+    return {
+        "generator": "product_ad_template",
+        "model": None,
+        "product_url": body.product_url,
+        "title": title,
+        "caption": caption,
+        "hashtags": _affiliate_seo_tags(product, body.platform, language),
+        "disclosure": disclosure,
+        "narration_script": "\n".join(narration_lines),
+        "broll_plan": "\n".join(visual_lines),
+        "compliance_warnings": _affiliate_compliance_warnings(body),
+        "duration_seconds": duration,
+        "creative_format": creative,
+        "model_prompt": model_prompt,
+        "quality_notes": [
+            "Built as a product ad, not a generic topic video.",
+            "Uses hook -> problem -> product reveal -> proof/demo -> objection -> CTA.",
+            "Product media should be uploaded; AI/stock should only fill context shots.",
+        ],
+    }
+
+
+def _affiliate_product_ad_creative_en(
+    body: AffiliateReviewBody,
+    product: str,
+    spoken_product: str,
+    duration: int,
+    creative: str,
+    claims: List[str],
+    pros: List[str],
+    cons: List[str],
+    audience: str,
+    experience: str,
+    disclosure: str,
+) -> Dict[str, Any]:
+    audience_text = audience or "people considering this product"
+    hook = f"If you are thinking about buying {spoken_product}, watch this real test first."
+    narration_lines = [
+        hook,
+        f"The question is not whether the ad sounds good, but whether it fits {audience_text}.",
+        f"My real usage note: {experience}.",
+        f"The strongest reason to consider it is {pros[0]}.",
+        f"The part to check before buying is {cons[0]}.",
+        f"Check current price, warranty, reviews, and return terms before deciding. {disclosure}",
+    ]
+    scene_count = 5 if duration <= 15 else 7 if duration < 60 else 10
+    timecodes = _product_ad_timecodes(duration, scene_count)
+    visual_lines = [
+        f"{timecodes[0]} | HERO PRODUCT MEDIA: real {product} on a clean table, vertical frame, clear light.",
+        f"{timecodes[1]} | PROBLEM SHOT: {audience_text} dealing with the exact problem before using it.",
+        f"{timecodes[2]} | PRODUCT REVEAL: real packaging, size, material, accessories; do not redraw the product with AI.",
+        f"{timecodes[3]} | DEMO PROOF: hands-on real use of {product}, product and result visible in one frame.",
+        f"{timecodes[4]} | CTA SHOT: product page, current price area, return terms, and affiliate disclosure.",
+    ]
+    if scene_count >= 7:
+        visual_lines.insert(4, f"{timecodes[4]} | RESULT SHOT: before-after comparison or side-by-side proof of {pros[0]}.")
+        visual_lines.insert(5, f"{timecodes[5]} | OBJECTION SHOT: show the limitation or buying check: {cons[0]}.")
+    return {
+        "generator": "product_ad_template",
+        "model": None,
+        "product_url": body.product_url,
+        "title": f"{product}: honest ad-style review for {audience_text}",
+        "caption": f"Real product ad review for {product}: proof, limitation, and buying checklist. {disclosure}",
+        "hashtags": _affiliate_seo_tags(product, body.platform, "en"),
+        "disclosure": disclosure,
+        "narration_script": "\n".join(narration_lines),
+        "broll_plan": "\n".join(visual_lines),
+        "compliance_warnings": _affiliate_compliance_warnings(body),
+        "duration_seconds": duration,
+        "creative_format": creative,
+        "quality_notes": [
+            "Built as a product ad, not a generic topic video.",
+            "Uses hook -> problem -> product reveal -> proof/demo -> objection -> CTA.",
+            "Upload real product media; AI/stock should only fill context shots.",
+        ],
+    }
+
+
+def _affiliate_strengthen_review_output(body: AffiliateReviewBody, result: Dict[str, Any]) -> Dict[str, Any]:
+    language = body.target_language or "vi"
+    product = body.product_name.strip()
+    spoken_product = _affiliate_product_voice_name(product)
+    audience = body.audience.strip()
+    audience_tail = audience if audience else ("nguoi dang can nhac mua san pham nay" if language == "vi" else "people considering this product")
+    upgraded = dict(result)
+    narration_lines = [line.strip() for line in str(upgraded.get("narration_script") or "").splitlines() if line.strip()]
+    if language == "vi":
+        hook = f"Äá»«ng mua vá»™i {spoken_product} náº¿u báº¡n chÆ°a tháº¥y pháº§n test tháº­t nÃ y."
+        upgraded["title"] = f"{product} co dang mua khong? Review that cho {audience_tail}"
+        upgraded["caption"] = (
+            f"Review that {product}: ai nen mua, ai nen can nhac, va diem can check truoc khi chot don. "
+            f"{upgraded.get('disclosure', '')} #reviewthat #codangmuakhong #affiliate"
+        ).strip()
+        proof_lines = [
+            f"Hook 0-3s: cam {product} tren tay, zoom vao chi tiet dang nghi ngo nhat.",
+            f"Proof shot: quay thao tac dung that cua {product} trong boi canh cua {audience_tail}.",
+            "Close-up: bao bi, chat lieu, kich thuoc, phu kien va chi tiet de nguoi xem tu danh gia.",
+            "Before-after or comparison: dat san pham canh cach lam cu hoac vat doi chieu de thay khac biet.",
+            "Risk shot: quay diem han che/diem can kiem tra, khong chi quay phan dep.",
+            "CTA shot: man hinh gia, chinh sach doi tra, disclosure affiliate va loi nhac tu kiem tra lai.",
+        ]
+    else:
+        hook = f"Do not buy {spoken_product} until you see this real test."
+        upgraded["title"] = f"{product} worth buying? Honest review for {audience_tail}"
+        upgraded["caption"] = (
+            f"Honest {product} review: who should buy, who should skip, and what to check first. "
+            f"{upgraded.get('disclosure', '')} #honestreview #worthbuying #affiliate"
+        ).strip()
+        proof_lines = [
+            f"Hook 0-3s: hold {product} and zoom into the most questionable detail.",
+            f"Proof shot: show a real hands-on use case for {audience_tail}.",
+            "Close-up: packaging, material, size, accessories, and details viewers can judge.",
+            "Before-after or comparison shot against the old method or a similar item.",
+            "Risk shot: show the limitation or check point, not only the flattering angle.",
+            "CTA shot: current price area, return policy, affiliate disclosure, and reminder to verify.",
+        ]
+    if not narration_lines or _is_weak_creator_hook(narration_lines[0], language):
+        narration_lines = [hook, *narration_lines[1:]]
+    else:
+        narration_lines[0] = hook
+    upgraded["narration_script"] = "\n".join(narration_lines)
+    original_broll = [line.strip() for line in str(upgraded.get("broll_plan") or "").splitlines() if line.strip()]
+    upgraded["broll_plan"] = "\n".join(_dedupe_clean_terms([*proof_lines, *original_broll], 10))
+    upgraded["hashtags"] = _affiliate_seo_tags(product, body.platform, language)
+    upgraded["quality_notes"] = [
+        "Rewrote the first line as a purchase-retention hook.",
+        "Added proof-based B-roll shots for product-media, Pexels, or AI generation.",
+        "Strengthened title, caption, and hashtags around review/search intent.",
+    ]
+    return upgraded
+
+
 def _affiliate_review_template(body: AffiliateReviewBody) -> Dict[str, Any]:
     language = body.target_language or "vi"
     product = body.product_name.strip()
@@ -3143,10 +4010,10 @@ def _affiliate_review_template(body: AffiliateReviewBody) -> Dict[str, Any]:
     duration = max(15, min(60, int(body.duration_seconds or 30)))
     claims, pros, cons = _infer_affiliate_points(body, language)
     audience = body.audience.strip()
-    audience_text = audience or ("người đang cân nhắc sản phẩm này" if language == "vi" else "people considering this product")
+    audience_text = audience or ("ngÆ°á»i Ä‘ang cÃ¢n nháº¯c sáº£n pháº©m nÃ y" if language == "vi" else "people considering this product")
     experience = body.real_experience.strip()
     disclosure = (
-        "Mình có thể nhận hoa hồng từ liên kết mua hàng."
+        "MÃ¬nh cÃ³ thá»ƒ nháº­n hoa há»“ng tá»« liÃªn káº¿t mua hÃ ng."
         if language == "vi" else
         "I may earn a commission from the purchase link."
     )
@@ -3155,43 +4022,43 @@ def _affiliate_review_template(body: AffiliateReviewBody) -> Dict[str, Any]:
         con_fragment = _affiliate_fragment(cons[0])
         if duration <= 15:
             narration_lines = [
-                f"Khoan mua vội {spoken_product}. Nghe mình nói thật một chút.",
-                f"Mình đã thử nhanh rồi: {_affiliate_expressive_line(experience)}.",
-                f"Nếu bạn thuộc nhóm {audience_text}, đây là món đáng cân nhắc.",
-                f"Nhưng nhớ kiểm tra giá, bảo hành và điều kiện đổi trả trước khi chốt đơn. {disclosure}",
+                f"Khoan mua vá»™i {spoken_product}. Nghe mÃ¬nh nÃ³i tháº­t má»™t chÃºt.",
+                f"MÃ¬nh Ä‘Ã£ thá»­ nhanh rá»“i: {_affiliate_expressive_line(experience)}.",
+                f"Náº¿u báº¡n thuá»™c nhÃ³m {audience_text}, Ä‘Ã¢y lÃ  mÃ³n Ä‘Ã¡ng cÃ¢n nháº¯c.",
+                f"NhÆ°ng nhá»› kiá»ƒm tra giÃ¡, báº£o hÃ nh vÃ  Ä‘iá»u kiá»‡n Ä‘á»•i tráº£ trÆ°á»›c khi chá»‘t Ä‘Æ¡n. {disclosure}",
             ]
         elif duration >= 60:
             narration_lines = [
-                f"Mình vừa dùng thử {spoken_product}. Và nói thật, cảm giác đầu tiên là... sản phẩm này không dành cho tất cả mọi người.",
-                f"Điểm mình quan tâm nhất không phải quảng cáo nói gì, mà là lúc dùng thật có tiện không.",
-                f"Với trải nghiệm của mình: {_affiliate_expressive_line(experience)}.",
-                f"Điểm ổn là {pro_fragment}.",
-                f"Nhưng điểm cần tỉnh táo là {con_fragment}.",
-                f"Nếu bạn là {audience_text}, thì đây là món có thể đáng để xem thêm.",
-                "Còn nếu bạn kỳ vọng một sản phẩm hoàn hảo ngay từ lần đầu dùng, mình nghĩ nên cân nhắc kỹ hơn.",
-                "Trước khi mua, hãy xem lại giá hiện tại, chính sách đổi trả và vài đánh giá gần nhất.",
-                f"Mình để thông tin ở phần sản phẩm để bạn tự kiểm tra trước khi quyết định. {disclosure}",
+                f"MÃ¬nh vá»«a dÃ¹ng thá»­ {spoken_product}. VÃ  nÃ³i tháº­t, cáº£m giÃ¡c Ä‘áº§u tiÃªn lÃ ... sáº£n pháº©m nÃ y khÃ´ng dÃ nh cho táº¥t cáº£ má»i ngÆ°á»i.",
+                f"Äiá»ƒm mÃ¬nh quan tÃ¢m nháº¥t khÃ´ng pháº£i quáº£ng cÃ¡o nÃ³i gÃ¬, mÃ  lÃ  lÃºc dÃ¹ng tháº­t cÃ³ tiá»‡n khÃ´ng.",
+                f"Vá»›i tráº£i nghiá»‡m cá»§a mÃ¬nh: {_affiliate_expressive_line(experience)}.",
+                f"Äiá»ƒm á»•n lÃ  {pro_fragment}.",
+                f"NhÆ°ng Ä‘iá»ƒm cáº§n tá»‰nh tÃ¡o lÃ  {con_fragment}.",
+                f"Náº¿u báº¡n lÃ  {audience_text}, thÃ¬ Ä‘Ã¢y lÃ  mÃ³n cÃ³ thá»ƒ Ä‘Ã¡ng Ä‘á»ƒ xem thÃªm.",
+                "CÃ²n náº¿u báº¡n ká»³ vá»ng má»™t sáº£n pháº©m hoÃ n háº£o ngay tá»« láº§n Ä‘áº§u dÃ¹ng, mÃ¬nh nghÄ© nÃªn cÃ¢n nháº¯c ká»¹ hÆ¡n.",
+                "TrÆ°á»›c khi mua, hÃ£y xem láº¡i giÃ¡ hiá»‡n táº¡i, chÃ­nh sÃ¡ch Ä‘á»•i tráº£ vÃ  vÃ i Ä‘Ã¡nh giÃ¡ gáº§n nháº¥t.",
+                f"MÃ¬nh Ä‘á»ƒ thÃ´ng tin á»Ÿ pháº§n sáº£n pháº©m Ä‘á»ƒ báº¡n tá»± kiá»ƒm tra trÆ°á»›c khi quyáº¿t Ä‘á»‹nh. {disclosure}",
             ]
         else:
             narration_lines = [
-                f"Mình vừa dùng thử {spoken_product}. Và có vài điểm rất đáng nói trước khi mua.",
-                f"Trải nghiệm thực tế của mình là: {_affiliate_expressive_line(experience)}.",
-                f"Cái mình thích là {pro_fragment}.",
-                f"Nhưng cũng phải nói thật, {con_fragment}.",
-                f"Nếu bạn là {audience_text}, đây là món đáng để xem thêm.",
-                f"Còn trước khi chốt đơn, nhớ kiểm tra giá mới nhất và điều kiện đổi trả. {disclosure}",
+                f"MÃ¬nh vá»«a dÃ¹ng thá»­ {spoken_product}. VÃ  cÃ³ vÃ i Ä‘iá»ƒm ráº¥t Ä‘Ã¡ng nÃ³i trÆ°á»›c khi mua.",
+                f"Tráº£i nghiá»‡m thá»±c táº¿ cá»§a mÃ¬nh lÃ : {_affiliate_expressive_line(experience)}.",
+                f"CÃ¡i mÃ¬nh thÃ­ch lÃ  {pro_fragment}.",
+                f"NhÆ°ng cÅ©ng pháº£i nÃ³i tháº­t, {con_fragment}.",
+                f"Náº¿u báº¡n lÃ  {audience_text}, Ä‘Ã¢y lÃ  mÃ³n Ä‘Ã¡ng Ä‘á»ƒ xem thÃªm.",
+                f"CÃ²n trÆ°á»›c khi chá»‘t Ä‘Æ¡n, nhá»› kiá»ƒm tra giÃ¡ má»›i nháº¥t vÃ  Ä‘iá»u kiá»‡n Ä‘á»•i tráº£. {disclosure}",
             ]
         visual_lines = [
-            "Cảnh mở đầu cầm sản phẩm trên tay hoặc đặt trên bàn, ánh sáng rõ.",
-            "Cận cảnh bao bì, nhãn, dung tích và chất liệu thật của sản phẩm.",
-            "Quay thao tác dùng sản phẩm trong bối cảnh đời thường.",
-            f"Cảnh minh họa điểm đáng chú ý: {pros[0]}",
-            f"Cảnh minh họa điểm cần cân nhắc: {cons[0]}",
-            "Cảnh người dùng so sánh nhu cầu thật trước khi bấm mua.",
-            "Cảnh kết với trang sản phẩm và disclosure affiliate rõ ràng.",
+            "Cáº£nh má»Ÿ Ä‘áº§u cáº§m sáº£n pháº©m trÃªn tay hoáº·c Ä‘áº·t trÃªn bÃ n, Ã¡nh sÃ¡ng rÃµ.",
+            "Cáº­n cáº£nh bao bÃ¬, nhÃ£n, dung tÃ­ch vÃ  cháº¥t liá»‡u tháº­t cá»§a sáº£n pháº©m.",
+            "Quay thao tÃ¡c dÃ¹ng sáº£n pháº©m trong bá»‘i cáº£nh Ä‘á»i thÆ°á»ng.",
+            f"Cáº£nh minh há»a Ä‘iá»ƒm Ä‘Ã¡ng chÃº Ã½: {pros[0]}",
+            f"Cáº£nh minh há»a Ä‘iá»ƒm cáº§n cÃ¢n nháº¯c: {cons[0]}",
+            "Cáº£nh ngÆ°á»i dÃ¹ng so sÃ¡nh nhu cáº§u tháº­t trÆ°á»›c khi báº¥m mua.",
+            "Cáº£nh káº¿t vá»›i trang sáº£n pháº©m vÃ  disclosure affiliate rÃµ rÃ ng.",
         ]
-        title = f"Review nhanh {product}: có đáng mua không?"
-        caption = f"Review thật về {product}. {disclosure} #review #tiktokshop #affiliate"
+        title = f"Review nhanh {product}: cÃ³ Ä‘Ã¡ng mua khÃ´ng?"
+        caption = f"Review tháº­t vá» {product}. {disclosure} #review #tiktokshop #affiliate"
         hashtags = ["review", "tiktokshop", "affiliate", "muasamthongminh", re.sub(r"\s+", "", product.lower())[:30]]
     else:
         hook = f"I tested {product}, and here is what to check before buying."
@@ -3223,7 +4090,7 @@ def _affiliate_review_template(body: AffiliateReviewBody) -> Dict[str, Any]:
             f"Extra close-up of daily use details for {product}",
             "Side-by-side shot of who should buy and who should skip",
         ])
-    return {
+    result = {
         "generator": "template",
         "model": None,
         "product_url": body.product_url,
@@ -3236,6 +4103,7 @@ def _affiliate_review_template(body: AffiliateReviewBody) -> Dict[str, Any]:
         "compliance_warnings": _affiliate_compliance_warnings(body),
         "duration_seconds": duration,
     }
+    return _affiliate_strengthen_review_output(body, result)
 
 
 @app.post("/api/affiliate/review")
@@ -3246,7 +4114,7 @@ def affiliate_review(body: AffiliateReviewBody, user_id: int = Depends(get_curre
         raise HTTPException(400, "Missing real experience note")
     if not 15 <= int(body.duration_seconds or 0) <= 60:
         raise HTTPException(400, "Affiliate review duration must be 15, 30, or 60 seconds")
-    return _affiliate_review_template(body)
+    return _affiliate_product_ad_creative(body)
 
 
 @app.post("/api/product-media/upload")
@@ -3281,12 +4149,12 @@ def get_product_media(media_id: str, user_id: int = Depends(get_current_user_id)
 @app.post("/api/upload-logo")
 async def upload_logo(file: UploadFile = File(...), user_id: int = Depends(get_current_user_id)):
     """Upload a logo/watermark image ahead of submitting a job. Returns an
-    opaque id to pass back as `NewJobBody.logo_path` — the actual file lives
+    opaque id to pass back as `NewJobBody.logo_path` â€” the actual file lives
     at `{user_id}_{id}{ext}` under the server's logo-upload dir, namespaced
     by user id so nobody can reference someone else's upload."""
     ext = Path(file.filename or "").suffix.lower()
     if ext not in (".png", ".jpg", ".jpeg", ".webp"):
-        raise HTTPException(400, "Chỉ hỗ trợ ảnh PNG, JPG hoặc WEBP")
+        raise HTTPException(400, "Chá»‰ há»— trá»£ áº£nh PNG, JPG hoáº·c WEBP")
 
     logo_id = uuid.uuid4().hex[:12]
     dest = _LOGO_UPLOAD_DIR / f"{user_id}_{logo_id}{ext}"
@@ -3299,7 +4167,7 @@ async def upload_logo(file: UploadFile = File(...), user_id: int = Depends(get_c
 def logo_preview(logo_id: str, user_id: int = Depends(get_current_user_id)):
     matches = list(_LOGO_UPLOAD_DIR.glob(f"{user_id}_{logo_id}.*"))
     if not matches:
-        raise HTTPException(404, "Không tìm thấy logo")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y logo")
     return FileResponse(matches[0])
 
 
@@ -3313,7 +4181,7 @@ def list_languages():
         for code, label in LANGUAGE_LABELS.items()
         if voice_for_language(code)
     ]
-    sources = [{"code": "auto", "label": "Tự động phát hiện"}] + [
+    sources = [{"code": "auto", "label": "Tá»± Ä‘á»™ng phÃ¡t hiá»‡n"}] + [
         {"code": code, "label": LANGUAGE_LABELS.get(code, code)}
         for code in ocr_language_map.OCR_LANGUAGE_MAP
     ]
@@ -3323,8 +4191,8 @@ def list_languages():
 @app.get("/api/voices")
 def list_voices(language: str = "vi"):
     """Curated male/female voice choices for `language`, for the optional
-    'chọn giọng đọc' dropdown. Empty list means: no curated options for
-    this language, UI should just show 'Mặc định' (None -> whatever
+    'chá»n giá»ng Ä‘á»c' dropdown. Empty list means: no curated options for
+    this language, UI should just show 'Máº·c Ä‘á»‹nh' (None -> whatever
     tts.voice_for_language() picks automatically, unchanged behavior)."""
     voices = voices_for_language(language)
     return {
@@ -3339,7 +4207,7 @@ def list_voices(language: str = "vi"):
 async def tts_synthesize(body: TTSSynthesizeBody, user_id: int = Depends(get_current_user_id)):
     """Synthesize text to speech using EdgeTTS. Returns audio file."""
     if not body.text.strip():
-        raise HTTPException(400, "Thiếu văn bản cần chuyển đổi")
+        raise HTTPException(400, "Thiáº¿u vÄƒn báº£n cáº§n chuyá»ƒn Ä‘á»•i")
     
     import edge_tts
     
@@ -3364,7 +4232,7 @@ async def tts_synthesize(body: TTSSynthesizeBody, user_id: int = Depends(get_cur
         await communicate.save(str(output_path))
         
         if not output_path.exists() or output_path.stat().st_size < 1024:
-            raise RuntimeError("TTS không tạo được file âm thanh hợp lệ")
+            raise RuntimeError("TTS khÃ´ng táº¡o Ä‘Æ°á»£c file Ã¢m thanh há»£p lá»‡")
         
         return FileResponse(
             output_path,
@@ -3373,7 +4241,7 @@ async def tts_synthesize(body: TTSSynthesizeBody, user_id: int = Depends(get_cur
         )
     except Exception as exc:
         logger.error("TTS synthesis error: %s", exc)
-        raise HTTPException(500, f"Lỗi khi tạo giọng nói: {str(exc)}")
+        raise HTTPException(500, f"Lá»—i khi táº¡o giá»ng nÃ³i: {str(exc)}")
 
 
 @app.get("/api/presets")
@@ -3387,7 +4255,7 @@ def list_video_presets(user_id: int = Depends(get_current_user_id)):
 def create_video_preset(body: VideoPresetBody, user_id: int = Depends(get_current_user_id)):
     """Create a new video preset."""
     if not body.name.strip():
-        raise HTTPException(400, "Thiếu tên preset")
+        raise HTTPException(400, "Thiáº¿u tÃªn preset")
     preset_id = store.create_video_preset(
         user_id,
         body.name,
@@ -3406,7 +4274,7 @@ def get_video_preset(preset_id: int, user_id: int = Depends(get_current_user_id)
     """Get a specific video preset."""
     preset = store.get_video_preset(preset_id, user_id)
     if not preset:
-        raise HTTPException(404, "Preset không tồn tại")
+        raise HTTPException(404, "Preset khÃ´ng tá»“n táº¡i")
     return preset
 
 
@@ -3425,7 +4293,7 @@ def update_video_preset(preset_id: int, body: VideoPresetBody, user_id: int = De
         is_default=body.is_default,
     )
     if not success:
-        raise HTTPException(404, "Preset không tồn tại")
+        raise HTTPException(404, "Preset khÃ´ng tá»“n táº¡i")
     return {"ok": True}
 
 
@@ -3434,7 +4302,7 @@ def delete_video_preset(preset_id: int, user_id: int = Depends(get_current_user_
     """Delete a video preset."""
     success = store.delete_video_preset(preset_id, user_id)
     if not success:
-        raise HTTPException(404, "Preset không tồn tại")
+        raise HTTPException(404, "Preset khÃ´ng tá»“n táº¡i")
     return {"ok": True}
 
 
@@ -3447,7 +4315,7 @@ def list_jobs(
 ):
     """History list for the logged-in user only. Optional `q` (matches
     title/source URL), `date_from`/`date_to` (unix timestamps) narrow it
-    down — used by the history panel's search + date-range filter."""
+    down â€” used by the history panel's search + date-range filter."""
     if q or date_from is not None or date_to is not None:
         jobs = store.search_jobs_for_user(user_id, query=q, date_from=date_from, date_to=date_to)
     else:
@@ -3455,25 +4323,52 @@ def list_jobs(
     return [j.to_dict() for j in jobs]
 
 
+@app.get("/api/job-queue/status")
+def job_queue_status(user_id: int = Depends(get_current_user_id)):
+    stats = store.user_stats(user_id)
+    by_status = stats.get("by_status", {})
+    queued = int(by_status.get("queued", 0) or 0)
+    running = int(by_status.get("running", 0) or 0)
+    review = int(by_status.get("review", 0) or 0)
+    try:
+        import redis  # noqa: F401
+        redis_client_available = True
+    except ImportError:
+        redis_client_available = False
+    return {
+        "phase": "Milestone 6",
+        "backend": "RedisQueue",
+        "redis_client_available": redis_client_available,
+        "redis_url": _redact_redis_url(REDIS_URL),
+        "web_runner": "local-thread",
+        "web_runner_note": "Redis queue backend is available; existing web jobs still use the local runner until service refactor is enabled.",
+        "queued": queued,
+        "running": running,
+        "review": review,
+        "active": queued + running + review,
+        "total_jobs": int(stats.get("total_jobs", 0) or 0),
+    }
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     deleted = store.delete_job(job_id, user_id)
     if not deleted:
-        raise HTTPException(404, "Không tìm thấy job")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y job")
     return {"ok": True}
 
 
 @app.post("/api/jobs/bulk-delete")
 def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
     if not body.job_ids:
-        raise HTTPException(400, "Chưa chọn video cần xoá")
+        raise HTTPException(400, "ChÆ°a chá»n video cáº§n xoÃ¡")
     return {"ok": True, "deleted": store.delete_jobs(body.job_ids, user_id)}
 
 
 def _get_owned_job(job_id: str, user_id: int):
     job = store.get_job(job_id)
     if job is None or job.user_id != user_id:
-        raise HTTPException(404, "Không tìm thấy job")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y job")
     return job
 
 
@@ -3486,7 +4381,7 @@ def get_job(job_id: str, user_id: int = Depends(get_current_user_id)):
 def get_job_video(job_id: str, download: bool = False, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
     if not job.final_video_path or not Path(job.final_video_path).exists():
-        raise HTTPException(404, "Video chưa sẵn sàng")
+        raise HTTPException(404, "Video chÆ°a sáºµn sÃ ng")
     filename = f"{job.title or job_id}.mp4".replace("/", "_")
     return FileResponse(
         job.final_video_path,
@@ -3504,11 +4399,11 @@ def get_job_source_video(job_id: str, user_id: int = Depends(get_current_user_id
     """
     job = _get_owned_job(job_id, user_id)
     if job.status != "review" or not job.review_state_json:
-        raise HTTPException(404, "Video nguồn chỉ có khi job đang chờ duyệt")
+        raise HTTPException(404, "Video nguá»“n chá»‰ cÃ³ khi job Ä‘ang chá» duyá»‡t")
     state = json.loads(job.review_state_json)
     source_path = Path(state.get("video_path", ""))
     if not source_path.exists() or not source_path.is_file():
-        raise HTTPException(404, "Không tìm thấy video nguồn của job")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y video nguá»“n cá»§a job")
     return FileResponse(source_path, media_type="video/mp4")
 
 
@@ -3517,11 +4412,33 @@ def get_prepublish_check(job_id: str, user_id: int = Depends(get_current_user_id
     """Return a read-only technical and platform-fit report."""
     job = _get_owned_job(job_id, user_id)
     if not job.final_video_path:
-        raise HTTPException(404, "Video chưa sẵn sàng để kiểm tra")
+        raise HTTPException(404, "Video chÆ°a sáºµn sÃ ng Ä‘á»ƒ kiá»ƒm tra")
     try:
         return prepublish_report_to_dict(inspect_for_publish(Path(job.final_video_path)))
     except FileNotFoundError as exc:
-        raise HTTPException(404, "Không tìm thấy video đầu ra") from exc
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y video Ä‘áº§u ra") from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}/quality-review")
+def get_quality_review(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Return actionable improvement advice for a finished video."""
+    job = _get_owned_job(job_id, user_id)
+    if not job.final_video_path:
+        raise HTTPException(404, "Video chÃ†Â°a sÃ¡ÂºÂµn sÃƒÂ ng Ã„â€˜Ã¡Â»Æ’ review")
+    segments = json.loads(job.segments_json) if job.segments_json else []
+    try:
+        report = review_finished_video(
+            Path(job.final_video_path),
+            title=job.title or "",
+            source_url=job.source_url,
+            target_language=job.target_language,
+            segments=segments,
+        )
+        return video_review_report_to_dict(report)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "KhÃƒÂ´ng tÃƒÂ¬m thÃ¡ÂºÂ¥y video Ã„â€˜Ã¡ÂºÂ§u ra") from exc
     except RuntimeError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -3532,15 +4449,15 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     (the failed attempt stays in history too, for reference)."""
     old_job = _get_owned_job(job_id, user_id)
     if old_job.status != "error":
-        raise HTTPException(400, "Chỉ có thể thử lại job bị lỗi")
+        raise HTTPException(400, "Chá»‰ cÃ³ thá»ƒ thá»­ láº¡i job bá»‹ lá»—i")
 
     user = store.get_user_by_id(user_id)
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
-        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
+        raise HTTPException(402, f"KhÃ´ng Ä‘á»§ credit (cÃ²n {user['credits']}, cáº§n {JOB_COST_CREDITS})")
 
     new_job = store.retry_job(job_id, user_id)
     if new_job is None:
-        raise HTTPException(404, "Không tìm thấy job")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y job")
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
     if old_job.source_language.startswith("creator"):
@@ -3560,7 +4477,7 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
 @app.get("/api/jobs/{job_id}/segments")
 def get_job_segments(job_id: str, user_id: int = Depends(get_current_user_id)):
     """The translated sentences for a job that's paused at status='review'
-    (or any job, really — useful after 'done' too, e.g. to review what was
+    (or any job, really â€” useful after 'done' too, e.g. to review what was
     actually said). Powers the subtitle-editor panel."""
     job = _get_owned_job(job_id, user_id)
     segments = json.loads(job.segments_json) if job.segments_json else []
@@ -3570,12 +4487,12 @@ def get_job_segments(job_id: str, user_id: int = Depends(get_current_user_id)):
 @app.put("/api/jobs/{job_id}/segments")
 def update_job_segments(job_id: str, body: UpdateSegmentsBody, user_id: int = Depends(get_current_user_id)):
     """Save edits to the translated sentences. Only allowed while the job
-    is sitting at status='review' — editing text that's already been
+    is sitting at status='review' â€” editing text that's already been
     rendered into a video wouldn't do anything, which would be confusing
     rather than harmless, so it's blocked instead of silently ignored."""
     job = _get_owned_job(job_id, user_id)
     if job.status != "review":
-        raise HTTPException(400, "Job này không ở trạng thái chờ chỉnh sửa phụ đề")
+        raise HTTPException(400, "Job nÃ y khÃ´ng á»Ÿ tráº¡ng thÃ¡i chá» chá»‰nh sá»­a phá»¥ Ä‘á»")
     store.set_job_segments(job_id, [s.model_dump() for s in body.segments])
     return {"ok": True}
 
@@ -3587,7 +4504,7 @@ async def render_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     not)."""
     job = _get_owned_job(job_id, user_id)
     if job.status != "review":
-        raise HTTPException(400, "Job này không ở trạng thái chờ render")
+        raise HTTPException(400, "Job nÃ y khÃ´ng á»Ÿ tráº¡ng thÃ¡i chá» render")
     task = asyncio.create_task(_run_render_from_review(job_id))
     _running_tasks[job_id] = task
     return {"ok": True}
@@ -3595,14 +4512,14 @@ async def render_job(job_id: str, user_id: int = Depends(get_current_user_id)):
 
 @app.get("/api/jobs/{job_id}/subtitles.srt")
 def get_job_subtitles_srt(job_id: str, user_id: int = Depends(get_current_user_id)):
-    """Export the translated subtitles as a standalone .srt — independent
+    """Export the translated subtitles as a standalone .srt â€” independent
     of the final video, e.g. for someone who wants to burn/sync them with
     other editing software instead of (or in addition to) this app's own
     render."""
     job = _get_owned_job(job_id, user_id)
     segments = json.loads(job.segments_json) if job.segments_json else []
     if not segments:
-        raise HTTPException(404, "Job này chưa có phụ đề đã dịch")
+        raise HTTPException(404, "Job nÃ y chÆ°a cÃ³ phá»¥ Ä‘á» Ä‘Ã£ dá»‹ch")
 
     def _srt_timestamp(seconds: float) -> str:
         seconds = max(0.0, seconds)
@@ -3630,7 +4547,7 @@ def get_job_subtitles_srt(job_id: str, user_id: int = Depends(get_current_user_i
 def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
     if not job.final_video_path or not Path(job.final_video_path).exists():
-        raise HTTPException(400, "Video chưa sẵn sàng để đăng")
+        raise HTTPException(400, "Video chÆ°a sáºµn sÃ ng Ä‘á»ƒ Ä‘Äƒng")
 
     results = []
     for platform in body.platforms:
@@ -3654,12 +4571,12 @@ def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_curre
 def schedule_publish(job_id: str, body: SchedulePublishBody, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
     if not job.final_video_path or not Path(job.final_video_path).exists():
-        raise HTTPException(400, "Video chưa sẵn sàng để lên lịch")
+        raise HTTPException(400, "Video chÆ°a sáºµn sÃ ng Ä‘á»ƒ lÃªn lá»‹ch")
     allowed = {"tiktok", "facebook", "youtube"}
     if not body.platforms or any(p not in allowed for p in body.platforms):
-        raise HTTPException(400, "Nền tảng không hợp lệ")
+        raise HTTPException(400, "Ná»n táº£ng khÃ´ng há»£p lá»‡")
     if body.scheduled_at < time.time() + 60:
-        raise HTTPException(400, "Thời gian đăng phải muộn hơn hiện tại ít nhất 1 phút")
+        raise HTTPException(400, "Thá»i gian Ä‘Äƒng pháº£i muá»™n hÆ¡n hiá»‡n táº¡i Ã­t nháº¥t 1 phÃºt")
     post_id = store.create_scheduled_post(
         user_id, job_id, body.platforms, body.title, body.description,
         body.hashtags, body.scheduled_at,
@@ -3680,7 +4597,7 @@ def scheduled_posts(user_id: int = Depends(get_current_user_id)):
 @app.delete("/api/scheduled-posts/{post_id}")
 def cancel_scheduled_post(post_id: int, user_id: int = Depends(get_current_user_id)):
     if not store.cancel_scheduled_post(post_id, user_id):
-        raise HTTPException(400, "Lịch đăng không còn ở trạng thái chờ")
+        raise HTTPException(400, "Lá»‹ch Ä‘Äƒng khÃ´ng cÃ²n á»Ÿ tráº¡ng thÃ¡i chá»")
     return {"ok": True}
 
 
@@ -3689,7 +4606,7 @@ def _run_scheduled_post(row) -> None:
     results = []
     try:
         if not job or job.user_id != row["user_id"] or not job.final_video_path or not Path(job.final_video_path).exists():
-            raise RuntimeError("Video nguồn không còn tồn tại")
+            raise RuntimeError("Video nguá»“n khÃ´ng cÃ²n tá»“n táº¡i")
         for platform in json.loads(row["platforms_json"]):
             uploader = get_uploader(platform)
             token, account_ref = _resolve_publish_credentials(row["user_id"], platform)
@@ -3740,6 +4657,12 @@ def get_version():
             "ai_script_generation": True,
             "video_templates": True,
             "queue_management": True,
+            "quality_review": True,
+            "improve_this_video": True,
+            "content_quality_director": True,
+            "voice_visual_director": True,
+            "product_ad_mockup_renderer": True,
+            "product_ad_model_prompt": True,
             "video_presets": True,
             "advanced_audio_filters": True,
             "openai_integration": OPENAI_AVAILABLE,
@@ -3803,7 +4726,7 @@ def _resolve_publish_credentials(user_id: int, platform: str) -> tuple[Optional[
             return None, None
         raise HTTPException(
             400,
-            f"Bạn chưa kết nối tài khoản {platform}. Hãy bấm Kết nối trước khi đăng.",
+            f"Báº¡n chÆ°a káº¿t ná»‘i tÃ i khoáº£n {platform}. HÃ£y báº¥m Káº¿t ná»‘i trÆ°á»›c khi Ä‘Äƒng.",
         )
     access_token = row["access_token"]
     if platform == "youtube" and row["refresh_token"]:
@@ -3843,7 +4766,7 @@ def connect_social(platform: str, request: Request, user_id: int = Depends(get_c
     try:
         client = oauth_module.get_oauth_client(platform)
     except ValueError:
-        raise HTTPException(404, "Nền tảng không hỗ trợ")
+        raise HTTPException(404, "Ná»n táº£ng khÃ´ng há»— trá»£")
     if not client.is_configured():
         raise HTTPException(400, client.not_configured_message())
 
@@ -3864,7 +4787,7 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
     user approves (or denies) access. Not behind `get_current_user_id`
     because the browser arrives here from an external redirect without our
     session necessarily being the "current" request context in all
-    browsers — instead, the `state` token (created per-user in
+    browsers â€” instead, the `state` token (created per-user in
     `connect_social` above) tells us who was connecting.
     """
     close_html = (
@@ -3875,11 +4798,11 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
         "}}, 1200);</script></div></body></html>"
     )
     if error:
-        return HTMLResponse(close_html.format(message=f"Đã huỷ kết nối: {error}"))
+        return HTMLResponse(close_html.format(message=f"ÄÃ£ huá»· káº¿t ná»‘i: {error}"))
 
     state_row = store.consume_oauth_state(state)
     if not state_row or state_row["platform"] != platform:
-        return HTMLResponse(close_html.format(message="Liên kết đăng nhập không hợp lệ hoặc đã hết hạn."), status_code=400)
+        return HTMLResponse(close_html.format(message="LiÃªn káº¿t Ä‘Äƒng nháº­p khÃ´ng há»£p lá»‡ hoáº·c Ä‘Ã£ háº¿t háº¡n."), status_code=400)
 
     user_id = state_row["user_id"]
     try:
@@ -3892,11 +4815,11 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
             expires_at=result.expires_at, account_name=result.account_name,
             account_ref=result.account_ref,
         )
-        label = result.account_name or "tài khoản của bạn"
-        return HTMLResponse(close_html.format(message=f"✓ Đã kết nối {platform} ({label}). Có thể đóng cửa sổ này."))
+        label = result.account_name or "tÃ i khoáº£n cá»§a báº¡n"
+        return HTMLResponse(close_html.format(message=f"âœ“ ÄÃ£ káº¿t ná»‘i {platform} ({label}). CÃ³ thá»ƒ Ä‘Ã³ng cá»­a sá»• nÃ y."))
     except Exception as exc:
         logger.exception("OAuth callback failed for platform=%s", platform)
-        return HTMLResponse(close_html.format(message=f"Kết nối thất bại: {exc}"), status_code=400)
+        return HTMLResponse(close_html.format(message=f"Káº¿t ná»‘i tháº¥t báº¡i: {exc}"), status_code=400)
 
 
 @app.delete("/api/social/connections/{platform}")
@@ -3981,9 +4904,9 @@ def admin_list_users(_admin_id: int = Depends(require_admin_user_id)):
 @app.post("/api/admin/users")
 def admin_create_user(body: CreateUserBody, _admin_id: int = Depends(require_admin_user_id)):
     if store.get_user_by_username(body.username):
-        raise HTTPException(409, "Tên đăng nhập đã tồn tại")
+        raise HTTPException(409, "TÃªn Ä‘Äƒng nháº­p Ä‘Ã£ tá»“n táº¡i")
     if len(body.password) < 8:
-        raise HTTPException(400, "Mật khẩu cần tối thiểu 8 ký tự")
+        raise HTTPException(400, "Máº­t kháº©u cáº§n tá»‘i thiá»ƒu 8 kÃ½ tá»±")
     user_id = store.create_user_by_admin(body.username, hash_password(body.password), credits=body.credits)
     return {"ok": True, "user_id": user_id}
 
@@ -3992,13 +4915,13 @@ def admin_create_user(body: CreateUserBody, _admin_id: int = Depends(require_adm
 def admin_adjust_credits(target_user_id: int, body: CreditsAdjustBody,
                           _admin_id: int = Depends(require_admin_user_id)):
     if not store.get_user_by_id(target_user_id):
-        raise HTTPException(404, "Không tìm thấy user")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y user")
     if body.set_to is not None:
         store.set_credits(target_user_id, body.set_to)
     elif body.delta is not None:
         store.adjust_credits(target_user_id, body.delta)
     else:
-        raise HTTPException(400, "Cần truyền delta hoặc set_to")
+        raise HTTPException(400, "Cáº§n truyá»n delta hoáº·c set_to")
     user = store.get_user_by_id(target_user_id)
     return {"ok": True, "credits": user["credits"]}
 
@@ -4039,7 +4962,7 @@ def admin_approve_top_up_request(
 ):
     row = store.approve_top_up_request(request_id, admin_note=(body.admin_note or "").strip() or None)
     if row is None:
-        raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y yÃªu cáº§u náº¡p Ä‘ang chá»")
     return {"ok": True, "status": row["status"]}
 
 
@@ -4051,7 +4974,7 @@ def admin_reject_top_up_request(
 ):
     row = store.reject_top_up_request(request_id, admin_note=(body.admin_note or "").strip() or None)
     if row is None:
-        raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y yÃªu cáº§u náº¡p Ä‘ang chá»")
     return {"ok": True, "status": row["status"]}
 
 
@@ -4060,7 +4983,7 @@ def admin_reject_top_up_request(
 @app.post("/api/feedback")
 def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_id)):
     if not body.message.strip():
-        raise HTTPException(400, "Nội dung góp ý không được để trống")
+        raise HTTPException(400, "Ná»™i dung gÃ³p Ã½ khÃ´ng Ä‘Æ°á»£c Ä‘á»ƒ trá»‘ng")
     store.create_feedback(user_id, body.message.strip()[:4000], page=body.page)
     return {"ok": True}
 
@@ -4068,3 +4991,4 @@ def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_
 @app.get("/health")
 def health():
     return {"status": "ok"}
+

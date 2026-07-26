@@ -431,6 +431,16 @@
   .stat-box:hover::before { opacity: 1; }
   .stat-box .num { font-size: 28px; font-weight: 800; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
   .stat-box .label { font-size: 13px; color: var(--text-dim); margin-top: 4px; font-weight: 500; }
+  .research-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 14px 0; }
+  .research-score { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; }
+  .research-score .num { font-size: 26px; font-weight: 800; color: var(--text); }
+  .research-score .label { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+  .research-score.good .num { color: var(--ok); }
+  .research-score.warn .num { color: var(--warn); }
+  .research-score.bad .num { color: var(--err); }
+  .research-json { min-height: 220px; resize: vertical; font-family: Consolas, "SFMono-Regular", monospace; font-size: 12px; line-height: 1.45; }
+  .research-list { margin: 8px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
+  .research-status { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
   .referral-row {
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
     border-top: 1px solid var(--border); padding-top: 14px; margin-top: 4px;
@@ -739,6 +749,22 @@
     </div>
   </div>
 
+  <div class="card" id="job-queue-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <div>
+        <h3 class="section-title" style="margin-bottom:4px">Job Queue</h3>
+        <div id="job-queue-note" style="font-size:13px;color:var(--text-dim)">Dang kiem tra trang thai queue...</div>
+      </div>
+      <button class="btn secondary small" id="job-queue-refresh-btn" type="button">Refresh</button>
+    </div>
+    <div class="stat-grid" id="job-queue-stats" style="margin-top:16px;margin-bottom:0">
+      <div class="stat-box"><div class="num" id="queue-active-count">0</div><div class="label">Active jobs</div></div>
+      <div class="stat-box"><div class="num" id="queue-waiting-count">0</div><div class="label">Queued</div></div>
+      <div class="stat-box"><div class="num" id="queue-running-count">0</div><div class="label">Running</div></div>
+      <div class="stat-box"><div class="num" id="queue-backend-label" style="font-size:20px">-</div><div class="label">Backend</div></div>
+    </div>
+  </div>
+
   <div class="dashboard-grid">
   <main class="tool-column">
 
@@ -973,9 +999,8 @@
     <button class="btn gradient" id="submit-btn">🚀 Bắt đầu xử lý</button>
     <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
-
-  <div class="card">
-    <h3 class="section-title">Product Review / Affiliate Mode</h3>
+<div class="card">
+    <h3 class="section-title">Product Ad Creative / Affiliate Mode</h3>
     <div class="row">
       <div class="field" style="flex: 2">
         <label>Link san pham (tuy chon)</label>
@@ -1001,6 +1026,14 @@
           <option value="60">60 giay</option>
         </select>
       </div>
+      <div class="field">
+        <label>Creative format</label>
+        <select id="affiliate-creative-format">
+          <option value="ugc_problem_solution" selected>UGC problem-solution</option>
+          <option value="demo_proof">Demo proof</option>
+          <option value="before_after">Before / after</option>
+        </select>
+      </div>
     </div>
     <div class="row">
       <div class="field">
@@ -1013,10 +1046,17 @@
       </div>
     </div>
     <div class="field">
+      <label>Người mẫu / prompt người mẫu</label>
+      <textarea id="affiliate-model-prompt" rows="2" placeholder="VD: nữ creator 25 tuổi trong phòng làm việc nhỏ, phong cách UGC tự nhiên, đang dùng sản phẩm trên bàn"></textarea>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:6px">
+        Dùng cho cảnh MODEL PROBLEM / MODEL USE / LIFESTYLE. Nếu chọn Stock hoặc AI Image, prompt này sẽ hướng cảnh người mẫu sử dụng sản phẩm.
+      </div>
+    </div>
+    <div class="field">
       <label>Product media that (khuyen dung): upload anh/video san pham de canh quay khop review</label>
       <input id="affiliate-product-media-input" type="file" multiple accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm,video/x-matroska">
       <div style="font-size:12px;color:var(--text-dim);margin-top:6px">
-        Uu tien anh/video san pham that. Stock se dung cho canh boi canh. AI Image chi nen la fallback, khong nen ve lai san pham that.
+        Ưu tiên ảnh/video sản phẩm thật. App sẽ dùng media này để tạo hero/reveal ad mockup có nền blur và chuyển động. Cảnh người mẫu sẽ ưu tiên Stock/AI context theo prompt bên trên.
       </div>
       <div id="affiliate-product-media-list" style="font-size:12px;color:var(--text-dim);margin-top:8px"></div>
     </div>
@@ -1046,7 +1086,7 @@
       </div>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-      <button class="btn gradient" id="affiliate-generate-btn" type="button">Gen script review</button>
+      <button class="btn gradient" id="affiliate-generate-btn" type="button">Gen product ad</button>
       <button class="btn secondary small" id="affiliate-send-creator-btn" type="button" disabled>Dua sang tao video AI</button>
       <button class="btn secondary small" id="affiliate-copy-caption-btn" type="button" disabled>Copy caption</button>
     </div>
@@ -1071,7 +1111,7 @@
         </div>
       </div>
       <div class="field">
-        <label>Caption + disclosure</label>
+        <label>Caption + ghi chú link</label>
         <textarea id="affiliate-caption-output" rows="3"></textarea>
       </div>
       <div id="affiliate-warnings-output" style="font-size:12px;color:var(--warn)"></div>
@@ -1230,6 +1270,7 @@
     <h3 class="section-title">Video đang xem</h3>
     <video id="latest-result-video" controls preload="metadata"></video>
     <div class="latest-result-title" id="latest-result-title"></div>
+    <button class="btn gradient small" id="latest-improve-btn" type="button" style="margin-top:10px">Improve this video</button>
   </div>
 
   <div class="card">
@@ -1368,8 +1409,17 @@
     <div style="margin-top: 14px; display:flex; gap:10px;">
       <a class="btn" id="preview-download">📥 Tải xuống</a>
       <button class="btn secondary" id="prepublish-check-btn">🔍 Kiểm tra trước đăng</button>
+      <button class="btn gradient" id="preview-improve-btn">Improve</button>
       <button class="btn gradient" id="preview-publish-btn">📱 Đăng lên mạng xã hội</button>
     </div>
+  </div>
+</div>
+
+<div id="quality-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="quality-close">×</button>
+    <h3>Improve This Video</h3>
+    <div id="quality-report-box" style="display:grid;gap:12px"></div>
   </div>
 </div>
 
@@ -1838,6 +1888,7 @@ function showHistoryVideo(job) {
   if (!job || !job.has_video) return;
   $("#latest-result-card").classList.remove("hidden");
   $("#latest-result-title").textContent = job.title || job.source_url;
+  $("#latest-improve-btn").dataset.jobId = job.id;
   if (latestResultJobId !== job.id) {
     latestResultJobId = job.id;
     $("#latest-result-video").src = `/api/jobs/${job.id}/video`;
@@ -1979,6 +2030,7 @@ function showApp(me) {
   $("#referral-link").textContent = `${location.origin}/?ref=${me.referral_code}`;
   loadLanguages();
   loadPersonalStats();
+  refreshJobQueueStatus();
   requestNotificationPermission();
   refreshJobs();
   pollTimer = setInterval(refreshJobs, 4000);
@@ -2005,6 +2057,25 @@ async function loadPersonalStats() {
     `;
   } catch (e) { /* non-critical widget, fail silently */ }
 }
+
+async function refreshJobQueueStatus() {
+  if (!$("#job-queue-card")) return;
+  try {
+    const status = await api("/api/job-queue/status");
+    $("#queue-active-count").textContent = status.active || 0;
+    $("#queue-waiting-count").textContent = status.queued || 0;
+    $("#queue-running-count").textContent = status.running || 0;
+    $("#queue-backend-label").textContent = status.backend || "-";
+    const redisState = status.redis_client_available ? "Redis client installed" : "Redis client missing";
+    $("#job-queue-note").textContent = `${status.phase || "Milestone 6"}: ${redisState}. Web runner: ${status.web_runner}. ${status.web_runner_note || ""}`;
+    $("#job-queue-note").style.color = "var(--text-dim)";
+  } catch (e) {
+    $("#job-queue-note").textContent = `Khong doc duoc trang thai queue: ${e.message}`;
+    $("#job-queue-note").style.color = "var(--err)";
+  }
+}
+
+$("#job-queue-refresh-btn").onclick = refreshJobQueueStatus;
 
 // ---------------- browser notifications ----------------
 // Fires a desktop notification when a job finishes (done or error) while
@@ -2666,7 +2737,7 @@ $("#affiliate-advanced-checkbox").onchange = (ev) => {
 function renderAffiliateProductMediaList() {
   const box = $("#affiliate-product-media-list");
   if (!affiliateProductMedia.length) {
-    box.textContent = "Chua upload product media. Video se dung stock footage neu co cau hinh Pexels/Pixabay.";
+    box.textContent = "Chưa upload product media. Video sẽ dùng stock footage nếu có cấu hình Pexels/Pixabay.";
     return;
   }
   box.innerHTML = affiliateProductMedia.map((item, idx) =>
@@ -2679,7 +2750,7 @@ $("#affiliate-product-media-input").onchange = async (ev) => {
   const files = Array.from(ev.target.files || []);
   if (!files.length) return;
   $("#affiliate-error").style.color = "var(--text-dim)";
-  $("#affiliate-error").textContent = "Dang upload product media...";
+  $("#affiliate-error").textContent = "Đang upload product media...";
   try {
     for (const file of files.slice(0, 12 - affiliateProductMedia.length)) {
       const form = new FormData();
@@ -2693,7 +2764,7 @@ $("#affiliate-product-media-input").onchange = async (ev) => {
     }
     renderAffiliateProductMediaList();
     $("#affiliate-error").style.color = "var(--ok)";
-    $("#affiliate-error").textContent = "Da upload product media. Khi tao video, media nay se duoc uu tien truoc stock/AI.";
+    $("#affiliate-error").textContent = "Đã upload product media. Hero/reveal sẽ dùng media thật; cảnh người mẫu sẽ ưu tiên Stock/AI context.";
   } catch (e) {
     $("#affiliate-error").style.color = "var(--err)";
     $("#affiliate-error").textContent = e.message;
@@ -2711,9 +2782,11 @@ function affiliatePayload() {
     cons: $("#affiliate-cons").value.trim(),
     audience: $("#affiliate-audience").value.trim(),
     real_experience: $("#affiliate-experience").value.trim(),
+    model_prompt: $("#affiliate-model-prompt").value.trim(),
     target_language: ($("#creator-lang-select") && $("#creator-lang-select").value) || $("#lang-select").value || "vi",
     duration_seconds: parseInt($("#affiliate-duration").value, 10) || 30,
     platform: $("#affiliate-platform").value,
+    creative_format: $("#affiliate-creative-format").value,
   };
 }
 
@@ -2726,9 +2799,13 @@ function showAffiliateReview(data) {
   $("#affiliate-caption-output").value = data.caption || "";
   $("#affiliate-hashtags-output").value = (data.hashtags || []).join(", ");
   const warnings = data.compliance_warnings || [];
+  const qualityNotes = data.quality_notes || [];
+  const qualityHtml = qualityNotes.length
+    ? `<br><strong>Quality upgrade:</strong><br>${qualityNotes.map(w => `- ${escapeHtml(w)}`).join("<br>")}`
+    : "";
   $("#affiliate-warnings-output").innerHTML = warnings.length
-    ? `<strong>Compliance check:</strong><br>${warnings.map(w => `- ${escapeHtml(w)}`).join("<br>")}`
-    : `<span style="color:var(--ok)">Compliance check: OK. Disclosure affiliate da duoc chen vao script/caption.</span>`;
+    ? `<strong>Compliance check:</strong><br>${warnings.map(w => `- ${escapeHtml(w)}`).join("<br>")}${qualityHtml}`
+    : `<span style="color:var(--ok)">Compliance check: OK. Ghi chú link sản phẩm đã được chèn vào caption.</span>${qualityHtml}`;
   $("#affiliate-send-creator-btn").disabled = false;
   $("#affiliate-copy-caption-btn").disabled = false;
 }
@@ -2739,29 +2816,31 @@ $("#affiliate-generate-btn").onclick = async () => {
   const button = $("#affiliate-generate-btn");
   button.disabled = true;
   button.classList.add("is-loading");
-  button.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span>Dang gen...</span>`;
+  button.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span>Đang gen...</span>`;
   try {
     const payload = affiliatePayload();
-    if (!payload.product_name) throw new Error("Nhap ten san pham");
-    if (!payload.real_experience) throw new Error("Nhap trai nghiem that / ghi chu bat buoc");
+    if (!payload.product_name) throw new Error("Nhập tên sản phẩm");
+    if (!payload.real_experience) throw new Error("Nhập trải nghiệm thật / ghi chú bắt buộc");
     const data = await api("/api/affiliate/review", { method: "POST", body: JSON.stringify(payload) });
     showAffiliateReview(data);
     $("#affiliate-error").style.color = "var(--ok)";
-    $("#affiliate-error").textContent = "Da tao script review. Hay doc lai claim truoc khi render/publish.";
+    $("#affiliate-error").textContent = affiliateProductMedia.length
+      ? "Đã tạo product ad creative. Hero/reveal dùng product media; cảnh người mẫu dùng Stock/AI context nếu có."
+      : "Đã tạo product ad creative. Nên upload ảnh/video sản phẩm thật trước khi tạo video để tránh cảnh stock/AI bị giả.";
   } catch (e) {
     $("#affiliate-error").style.color = "var(--err)";
     $("#affiliate-error").textContent = e.message;
   } finally {
     button.disabled = false;
     button.classList.remove("is-loading");
-    button.textContent = "Gen script review";
+    button.textContent = "Gen product ad";
   }
 };
 
 $("#affiliate-send-creator-btn").onclick = () => {
   if (!latestAffiliateReview) return;
   const product = $("#affiliate-product-name").value.trim();
-  $("#creator-topic").value = `Product review: ${product}`;
+  $("#creator-topic").value = `Product ad: ${product}`;
   $("#creator-duration").value = String(latestAffiliateReview.duration_seconds || $("#affiliate-duration").value || 30);
   $("#creator-image-provider").value = "stock";
   $("#creator-keywords").value = $("#affiliate-hashtags-output").value.replace(/#/g, "");
@@ -2774,8 +2853,8 @@ $("#affiliate-send-creator-btn").onclick = () => {
   updateCreatorSubmitState();
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = affiliateProductMedia.length
-    ? "Affiliate media da san sang: product media se duoc dung truoc, stock dung cho canh thieu, AI chi la fallback neu ban tu chon."
-    : "Affiliate flow dang de visual source la Stock. Upload product media de canh review khop san pham hon.";
+    ? "Affiliate media đã sẵn sàng: hero/reveal dùng product ad mockup; cảnh người mẫu/problem/objection ưu tiên Stock/AI context."
+    : "Affiliate flow đang để visual source là Stock. Upload product media để cảnh review khớp sản phẩm hơn.";
   $("#creator-topic").scrollIntoView({ behavior: "smooth", block: "center" });
 };
 
@@ -2785,11 +2864,11 @@ $("#affiliate-copy-caption-btn").onclick = async () => {
   try {
     await navigator.clipboard.writeText(text);
     $("#affiliate-error").style.color = "var(--ok)";
-    $("#affiliate-error").textContent = "Da copy caption.";
+    $("#affiliate-error").textContent = "Đã copy caption.";
   } catch {
     $("#affiliate-caption-output").select();
     $("#affiliate-error").style.color = "var(--warn)";
-    $("#affiliate-error").textContent = "Trinh duyet khong cho copy tu dong, caption da duoc boi chon.";
+    $("#affiliate-error").textContent = "Trình duyệt không cho copy tự động, caption đã được bôi chọn.";
   }
 };
 
@@ -2833,10 +2912,11 @@ function creatorGeneratorMessage(data, successText) {
   const timing = data.duration_seconds
     ? ` · ${data.duration_seconds}s · ${data.scene_count || 0} cảnh · ${data.narration_word_count || 0} từ voice`
     : "";
-  if (data.warning) return `${data.warning}${timing}`;
+  const quality = (data.quality_notes || []).length ? ` · Hook/SEO/visual đã được tối ưu` : "";
+  if (data.warning) return `${data.warning}${quality}${timing}`;
   const searched = (data.search_queries || []).slice(0, 2).join(" · ");
   const grounding = data.grounded ? " + Google Search" : "";
-  return `${successText} bằng ${data.model || "AI"}${grounding}${data.cached ? " (cache)" : ""}${searched ? ` (${searched})` : ""}.${timing}`;
+  return `${successText} bằng ${data.model || "AI"}${grounding}${data.cached ? " (cache)" : ""}${searched ? ` (${searched})` : ""}.${quality}${timing}`;
 }
 
 function ensureCreatorSuggestionCurrent(data) {
@@ -3140,6 +3220,7 @@ async function refreshJobs() {
   
   // Update statistics
   updateStats(jobs);
+  refreshJobQueueStatus();
   if (!activeCreatorJobId) {
     const runningCreator = jobs.find(job =>
       String(job.source_url || "").startsWith("creator:") &&
@@ -3206,6 +3287,7 @@ async function refreshJobs() {
           ${job.status === "review" ? `<button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>` : ""}
           ${job.has_video ? `
             <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
+            <button class="btn gradient small" data-improve="${job.id}">Improve</button>
             <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
           ` : ""}
           ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>Tải .srt</a>` : ""}
@@ -3218,6 +3300,9 @@ async function refreshJobs() {
   }
   list.querySelectorAll("[data-preview]").forEach(btn => {
     btn.onclick = () => openPreview(btn.dataset.preview);
+  });
+  list.querySelectorAll("[data-improve]").forEach(btn => {
+    btn.onclick = () => openQualityReview(btn.dataset.improve);
   });
   list.querySelectorAll("[data-play-video]").forEach(title => {
     title.onclick = () => showHistoryVideo(window._jobsById[title.dataset.playVideo]);
@@ -3415,6 +3500,7 @@ function openPreview(jobId) {
   $("#preview-video").src = `/api/jobs/${jobId}/video`;
   $("#preview-download").href = `/api/jobs/${jobId}/video?download=true`;
   $("#prepublish-check-btn").dataset.jobId = jobId;
+  $("#preview-improve-btn").dataset.jobId = jobId;
   $("#prepublish-result").classList.add("hidden");
   $("#prepublish-result").innerHTML = "";
   $("#preview-modal").classList.remove("hidden");
@@ -3474,6 +3560,70 @@ $("#prepublish-check-btn").onclick = async () => {
     box.innerHTML = `<span style="color:var(--err)">${_escapeHtml(e.message)}</span>`;
   }
 };
+
+function _qualitySeverityColor(severity) {
+  if (severity === "error") return "var(--err)";
+  if (severity === "warning") return "var(--warn)";
+  return "var(--text-dim)";
+}
+
+function renderQualityReport(report) {
+  const findings = report.findings || [];
+  const actions = report.next_actions || [];
+  const summary = report.summary || [];
+  const facts = (report.prepublish || {}).facts || {};
+  return `
+    <div style="display:grid;grid-template-columns:120px minmax(0,1fr);gap:14px;align-items:center">
+      <div class="stat-box" style="margin:0;text-align:center"><div class="num">${report.score}</div><div class="label">Quality score</div></div>
+      <div>
+        <div style="font-size:16px;font-weight:700;margin-bottom:6px">${_escapeHtml(report.verdict || "")}</div>
+        <div style="font-size:12px;color:var(--text-dim)">${summary.map(_escapeHtml).join(" · ")}</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Findings</label>
+        <div style="display:grid;gap:8px">
+          ${findings.length ? findings.map(item => `
+            <div style="padding:10px 12px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px">
+              <div style="font-size:12px;font-weight:700;color:${_qualitySeverityColor(item.severity)}">${_escapeHtml(item.severity.toUpperCase())} · ${_escapeHtml(item.category)}</div>
+              <div style="font-size:13px;margin-top:4px">${_escapeHtml(item.message)}</div>
+              <div style="font-size:12px;color:var(--text-dim);margin-top:5px">${_escapeHtml(item.action)}</div>
+            </div>
+          `).join("") : `<div style="font-size:13px;color:var(--ok)">No automated findings. Still watch the video once before publishing.</div>`}
+        </div>
+      </div>
+      <div>
+        <label>Next actions</label>
+        <ul class="research-list">${actions.map(item => `<li>${_escapeHtml(item)}</li>`).join("")}</ul>
+        <label style="margin-top:14px">Platform facts</label>
+        <div style="font-size:12px;color:var(--text-dim);line-height:1.6">
+          ${facts.width || 0}x${facts.height || 0}<br>
+          ${facts.duration || 0}s · ${facts.fps || 0} FPS<br>
+          ${_escapeHtml(facts.video_codec || "unknown")} / ${_escapeHtml(facts.audio_codec || "no audio")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function openQualityReview(jobId) {
+  $("#quality-report-box").innerHTML = `<div style="color:var(--text-dim)">Dang review video...</div>`;
+  $("#quality-modal").classList.remove("hidden");
+  try {
+    const report = await api(`/api/jobs/${jobId}/quality-review`);
+    $("#quality-report-box").innerHTML = renderQualityReport(report);
+  } catch (e) {
+    $("#quality-report-box").innerHTML = `<div style="color:var(--err)">${_escapeHtml(e.message)}</div>`;
+  }
+}
+
+$("#quality-close").onclick = () => $("#quality-modal").classList.add("hidden");
+$("#quality-modal").addEventListener("click", ev => {
+  if (ev.target === $("#quality-modal")) $("#quality-modal").classList.add("hidden");
+});
+$("#preview-improve-btn").onclick = () => openQualityReview($("#preview-improve-btn").dataset.jobId);
+$("#latest-improve-btn").onclick = () => openQualityReview($("#latest-improve-btn").dataset.jobId);
 
 $("#preview-publish-btn").onclick = () => {
   closePreview();

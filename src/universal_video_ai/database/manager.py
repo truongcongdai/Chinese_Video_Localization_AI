@@ -80,6 +80,7 @@ class DatabaseManager:
             2: self._migrate_2_create_users,
             3: self._migrate_3_create_audit_log,
             4: self._migrate_4_add_subscription,  # NEW
+            5: self._migrate_5_create_youtube_research,
         }
 
     # ---------------------------
@@ -265,6 +266,133 @@ class DatabaseManager:
             pass
         self._conn.commit()
         self.logger.debug("Migration 4: subscription columns added to users table")
+
+    def _migrate_5_create_youtube_research(self) -> None:
+        """
+        Migration v5: create additive YouTube Research tables.
+        No existing table or column is modified.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_research_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                niche TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                target_language TEXT,
+                target_country TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                metadata TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_research_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                collected_at REAL NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY(project_id) REFERENCES youtube_research_projects(id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_research_videos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                video_id TEXT NOT NULL,
+                channel_id TEXT,
+                channel_title TEXT,
+                title TEXT NOT NULL,
+                description TEXT,
+                published_at REAL,
+                duration_seconds INTEGER,
+                view_count INTEGER,
+                like_count INTEGER,
+                comment_count INTEGER,
+                subscriber_count INTEGER,
+                thumbnail_url TEXT,
+                search_query TEXT,
+                collected_at REAL NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY(project_id) REFERENCES youtube_research_projects(id),
+                UNIQUE(project_id, video_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_research_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                snapshot_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES youtube_research_projects(id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_research_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                analysis_type TEXT NOT NULL,
+                score REAL,
+                confidence_score REAL,
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES youtube_research_projects(id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_research_opportunities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                raw_score REAL NOT NULL,
+                adjusted_score REAL NOT NULL,
+                confidence_score REAL NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES youtube_research_projects(id)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ytr_projects_keyword ON youtube_research_projects(keyword)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ytr_videos_project ON youtube_research_videos(project_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ytr_videos_video ON youtube_research_videos(video_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ytr_analyses_project ON youtube_research_analyses(project_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ytr_opportunities_project ON youtube_research_opportunities(project_id)")
+        self._conn.commit()
+        self.logger.debug("Migration 5: YouTube Research tables ensured")
+
+    def downgrade_youtube_research(self) -> None:
+        """
+        Drop only tables introduced by migration v5 and reset schema version to 4.
+        This is intentionally scoped to the YouTube Research feature.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            for table in (
+                "youtube_research_opportunities",
+                "youtube_research_analyses",
+                "youtube_research_snapshots",
+                "youtube_research_videos",
+                "youtube_research_sources",
+                "youtube_research_projects",
+            ):
+                cur.execute(f"DROP TABLE IF EXISTS {table}")
+            cur.execute("UPDATE schema_version SET version = 4 WHERE id = 1 AND version >= 5")
+            self._conn.commit()
+            self.logger.info("YouTube Research migration downgraded to schema version 4")
 
     # ---------------------------
     # Audit Logging (new feature)
