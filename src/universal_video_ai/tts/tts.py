@@ -21,7 +21,7 @@ _logger = logging.getLogger(__name__)
 # Vietnamese text to "en-US-JennyNeural". Keys are lowercased language
 # codes as used throughout this project (e.g. "vi", "en", "zh").
 DEFAULT_VOICES_BY_LANGUAGE = {
-    "vi": "vi-VN-HoaiMyNeural",
+    "vi": "vi-VN-HoaiMyNeural|rate=-6%|pitch=+2Hz",
     "en": "en-US-JennyNeural",
     "zh": "zh-CN-XiaoxiaoNeural",
     "zh-cn": "zh-CN-XiaoxiaoNeural",

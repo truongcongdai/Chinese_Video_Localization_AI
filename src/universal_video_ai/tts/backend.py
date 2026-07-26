@@ -51,6 +51,10 @@ class EdgeTTSBackend:
         parts = preset.split("|")
         effective_voice = parts[0]
         options = dict(part.split("=", 1) for part in parts[1:] if "=" in part)
+        primary_language = (language or "").strip().lower().split("-")[0]
+        if primary_language == "vi":
+            options.setdefault("rate", "-6%")
+            options.setdefault("pitch", "+2Hz")
         try:
             self.logger.debug(
                 "EdgeTTSBackend.synthesize: output=%s text_len=%d language=%s voice=%s",

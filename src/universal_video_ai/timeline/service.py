@@ -26,7 +26,7 @@ def _balanced_caption_chunks(text: str, max_chars: int = 72, line_chars: int = 3
     clean = " ".join((text or "").split())
     if not clean:
         return []
-    raw_punctuation_parts = [p.strip() for p in re.split(r"(?<=[,;:!?。！？；：.])\s+", clean) if p.strip()]
+    raw_punctuation_parts = [p.strip() for p in re.split(r"(?<=[;:!?。！？；：.])\s+", clean) if p.strip()]
     punctuation_parts: List[str] = []
     for part in raw_punctuation_parts:
         combined = f"{punctuation_parts[-1]} {part}" if punctuation_parts else part
@@ -63,6 +63,12 @@ def _balanced_caption_chunks(text: str, max_chars: int = 72, line_chars: int = 3
             return False
         left = normalized_word(units[index - 1])
         right = normalized_word(units[index])
+        raw_left = units[index - 1].strip()
+        raw_right = units[index].strip()
+        if "+" in raw_left or "+" in raw_right:
+            return False
+        if re.search(r"[A-Z].*[A-Z]", raw_left) and re.search(r"^[A-Z0-9+_-]{2,}", raw_right):
+            return False
         return (left, right) not in protected_pairs and left not in dangling_left
 
     def boundary_cost(units: List[str], index: int, target_chars: float, separator: str) -> float:

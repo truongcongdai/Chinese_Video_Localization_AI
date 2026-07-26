@@ -746,8 +746,8 @@
     <h3 class="section-title">Dịch &amp; lồng tiếng video có sẵn</h3>
     <div class="row reup-language-row">
       <div class="field" style="flex: 3">
-        <label>Đường link video — 1 link mỗi dòng để xử lý hàng loạt (TikTok / Douyin / v.v.)</label>
-        <textarea id="url-input" rows="2" placeholder="https://v.douyin.com/....&#10;https://v.douyin.com/.... (dán thêm dòng khác để xử lý hàng loạt)"></textarea>
+        <label>Dan link video - YouTube / Douyin / TikTok / Facebook / Instagram... (1 link moi dong de xu ly hang loat)</label>
+        <textarea id="url-input" rows="2" placeholder="https://www.youtube.com/watch?v=...&#10;https://v.douyin.com/...&#10;https://www.tiktok.com/@user/video/..."></textarea>
       </div>
       <div class="field reup-language-field" style="flex: 1">
         <label>Ngôn ngữ gốc video reup</label>
@@ -794,7 +794,7 @@
     <div class="field">
       <label>
         <input type="checkbox" id="youtube-tools-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-        Công cụ YouTube 📺
+        Tien ich YouTube (phu)
       </label>
     </div>
     <div id="youtube-tools-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
@@ -802,12 +802,15 @@
         <label title="URL video YouTube">URL YouTube ℹ️</label>
         <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." style="width:100%;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);">
       </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:-6px;margin-bottom:12px">
+        Day chi la tien ich phu. De dich, chay sub, long tieng va render, hay dua URL vao pipeline chinh.
+      </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
-        <button onclick="downloadYouTubeVideo()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">📥 Download Video</button>
-        <button onclick="extractYouTubeAudio()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">🎵 Extract Audio</button>
-        <button onclick="downloadYouTubeSubtitles()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">� subs Download Subtitles</button>
-        <button onclick="downloadYouTubeThumbnail()" style="padding:8px 16px;background:var(--accent);color:white;border:none;border-radius:8px;cursor:pointer;">🖼️ Download Thumbnail</button>
-        <button onclick="getYouTubeMetadata()" style="padding:8px 16px;background:var(--accent-2);color:white;border:none;border-radius:8px;cursor:pointer;">ℹ️ Get Metadata</button>
+        <button onclick="useYouTubeInPipeline()" style="padding:8px 16px;background:var(--ok);color:white;border:none;border-radius:8px;cursor:pointer;">Dua link nay vao pipeline long tieng</button>
+        <button onclick="extractYouTubeAudio()" style="padding:8px 16px;background:var(--panel);color:white;border:1px solid var(--border);border-radius:8px;cursor:pointer;">Extract Audio</button>
+        <button onclick="downloadYouTubeSubtitles()" style="padding:8px 16px;background:var(--panel);color:white;border:1px solid var(--border);border-radius:8px;cursor:pointer;">Download Subtitles</button>
+        <button onclick="downloadYouTubeThumbnail()" style="padding:8px 16px;background:var(--panel);color:white;border:1px solid var(--border);border-radius:8px;cursor:pointer;">Download Thumbnail</button>
+        <button onclick="getYouTubeMetadata()" style="padding:8px 16px;background:var(--accent-2);color:white;border:none;border-radius:8px;cursor:pointer;">Get Metadata</button>
       </div>
       <div id="youtube-result" style="margin-top:12px;padding:12px;background:var(--bg);border-radius:8px;border:1px solid var(--border);display:none;"></div>
     </div>
@@ -972,6 +975,110 @@
   </div>
 
   <div class="card">
+    <h3 class="section-title">Product Review / Affiliate Mode</h3>
+    <div class="row">
+      <div class="field" style="flex: 2">
+        <label>Link san pham (tuy chon)</label>
+        <input id="affiliate-product-url" placeholder="https://shop...">
+      </div>
+      <div class="field" style="flex: 2">
+        <label>Ten san pham</label>
+        <input id="affiliate-product-name" placeholder="VD: may hut bui mini cam tay">
+      </div>
+      <div class="field">
+        <label>Nen tang</label>
+        <select id="affiliate-platform">
+          <option value="tiktok_shop">TikTok Shop</option>
+          <option value="reels">Reels</option>
+          <option value="shorts">YouTube Shorts</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Thoi luong</label>
+        <select id="affiliate-duration">
+          <option value="15">15 giay</option>
+          <option value="30" selected>30 giay</option>
+          <option value="60">60 giay</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>Ai nen mua</label>
+        <input id="affiliate-audience" placeholder="VD: nguoi o phong nho, can don ban lam viec nhanh">
+      </div>
+      <div class="field" style="flex: 2">
+        <label>Trai nghiem that / ghi chu bat buoc</label>
+        <textarea id="affiliate-experience" rows="3" placeholder="Ban da test gi, thay gi, dieu gi khong chac thi noi ro. Khong de trong."></textarea>
+      </div>
+    </div>
+    <div class="field">
+      <label>Product media that (khuyen dung): upload anh/video san pham de canh quay khop review</label>
+      <input id="affiliate-product-media-input" type="file" multiple accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm,video/x-matroska">
+      <div style="font-size:12px;color:var(--text-dim);margin-top:6px">
+        Uu tien anh/video san pham that. Stock se dung cho canh boi canh. AI Image chi nen la fallback, khong nen ve lai san pham that.
+      </div>
+      <div id="affiliate-product-media-list" style="font-size:12px;color:var(--text-dim);margin-top:8px"></div>
+    </div>
+    <div class="field">
+      <label>
+        <input type="checkbox" id="affiliate-advanced-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Advanced override: tu nhap claim / diem manh / han che neu muon sua AI
+      </label>
+    </div>
+    <div id="affiliate-advanced-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+        Mac dinh AI se tu tong hop cac muc nay. Chi mo phan nay khi ban muon override bang du lieu chac chan.
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Claim chinh cua san pham (optional)</label>
+          <textarea id="affiliate-claims" rows="3" placeholder="Moi dong mot claim neu ban da kiem chung"></textarea>
+        </div>
+        <div class="field">
+          <label>Diem manh that (optional)</label>
+          <textarea id="affiliate-pros" rows="3" placeholder="Moi dong mot diem manh co the chung minh bang canh quay"></textarea>
+        </div>
+        <div class="field">
+          <label>Han che / luu y (optional)</label>
+          <textarea id="affiliate-cons" rows="3" placeholder="Moi dong mot han che neu ban muon sua AI"></textarea>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+      <button class="btn gradient" id="affiliate-generate-btn" type="button">Gen script review</button>
+      <button class="btn secondary small" id="affiliate-send-creator-btn" type="button" disabled>Dua sang tao video AI</button>
+      <button class="btn secondary small" id="affiliate-copy-caption-btn" type="button" disabled>Copy caption</button>
+    </div>
+    <div id="affiliate-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+    <div id="affiliate-output" class="hidden" style="margin-top:14px;display:grid;gap:12px">
+      <div class="field">
+        <label>Voice script / subtitle</label>
+        <textarea id="affiliate-narration-output" rows="6"></textarea>
+      </div>
+      <div class="field">
+        <label>B-roll planner</label>
+        <textarea id="affiliate-broll-output" rows="6"></textarea>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Title</label>
+          <input id="affiliate-title-output">
+        </div>
+        <div class="field">
+          <label>Hashtags</label>
+          <input id="affiliate-hashtags-output">
+        </div>
+      </div>
+      <div class="field">
+        <label>Caption + disclosure</label>
+        <textarea id="affiliate-caption-output" rows="3"></textarea>
+      </div>
+      <div id="affiliate-warnings-output" style="font-size:12px;color:var(--warn)"></div>
+    </div>
+  </div>
+
+  <div class="card">
     <h3 class="section-title">Tạo video AI từ ý tưởng/cảnh quay</h3>
     <div class="row">
       <div class="field" style="flex: 2">
@@ -988,6 +1095,7 @@
       <div class="field">
         <label>Thời lượng</label>
         <select id="creator-duration">
+          <option value="15">15 giây</option>
           <option value="30">30 giây</option>
           <option value="45">45 giây</option>
           <option value="60">60 giây</option>
@@ -1025,6 +1133,7 @@
           <option value="ai_video">AI Sinh Video (GPU)</option>
         </select>
         <div id="creator-image-provider-help" style="font-size:11px;color:var(--text-dim);margin-top:5px"></div>
+        <div style="font-size:11px;color:var(--warn);margin-top:5px">Review san pham: nen dung product media/stock. AI Image co the ve sai san pham that.</div>
       </div>
     </div>
     <div class="field">
@@ -2183,6 +2292,21 @@ $("#youtube-tools-checkbox").onchange = (ev) => {
   $("#youtube-tools-panel").classList.toggle("hidden", !ev.target.checked);
 };
 
+function useYouTubeInPipeline() {
+  const url = $("#youtube-url").value.trim();
+  if (!url) {
+    alert("Vui long nhap URL YouTube");
+    return;
+  }
+  const input = $("#url-input");
+  const existing = input.value.trim();
+  input.value = existing ? `${existing}\n${url}` : url;
+  $("#youtube-result").style.display = "block";
+  $("#youtube-result").innerHTML = `<div style="color:var(--ok)">Da dua URL vao pipeline chinh. Hay chon ngon ngu/voice roi bam Bat dau xu ly.</div>`;
+  input.focus();
+  input.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
 async function downloadYouTubeVideo() {
   const url = $("#youtube-url").value.trim();
   if (!url) {
@@ -2532,6 +2656,143 @@ $("#submit-btn").onclick = async () => {
   } finally { $("#submit-btn").disabled = false; }
 };
 
+let latestAffiliateReview = null;
+let affiliateProductMedia = [];
+
+$("#affiliate-advanced-checkbox").onchange = (ev) => {
+  $("#affiliate-advanced-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+function renderAffiliateProductMediaList() {
+  const box = $("#affiliate-product-media-list");
+  if (!affiliateProductMedia.length) {
+    box.textContent = "Chua upload product media. Video se dung stock footage neu co cau hinh Pexels/Pixabay.";
+    return;
+  }
+  box.innerHTML = affiliateProductMedia.map((item, idx) =>
+    `${idx + 1}. ${escapeHtml(item.filename)} (${escapeHtml(item.media_type)})`
+  ).join("<br>");
+}
+renderAffiliateProductMediaList();
+
+$("#affiliate-product-media-input").onchange = async (ev) => {
+  const files = Array.from(ev.target.files || []);
+  if (!files.length) return;
+  $("#affiliate-error").style.color = "var(--text-dim)";
+  $("#affiliate-error").textContent = "Dang upload product media...";
+  try {
+    for (const file of files.slice(0, 12 - affiliateProductMedia.length)) {
+      const form = new FormData();
+      form.append("file", file);
+      const resp = await fetch("/api/product-media/upload", { method: "POST", body: form });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || `Upload failed: HTTP ${resp.status}`);
+      }
+      affiliateProductMedia.push(await resp.json());
+    }
+    renderAffiliateProductMediaList();
+    $("#affiliate-error").style.color = "var(--ok)";
+    $("#affiliate-error").textContent = "Da upload product media. Khi tao video, media nay se duoc uu tien truoc stock/AI.";
+  } catch (e) {
+    $("#affiliate-error").style.color = "var(--err)";
+    $("#affiliate-error").textContent = e.message;
+  } finally {
+    ev.target.value = "";
+  }
+};
+
+function affiliatePayload() {
+  return {
+    product_url: $("#affiliate-product-url").value.trim() || null,
+    product_name: $("#affiliate-product-name").value.trim(),
+    product_claims: $("#affiliate-claims").value.trim(),
+    pros: $("#affiliate-pros").value.trim(),
+    cons: $("#affiliate-cons").value.trim(),
+    audience: $("#affiliate-audience").value.trim(),
+    real_experience: $("#affiliate-experience").value.trim(),
+    target_language: ($("#creator-lang-select") && $("#creator-lang-select").value) || $("#lang-select").value || "vi",
+    duration_seconds: parseInt($("#affiliate-duration").value, 10) || 30,
+    platform: $("#affiliate-platform").value,
+  };
+}
+
+function showAffiliateReview(data) {
+  latestAffiliateReview = data;
+  $("#affiliate-output").classList.remove("hidden");
+  $("#affiliate-narration-output").value = data.narration_script || "";
+  $("#affiliate-broll-output").value = data.broll_plan || "";
+  $("#affiliate-title-output").value = data.title || "";
+  $("#affiliate-caption-output").value = data.caption || "";
+  $("#affiliate-hashtags-output").value = (data.hashtags || []).join(", ");
+  const warnings = data.compliance_warnings || [];
+  $("#affiliate-warnings-output").innerHTML = warnings.length
+    ? `<strong>Compliance check:</strong><br>${warnings.map(w => `- ${escapeHtml(w)}`).join("<br>")}`
+    : `<span style="color:var(--ok)">Compliance check: OK. Disclosure affiliate da duoc chen vao script/caption.</span>`;
+  $("#affiliate-send-creator-btn").disabled = false;
+  $("#affiliate-copy-caption-btn").disabled = false;
+}
+
+$("#affiliate-generate-btn").onclick = async () => {
+  $("#affiliate-error").style.color = "var(--text-dim)";
+  $("#affiliate-error").textContent = "";
+  const button = $("#affiliate-generate-btn");
+  button.disabled = true;
+  button.classList.add("is-loading");
+  button.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span>Dang gen...</span>`;
+  try {
+    const payload = affiliatePayload();
+    if (!payload.product_name) throw new Error("Nhap ten san pham");
+    if (!payload.real_experience) throw new Error("Nhap trai nghiem that / ghi chu bat buoc");
+    const data = await api("/api/affiliate/review", { method: "POST", body: JSON.stringify(payload) });
+    showAffiliateReview(data);
+    $("#affiliate-error").style.color = "var(--ok)";
+    $("#affiliate-error").textContent = "Da tao script review. Hay doc lai claim truoc khi render/publish.";
+  } catch (e) {
+    $("#affiliate-error").style.color = "var(--err)";
+    $("#affiliate-error").textContent = e.message;
+  } finally {
+    button.disabled = false;
+    button.classList.remove("is-loading");
+    button.textContent = "Gen script review";
+  }
+};
+
+$("#affiliate-send-creator-btn").onclick = () => {
+  if (!latestAffiliateReview) return;
+  const product = $("#affiliate-product-name").value.trim();
+  $("#creator-topic").value = `Product review: ${product}`;
+  $("#creator-duration").value = String(latestAffiliateReview.duration_seconds || $("#affiliate-duration").value || 30);
+  $("#creator-image-provider").value = "stock";
+  $("#creator-keywords").value = $("#affiliate-hashtags-output").value.replace(/#/g, "");
+  $("#creator-script").value = $("#affiliate-broll-output").value;
+  $("#creator-narration").value = $("#affiliate-narration-output").value;
+  $("#script-style-select").value = "review";
+  $("#script-tone-select").value = "casual";
+  window._creatorSuggestionCache = null;
+  window._creatorSuggestionPending = null;
+  updateCreatorSubmitState();
+  $("#creator-error").style.color = "var(--text-dim)";
+  $("#creator-error").textContent = affiliateProductMedia.length
+    ? "Affiliate media da san sang: product media se duoc dung truoc, stock dung cho canh thieu, AI chi la fallback neu ban tu chon."
+    : "Affiliate flow dang de visual source la Stock. Upload product media de canh review khop san pham hon.";
+  $("#creator-topic").scrollIntoView({ behavior: "smooth", block: "center" });
+};
+
+$("#affiliate-copy-caption-btn").onclick = async () => {
+  const text = `${$("#affiliate-caption-output").value.trim()}\n${$("#affiliate-hashtags-output").value.trim()}`;
+  if (!text.trim()) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    $("#affiliate-error").style.color = "var(--ok)";
+    $("#affiliate-error").textContent = "Da copy caption.";
+  } catch {
+    $("#affiliate-caption-output").select();
+    $("#affiliate-error").style.color = "var(--warn)";
+    $("#affiliate-error").textContent = "Trinh duyet khong cho copy tu dong, caption da duoc boi chon.";
+  }
+};
+
 async function loadCreatorSuggestions() {
   const topic = $("#creator-topic").value.trim();
   if (!topic) throw new Error("Nhập chủ đề video trước");
@@ -2794,6 +3055,7 @@ $("#creator-submit-btn").onclick = async () => {
       transition: $("#creator-transition").value,
       tts_voice: $("#creator-voice-select").value || null,
       image_provider: $("#creator-image-provider").value,
+      product_media_paths: affiliateProductMedia.map(item => item.media_id),
     })});
     activeCreatorJobId = job.id;
     showCreatorProgress(job);

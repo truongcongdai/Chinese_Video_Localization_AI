@@ -39,7 +39,7 @@ import requests
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from universal_video_ai.orchestrator.factory import create_localization_service
 from universal_video_ai.orchestrator.service import (
@@ -161,6 +161,8 @@ REFERRAL_BONUS_CREDITS = int(os.environ.get("REFERRAL_BONUS_CREDITS", "20"))
 
 _LOGO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "logos"
 _LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_PRODUCT_MEDIA_UPLOAD_DIR = _REPO_ROOT / "local_data" / "web_uploads" / "product_media"
+_PRODUCT_MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Human-readable Vietnamese labels for language codes, shown in the
 # frontend's dropdowns. Target-language options come straight from
@@ -238,6 +240,7 @@ class CreatorJobBody(BaseModel):
     transition: str = "fade"
     tts_voice: Optional[str] = None
     image_provider: str = "stock"  # stock | cpu_ai | ai_video
+    product_media_paths: List[str] = Field(default_factory=list)
 
 
 class CreatorSuggestionBody(BaseModel):
@@ -248,6 +251,20 @@ class CreatorSuggestionBody(BaseModel):
     transition: str = "fade"
     advanced_options: Optional[Dict[str, Any]] = None
     provider: str = "gemini"  # gemini | openai | ollama | openrouter
+
+
+class AffiliateReviewBody(BaseModel):
+    product_url: Optional[str] = None
+    product_name: str
+    product_claims: str = ""
+    pros: str = ""
+    cons: str = ""
+    audience: str = ""
+    real_experience: str
+    target_language: str = "vi"
+    duration_seconds: int = 30
+    platform: str = "tiktok_shop"  # tiktok_shop | reels | shorts
+    provider: str = "auto"
 
 
 class BulkDeleteBody(BaseModel):
@@ -2339,6 +2356,35 @@ def _ass_karaoke_text(
     return r"\N".join(rendered_lines)
 
 
+def _fit_creator_subtitle_text(text: str, frame_width: int, font_size: int) -> str:
+    """Hard-wrap ASS cues so subtitles stay inside the video frame."""
+    clean = " ".join(str(text or "").replace("\n", " ").split())
+    if not clean:
+        return clean
+    # Approximate DejaVu Sans bold width. Keep enough side margin for 9:16.
+    max_chars = max(18, int((frame_width * 0.80) / (font_size * 0.58)))
+    words = clean.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > max_chars and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    if len(lines) <= 2:
+        return "\n".join(lines)
+    midpoint = max(1, len(words) // 2)
+    best = min(
+        range(max(1, midpoint - 4), min(len(words), midpoint + 5)),
+        key=lambda idx: abs(len(" ".join(words[:idx])) - len(" ".join(words[idx:]))),
+    )
+    return " ".join(words[:best]) + "\n" + " ".join(words[best:])
+
+
 def _write_creator_subtitles(
     scenes: List[str], path: Path, spoken_duration: float,
     cue_durations: Optional[List[float]] = None, frame_width: int = 1080,
@@ -2346,7 +2392,18 @@ def _write_creator_subtitles(
 ) -> tuple[List[Dict[str, Any]], float]:
     segments: List[Dict[str, Any]] = []
     dialogues: List[str] = []
-    cues_text = [chunk for scene in scenes for chunk in _balanced_caption_chunks(scene)]
+    # Explicit PlayRes makes margins/font sizes deterministic on both 9:16
+    # and 16:9 output. Creator subtitles are intentionally capped at two
+    # lines; long cues are split by time before this point, then hard-wrapped
+    # here so libass cannot overflow off-screen.
+    font_size = 38 if frame_height >= frame_width else 40
+    margin_lr = max(72, round(frame_width * 0.09))
+    margin_v = max(90, round(frame_height * 0.075))
+    cues_text = [
+        _fit_creator_subtitle_text(chunk, frame_width, font_size)
+        for scene in scenes
+        for chunk in _balanced_caption_chunks(scene, max_chars=100, line_chars=52)
+    ]
     weights = (
         [max(0.01, duration) for duration in cue_durations]
         if cue_durations and len(cue_durations) == len(cues_text)
@@ -2375,17 +2432,11 @@ def _write_creator_subtitles(
             f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},Default,,0,0,0,,"
             f"{{\\fad(100,120)}}{karaoke}"
         )
-    # Explicit PlayRes makes margins/font sizes deterministic on both 9:16
-    # and 16:9 output. WrapStyle=2 respects our one intentional \N only, so
-    # libass cannot turn a two-line cue into four/five lines.
-    font_size = 48 if frame_height >= frame_width else 50
-    margin_lr = max(40, round(frame_width * 0.07))
-    margin_v = max(70, round(frame_height * 0.07))
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {frame_width}
 PlayResY: {frame_height}
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
@@ -2410,6 +2461,37 @@ def _media_duration(path: Path) -> float:
         return 0.0
 
 
+def _uploaded_product_media_kind(path: Path) -> str:
+    return "video" if path.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv"} else "image"
+
+
+def _uploaded_product_media_path(user_id: int, media_id: str) -> Optional[Path]:
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", media_id or "")
+    if not safe_id:
+        return None
+    candidates = sorted(_PRODUCT_MEDIA_UPLOAD_DIR.glob(f"{user_id}_{safe_id}.*"))
+    if not candidates:
+        return None
+    root = _PRODUCT_MEDIA_UPLOAD_DIR.resolve()
+    path = candidates[0].resolve()
+    try:
+        inside_root = path.is_relative_to(root)
+    except AttributeError:
+        inside_root = root in path.parents
+    if not path.is_file() or not inside_root:
+        return None
+    return path
+
+
+def _validated_product_media_paths(user_id: int, media_ids: List[str]) -> List[str]:
+    paths: List[str] = []
+    for media_id in media_ids[:12]:
+        path = _uploaded_product_media_path(user_id, media_id)
+        if path and str(path) not in paths:
+            paths.append(str(path))
+    return paths
+
+
 def _synthesize_creator_cues(
     scenes: List[str], output_dir: Path, language: str, voice: Optional[str], output_path: Path,
 ) -> tuple[List[float], List[List[int]]]:
@@ -2418,7 +2500,7 @@ def _synthesize_creator_cues(
     Measuring every cue's real audio duration gives subtitle boundaries that
     follow the selected voice, including its pauses and speaking style.
     """
-    cues = [chunk for scene in scenes for chunk in _balanced_caption_chunks(scene)]
+    cues = [chunk for scene in scenes for chunk in _balanced_caption_chunks(scene, max_chars=100, line_chars=52)]
     cue_dir = output_dir / "narration_cues"
     cue_dir.mkdir(parents=True, exist_ok=True)
     import edge_tts
@@ -2552,6 +2634,10 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         clip_paths: List[Path] = []
         video_fallback_count = 0
         image_provider = body.image_provider.lower()
+        product_media_paths = [
+            Path(path) for path in (body.product_media_paths or [])
+            if Path(path).exists() and Path(path).is_file()
+        ]
         video_backend = _creator_video_backend() if image_provider == "ai_video" else None
         ai_scene_prompts: List[str] = []
         story_seed: Optional[int] = None
@@ -2592,7 +2678,22 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
             )
             logger.info("Creator scene %s/%s stock queries: %s", idx + 1, len(scenes), queries)
             media = None
-            if image_provider in ("ai", "cpu_ai"):
+            if product_media_paths:
+                source_path = product_media_paths[idx % len(product_media_paths)]
+                media_type = _uploaded_product_media_kind(source_path)
+                _render_stock_clip(
+                    source_path, media_type, clip_path, width, height,
+                    scene_duration, body.transition,
+                )
+                media = {
+                    "type": media_type, "url": str(source_path),
+                    "provider": "Product media",
+                }
+                store.update_job(
+                    job_id,
+                    progress_note=f"Da dung canh {idx + 1}/{len(scenes)} tu product media...",
+                )
+            elif image_provider in ("ai", "cpu_ai"):
                 try:
                     store.update_job(
                         job_id,
@@ -2695,7 +2796,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
                     media = _search_stock_media(query, body.aspect_ratio)
                     if media:
                         break
-            if media and not media["provider"].startswith(("AI sinh ảnh", "AI Sinh Video")):
+            if media and not media["provider"].startswith(("AI sinh ảnh", "AI Sinh Video", "Product media")):
                 try:
                     source_path = _download_stock_media(media, output_dir / f"stock_{idx:02d}")
                     _render_stock_clip(
@@ -2810,8 +2911,11 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
         raise HTTPException(400, "Thời lượng video phải từ 10 giây đến 20 phút")
     if body.image_provider not in ("stock", "ai", "cpu_ai", "ai_video"):
         raise HTTPException(400, "Nguồn hình ảnh không hợp lệ")
-    _validate_creator_ai_runtime(body.image_provider)
-    if body.image_provider == "stock" and not _env_first("PEXELS_API_KEY", "PEXELS_KEY", "PIXABAY_API_KEY", "PIXABAY_KEY"):
+    product_media_paths = _validated_product_media_paths(user_id, body.product_media_paths or [])
+    body.product_media_paths = product_media_paths
+    if not product_media_paths:
+        _validate_creator_ai_runtime(body.image_provider)
+    if body.image_provider == "stock" and not product_media_paths and not _env_first("PEXELS_API_KEY", "PEXELS_KEY", "PIXABAY_API_KEY", "PIXABAY_KEY"):
         raise HTTPException(
             503,
             "Chưa cấu hình kho ảnh. Thêm PEXELS_API_KEY vào file .env rồi khởi động lại web.",
@@ -2932,6 +3036,246 @@ def creator_suggestions(body: CreatorSuggestionBody, user_id: int = Depends(get_
         "warning": "AI chưa được cấu hình hoặc tạm thời không phản hồi; đang dùng nội dung mẫu local.",
     }
     return _annotate_creator_suggestion_timing(result, body.duration_seconds)
+
+
+_AFFILIATE_RISK_PATTERNS = [
+    (re.compile(r"\b(100%|chac chan|bao dam|cam ket|than toc|ngay lap tuc)\b", re.I), "Claim sounds absolute; soften it and tie it to real usage."),
+    (re.compile(r"\b(tri benh|chua benh|het benh|giam can|moc toc|trang da|het mun)\b", re.I), "Health/beauty result claim needs evidence and careful wording."),
+    (re.compile(r"\b(tot nhat|so 1|re nhat|duy nhat)\b", re.I), "Superlative claim needs proof or comparison context."),
+    (re.compile(r"\b(fake|nhai|replica|hang gia)\b", re.I), "Avoid promoting counterfeit or misleading product positioning."),
+]
+
+
+def _split_user_lines(value: str) -> List[str]:
+    parts = re.split(r"[\n,;]+", value or "")
+    return [part.strip(" -\t") for part in parts if part.strip(" -\t")]
+
+
+def _affiliate_fragment(value: str) -> str:
+    text = " ".join(str(value or "").strip().rstrip(".").split())
+    if not text:
+        return text
+    return text[:1].lower() + text[1:]
+
+
+def _affiliate_expressive_line(text: str) -> str:
+    text = " ".join(str(text or "").split())
+    text = re.sub(r"^nhưng\b", "Nhưng,", text, flags=re.I)
+    text = re.sub(r"\bnếu bạn\b", "Nếu bạn", text, flags=re.I)
+    return text
+
+
+def _affiliate_product_voice_name(product: str) -> str:
+    """Use a short spoken product name; keep the full name for title/caption."""
+    text = " ".join(str(product or "").split())
+    text = re.sub(r"^(?:chai|lọ|lo|hộp|hop|túi|tui|gói|goi|bộ|bo)\s+", "", text, flags=re.I)
+    text = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|gram|chai|túi|goi|gói)\b", "", text, flags=re.I)
+    text = re.split(
+        r"\b(?:giữ|giu|lưu|luu|thơm|thom|trên|tren|cho|dành|danh|phù hợp|phu hop|hương thơm|huong thom)\b",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    words = [word.strip(" -,.") for word in text.split() if word.strip(" -,.")]
+    if len(words) > 8:
+        words = words[:8]
+    short = " ".join(words).strip(" -,.")
+    return short or product.strip()
+
+
+def _infer_affiliate_points(body: AffiliateReviewBody, language: str) -> tuple[List[str], List[str], List[str]]:
+    product = body.product_name.strip()
+    experience = body.real_experience.strip()
+    audience = body.audience.strip()
+    claims = _split_user_lines(body.product_claims)
+    pros = _split_user_lines(body.pros)
+    cons = _split_user_lines(body.cons)
+
+    if language == "vi":
+        inferred_claims = [
+            f"{product} có thể giải quyết một nhu cầu khá cụ thể trong sinh hoạt hằng ngày",
+            "Nên đối chiếu mô tả của shop với trải nghiệm thực tế trước khi mua",
+        ]
+        inferred_pros = [
+            "Sản phẩm cho cảm giác hữu ích trong những tình huống nhỏ, cần xử lý nhanh",
+            f"Hợp hơn với {audience}" if audience else "Hợp hơn với người có nhu cầu rõ ràng và ngân sách phù hợp",
+        ]
+        inferred_cons = [
+            "Kết quả thực tế vẫn phụ thuộc vào cách dùng và kỳ vọng của mỗi người",
+            "Nên kiểm tra giá, bảo hành, đánh giá mới nhất và điều kiện đổi trả trước khi mua",
+        ]
+    else:
+        inferred_claims = [
+            f"{product} may solve a specific everyday use case",
+            "Compare the seller description with real usage before buying",
+        ]
+        inferred_pros = [
+            f"Most useful real note: {experience}",
+            f"Best fit for {audience}" if audience else "Best fit for buyers with a clear need and matching budget",
+        ]
+        inferred_cons = [
+            "Results can vary by usage habits and expectations",
+            "Check current price, warranty, recent reviews, and return terms before buying",
+        ]
+    return claims or inferred_claims, pros or inferred_pros, cons or inferred_cons
+
+
+def _affiliate_compliance_warnings(body: AffiliateReviewBody) -> List[str]:
+    haystack = " ".join([
+        body.product_name, body.product_claims, body.pros, body.cons,
+        body.audience, body.real_experience,
+    ])
+    normalized = unicodedata.normalize("NFKD", haystack.lower().replace("đ", "d"))
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    warnings: List[str] = []
+    for pattern, message in _AFFILIATE_RISK_PATTERNS:
+        if pattern.search(normalized) and message not in warnings:
+            warnings.append(message)
+    if len(body.real_experience.strip().split()) < 8:
+        warnings.append("Real experience is too thin; add what you personally tested, noticed, or measured.")
+    return warnings
+
+
+def _affiliate_review_template(body: AffiliateReviewBody) -> Dict[str, Any]:
+    language = body.target_language or "vi"
+    product = body.product_name.strip()
+    spoken_product = _affiliate_product_voice_name(product)
+    duration = max(15, min(60, int(body.duration_seconds or 30)))
+    claims, pros, cons = _infer_affiliate_points(body, language)
+    audience = body.audience.strip()
+    audience_text = audience or ("người đang cân nhắc sản phẩm này" if language == "vi" else "people considering this product")
+    experience = body.real_experience.strip()
+    disclosure = (
+        "Mình có thể nhận hoa hồng từ liên kết mua hàng."
+        if language == "vi" else
+        "I may earn a commission from the purchase link."
+    )
+    if language == "vi":
+        pro_fragment = _affiliate_fragment(pros[0])
+        con_fragment = _affiliate_fragment(cons[0])
+        if duration <= 15:
+            narration_lines = [
+                f"Khoan mua vội {spoken_product}. Nghe mình nói thật một chút.",
+                f"Mình đã thử nhanh rồi: {_affiliate_expressive_line(experience)}.",
+                f"Nếu bạn thuộc nhóm {audience_text}, đây là món đáng cân nhắc.",
+                f"Nhưng nhớ kiểm tra giá, bảo hành và điều kiện đổi trả trước khi chốt đơn. {disclosure}",
+            ]
+        elif duration >= 60:
+            narration_lines = [
+                f"Mình vừa dùng thử {spoken_product}. Và nói thật, cảm giác đầu tiên là... sản phẩm này không dành cho tất cả mọi người.",
+                f"Điểm mình quan tâm nhất không phải quảng cáo nói gì, mà là lúc dùng thật có tiện không.",
+                f"Với trải nghiệm của mình: {_affiliate_expressive_line(experience)}.",
+                f"Điểm ổn là {pro_fragment}.",
+                f"Nhưng điểm cần tỉnh táo là {con_fragment}.",
+                f"Nếu bạn là {audience_text}, thì đây là món có thể đáng để xem thêm.",
+                "Còn nếu bạn kỳ vọng một sản phẩm hoàn hảo ngay từ lần đầu dùng, mình nghĩ nên cân nhắc kỹ hơn.",
+                "Trước khi mua, hãy xem lại giá hiện tại, chính sách đổi trả và vài đánh giá gần nhất.",
+                f"Mình để thông tin ở phần sản phẩm để bạn tự kiểm tra trước khi quyết định. {disclosure}",
+            ]
+        else:
+            narration_lines = [
+                f"Mình vừa dùng thử {spoken_product}. Và có vài điểm rất đáng nói trước khi mua.",
+                f"Trải nghiệm thực tế của mình là: {_affiliate_expressive_line(experience)}.",
+                f"Cái mình thích là {pro_fragment}.",
+                f"Nhưng cũng phải nói thật, {con_fragment}.",
+                f"Nếu bạn là {audience_text}, đây là món đáng để xem thêm.",
+                f"Còn trước khi chốt đơn, nhớ kiểm tra giá mới nhất và điều kiện đổi trả. {disclosure}",
+            ]
+        visual_lines = [
+            "Cảnh mở đầu cầm sản phẩm trên tay hoặc đặt trên bàn, ánh sáng rõ.",
+            "Cận cảnh bao bì, nhãn, dung tích và chất liệu thật của sản phẩm.",
+            "Quay thao tác dùng sản phẩm trong bối cảnh đời thường.",
+            f"Cảnh minh họa điểm đáng chú ý: {pros[0]}",
+            f"Cảnh minh họa điểm cần cân nhắc: {cons[0]}",
+            "Cảnh người dùng so sánh nhu cầu thật trước khi bấm mua.",
+            "Cảnh kết với trang sản phẩm và disclosure affiliate rõ ràng.",
+        ]
+        title = f"Review nhanh {product}: có đáng mua không?"
+        caption = f"Review thật về {product}. {disclosure} #review #tiktokshop #affiliate"
+        hashtags = ["review", "tiktokshop", "affiliate", "muasamthongminh", re.sub(r"\s+", "", product.lower())[:30]]
+    else:
+        hook = f"I tested {product}, and here is what to check before buying."
+        claim_line = f"The main seller claim is {claims[0]}." if claims else f"The key thing to inspect is {pros[0]}."
+        narration_lines = [
+            hook, claim_line, f"My real usage note: {experience}",
+            f"What I liked most: {pros[0]}.", f"What to watch out for: {cons[0]}.",
+            f"It fits {audience}, but do not buy from one short video alone.",
+            "Check the latest product details and price before deciding.", disclosure,
+        ]
+        visual_lines = [
+            f"Opening shot holding or placing {product} on a clean table",
+            f"Close-up of real packaging, material, and product details for {product}",
+            f"Hands-on demo using {product} in a normal setting",
+            f"Visual proof of the strongest benefit: {pros[0]}",
+            f"Visual note showing the limitation: {cons[0]}",
+            "Person comparing real needs before purchase",
+            "Closing shot with product page and clear affiliate disclosure",
+        ]
+        title = f"Quick {product} review: worth buying?"
+        caption = f"Honest review of {product}. {disclosure} #review #affiliate #shopping"
+        hashtags = ["review", "affiliate", "shopping", "productreview", re.sub(r"\s+", "", product.lower())[:30]]
+
+    if language != "vi" and duration <= 15:
+        narration_lines = narration_lines[:5] + [disclosure]
+        visual_lines = visual_lines[:5]
+    elif language != "vi" and duration >= 60:
+        visual_lines.extend([
+            f"Extra close-up of daily use details for {product}",
+            "Side-by-side shot of who should buy and who should skip",
+        ])
+    return {
+        "generator": "template",
+        "model": None,
+        "product_url": body.product_url,
+        "title": title,
+        "caption": caption,
+        "hashtags": list(dict.fromkeys([tag for tag in hashtags if tag])),
+        "disclosure": disclosure,
+        "narration_script": "\n".join(narration_lines),
+        "broll_plan": "\n".join(visual_lines),
+        "compliance_warnings": _affiliate_compliance_warnings(body),
+        "duration_seconds": duration,
+    }
+
+
+@app.post("/api/affiliate/review")
+def affiliate_review(body: AffiliateReviewBody, user_id: int = Depends(get_current_user_id)):
+    if not body.product_name.strip():
+        raise HTTPException(400, "Missing product name")
+    if not body.real_experience.strip():
+        raise HTTPException(400, "Missing real experience note")
+    if not 15 <= int(body.duration_seconds or 0) <= 60:
+        raise HTTPException(400, "Affiliate review duration must be 15, 30, or 60 seconds")
+    return _affiliate_review_template(body)
+
+
+@app.post("/api/product-media/upload")
+async def upload_product_media(file: UploadFile = File(...), user_id: int = Depends(get_current_user_id)):
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mov", ".webm", ".mkv"):
+        raise HTTPException(400, "Only PNG, JPG, WEBP, MP4, MOV, WEBM, or MKV product media is supported")
+
+    media_id = uuid.uuid4().hex[:12]
+    dest = _PRODUCT_MEDIA_UPLOAD_DIR / f"{user_id}_{media_id}{ext}"
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    media_type = _uploaded_product_media_kind(dest)
+    return {
+        "ok": True,
+        "media_id": media_id,
+        "media_type": media_type,
+        "filename": file.filename or dest.name,
+        "preview_url": f"/api/product-media/{media_id}",
+    }
+
+
+@app.get("/api/product-media/{media_id}")
+def get_product_media(media_id: str, user_id: int = Depends(get_current_user_id)):
+    path = _uploaded_product_media_path(user_id, media_id)
+    if not path:
+        raise HTTPException(404, "Product media not found")
+    media_type = "video/mp4" if _uploaded_product_media_kind(path) == "video" else "image/jpeg"
+    return FileResponse(path, media_type=media_type)
 
 
 @app.post("/api/upload-logo")
