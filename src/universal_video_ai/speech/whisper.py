@@ -17,17 +17,10 @@ _MODEL_CACHE_LOCK = threading.Lock()
 
 
 def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str]):
-    """Load each Whisper model once per process instead of once per video."""
-    key = (model_name, device)
-    model = _MODEL_CACHE.get(key)
-    if model is not None:
-        return model
-    with _MODEL_CACHE_LOCK:
-        model = _MODEL_CACHE.get(key)
-        if model is None:
-            model = whisper_module.load_model(model_name, device=device)
-            _MODEL_CACHE[key] = model
-    return model
+    """Load Whisper model - disabled caching to avoid dtype issues with fp32."""
+    # Temporarily disable caching due to dtype mismatch errors when using fp32
+    # The cache can cause corrupted state when switching between fp16 and fp32
+    return whisper_module.load_model(model_name, device=device)
 
 
 @dataclass
