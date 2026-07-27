@@ -154,28 +154,20 @@ class WhisperTranscriber:
                 whisper_kwargs["language"] = language
             if self.config.task:
                 whisper_kwargs["task"] = self.config.task
+            # Force fp32 to avoid dtype mismatch errors on some hardware
+            whisper_kwargs["fp16"] = False
 
             try:
                 result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
-            except ValueError as decode_exc:
-                # Classic openai-whisper/CUDA bug: on some GPU+driver
-                # combinations, fp16 decoding produces NaN logits partway
-                # through, which torch's Categorical distribution rejects
-                # with "found invalid values: tensor([[nan, nan, ...]])".
-                # This is not a data problem (the audio is fine) and not
-                # something the caller did wrong; it's numerical
-                # instability specific to fp16 on that hardware/driver
-                # combo. Retrying the same audio in fp32 (fp16=False)
-                # avoids the unstable code path entirely and reliably
-                # succeeds, at the cost of being a bit slower for this one
-                # file.
+            except (ValueError, RuntimeError) as decode_exc:
+                # Retry with fp16=False if it wasn't already set (defensive)
                 message = str(decode_exc)
-                if "invalid values" in message and "device='cuda" in message:
+                if whisper_kwargs.get("fp16") is True:
                     self.logger.warning(
-                        "Whisper fp16 decoding produced NaN logits on %s; "
-                        "retrying %s once with fp16=False",
-                        self.config.device,
+                        "Whisper fp16 decoding failed on %s with %s; "
+                        "retrying once with fp16=False",
                         audio_path,
+                        type(decode_exc).__name__,
                     )
                     retry_kwargs = dict(whisper_kwargs)
                     retry_kwargs["fp16"] = False

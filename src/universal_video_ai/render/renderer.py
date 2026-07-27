@@ -15,6 +15,10 @@ from universal_video_ai.render.animated_subtitles import (
     SubtitleEffect,
     SubtitleStyle,
 )
+from universal_video_ai.postprocess.video_transform import (
+    VideoTransformer,
+    TransformConfig,
+)
 
 __all__ = ["Renderer", "RenderConfig", "TextOverlay", "AnimatedSubtitleConfig", "VideoTemplateConfig"]
 
@@ -190,6 +194,8 @@ class RenderConfig:
                   Unicode-capable TTF (e.g. NotoSans, DejaVuSans) so
                   Vietnamese/other diacritics render correctly.
         animated_subtitle_config: Configuration for animated subtitle effects.
+        video_template_config: Configuration for video template effects.
+        transform_config: Configuration for video transformations (flip, border, etc.).
     """
 
     video_codec: str = "libx264"
@@ -204,6 +210,7 @@ class RenderConfig:
     default_overlay_font_path: Optional[str] = None
     animated_subtitle_config: Optional[AnimatedSubtitleConfig] = None
     video_template_config: Optional[VideoTemplateConfig] = None
+    transform_config: Optional[TransformConfig] = None
     # Static region to permanently blur for the ENTIRE video, regardless of
     # blur_text/text_overlays — intended for a platform watermark (e.g. the
     # TikTok/Douyin logo + @username + reup title baked into the corner of
@@ -806,6 +813,11 @@ class Renderer:
                 raise RuntimeError(f"FFmpeg did not create output file: {output}")
 
             self.logger.info("Rendering completed successfully: %s", output)
+            
+            # Apply video transformations if configured
+            if self.config.transform_config:
+                output = self._apply_transformations(output)
+            
             return output
 
         except subprocess.TimeoutExpired:
@@ -818,6 +830,38 @@ class Renderer:
         except Exception as exc:
             self.logger.exception("Unexpected error during rendering: %s", exc)
             raise RuntimeError(f"Rendering failed: {exc}") from exc
+    
+    def _apply_transformations(self, video_path: Path) -> Path:
+        """
+        Apply video transformations (flip, border, split-screen, etc.) to the rendered video.
+        
+        :param video_path: Path to the rendered video
+        :return: Path to the transformed video
+        """
+        if not self.config.transform_config:
+            return video_path
+        
+        # Create output path for transformed video
+        transformed_path = video_path.parent / f"{video_path.stem}.transformed{video_path.suffix}"
+        
+        self.logger.info("Applying video transformations to %s", video_path)
+        
+        transformer = VideoTransformer(
+            config=self.config.transform_config,
+            logger=self.logger
+        )
+        
+        success = transformer.transform(video_path, transformed_path)
+        
+        if success and transformed_path.exists():
+            # Replace original with transformed version
+            video_path.unlink()
+            transformed_path.rename(video_path)
+            self.logger.info("Video transformations applied successfully: %s", video_path)
+            return video_path
+        else:
+            self.logger.warning("Video transformations failed, using original video")
+            return video_path
 
     def _run_ffmpeg_with_progress(self, cmd: List[str], timeout_seconds: int, heartbeat_seconds: float = 15.0) -> "tuple[int, str]":
         """

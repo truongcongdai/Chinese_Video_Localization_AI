@@ -47,6 +47,11 @@ from universal_video_ai.orchestrator.service import (
 )
 from universal_video_ai.render.renderer import RenderConfig, AnimatedSubtitleConfig, VideoTemplateConfig
 from universal_video_ai.render.animated_subtitles import SubtitleEffect, SubtitleStyle
+from universal_video_ai.postprocess.video_transform import (
+    TransformConfig,
+    FlipMode,
+    BorderPosition,
+)
 from universal_video_ai.render import ocr_language_map
 from universal_video_ai.render.quality_check import analyze_output_quality
 from universal_video_ai.render.prepublish import inspect_for_publish, prepublish_report_to_dict
@@ -241,6 +246,8 @@ class NewJobBody(BaseModel):
     max_concurrent: int = 2
     # Video template configuration
     video_template_config: Optional[Dict[str, Any]] = None
+    # Video transformation configuration (flip, border, split-screen, etc.)
+    transform_config: Optional[Dict[str, Any]] = None
 
 
 class CreatorJobBody(BaseModel):
@@ -722,6 +729,36 @@ def _build_service_for_job(job):
         except Exception as e:
             logger.warning(f"Failed to parse video_template_config: {e}")
     
+    # Build transform config if provided
+    transform_config = None
+    transform_config_data = getattr(job, 'transform_config', None)
+    if transform_config_data and transform_config_data.get("enabled"):
+        try:
+            flip_mode_str = transform_config_data.get("flip_mode", "none")
+            flip_mode = FlipMode(flip_mode_str) if flip_mode_str != "none" else FlipMode.NONE
+            
+            border_position_str = transform_config_data.get("border_position", "none")
+            border_position = BorderPosition(border_position_str) if border_position_str != "none" else BorderPosition.NONE
+            
+            transform_config = TransformConfig(
+                enable_flip=transform_config_data.get("enable_flip", False),
+                flip_mode=flip_mode,
+                enable_border=transform_config_data.get("enable_border", False),
+                border_position=border_position,
+                border_px=transform_config_data.get("border_px", 60),
+                border_color=transform_config_data.get("border_color", "black"),
+                enable_split_screen=transform_config_data.get("enable_split_screen", False),
+                overlay_image_path=Path(transform_config_data.get("overlay_image_path")) if transform_config_data.get("overlay_image_path") else None,
+                split_mode=transform_config_data.get("split_mode", "vertical"),
+                enable_randomization=transform_config_data.get("enable_randomization", False),
+                crop_percent=transform_config_data.get("crop_percent", 0.0),
+                speed_factor=transform_config_data.get("speed_factor", 1.0),
+                brightness_adjust=transform_config_data.get("brightness_adjust", 0.0),
+                contrast_adjust=transform_config_data.get("contrast_adjust", 0.0),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to parse transform_config: {e}")
+    
     if job.logo_path and Path(job.logo_path).exists():
         render_config = RenderConfig(
             preset=WEB_RENDER_PRESET,
@@ -731,6 +768,7 @@ def _build_service_for_job(job):
             logo_size_px=job.logo_size_px or 120,
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
+            transform_config=transform_config,
         )
     else:
         render_config = RenderConfig(
@@ -738,6 +776,7 @@ def _build_service_for_job(job):
             timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
+            transform_config=transform_config,
         )
 
     return create_localization_service(
@@ -760,50 +799,76 @@ def _build_service_for_job(job):
         progress_callback=lambda percent, message: store.update_job(
             job.id, progress_note=f"[{percent}%] {message}"
         ),
+        user_id=job.user_id,
     )
+
+
+MAX_JOB_RETRIES = 2
+RETRY_DELAY_SECONDS = 30
 
 
 async def _run_job(job_id: str) -> None:
     job = store.get_job(job_id)
     if job is None:
         return
-    try:
-        store.update_job(job_id, status="running", progress_note="Äang táº£i video...")
-        service = _build_service_for_job(job)
-        job_output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
+    
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= MAX_JOB_RETRIES:
+        try:
+            store.update_job(job_id, status="running", progress_note="Đang tải video...")
+            service = _build_service_for_job(job)
+            job_output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
 
-        if job.review_mode:
-            # Stop after translation and wait for the person to review/edit
-            # the translated sentences via PUT .../segments, then
-            # POST .../render (-> _run_render_from_review) to continue.
-            store.update_job(job_id, progress_note="Äang dá»‹ch phá»¥ Ä‘á» Ä‘á»ƒ báº¡n xem trÆ°á»›c...")
-            prepared = await service.prepare_for_review(
-                job.source_url, job_output_dir, target_language=job.target_language
-            )
-            segments = prepared.translated_segments or [
-                {"start": 0.0, "end": 0.0, "text": prepared.translated_text or ""}
-            ]
-            segments_payload = (
-                [{"start": s.start, "end": s.end, "text": s.text} for s in prepared.translated_segments]
-                if prepared.translated_segments else segments
-            )
-            store.set_job_segments(job_id, segments_payload)
-            store.set_job_review_state(job_id, prepared_localization_to_dict(prepared))
-            store.update_job(
-                job_id, status="review",
-                progress_note="ÄÃ£ dá»‹ch xong â€” chá»‰nh sá»­a phá»¥ Ä‘á» rá»“i báº¥m Render",
-            )
-            return
+            if job.review_mode:
+                # Stop after translation and wait for the person to review/edit
+                # the translated sentences via PUT .../segments, then
+                # POST .../render (-> _run_render_from_review) to continue.
+                store.update_job(job_id, progress_note="Đang dịch phụ đề để bạn xem trước...")
+                prepared = await service.prepare_for_review(
+                    job.source_url, job_output_dir, target_language=job.target_language
+                )
+                segments = prepared.translated_segments or [
+                    {"start": 0.0, "end": 0.0, "text": prepared.translated_text or ""}
+                ]
+                segments_payload = (
+                    [{"start": s.start, "end": s.end, "text": s.text} for s in prepared.translated_segments]
+                    if prepared.translated_segments else segments
+                )
+                store.set_job_segments(job_id, segments_payload)
+                store.set_job_review_state(job_id, prepared_localization_to_dict(prepared))
+                store.update_job(
+                    job_id, status="review",
+                    progress_note="Đã dịch xong — chỉnh sửa phụ đề rồi bấm Render",
+                )
+                return
 
-        store.update_job(job_id, progress_note="Äang xá»­ lÃ½ (dá»‹ch, lá»“ng tiáº¿ng, render)...")
-        result = await service.localize(job.source_url, job_output_dir, target_language=job.target_language)
-        _finish_job_from_result(job_id, job, result)
-    except Exception as exc:
-        logger.exception("Job %s failed", job_id)
-        store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
-        _refund_job_credits(job)
-    finally:
-        _running_tasks.pop(job_id, None)
+            store.update_job(job_id, progress_note="Đang xử lý (dịch, lồng tiếng, render)...")
+            result = await service.localize(job.source_url, job_output_dir, target_language=job.target_language)
+            _finish_job_from_result(job_id, job, result)
+            return  # Success, exit retry loop
+            
+        except Exception as exc:
+            last_error = exc
+            logger.exception("Job %s failed (attempt %d/%d)", job_id, retry_count + 1, MAX_JOB_RETRIES + 1)
+            
+            retry_count += 1
+            if retry_count <= MAX_JOB_RETRIES:
+                # Exponential backoff: 30s, 60s
+                delay = RETRY_DELAY_SECONDS * (2 ** (retry_count - 1))
+                store.update_job(
+                    job_id, status="running",
+                    progress_note=f"Lỗi, thử lại sau {delay} giây (lần {retry_count}/{MAX_JOB_RETRIES})..."
+                )
+                logger.info("Retrying job %s in %d seconds (attempt %d/%d)", job_id, delay, retry_count, MAX_JOB_RETRIES)
+                await asyncio.sleep(delay)
+            else:
+                # Max retries reached, mark as failed
+                store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
+                _refund_job_credits(job)
+        finally:
+            _running_tasks.pop(job_id, None)
 
 
 def _finish_job_from_result(job_id: str, job, result) -> None:
@@ -3470,6 +3535,7 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         review_mode=body.review_before_render,
         animated_subtitle_config=body.animated_subtitle_config,
         video_template_config=body.video_template_config,
+        transform_config=body.transform_config,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)

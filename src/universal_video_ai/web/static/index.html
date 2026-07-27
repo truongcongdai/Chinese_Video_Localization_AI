@@ -996,6 +996,110 @@
       </div>
     </div>
 
+        <div class="field">
+      <label>
+        <input type="checkbox" id="video-transform-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Bật hiệu ứng biến đổi video 🎨 (lật, khung viền, random hóa...)
+      </label>
+    </div>
+    <div id="video-transform-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+      <div style="margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border);">
+        <label style="font-weight: 600; margin-bottom: 8px; display: block;">🔄 Lật video (Flip)</label>
+        <div class="field">
+          <label style="display: flex; align-items: center;">
+            <input type="checkbox" id="transform-flip-enable" style="width: auto; margin-right: 8px;">
+            Bật lật video
+          </label>
+        </div>
+        <div class="field">
+          <label>Chế độ lật</label>
+          <select id="transform-flip-mode">
+            <option value="hflip">Lật ngang (horizontal)</option>
+            <option value="vflip">Lật dọc (vertical)</option>
+            <option value="both">Cả hai (ngang + dọc)</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border);">
+        <label style="font-weight: 600; margin-bottom: 8px; display: block;">🖼️ Khung viền (Border)</label>
+        <div class="field">
+          <label style="display: flex; align-items: center;">
+            <input type="checkbox" id="transform-border-enable" style="width: auto; margin-right: 8px;">
+            Bật khung viền
+          </label>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Vị trí</label>
+            <select id="transform-border-position">
+              <option value="top_bottom">Trên + Dưới (letterbox)</option>
+              <option value="left_right">Trái + Phải (pillarbox)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Độ rộng (px)</label>
+            <input type="number" id="transform-border-px" value="60" min="0" max="300">
+          </div>
+        </div>
+        <div class="field">
+          <label>Màu khung</label>
+          <input type="color" id="transform-border-color" value="#000000" style="height: 40px; padding: 2px;">
+        </div>
+      </div>
+
+      <div style="margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border);">
+        <label style="font-weight: 600; margin-bottom: 8px; display: block;">📊 Split Screen</label>
+        <div class="field">
+          <label style="display: flex; align-items: center;">
+            <input type="checkbox" id="transform-split-enable" style="width: auto; margin-right: 8px;">
+            Bật split screen
+          </label>
+        </div>
+        <div class="field">
+          <label>Chế độ split</label>
+          <select id="transform-split-mode">
+            <option value="vertical">Dọc (trái - phải)</option>
+            <option value="horizontal">Ngang (trên - dưới)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Ảnh overlay (đường dẫn file)</label>
+          <input type="text" id="transform-overlay-path" placeholder="/path/to/overlay.png">
+        </div>
+      </div>
+
+      <div>
+        <label style="font-weight: 600; margin-bottom: 8px; display: block;">🎲 Random hóa (Anti-detection)</label>
+        <div class="field">
+          <label style="display: flex; align-items: center;">
+            <input type="checkbox" id="transform-random-enable" style="width: auto; margin-right: 8px;">
+            Bật random hóa nhẹ
+          </label>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Crop (%)</label>
+            <input type="number" id="transform-crop-percent" value="1.0" min="0" max="5" step="0.1">
+          </div>
+          <div class="field">
+            <label>Tốc độ (x)</label>
+            <input type="number" id="transform-speed-factor" value="1.0" min="0.9" max="1.1" step="0.01">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Brightness (-10 đến +10)</label>
+            <input type="number" id="transform-brightness" value="0" min="-10" max="10" step="0.5">
+          </div>
+          <div class="field">
+            <label>Contrast (-10 đến +10)</label>
+            <input type="number" id="transform-contrast" value="0" min="-10" max="10" step="0.5">
+          </div>
+        </div>
+      </div>
+    </div>
+
     <button class="btn gradient" id="submit-btn">🚀 Bắt đầu xử lý</button>
     <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
@@ -2608,6 +2712,41 @@ function getVideoTemplateConfig() {
   };
 }
 
+// ---------------- video transformations ----------------
+$("#video-transform-checkbox").onchange = (ev) => {
+  $("#video-transform-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+function getTransformConfig() {
+  if (!$("#video-transform-checkbox").checked) {
+    return null;
+  }
+  
+  const config = {
+    enabled: true,
+    enable_flip: $("#transform-flip-enable").checked,
+    flip_mode: $("#transform-flip-mode").value,
+    enable_border: $("#transform-border-enable").checked,
+    border_position: $("#transform-border-position").value,
+    border_px: parseInt($("#transform-border-px").value, 10),
+    border_color: $("#transform-border-color").value,
+    enable_split_screen: $("#transform-split-enable").checked,
+    split_mode: $("#transform-split-mode").value,
+    enable_randomization: $("#transform-random-enable").checked,
+    crop_percent: parseFloat($("#transform-crop-percent").value),
+    speed_factor: parseFloat($("#transform-speed-factor").value),
+    brightness_adjust: parseFloat($("#transform-brightness").value),
+    contrast_adjust: parseFloat($("#transform-contrast").value),
+  };
+  
+  // Only include overlay path if split screen is enabled
+  if (config.enable_split_screen && $("#transform-overlay-path").value.trim()) {
+    config.overlay_path = $("#transform-overlay-path").value.trim();
+  }
+  
+  return config;
+}
+
 // ---------------- onboarding wizard ----------------
 let currentOnboardingStep = 1;
 const totalOnboardingSteps = 4;
@@ -2705,6 +2844,7 @@ $("#submit-btn").onclick = async () => {
     priority: $("#queue-priority-checkbox").checked ? "high" : "normal",
     max_concurrent: parseInt($("#max-concurrent-jobs").value, 10) || 2,
     video_template_config: getVideoTemplateConfig(),
+    transform_config: getTransformConfig(),
   };
 
   $("#submit-btn").disabled = true;

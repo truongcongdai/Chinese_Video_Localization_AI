@@ -214,6 +214,8 @@ _MIGRATIONS = [
     ("jobs", "animated_subtitle_config", "ALTER TABLE jobs ADD COLUMN animated_subtitle_config TEXT"),
     # Video template configuration (template, transition, color_effect, etc.) as JSON.
     ("jobs", "video_template_config", "ALTER TABLE jobs ADD COLUMN video_template_config TEXT"),
+    # Video transformation configuration (flip, border, split-screen, randomization) as JSON.
+    ("jobs", "transform_config", "ALTER TABLE jobs ADD COLUMN transform_config TEXT"),
 ]
 
 @dataclass
@@ -240,6 +242,7 @@ class Job:
     qc_warnings_json: Optional[str] = None
     animated_subtitle_config: Optional[Dict[str, Any]] = None
     video_template_config: Optional[Dict[str, Any]] = None
+    transform_config: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -428,6 +431,7 @@ class Store:
         tts_voice: Optional[str] = None, review_mode: bool = False,
         animated_subtitle_config: Optional[Dict[str, Any]] = None,
         video_template_config: Optional[Dict[str, Any]] = None,
+        transform_config: Optional[Dict[str, Any]] = None,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -441,19 +445,21 @@ class Store:
             tts_voice=tts_voice, review_mode=int(review_mode),
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
+            transform_config=transform_config,
         )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
                 "progress_note, error, title, final_video_path, logo_path, logo_corner, logo_size_px, "
                 "tts_voice, review_mode, review_state_json, segments_json, qc_warnings_json, "
-                "animated_subtitle_config, video_template_config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "animated_subtitle_config, video_template_config, transform_config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
                  job.status, job.progress_note, job.error, job.title, job.final_video_path,
                  job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
                  None, None, None,
                  json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
                  json.dumps(job.video_template_config) if job.video_template_config else None,
+                 json.dumps(job.transform_config) if job.transform_config else None,
                  job.created_at, job.updated_at),
             )
         return job
@@ -474,6 +480,7 @@ class Store:
             tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
             animated_subtitle_config=old.animated_subtitle_config,
             video_template_config=old.video_template_config,
+            transform_config=old.transform_config,
         )
 
     def set_job_segments(self, job_id: str, segments: List[Dict[str, Any]]) -> None:
@@ -664,6 +671,8 @@ class Store:
             row_dict["animated_subtitle_config"] = json.loads(row_dict["animated_subtitle_config"])
         if row_dict.get("video_template_config"):
             row_dict["video_template_config"] = json.loads(row_dict["video_template_config"])
+        if row_dict.get("transform_config"):
+            row_dict["transform_config"] = json.loads(row_dict["transform_config"])
         return Job(**row_dict)
 
     def get_job(self, job_id: str) -> Optional[Job]:

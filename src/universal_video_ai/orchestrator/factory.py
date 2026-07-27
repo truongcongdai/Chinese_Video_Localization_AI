@@ -48,6 +48,8 @@ def create_localization_service(
         ),
         logger: Optional[logging.Logger] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
+        user_id: Optional[int] = None,
+        use_download_cache: bool = True,
 ) -> LocalizationService:
     """Convenience factory for LocalizationService with auto-detected backends.
 
@@ -91,7 +93,7 @@ def create_localization_service(
     logger = logger or _logger
 
     # Downloader (auto-detects platform from URL)
-    downloader = DownloadService()
+    downloader = DownloadService(user_id=user_id, use_cache=use_download_cache)
 
     # Translation service (optional)
     translate_service = None
@@ -180,4 +182,6 @@ def create_localization_service(
         config=config,
         logger=logger,
         progress_callback=progress_callback,
+        user_id=user_id,
+        use_download_cache=use_download_cache,
     )

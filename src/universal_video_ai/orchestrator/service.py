@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.downloader.download_result import DownloadResult
 from universal_video_ai.downloader.platform import Platform
+from universal_video_ai.downloader.rate_limiter import get_rate_limiter
 from universal_video_ai.audio.factory import create_audio_pipeline
 from universal_video_ai.audio.pipeline import AudioPipelineResult
 from universal_video_ai.audio.audio_result import AudioResult
@@ -36,8 +37,8 @@ _logger = logging.getLogger(__name__)
 # Pipeline-level concurrency: network download and FFmpeg can overlap with the
 # single CPU-heavy Whisper stage. Running several Whisper-small inferences at
 # once on a 16 GB CPU host causes thread oversubscription and swapping.
-_DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "3"))))
-_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "1"))))
+_DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "10"))))
+_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "3"))))
 _RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
 
 
@@ -268,8 +269,10 @@ class LocalizationService:
             config: Optional[LocalizationConfig] = None,
             logger: Optional[logging.Logger] = None,
             progress_callback: Optional[Callable[[int, str], None]] = None,
+            user_id: Optional[int] = None,
+            use_download_cache: bool = True,
     ) -> None:
-        self.downloader = downloader or DownloadService()
+        self.downloader = downloader or DownloadService(user_id=user_id, use_cache=use_download_cache)
         self.translate_service = translate_service
         self.tts_service = tts_service
         self.timeline = timeline or TimelineService()
@@ -280,6 +283,7 @@ class LocalizationService:
         self.config = config or LocalizationConfig()
         self.logger = logger or _logger
         self.progress_callback = progress_callback
+        self.user_id = user_id
 
         self.logger.debug(
             "LocalizationService initialized run_transcription=%s run_translation=%s run_tts=%s run_render=%s "
@@ -352,7 +356,13 @@ class LocalizationService:
         self, url: str, output_dir: Path, target_language: Optional[str] = None
     ) -> "PreparedLocalization":
         """Steps 1-3: download the source video, extract/transcribe its
-        audio, and translate the transcript. See `localize()`."""
+        audio, and translate the transcript. See `localize()`.
+        
+        Optimized with parallel processing where possible:
+        - Download runs immediately with rate limiting
+        - Audio processing starts as soon as download completes
+        - Translation can start as soon as transcript is available
+        """
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -364,18 +374,27 @@ class LocalizationService:
         )
 
         # Step 1: Download video
-        self._progress(5, "Đang tải video nguồn")
+        self._progress(5, "Đang tải video nguồn...")
         self.logger.info("LocalizationService: downloading video")
-        async with _DOWNLOAD_SLOTS:
-            download_result = await asyncio.to_thread(self.downloader.download, url, output_dir)
+        
+        # Apply rate limiting before download
+        rate_limiter = get_rate_limiter()
+        await rate_limiter.acquire(self.user_id)
+        
+        try:
+            async with _DOWNLOAD_SLOTS:
+                download_result = await asyncio.to_thread(self.downloader.download, url, output_dir)
+        finally:
+            rate_limiter.release()
 
         if not download_result.success:
             raise ValueError(f"Download failed for {url}")
 
         self.logger.info("LocalizationService: download successful: %s", download_result.video_path)
-        self._progress(15, "Đã tải video, đang xử lý âm thanh")
-
+        self._progress(15, "Đã tải video ✓")
+        
         # Step 2: Process audio (extract → demucs → transcribe)
+        self._progress(20, "Đang tách âm thanh...")
         self.logger.info("LocalizationService: processing audio")
         pipeline = create_audio_pipeline(
             run_demucs=self.config.run_demucs,
@@ -384,12 +403,14 @@ class LocalizationService:
             demucs_output_dir=self.config.demucs_output_dir,
             logger=self.logger,
         )
+        
+        # Run audio processing (this is the CPU-heavy bottleneck)
         async with _TRANSCRIPTION_SLOTS:
             audio_result = await asyncio.to_thread(
                 pipeline.process, download_result, output_dir=output_dir / "audio"
             )
         self.logger.info("LocalizationService: audio processing complete")
-        self._progress(40, "Đã tách âm thanh và nhận diện lời nói")
+        self._progress(40, "Đã nhận diện lời nói ✓")
 
         source_segments: List[TranscriptSegment] = [
             s for s in (audio_result.segments or []) if s.has_timing
@@ -401,7 +422,7 @@ class LocalizationService:
         # Step 3: Translate transcript — prefer segment-level translation so
         # every sentence keeps the timestamp it had in the source video.
         if self.config.run_translation and audio_result.transcript:
-            self._progress(45, "Đang dịch nội dung")
+            self._progress(45, "Đang dịch nội dung...")
             if self.translate_service is None:
                 self.logger.warning("Translation requested but no TranslateService injected; skipping")
             else:
@@ -440,7 +461,7 @@ class LocalizationService:
                         "LocalizationService: translation complete (length=%d)",
                         len(translated_text) if translated_text else 0,
                     )
-                    self._progress(58, "Đã dịch nội dung")
+                    self._progress(58, "Đã dịch nội dung ✓")
                 except Exception as exc:
                     self.logger.error("Translation failed: %s", exc)
                     # A localized video with untranslated source-language
@@ -485,7 +506,7 @@ class LocalizationService:
         # Step 4: Synthesize TTS from translated text, anchored to the
         # original sentence timestamps whenever we have them.
         if self.config.run_tts and (translated_segments or translated_text):
-            self._progress(62, "Đang tạo giọng đọc")
+            self._progress(62, "Đang tạo giọng đọc...")
             if self.tts_service is None:
                 self.logger.warning("TTS requested but no TTSService injected; skipping")
             else:
@@ -510,7 +531,7 @@ class LocalizationService:
                             voice=self.config.tts_voice,
                         )
                     self.logger.info("LocalizationService: TTS complete: %s", tts_audio_path)
-                    self._progress(72, "Đã tạo giọng đọc")
+                    self._progress(72, "Đã tạo giọng đọc ✓")
                 except Exception as exc:
                     self.logger.error("TTS synthesis failed: %s", exc)
                     # Never silently deliver a "dubbed" reup with no dub.
@@ -521,7 +542,7 @@ class LocalizationService:
         subtitle_segments: Optional[List[TimelineSegment]] = None
         subtitles_path: Optional[Path] = None
         if self.config.generate_subtitles and (translated_segments or translated_text or audio_result.transcript):
-            self._progress(75, "Đang tạo phụ đề")
+            self._progress(75, "Đang tạo phụ đề...")
             self.logger.info("LocalizationService: generating subtitles")
             if translated_segments:
                 subtitle_segments = self.timeline.from_segments(
@@ -548,7 +569,7 @@ class LocalizationService:
             )
             subtitles_path.write_text(ass_content, encoding="utf-8")
             self.logger.info("LocalizationService: subtitles written to %s", subtitles_path)
-            self._progress(79, "Đã tạo phụ đề")
+            self._progress(79, "Đã tạo phụ đề ✓")
 
         # Step 6: Detect + build on-screen text-cover overlays (best-effort).
         text_overlays: Optional[List[TextOverlay]] = None
@@ -604,7 +625,7 @@ class LocalizationService:
         # replacement track are used.
         mixed_audio_path: Optional[Path] = None
         if self.config.mix_audio and tts_audio_path:
-            self._progress(83, "Đang phối âm thanh")
+            self._progress(83, "Đang phối âm thanh...")
             self.logger.info("LocalizationService: mixing audio streams")
             if self.config.replace_source_audio:
                 replacement_track = (
@@ -641,12 +662,12 @@ class LocalizationService:
                     mixed_audio_path
                 )
             self.logger.info("LocalizationService: audio mix complete: %s", mixed_audio_path)
-            self._progress(87, "Đã phối âm thanh")
+            self._progress(87, "Đã phối âm thanh ✓")
 
         # Step 8: Render final video (merge video + audio + optional subtitles/overlays)
         final_video_path: Optional[Path] = None
         if self.config.render_video and download_result.video_path:
-            self._progress(90, "Đang render video cuối")
+            self._progress(90, "Đang render video cuối...")
             if self.renderer is None:
                 self.logger.warning("Rendering requested but no Renderer available; skipping")
             else:
@@ -734,7 +755,7 @@ class LocalizationService:
                             text_overlays=text_overlays,
                             subtitle_segments=subtitle_segments_for_render,
                         )
-                    self._progress(98, "Đã render, đang kiểm tra video")
+                    self._progress(98, "Đã render ✓")
                     self.logger.info("LocalizationService: render complete: %s", final_video_path)
                 except Exception as exc:
                     self.logger.error("Rendering failed: %s", exc)
