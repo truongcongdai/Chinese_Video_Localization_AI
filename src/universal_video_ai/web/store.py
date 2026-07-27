@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     review_state_json TEXT,
     segments_json TEXT,
     qc_warnings_json TEXT,
+    animated_subtitle_config TEXT,
+    video_template_config TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -208,6 +210,10 @@ _MIGRATIONS = [
     # render.quality_check.analyze_output_quality), as a JSON list of
     # human-readable strings. Empty/NULL = no warnings triggered.
     ("jobs", "qc_warnings_json", "ALTER TABLE jobs ADD COLUMN qc_warnings_json TEXT"),
+    # Animated subtitle configuration (effect, style, effect_params) as JSON.
+    ("jobs", "animated_subtitle_config", "ALTER TABLE jobs ADD COLUMN animated_subtitle_config TEXT"),
+    # Video template configuration (template, transition, color_effect, etc.) as JSON.
+    ("jobs", "video_template_config", "ALTER TABLE jobs ADD COLUMN video_template_config TEXT"),
 ]
 
 @dataclass
@@ -232,6 +238,8 @@ class Job:
     review_state_json: Optional[str] = None
     segments_json: Optional[str] = None
     qc_warnings_json: Optional[str] = None
+    animated_subtitle_config: Optional[Dict[str, Any]] = None
+    video_template_config: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -418,6 +426,8 @@ class Store:
         source_language: str = "auto", logo_path: Optional[str] = None,
         logo_corner: str = "bottom_right", logo_size_px: int = 120,
         tts_voice: Optional[str] = None, review_mode: bool = False,
+        animated_subtitle_config: Optional[Dict[str, Any]] = None,
+        video_template_config: Optional[Dict[str, Any]] = None,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -429,15 +439,21 @@ class Store:
             source_language=source_language, logo_path=logo_path,
             logo_corner=logo_corner, logo_size_px=logo_size_px,
             tts_voice=tts_voice, review_mode=int(review_mode),
+            animated_subtitle_config=animated_subtitle_config,
+            video_template_config=video_template_config,
         )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
                 "progress_note, error, title, final_video_path, logo_path, logo_corner, logo_size_px, "
-                "tts_voice, review_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "tts_voice, review_mode, review_state_json, segments_json, qc_warnings_json, "
+                "animated_subtitle_config, video_template_config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
                  job.status, job.progress_note, job.error, job.title, job.final_video_path,
                  job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
+                 None, None, None,
+                 json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
+                 json.dumps(job.video_template_config) if job.video_template_config else None,
                  job.created_at, job.updated_at),
             )
         return job
@@ -456,6 +472,8 @@ class Store:
             source_language=old.source_language, logo_path=old.logo_path,
             logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
             tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
+            animated_subtitle_config=old.animated_subtitle_config,
+            video_template_config=old.video_template_config,
         )
 
     def set_job_segments(self, job_id: str, segments: List[Dict[str, Any]]) -> None:
@@ -641,6 +659,11 @@ class Store:
         if unknown:
             for key in unknown:
                 row_dict.pop(key, None)
+        # Deserialize JSON fields
+        if row_dict.get("animated_subtitle_config"):
+            row_dict["animated_subtitle_config"] = json.loads(row_dict["animated_subtitle_config"])
+        if row_dict.get("video_template_config"):
+            row_dict["video_template_config"] = json.loads(row_dict["video_template_config"])
         return Job(**row_dict)
 
     def get_job(self, job_id: str) -> Optional[Job]:
