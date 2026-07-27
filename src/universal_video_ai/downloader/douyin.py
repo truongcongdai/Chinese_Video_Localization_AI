@@ -213,6 +213,25 @@ class DouyinDownloader(BaseDownloader):
             if result and result.success:
                 return result
 
-        # Strategy 2: yt-dlp fallback
+        # Strategy 2: yt-dlp fallback.
+        #
+        # BUG (seen in production logs): passing the raw resolved URL here
+        # sends yt-dlp a `iesdouyin.com/share/video/...` link decorated with
+        # long tracking query params (region=, share_sign=, ts=, ...). That
+        # URL doesn't match yt-dlp's Douyin extractor regex, so it falls
+        # through to the generic extractor and raises
+        # `UnsupportedError`. When it *does* occasionally match (after yet
+        # another redirect to www.douyin.com/video/{id}), yt-dlp's Douyin
+        # extractor then demands fresh cookies, which we don't have.
+        #
+        # Fix: once we already have the canonical numeric video_id (either
+        # from the original URL or by resolving the short link above),
+        # build the clean, well-known URL shape
+        # (`https://www.douyin.com/video/{id}`) that yt-dlp's Douyin
+        # extractor is written to match directly. If we can't extract an id
+        # at all, fall back to the original URL untouched.
         logger.info("🎯 Strategy 2: yt-dlp fallback...")
-        return self._ytdlp_fallback.download(url, output_dir)
+        fallback_url = f"https://www.douyin.com/video/{video_id}" if video_id else url
+        if fallback_url != url:
+            logger.info(f"🔧 Normalized URL for yt-dlp: {fallback_url}")
+        return self._ytdlp_fallback.download(fallback_url, output_dir)

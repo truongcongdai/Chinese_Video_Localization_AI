@@ -3468,6 +3468,8 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         logo_size_px=body.logo_size_px or 120,
         tts_voice=body.tts_voice or None,
         review_mode=body.review_before_render,
+        animated_subtitle_config=body.animated_subtitle_config,
+        video_template_config=body.video_template_config,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)

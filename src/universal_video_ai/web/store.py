@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     review_state_json TEXT,
     segments_json TEXT,
     qc_warnings_json TEXT,
+    animated_subtitle_config_json TEXT,
+    video_template_config_json TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -208,6 +210,8 @@ _MIGRATIONS = [
     # render.quality_check.analyze_output_quality), as a JSON list of
     # human-readable strings. Empty/NULL = no warnings triggered.
     ("jobs", "qc_warnings_json", "ALTER TABLE jobs ADD COLUMN qc_warnings_json TEXT"),
+    ("jobs", "animated_subtitle_config_json", "ALTER TABLE jobs ADD COLUMN animated_subtitle_config_json TEXT"),
+    ("jobs", "video_template_config_json", "ALTER TABLE jobs ADD COLUMN video_template_config_json TEXT"),
 ]
 
 @dataclass
@@ -232,6 +236,22 @@ class Job:
     review_state_json: Optional[str] = None
     segments_json: Optional[str] = None
     qc_warnings_json: Optional[str] = None
+    animated_subtitle_config_json: Optional[str] = None
+    video_template_config_json: Optional[str] = None
+
+    @property
+    def animated_subtitle_config(self) -> Optional[Dict[str, Any]]:
+        """Parse and return animated_subtitle_config as a dict."""
+        if self.animated_subtitle_config_json:
+            return json.loads(self.animated_subtitle_config_json)
+        return None
+
+    @property
+    def video_template_config(self) -> Optional[Dict[str, Any]]:
+        """Parse and return video_template_config as a dict."""
+        if self.video_template_config_json:
+            return json.loads(self.video_template_config_json)
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -246,6 +266,10 @@ class Job:
         d["segments"] = json.loads(segments_json) if segments_json else None
         qc_warnings_json = d.pop("qc_warnings_json", None)
         d["qc_warnings"] = json.loads(qc_warnings_json) if qc_warnings_json else []
+        animated_subtitle_config_json = d.pop("animated_subtitle_config_json", None)
+        d["animated_subtitle_config"] = json.loads(animated_subtitle_config_json) if animated_subtitle_config_json else None
+        video_template_config_json = d.pop("video_template_config_json", None)
+        d["video_template_config"] = json.loads(video_template_config_json) if video_template_config_json else None
         return d
 
 
@@ -418,6 +442,8 @@ class Store:
         source_language: str = "auto", logo_path: Optional[str] = None,
         logo_corner: str = "bottom_right", logo_size_px: int = 120,
         tts_voice: Optional[str] = None, review_mode: bool = False,
+        animated_subtitle_config: Optional[Dict[str, Any]] = None,
+        video_template_config: Optional[Dict[str, Any]] = None,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -429,16 +455,18 @@ class Store:
             source_language=source_language, logo_path=logo_path,
             logo_corner=logo_corner, logo_size_px=logo_size_px,
             tts_voice=tts_voice, review_mode=int(review_mode),
+            animated_subtitle_config_json=json.dumps(animated_subtitle_config) if animated_subtitle_config else None,
+            video_template_config_json=json.dumps(video_template_config) if video_template_config else None,
         )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
                 "progress_note, error, title, final_video_path, logo_path, logo_corner, logo_size_px, "
-                "tts_voice, review_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "tts_voice, review_mode, animated_subtitle_config_json, video_template_config_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
                  job.status, job.progress_note, job.error, job.title, job.final_video_path,
                  job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
-                 job.created_at, job.updated_at),
+                 job.animated_subtitle_config_json, job.video_template_config_json, job.created_at, job.updated_at),
             )
         return job
 

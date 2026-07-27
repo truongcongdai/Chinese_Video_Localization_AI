@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yt_dlp
@@ -7,6 +8,24 @@ import yt_dlp
 from .base import BaseDownloader
 from .download_result import DownloadResult
 from .platform import Platform
+
+# Optional cookies for yt-dlp, only used if actually configured/present.
+# Some platforms (Douyin in particular) intermittently require "fresh
+# cookies (not necessarily logged in)" for their web-detail JSON endpoint.
+# This is opt-in: if no env var is set, or the file doesn't exist, behavior
+# is unchanged (no cookies sent) so platforms that don't need this keep
+# working exactly as before.
+#
+# Set one of these to a Netscape-format cookies file exported from a
+# logged-in (or even anonymous but cookie-primed) browser session, e.g.:
+#   DOUYIN_COOKIES_FILE=/path/to/douyin_cookies.txt
+#   YTDLP_COOKIES_FILE=/path/to/generic_cookies.txt   (fallback for any platform)
+def _cookiefile_for(platform: Platform) -> str | None:
+    env_key = f"{platform.name.upper()}_COOKIES_FILE"
+    candidate = os.environ.get(env_key) or os.environ.get("YTDLP_COOKIES_FILE")
+    if candidate and Path(candidate).is_file():
+        return candidate
+    return None
 
 
 class YTDLPDownloader(BaseDownloader):
@@ -78,6 +97,10 @@ class YTDLPDownloader(BaseDownloader):
             "writeautomaticsub": False,
 
         }
+
+        cookiefile = _cookiefile_for(self.platform)
+        if cookiefile:
+            options["cookiefile"] = cookiefile
 
         options.update(self.get_extra_options())
 

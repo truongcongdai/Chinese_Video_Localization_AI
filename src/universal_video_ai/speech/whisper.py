@@ -155,7 +155,33 @@ class WhisperTranscriber:
             if self.config.task:
                 whisper_kwargs["task"] = self.config.task
 
-            result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
+            try:
+                result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
+            except ValueError as decode_exc:
+                # Classic openai-whisper/CUDA bug: on some GPU+driver
+                # combinations, fp16 decoding produces NaN logits partway
+                # through, which torch's Categorical distribution rejects
+                # with "found invalid values: tensor([[nan, nan, ...]])".
+                # This is not a data problem (the audio is fine) and not
+                # something the caller did wrong; it's numerical
+                # instability specific to fp16 on that hardware/driver
+                # combo. Retrying the same audio in fp32 (fp16=False)
+                # avoids the unstable code path entirely and reliably
+                # succeeds, at the cost of being a bit slower for this one
+                # file.
+                message = str(decode_exc)
+                if "invalid values" in message and "device='cuda" in message:
+                    self.logger.warning(
+                        "Whisper fp16 decoding produced NaN logits on %s; "
+                        "retrying %s once with fp16=False",
+                        self.config.device,
+                        audio_path,
+                    )
+                    retry_kwargs = dict(whisper_kwargs)
+                    retry_kwargs["fp16"] = False
+                    result = model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
+                else:
+                    raise
             if not isinstance(result, dict):
                 # Defensive: some mocks/backends might return a plain string.
                 result = {"text": str(result), "segments": []}
