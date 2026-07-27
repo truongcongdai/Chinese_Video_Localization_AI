@@ -38,7 +38,7 @@ _logger = logging.getLogger(__name__)
 # single CPU-heavy Whisper stage. Running several Whisper-small inferences at
 # once on a 16 GB CPU host causes thread oversubscription and swapping.
 _DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "10"))))
-_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "3"))))
+_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "5"))))
 _RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
 
 

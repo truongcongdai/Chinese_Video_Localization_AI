@@ -16,11 +16,22 @@ _MODEL_CACHE: dict[tuple[str, Optional[str]], object] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
 
-def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str]):
-    """Load Whisper model - disabled caching to avoid dtype issues with fp32."""
-    # Temporarily disable caching due to dtype mismatch errors when using fp32
-    # The cache can cause corrupted state when switching between fp16 and fp32
-    return whisper_module.load_model(model_name, device=device)
+def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str], fp16: bool = False):
+    """Load Whisper model with caching and dtype consistency."""
+    # Include fp16 in cache key to ensure dtype consistency
+    key = (model_name, device, fp16)
+    model = _MODEL_CACHE.get(key)
+    if model is not None:
+        return model
+    with _MODEL_CACHE_LOCK:
+        model = _MODEL_CACHE.get(key)
+        if model is None:
+            model = whisper_module.load_model(model_name, device=device)
+            # Convert model dtype based on fp16 setting
+            if fp16 and model.device.type == "cuda":
+                model = model.half()
+            _MODEL_CACHE[key] = model
+    return model
 
 
 @dataclass
@@ -30,12 +41,15 @@ class WhisperConfig:
 
     Attributes:
         model: model name (e.g. "tiny", "base", "small", "medium", "large").
+               base = balanced accuracy/speed (recommended for quality), small = higher accuracy.
         device: device string passed to whisper (e.g. "cpu", "cuda:0") or None to let library decide.
         task: "transcribe" or "translate" (if supported).
+        fp16: use fp16 for faster inference (default True for GPU, False for CPU).
     """
-    model: str = "small"
+    model: str = "base"
     device: Optional[str] = None
     task: str = "transcribe"
+    fp16: Optional[bool] = None  # None = auto-detect (True for GPU, False for CPU)
 
 
 class WhisperTranscriber:
@@ -136,9 +150,15 @@ class WhisperTranscriber:
             ) from exc
 
         try:
+            # Auto-detect fp16: True for GPU, False for CPU (unless explicitly set)
+            use_fp16 = self.config.fp16
+            if use_fp16 is None:
+                # Auto-detect based on device
+                use_fp16 = self.config.device is not None and "cuda" in self.config.device.lower()
+
             # Load model (this can be heavy; caller is responsible for environment)
-            self.logger.debug("Loading whisper model %s (device=%s)", self.config.model, self.config.device)
-            model = _cached_whisper_model(whisper, self.config.model, self.config.device)
+            self.logger.debug("Loading whisper model %s (device=%s, fp16=%s)", self.config.model, self.config.device, use_fp16)
+            model = _cached_whisper_model(whisper, self.config.model, self.config.device, use_fp16)
             self.logger.debug("Model loaded, starting transcription for %s", audio_path)
 
             # whisper.transcribe accepts language and task
@@ -147,15 +167,16 @@ class WhisperTranscriber:
                 whisper_kwargs["language"] = language
             if self.config.task:
                 whisper_kwargs["task"] = self.config.task
-            # Force fp32 to avoid dtype mismatch errors on some hardware
-            whisper_kwargs["fp16"] = False
+            # Use fp16 for GPU if enabled (much faster)
+            if use_fp16:
+                whisper_kwargs["fp16"] = True
 
             try:
                 result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
             except (ValueError, RuntimeError) as decode_exc:
-                # Retry with fp16=False if it wasn't already set (defensive)
+                # Retry with fp16=False if fp16 failed (dtype mismatch or NaN)
                 message = str(decode_exc)
-                if whisper_kwargs.get("fp16") is True:
+                if use_fp16 and ("dtype" in message.lower() or "invalid values" in message.lower()):
                     self.logger.warning(
                         "Whisper fp16 decoding failed on %s with %s; "
                         "retrying once with fp16=False",
