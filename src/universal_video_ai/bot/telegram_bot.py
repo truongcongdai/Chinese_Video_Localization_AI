@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import asyncio
+import inspect
 from pathlib import Path
 import logging
 import time
@@ -87,7 +89,17 @@ class MockAdapter:
         handler = self._handlers.get(command)
         if not handler:
             raise RuntimeError(f"No handler registered for command '{command}'")
-        handler(chat_id, args or [])
+        result = handler(chat_id, args or [])
+        if inspect.isawaitable(result):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(result)
+            else:
+                raise RuntimeError(
+                    "simulate_command cannot synchronously execute an async handler "
+                    "inside an active event loop; await the handler directly"
+                )
 
 
 @dataclass

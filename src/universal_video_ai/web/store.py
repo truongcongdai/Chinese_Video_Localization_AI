@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     title TEXT,
     final_video_path TEXT,
+    source_video_path TEXT,
     logo_path TEXT,
     logo_corner TEXT DEFAULT 'bottom_right',
     logo_size_px INTEGER DEFAULT 120,
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     review_mode INTEGER NOT NULL DEFAULT 0,
     review_state_json TEXT,
     segments_json TEXT,
+    source_segments_json TEXT,
     qc_warnings_json TEXT,
     animated_subtitle_config TEXT,
     video_template_config TEXT,
@@ -161,6 +163,20 @@ CREATE TABLE IF NOT EXISTS video_presets (
     updated_at REAL NOT NULL,
     UNIQUE(user_id, name)
 );
+
+CREATE TABLE IF NOT EXISTS user_provider_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,          -- openai | elevenlabs | playht | cartesia | xtts
+    api_key TEXT,
+    api_secret TEXT,
+    default_model TEXT,
+    default_voice TEXT,
+    extra_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, provider)
+);
 """
 
 _MIGRATIONS = [
@@ -206,6 +222,7 @@ _MIGRATIONS = [
     # overwritten with whatever the person edited it to before they hit
     # "Render". Also what GET .../subtitles.srt is generated from.
     ("jobs", "segments_json", "ALTER TABLE jobs ADD COLUMN segments_json TEXT"),
+    ("jobs", "source_segments_json", "ALTER TABLE jobs ADD COLUMN source_segments_json TEXT"),
     # Post-render automated sanity-check warnings (see
     # render.quality_check.analyze_output_quality), as a JSON list of
     # human-readable strings. Empty/NULL = no warnings triggered.
@@ -214,8 +231,20 @@ _MIGRATIONS = [
     ("jobs", "animated_subtitle_config", "ALTER TABLE jobs ADD COLUMN animated_subtitle_config TEXT"),
     # Video template configuration (template, transition, color_effect, etc.) as JSON.
     ("jobs", "video_template_config", "ALTER TABLE jobs ADD COLUMN video_template_config TEXT"),
+    # Persist the downloaded source so completed jobs can offer a secure,
+    # owner-scoped Before/After comparison instead of only the final render.
+    ("jobs", "source_video_path", "ALTER TABLE jobs ADD COLUMN source_video_path TEXT"),
     # Video transformation configuration (flip, border, split-screen, randomization) as JSON.
     ("jobs", "transform_config", "ALTER TABLE jobs ADD COLUMN transform_config TEXT"),
+    ("jobs", "processing_mode", "ALTER TABLE jobs ADD COLUMN processing_mode TEXT DEFAULT 'fast'"),
+    ("jobs", "tts_provider", "ALTER TABLE jobs ADD COLUMN tts_provider TEXT DEFAULT 'edge'"),
+    ("jobs", "tts_style", "ALTER TABLE jobs ADD COLUMN tts_style TEXT DEFAULT 'natural'"),
+    ("jobs", "tts_model", "ALTER TABLE jobs ADD COLUMN tts_model TEXT"),
+    ("jobs", "translation_mode", "ALTER TABLE jobs ADD COLUMN translation_mode TEXT DEFAULT 'faithful'"),
+    ("jobs", "translation_model", "ALTER TABLE jobs ADD COLUMN translation_model TEXT"),
+    ("jobs", "translation_tone", "ALTER TABLE jobs ADD COLUMN translation_tone TEXT DEFAULT 'natural'"),
+    ("jobs", "translation_audience", "ALTER TABLE jobs ADD COLUMN translation_audience TEXT"),
+    ("jobs", "translation_glossary", "ALTER TABLE jobs ADD COLUMN translation_glossary TEXT"),
 ]
 
 @dataclass
@@ -229,6 +258,7 @@ class Job:
     error: Optional[str]
     title: Optional[str]
     final_video_path: Optional[str]
+    source_video_path: Optional[str]
     created_at: float
     updated_at: float
     source_language: str = "auto"
@@ -239,10 +269,20 @@ class Job:
     review_mode: int = 0
     review_state_json: Optional[str] = None
     segments_json: Optional[str] = None
+    source_segments_json: Optional[str] = None
     qc_warnings_json: Optional[str] = None
     animated_subtitle_config: Optional[Dict[str, Any]] = None
     video_template_config: Optional[Dict[str, Any]] = None
     transform_config: Optional[Dict[str, Any]] = None
+    processing_mode: str = "fast"
+    tts_provider: str = "edge"
+    tts_style: str = "natural"
+    tts_model: Optional[str] = None
+    translation_mode: str = "faithful"
+    translation_model: Optional[str] = None
+    translation_tone: str = "natural"
+    translation_audience: Optional[str] = None
+    translation_glossary: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -255,6 +295,8 @@ class Job:
         d.pop("review_state_json", None)
         segments_json = d.pop("segments_json", None)
         d["segments"] = json.loads(segments_json) if segments_json else None
+        source_segments_json = d.pop("source_segments_json", None)
+        d["source_segments"] = json.loads(source_segments_json) if source_segments_json else None
         qc_warnings_json = d.pop("qc_warnings_json", None)
         d["qc_warnings"] = json.loads(qc_warnings_json) if qc_warnings_json else []
         return d
@@ -432,6 +474,15 @@ class Store:
         animated_subtitle_config: Optional[Dict[str, Any]] = None,
         video_template_config: Optional[Dict[str, Any]] = None,
         transform_config: Optional[Dict[str, Any]] = None,
+        processing_mode: str = "fast",
+        tts_provider: str = "edge",
+        tts_style: str = "natural",
+        tts_model: Optional[str] = None,
+        translation_mode: str = "faithful",
+        translation_model: Optional[str] = None,
+        translation_tone: str = "natural",
+        translation_audience: Optional[str] = None,
+        translation_glossary: Optional[str] = None,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -439,27 +490,42 @@ class Store:
             id=job_id, user_id=user_id, source_url=source_url,
             target_language=target_language, status="queued",
             progress_note="Đã xếp hàng chờ xử lý", error=None, title=None,
-            final_video_path=None, created_at=now, updated_at=now,
+            final_video_path=None, source_video_path=None, created_at=now, updated_at=now,
             source_language=source_language, logo_path=logo_path,
             logo_corner=logo_corner, logo_size_px=logo_size_px,
             tts_voice=tts_voice, review_mode=int(review_mode),
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
+            processing_mode=processing_mode,
+            tts_provider=tts_provider,
+            tts_style=tts_style,
+            tts_model=tts_model,
+            translation_mode=translation_mode,
+            translation_model=translation_model,
+            translation_tone=translation_tone,
+            translation_audience=translation_audience,
+            translation_glossary=translation_glossary,
         )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
-                "progress_note, error, title, final_video_path, logo_path, logo_corner, logo_size_px, "
-                "tts_voice, review_mode, review_state_json, segments_json, qc_warnings_json, "
-                "animated_subtitle_config, video_template_config, transform_config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "progress_note, error, title, final_video_path, source_video_path, logo_path, logo_corner, logo_size_px, "
+                "tts_voice, review_mode, review_state_json, segments_json, source_segments_json, qc_warnings_json, "
+                "animated_subtitle_config, video_template_config, transform_config, processing_mode, tts_provider, "
+                "tts_style, tts_model, translation_mode, translation_model, translation_tone, "
+                "translation_audience, translation_glossary, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
-                 job.status, job.progress_note, job.error, job.title, job.final_video_path,
+                 job.status, job.progress_note, job.error, job.title, job.final_video_path, job.source_video_path,
                  job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
-                 None, None, None,
+                 None, None, None, None,
                  json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
                  json.dumps(job.video_template_config) if job.video_template_config else None,
                  json.dumps(job.transform_config) if job.transform_config else None,
+                 job.processing_mode, job.tts_provider, job.tts_style, job.tts_model,
+                 job.translation_mode, job.translation_model, job.translation_tone,
+                 job.translation_audience, job.translation_glossary,
                  job.created_at, job.updated_at),
             )
         return job
@@ -481,7 +547,93 @@ class Store:
             animated_subtitle_config=old.animated_subtitle_config,
             video_template_config=old.video_template_config,
             transform_config=old.transform_config,
+            processing_mode=old.processing_mode,
+            tts_provider=old.tts_provider,
+            tts_style=old.tts_style,
+            tts_model=old.tts_model,
+            translation_mode=old.translation_mode,
+            translation_model=old.translation_model,
+            translation_tone=old.translation_tone,
+            translation_audience=old.translation_audience,
+            translation_glossary=old.translation_glossary,
         )
+
+    # ---- provider settings ----
+    def upsert_provider_settings(
+        self,
+        user_id: int,
+        provider: str,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        default_model: Optional[str] = None,
+        default_voice: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        now = time.time()
+        provider = provider.strip().lower()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM user_provider_settings WHERE user_id = ? AND provider = ?",
+                (user_id, provider),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE user_provider_settings SET api_key = COALESCE(?, api_key), "
+                    "api_secret = COALESCE(?, api_secret), default_model = ?, default_voice = ?, "
+                    "extra_json = ?, updated_at = ? WHERE user_id = ? AND provider = ?",
+                    (
+                        api_key, api_secret, default_model, default_voice,
+                        json.dumps(extra or {}, ensure_ascii=False), now, user_id, provider,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO user_provider_settings "
+                    "(user_id, provider, api_key, api_secret, default_model, default_voice, extra_json, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        user_id, provider, api_key, api_secret, default_model, default_voice,
+                        json.dumps(extra or {}, ensure_ascii=False), now, now,
+                    ),
+                )
+
+    def delete_provider_settings(self, user_id: int, provider: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM user_provider_settings WHERE user_id = ? AND provider = ?",
+                (user_id, provider.strip().lower()),
+            )
+
+    def get_provider_settings(self, user_id: int, provider: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM user_provider_settings WHERE user_id = ? AND provider = ?",
+                (user_id, provider.strip().lower()),
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data["extra"] = json.loads(data.pop("extra_json") or "{}")
+        except json.JSONDecodeError:
+            data["extra"] = {}
+        return data
+
+    def list_provider_settings(self, user_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM user_provider_settings WHERE user_id = ? ORDER BY provider ASC",
+                (user_id,),
+            ).fetchall()
+        settings = []
+        for row in rows:
+            data = dict(row)
+            try:
+                data["extra"] = json.loads(data.pop("extra_json") or "{}")
+            except json.JSONDecodeError:
+                data["extra"] = {}
+            settings.append(data)
+        return settings
 
     def set_job_segments(self, job_id: str, segments: List[Dict[str, Any]]) -> None:
         """Overwrite the current translated segments (used both when
@@ -490,6 +642,13 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE jobs SET segments_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(segments, ensure_ascii=False), time.time(), job_id),
+            )
+
+    def set_job_source_segments(self, job_id: str, segments: List[Dict[str, Any]]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET source_segments_json = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(segments, ensure_ascii=False), time.time(), job_id),
             )
 

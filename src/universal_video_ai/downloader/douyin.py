@@ -4,7 +4,7 @@ import re
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
@@ -37,14 +37,42 @@ class DouyinDownloader(BaseDownloader):
         self._ytdlp_fallback = YTDLPDownloader(Platform.DOUYIN)
 
     def _extract_video_id(self, url: str) -> Optional[str]:
-        """Extract video ID from URL"""
-        match = re.search(r'/video/(\d+)', url)
-        if match:
-            return match.group(1)
+        """Extract a Douyin video/note ID from short-resolved or full URLs."""
+        decoded_url = unquote(url or "")
 
-        match = re.search(r'/note/(\d+)', url)
-        if match:
-            return match.group(1)
+        path_patterns = [
+            r"/video/(\d+)",
+            r"/note/(\d+)",
+            r"/share/video/(\d+)",
+            r"/share/note/(\d+)",
+        ]
+        for pattern in path_patterns:
+            match = re.search(pattern, decoded_url)
+            if match:
+                return match.group(1)
+
+        parsed = urlparse(decoded_url)
+        query = parse_qs(parsed.query)
+        id_query_keys = (
+            "modal_id",
+            "aweme_id",
+            "item_id",
+            "share_item_id",
+            "video_id",
+            "note_id",
+        )
+        for key in id_query_keys:
+            for value in query.get(key, []):
+                match = re.search(r"\d{10,}", value)
+                if match:
+                    return match.group(0)
+
+        embedded_match = re.search(
+            r"(?:modal_id|aweme_id|item_id|share_item_id|video_id|note_id)[\"':=]+(\d{10,})",
+            decoded_url,
+        )
+        if embedded_match:
+            return embedded_match.group(1)
 
         return None
 
@@ -205,7 +233,7 @@ class DouyinDownloader(BaseDownloader):
 
         # Strategy 1: HTML scraping (no login required)
         resolved_url = self._resolve_short_url(url)
-        video_id = self._extract_video_id(resolved_url)
+        video_id = self._extract_video_id(resolved_url) or self._extract_video_id(url)
 
         if video_id:
             logger.info("🎯 Strategy 1: Douyin HTML scraping...")

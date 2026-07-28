@@ -18,6 +18,7 @@ def create_audio_pipeline(
     run_demucs: bool = False,
     run_transcription: bool = False,
     transcription_language: Optional[str] = None,
+    transcription_model: Optional[str] = None,
     demucs_output_dir: Optional[Path] = None,
     audio_config: Optional[AudioConfig] = None,
     logger: Optional[logging.Logger] = None,
@@ -40,6 +41,8 @@ def create_audio_pipeline(
     :param run_demucs: whether to attempt Demucs separation.
     :param run_transcription: whether to attempt transcription via Whisper.
     :param transcription_language: language code to pass to transcriber (ignored if run_transcription=False).
+    :param transcription_model: Whisper model name to use for transcription.
+        None keeps WhisperConfig's default.
     :param demucs_output_dir: optional base directory for demucs outputs.
     :param audio_config: optional AudioConfig for extraction (sample rate, channels, codec, etc.).
     :param logger: optional logger; if None, module logger is used.
@@ -70,9 +73,11 @@ def create_audio_pipeline(
         try:
             # Check if whisper is available by attempting to import the backend
             from universal_video_ai.speech.backend import WhisperBackend
+            from universal_video_ai.speech.whisper import WhisperConfig
             from universal_video_ai.speech.service import SpeechService
 
-            backend = WhisperBackend(logger=logger)
+            backend_config = WhisperConfig(model=transcription_model) if transcription_model else None
+            backend = WhisperBackend(config=backend_config, logger=logger)
             speech_service = SpeechService(backend=backend, logger=logger)
             logger.debug("Created SpeechService with WhisperBackend for pipeline")
         except Exception as exc:
@@ -84,6 +89,7 @@ def create_audio_pipeline(
         demucs_output_dir=demucs_output_dir,
         run_transcription=run_transcription,
         transcription_language=transcription_language,
+        transcription_model=transcription_model,
     )
 
     # Create pipeline

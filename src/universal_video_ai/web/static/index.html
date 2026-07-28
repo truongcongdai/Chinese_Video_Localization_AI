@@ -4,586 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Video Localization AI</title>
-<style>
-  :root {
-    --bg: #0a0c10;
-    --panel: #12151e;
-    --panel-2: #1a1f2a;
-    --border: #2a3040;
-    --text: #f0f2f5;
-    --text-dim: #8b9bb4;
-    --accent: #6366f1;
-    --accent-2: #4f46e5;
-    --accent-glow: rgba(99, 102, 241, 0.4);
-    --ok: #10b981;
-    --err: #ef4444;
-    --warn: #f59e0b;
-    --radius: 16px;
-    --radius-sm: 10px;
-    --shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-    --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4);
-    --gradient-1: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    --gradient-2: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-    --gradient-3: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; color: var(--text); min-height: 100vh;
-    background:
-      radial-gradient(ellipse at 10% 0%, rgba(99, 102, 241, 0.15) 0%, transparent 50%),
-      radial-gradient(ellipse at 90% 10%, rgba(16, 185, 129, 0.1) 0%, transparent 40%),
-      radial-gradient(ellipse at 50% 100%, rgba(245, 158, 11, 0.08) 0%, transparent 50%),
-      var(--bg);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
-  .ui-language-picker {
-    position: fixed; bottom: 24px; left: 24px; z-index: 100;
-    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
-    background: rgba(18, 21, 30, .95); border: 1px solid var(--border);
-    border-radius: 12px; box-shadow: var(--shadow-lg);
-    backdrop-filter: blur(16px);
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
-  }
-  .ui-language-picker:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 12px 48px rgba(99, 102, 241, 0.3);
-  }
-  .ui-language-picker span { font-size: 18px; }
-  .ui-language-picker select { 
-    width: auto; min-width: 150px; padding: 8px 32px 8px 10px;
-    background: var(--panel-2); border: 1px solid var(--border);
-    border-radius: 8px; color: var(--text); font-size: 13px;
-    cursor: pointer;
-  }
-  .wrap { width: min(96vw, 1600px); max-width: none; margin: 0 auto; padding: 32px 0 100px; }
-  header {
-    position: sticky; top: 16px; z-index: 30; display: flex; align-items: center;
-    justify-content: space-between; margin-bottom: 28px; padding: 16px 24px;
-    background: rgba(18, 21, 30, .92); border: 1px solid var(--border); border-radius: var(--radius);
-    backdrop-filter: blur(20px); box-shadow: var(--shadow-lg);
-    transition: all 0.3s ease;
-  }
-  header:hover {
-    border-color: rgba(99, 102, 241, 0.3);
-    box-shadow: 0 12px 48px rgba(99, 102, 241, 0.15);
-  }
-  header h1 { 
-    font-size: 22px; font-weight: 700; margin: 0;
-    background: var(--gradient-1);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-  }
-  header .sub { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
-  #userbar { display: flex; align-items: center; gap: 14px; font-size: 14px; color: var(--text-dim); }
-  button { cursor: pointer; font-family: inherit; transition: all 0.2s ease; }
-  .btn {
-    background: var(--accent); color: white; border: none; border-radius: var(--radius-sm);
-    padding: 12px 20px; font-size: 14px; font-weight: 600;
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-    position: relative; overflow: hidden;
-  }
-  .btn::before {
-    content: '';
-    position: absolute; top: 0; left: -100%;
-    width: 100%; height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-    transition: left 0.5s ease;
-  }
-  .btn:hover::before { left: 100%; }
-  .btn:hover { 
-    background: var(--accent-2); 
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
-  }
-  .btn:active { transform: translateY(0); }
-  .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; box-shadow: none; }
-  .btn.secondary { 
-    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-  }
-  .btn.secondary:hover { 
-    background: #252a36; 
-    border-color: var(--accent);
-    transform: translateY(-2px);
-  }
-  .btn.danger { 
-    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-    color: #fff; border: none;
-    box-shadow: 0 4px  12px rgba(239, 68, 68, 0.3);
-  }
-  .btn.danger:hover { 
-    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
-  }
-  .btn.small { padding: 8px 14px; font-size: 13px; }
-  .btn.gradient {
-    background: var(--gradient-1);
-    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-  }
-  .btn.gradient:hover {
-    background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
-    box-shadow: 0 6px 25px rgba(102, 126, 234, 0.5);
-  }
-  .btn .loading-spinner {
-    width: 14px; height: 14px; display: inline-block; flex: 0 0 14px;
-    border: 2px solid rgba(255,255,255,.28); border-top-color: currentColor;
-    border-radius: 50%; animation: button-spin .7s linear infinite;
-  }
-  .btn.is-loading { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
-  @keyframes button-spin { to { transform: rotate(360deg); } }
-  .creator-progress { 
-    margin-top: 16px; padding: 16px; 
-    background: var(--panel-2); border: 1px solid var(--border); 
-    border-radius: var(--radius-sm);
-    box-shadow: inset 0 2px 8px rgba(0,0,0,0.2);
-  }
-  .creator-progress-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; font-size: 13px; font-weight: 600; }
-  .progress-track { 
-    height: 10px; overflow: hidden; 
-    background: rgba(255,255,255,.06); 
-    border-radius: 999px;
-    box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);
-  }
-  .progress-fill { 
-    height: 100%; width: 0; 
-    background: linear-gradient(90deg, var(--accent), #10b981, #3b82f6);
-    background-size: 200% 100%;
-    border-radius: inherit; 
-    transition: width .45s ease;
-    animation: progress-shine 2s ease-in-out infinite;
-  }
-  @keyframes progress-shine {
-    0%, 100% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-  }
-  .job-progress { margin-top: 10px; max-width: 520px; }
-  .job-progress .progress-track { height: 6px; }
-  .job-progress-label { color: var(--text-dim); font-size: 11px; margin-top: 4px; text-align: right; }
-  .card {
-    background: linear-gradient(145deg, rgba(26, 31, 42, .85), rgba(18, 21, 30, .95));
-    border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px;
-    box-shadow: var(--shadow);
-    transition: all 0.3s ease;
-    position: relative;
-    overflow: hidden;
-  }
-  .card::before {
-    content: '';
-    position: absolute; top: 0; left: 0; right: 0; height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.3), transparent);
-    opacity: 0; transition: opacity 0.3s ease;
-  }
-  .card:hover {
-    border-color: rgba(99, 102, 241, 0.3);
-    box-shadow: var(--shadow-lg);
-    transform: translateY(-2px);
-  }
-  .card:hover::before { opacity: 1; }
-  input, select, textarea {
-    width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
-    border-radius: var(--radius-sm); padding: 12px 14px; font-size: 14px; font-family: inherit;
-    transition: all 0.2s ease;
-    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
-  }
-  input:focus, select:focus, textarea:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15), inset 0 1px 3px rgba(0,0,0,0.2);
-  }
-  input:hover, select:hover, textarea:hover {
-    border-color: rgba(99, 102, 241, 0.4);
-  }
-  label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 8px; font-weight: 500; }
-  .field { margin-bottom: 16px; }
-  .row { display: flex; gap: 16px; }
-  .row > * { flex: 1; }
-  .reup-language-row .reup-language-field label {
-    min-height: 32px; display: flex; align-items: flex-end;
-  }
-  #auth-view { max-width: 380px; margin: 80px auto 0; }
-  #auth-view h2 { text-align: center; margin-bottom: 4px; }
-  #auth-view p.sub { text-align: center; color: var(--text-dim); font-size: 13px; margin-top: 0; margin-bottom: 24px; }
-  #auth-error { color: var(--err); font-size: 13px; min-height: 18px; margin-top: 8px; }
-  .hidden { display: none !important; }
-  .job {
-    display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px 14px;
-    align-items: stretch; padding: 14px 0; border-bottom: 1px solid var(--border);
-  }
-  .job:last-child { border-bottom: none; }
-  .job .job-main { min-width: 0; display: grid; grid-template-rows: auto auto; gap: 10px; }
-  .history-job-check { align-self: start; margin-top: 4px; }
-  .job .job-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .job .job-info { flex: 1; min-width: 0; }
-  .job .job-url { font-size: 14px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .job .job-url.playable { cursor: pointer; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
-  .job .job-url.playable:hover { color: #91b6ff; }
-  .job .job-meta { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
-  .badge {
-    font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 999px; text-transform: uppercase;
-    letter-spacing: .03em;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-    transition: all 0.2s ease;
-  }
-  .badge:hover { transform: scale(1.05); }
-  .badge.queued { 
-    background: linear-gradient(135deg, #4b5563 0%, #374151 100%); 
-    color: var(--text-dim); 
-  }
-  .badge.running { 
-    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); 
-    color: white;
-    animation: pulse-badge 2s ease-in-out infinite;
-  }
-  @keyframes pulse-badge {
-    0%, 100% { box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3); }
-    50% { box-shadow: 0 4px 16px rgba(59, 130, 246, 0.5); }
-  }
-  .badge.review { 
-    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); 
-    color: white; 
-  }
-  .badge.done { 
-    background: linear-gradient(135deg, #10b981 0%, #059669 100%); 
-    color: white; 
-  }
-  .badge.error { 
-    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); 
-    color: white; 
-  }
-  .job-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .job-delete { grid-column: 3; grid-row: 1; min-width: 62px; height: 100%; }
-  #empty-history { color: var(--text-dim); font-size: 14px; padding: 20px 0; text-align: center; }
-
-  .modal-backdrop {
-    position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex;
-    align-items: center; justify-content: center; z-index: 50; padding: 20px;
-    backdrop-filter: blur(8px);
-    animation: fade-in 0.2s ease;
-  }
-  @keyframes fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  .modal { 
-    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
-    max-width: 640px; width: 100%; max-height: 88vh; overflow-y: auto; padding: 28px;
-    box-shadow: var(--shadow-lg);
-    animation: slide-up 0.3s ease;
-  }
-  @keyframes slide-up {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .modal h3 { margin-top: 0; font-size: 18px; font-weight: 700; }
-  .modal video { width: 100%; border-radius: var(--radius-sm); background: #000; box-shadow: var(--shadow); }
-  .modal-close { 
-    float: right; background: none; border: none; color: var(--text-dim); font-size: 24px;
-    cursor: pointer; transition: all 0.2s ease; padding: 4px;
-  }
-  .modal-close:hover { color: var(--text); transform: rotate(90deg); }
-  .chip-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
-  .chip {
-    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 16px; font-size: 13px;
-    background: var(--panel-2); color: var(--text-dim); cursor: pointer;
-    transition: all 0.2s ease; font-weight: 500;
-  }
-  .chip:hover { 
-    border-color: var(--accent); 
-    color: var(--accent); 
-    background: rgba(99, 102, 241, 0.1);
-    transform: translateY(-2px);
-  }
-  .chip.active { 
-    border-color: var(--accent); 
-    color: var(--accent); 
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
-  }
-  .publish-result { font-size: 13px; padding: 8px 10px; border-radius: 6px; margin-top: 6px; }
-  .publish-result.ok { background: #17352a; color: var(--ok); }
-  .publish-result.fail { background: #3a2323; color: var(--err); }
-
-  .credits-badge {
-    background: linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(245, 158, 11, 0.1));
-    border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 999px;
-    padding: 6px 14px; font-size: 13px; font-weight: 700; color: var(--warn);
-    box-shadow: 0 2px 8px rgba(245, 158, 11, 0.2);
-    display: flex; align-items: center; gap: 6px;
-  }
-  .credits-badge::before {
-    content: '💎';
-    font-size: 14px;
-  }
-
-  /* auth tabs + social login */
-  .auth-tabs { display: flex; gap: 10px; margin-bottom: 20px; }
-  .auth-tab {
-    flex: 1; text-align: center; padding: 12px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600;
-    background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border);
-    transition: all 0.2s ease; cursor: pointer;
-  }
-  .auth-tab:hover { border-color: var(--accent); color: var(--accent); }
-  .auth-tab.active { 
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
-    color: var(--accent); border-color: var(--accent);
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
-  }
-  .social-row { display: flex; flex-direction: column; gap: 12px; margin-top: 20px; }
-  .btn.social {
-    display: flex; align-items: center; justify-content: center; gap: 12px;
-    background: var(--panel-2); color: var(--text); border: 1px solid var(--border); width: 100%;
-    padding: 12px 16px; font-size: 14px;
-  }
-  .btn.social:hover { 
-    background: #252a36; 
-    border-color: var(--accent);
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-  }
-  .btn.social:disabled { opacity: .4; cursor: not-allowed; transform: none; }
-  .auth-divider { display: flex; align-items: center; gap: 12px; margin: 20px 0; color: var(--text-dim); font-size: 12px; }
-  .auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
-
-  /* logo overlay panel */
-  .corner-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .corner-opt {
-    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; font-size: 12px; text-align: center;
-    background: var(--panel-2); color: var(--text-dim); cursor: pointer;
-    transition: all 0.2s ease; font-weight: 500;
-  }
-  .corner-opt:hover { border-color: var(--accent); color: var(--accent); }
-  .corner-opt.active { 
-    border-color: var(--accent); 
-    color: var(--accent); 
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
-  }
-  #logo-preview-box { display: flex; align-items: center; gap: 12px; margin-top: 12px; padding: 12px; background: var(--panel-2); border-radius: var(--radius-sm); }
-  #logo-preview-box img { width: 56px; height: 56px; object-fit: contain; background: #fff; border-radius: 8px; padding: 4px; box-shadow: var(--shadow); }
-
-  /* history search/filter/delete */
-  .history-toolbar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
-  .history-toolbar input[type="date"] { flex: none; width: 150px; }
-  .history-toolbar input[type="text"] { flex: 1; min-width: 200px; }
-
-  /* floating feedback button */
-  #feedback-fab {
-    position: fixed; right: 24px; bottom: 24px; z-index: 50;
-    border-radius: 999px; padding: 14px 20px; 
-    background: var(--gradient-1);
-    color: white;
-    box-shadow: 0 6px 24px rgba(102, 126, 234, 0.4);
-    border: none;
-    font-weight: 600;
-    transition: all 0.3s ease;
-  }
-  #feedback-fab:hover {
-    transform: translateY(-4px) scale(1.05);
-    box-shadow: 0 8px 32px rgba(102, 126, 234, 0.5);
-  }
-
-  /* subtitle review editor */
-  #review-segments-list { max-height: 50vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-  .review-segment { display: flex; gap: 10px; align-items: flex-start; }
-  .review-segment .seg-time { flex: none; width: 90px; font-size: 11px; color: var(--text-dim); padding-top: 10px; }
-  .review-segment textarea { flex: 1; min-height: 44px; resize: vertical; }
-  #review-source-video { width: 100%; max-height: 38vh; background: #000; border-radius: 8px; margin-bottom: 12px; }
-  .review-segment.active { outline: 1px solid var(--accent); border-radius: 8px; background: #111a2a; }
-
-  .connect-card {
-    border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
-    margin-bottom: 12px; background: var(--panel-2);
-  }
-  .connect-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .connect-name { font-weight: 700; font-size: 14px; }
-  .connect-sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
-  .connect-note { font-size: 12px; color: var(--warn); margin-top: 6px; line-height: 1.5; }
-  .connect-qr-box { margin-top: 10px; display: flex; align-items: center; gap: 12px; }
-  .connect-qr-box img { border-radius: 8px; background: white; padding: 6px; }
-  .pill { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 700; }
-  .pill.on { background: #17352a; color: var(--ok); }
-  .pill.off { background: #3a3f4c; color: var(--text-dim); }
-
-  /* admin */
-  #admin-view { max-width: 1000px; }
-  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 16px; margin-bottom: 16px; }
-  .stat-box { 
-    background: linear-gradient(145deg, rgba(26, 31, 42, .8), rgba(18, 21, 30, .9));
-    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 18px;
-    transition: all 0.3s ease;
-    position: relative;
-    overflow: hidden;
-  }
-  .stat-box::before {
-    content: '';
-    position: absolute; top: 0; left: 0; right: 0; height: 3px;
-    background: var(--gradient-1);
-    opacity: 0; transition: opacity 0.3s ease;
-  }
-  .stat-box:hover {
-    border-color: rgba(99, 102, 241, 0.3);
-    transform: translateY(-4px);
-    box-shadow: var(--shadow);
-  }
-  .stat-box:hover::before { opacity: 1; }
-  .stat-box .num { font-size: 28px; font-weight: 800; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-  .stat-box .label { font-size: 13px; color: var(--text-dim); margin-top: 4px; font-weight: 500; }
-  .research-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 14px 0; }
-  .research-score { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; }
-  .research-score .num { font-size: 26px; font-weight: 800; color: var(--text); }
-  .research-score .label { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
-  .research-score.good .num { color: var(--ok); }
-  .research-score.warn .num { color: var(--warn); }
-  .research-score.bad .num { color: var(--err); }
-  .research-json { min-height: 220px; resize: vertical; font-family: Consolas, "SFMono-Regular", monospace; font-size: 12px; line-height: 1.45; }
-  .research-list { margin: 8px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
-  .research-status { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
-  .referral-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 14px;
-    border-top: 1px solid var(--border); padding-top: 14px; margin-top: 4px;
-  }
-  .referral-row code { background: var(--panel-2); padding: 3px 8px; border-radius: 6px; font-size: 12px; }
-  .hashtag-chip {
-    display: inline-block; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
-    padding: 2px 10px; font-size: 12px; color: var(--accent); cursor: pointer; margin: 2px;
-  }
-  .hashtag-chip:hover { border-color: var(--accent); }
-  table.admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  table.admin-table th, table.admin-table td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--border); }
-  table.admin-table th { 
-    color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: uppercase;
-    background: rgba(26, 31, 42, 0.5);
-  }
-  table.admin-table tr:hover td { background: rgba(99, 102, 241, 0.05); }
-  .credit-adjust { display: flex; gap: 8px; align-items: center; }
-  .credit-adjust input { width: 80px; padding: 8px 10px; }
-  .topup-packages { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 12px; margin-bottom: 16px; }
-  .topup-package {
-    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px;
-    background: var(--panel-2); cursor: pointer;
-    transition: all 0.2s ease;
-  }
-  .topup-package:hover { border-color: var(--accent); transform: translateY(-2px); }
-  .topup-package.active { 
-    border-color: var(--accent); 
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.1));
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
-  }
-  .topup-package .credits { font-weight: 800; font-size: 20px; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-  .topup-package .price { color: var(--text-dim); font-size: 14px; margin-top: 6px; }
-  .payment-box { border: 1px solid var(--border); background: var(--panel-2); border-radius: var(--radius-sm); padding: 18px; margin: 16px 0; }
-  .payment-box img { display: block; width: min(280px, 100%); margin: 16px auto; border-radius: var(--radius-sm); background: white; box-shadow: var(--shadow); }
-  .payment-line { display:flex; justify-content:space-between; gap:12px; margin:8px 0; font-size:14px; }
-  .status-pending { color: var(--warn); font-weight: 600; }
-  .status-approved { color: var(--ok); font-weight: 600; }
-  .status-rejected { color: var(--err); font-weight: 600; }
-  
-  /* Onboarding Wizard */
-  .onboarding-overlay {
-    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(10, 12, 16, 0.9); z-index: 1000;
-    display: flex; align-items: center; justify-content: center;
-    backdrop-filter: blur(8px);
-  }
-  .onboarding-modal {
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 32px;
-    max-width: 500px; width: 90%;
-    box-shadow: var(--shadow-lg);
-    animation: slideUp 0.3s ease;
-  }
-  @keyframes slideUp {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .onboarding-step { display: none; }
-  .onboarding-step.active { display: block; }
-  .onboarding-title {
-    font-size: 24px; font-weight: 700; margin: 0 0 16px;
-    background: var(--gradient-1); -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent; background-clip: text;
-  }
-  .onboarding-content {
-    color: var(--text-dim); line-height: 1.6; margin-bottom: 24px;
-  }
-  .onboarding-content ul {
-    margin: 12px 0; padding-left: 20px;
-  }
-  .onboarding-content li {
-    margin: 8px 0;
-  }
-  .onboarding-progress {
-    display: flex; gap: 8px; margin-bottom: 24px;
-  }
-  .onboarding-progress-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--border); transition: all 0.3s ease;
-  }
-  .onboarding-progress-dot.active {
-    background: var(--accent); box-shadow: 0 0 8px var(--accent);
-  }
-  .onboarding-progress-dot.completed {
-    background: var(--ok);
-  }
-  .onboarding-buttons {
-    display: flex; gap: 12px; justify-content: flex-end;
-  }
-  .onboarding-skip {
-    background: transparent; border: none; color: var(--text-dim);
-    padding: 10px 16px; cursor: pointer; font-size: 14px;
-    transition: color 0.2s ease;
-  }
-  .onboarding-skip:hover { color: var(--text); }
-  
-  .section-title { 
-    margin: 0 0 16px; font-size: 18px; font-weight: 700;
-    background: var(--gradient-1);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-  }
-  .dashboard-grid {
-    display:grid; grid-template-columns:minmax(680px, 1.45fr) minmax(440px, .85fr);
-    gap:28px; align-items:start;
-  }
-  .tool-column, .result-column { min-width:0; }
-  .result-column { position:sticky; top:100px; max-height:calc(100vh - 112px); overflow:auto; padding-right:4px; }
-  .latest-result video { 
-    width:100%; max-height:52vh; background:#000; 
-    border-radius: var(--radius-sm); object-fit:contain;
-    box-shadow: var(--shadow);
-    transition: all 0.3s ease;
-  }
-  .latest-result video:hover { box-shadow: var(--shadow-lg); }
-  .latest-result-title { font-size:14px; color:var(--text-dim); margin:10px 0 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight: 500; }
-  @media (max-width: 760px) {
-    .ui-language-picker { bottom: 10px; left: 10px; }
-    .wrap { width:auto; padding:12px 12px 60px; }
-    header { position: static; align-items: flex-start; gap: 14px; }
-    #userbar { flex-wrap: wrap; justify-content: flex-end; }
-    .row { flex-direction: column; gap: 0; }
-    .history-toolbar { flex-wrap: wrap; }
-    .history-toolbar input[type="date"] { width: 100%; }
-    .job { grid-template-columns: auto minmax(0, 1fr); }
-    .job-head { align-items: flex-start !important; flex-wrap: wrap; }
-    .job-actions { width: 100%; }
-    .job-delete { grid-column: 2; grid-row: auto; width: 100%; min-height: 38px; }
-    .dashboard-grid { display:block; }
-    .result-column { position:static; max-height:none; overflow:visible; }
-  }
-  @media (min-width: 761px) and (max-width: 1199px) {
-    .wrap { width:min(96vw, 1080px); }
-    .dashboard-grid { display:block; }
-    .result-column { position:static; max-height:none; overflow:visible; }
-  }
-  @media (min-width: 1600px) {
-    .wrap { width:min(94vw, 1720px); }
-    .dashboard-grid { grid-template-columns:minmax(820px, 1.55fr) minmax(500px, .85fr); gap:28px; }
-  }
-</style>
+<meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css?v=20260728">
 </head>
 <body>
 
@@ -688,6 +111,64 @@
   </select>
 </label>
 
+<div id="landing-view">
+  <nav class="landing-nav">
+    <div class="landing-brand">Video Localization AI</div>
+    <div class="landing-nav-actions">
+      <a href="#landing-pricing">Bảng giá</a>
+      <button class="btn secondary small" id="landing-login-btn" type="button">Đăng nhập</button>
+      <button class="btn gradient small" id="landing-try-btn" type="button">Dùng thử miễn phí</button>
+    </div>
+  </nav>
+  <main class="landing-main">
+    <section class="landing-hero">
+      <div>
+        <div class="landing-eyebrow">AI VIDEO LOCALIZATION WORKSPACE</div>
+        <h1>Biến một video thành nội dung phù hợp với mọi thị trường.</h1>
+        <p>Dịch lời thoại, tạo giọng đọc tự nhiên, dựng phụ đề và xuất preset TikTok, Shorts hoặc Reels trong một quy trình rõ ràng.</p>
+        <div class="landing-hero-actions">
+          <button class="btn gradient" id="landing-hero-try-btn" type="button">Tạo video đầu tiên miễn phí →</button>
+          <a class="btn secondary" href="#landing-demo">Xem video demo</a>
+        </div>
+        <div class="landing-trust-row">
+          <span>✓ Giữ timestamp</span><span>✓ Preview giọng đọc</span><span>✓ Before / After</span>
+        </div>
+      </div>
+      <div class="landing-product-card">
+        <div class="landing-product-top"><span></span><span></span><span></span><b>3 bước để xuất video</b></div>
+        <div class="landing-mini-step active"><b>1</b><span>Dán link video nguồn</span></div>
+        <div class="landing-mini-step"><b>2</b><span>Chọn ngôn ngữ và nghe thử voice</span></div>
+        <div class="landing-mini-step"><b>3</b><span>Chọn preset rồi bắt đầu xử lý</span></div>
+        <div class="landing-output-chips"><span>TikTok 9:16</span><span>Shorts</span><span>Reels</span></div>
+      </div>
+    </section>
+
+    <section class="landing-section" id="landing-demo">
+      <div class="landing-section-heading"><span>DEMO THỰC TẾ</span><h2>Xem cách một video được chuyển thành bản đã bản địa hóa.</h2></div>
+      <div class="landing-demo-grid">
+        <video controls muted loop playsinline preload="metadata" poster="/assets/demo-poster.svg">
+          <source src="/assets/demo-localization.mp4" type="video/mp4">
+        </video>
+        <div class="landing-feature-list">
+          <div><b>01 · Nhận dạng</b><p>Whisper giữ lại từng đoạn thoại và timestamp.</p></div>
+          <div><b>02 · Bản địa hóa</b><p>Dịch, chọn voice và nghe thử trước khi tiêu credit.</p></div>
+          <div><b>03 · Xuất bản</b><p>Preset nền tảng, kiểm tra kỹ thuật và Before/After.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="landing-section" id="landing-pricing">
+      <div class="landing-section-heading"><span>BẢNG GIÁ MINH BẠCH</span><h2>Bắt đầu miễn phí, nạp thêm khi cần.</h2></div>
+      <div class="landing-pricing-grid" id="landing-pricing-grid">
+        <article><small>Dùng thử</small><h3>10 credit</h3><p>Dành cho tài khoản mới</p><button class="btn gradient landing-cta" type="button">Bắt đầu miễn phí</button></article>
+        <article class="featured"><small>Creator</small><h3>120 credit</h3><p>100.000₫ · phù hợp sử dụng thường xuyên</p><button class="btn gradient landing-cta" type="button">Dùng thử ngay</button></article>
+        <article><small>Studio</small><h3>700 credit</h3><p>500.000₫ · cho xử lý số lượng lớn</p><button class="btn gradient landing-cta" type="button">Tạo tài khoản</button></article>
+      </div>
+    </section>
+  </main>
+  <footer class="landing-footer">Video Localization AI · Dữ liệu và video được xử lý trong workspace của bạn.</footer>
+</div>
+
 <div id="auth-view" class="wrap hidden">
   <h2 id="auth-title">Đăng nhập</h2>
   <p class="sub" id="auth-sub">Video Localization AI</p>
@@ -769,54 +250,290 @@
   <main class="tool-column">
 
   <div class="card">
-    <h3 class="section-title">Dịch &amp; lồng tiếng video có sẵn</h3>
-    <div class="row reup-language-row">
-      <div class="field" style="flex: 3">
-        <label>Dan link video - YouTube / Douyin / TikTok / Facebook / Instagram... (1 link moi dong de xu ly hang loat)</label>
-        <textarea id="url-input" rows="2" placeholder="https://www.youtube.com/watch?v=...&#10;https://v.douyin.com/...&#10;https://www.tiktok.com/@user/video/..."></textarea>
-      </div>
-      <div class="field reup-language-field" style="flex: 1">
-        <label>Ngôn ngữ gốc video reup</label>
-        <select id="source-lang-select"></select>
-      </div>
-      <div class="field reup-language-field" style="flex: 1">
-        <label>Ngôn ngữ voice &amp; subtitle video reup</label>
-        <select id="lang-select"></select>
-      </div>
+    <div class="template-library-heading">
+      <h3 class="section-title">Dịch &amp; lồng tiếng video có sẵn</h3>
+      <span id="draft-status" class="muted-help">Tự động lưu bản nháp</span>
+    </div>
+    <div class="localization-stepper" aria-label="Các bước tạo video">
+      <button class="localization-step-tab active" type="button" data-localization-step="1">
+        <span class="step-number">1</span><span><strong>Nguồn video</strong><br><small>Nhập một hoặc nhiều link</small></span>
+      </button>
+      <button class="localization-step-tab" type="button" data-localization-step="2">
+        <span class="step-number">2</span><span><strong>Ngôn ngữ &amp; giọng</strong><br><small>Chọn đầu vào và đầu ra</small></span>
+      </button>
+      <button class="localization-step-tab" type="button" data-localization-step="3">
+        <span class="step-number">3</span><span><strong>Cấu hình &amp; chạy</strong><br><small>Kiểm tra trước khi xử lý</small></span>
+      </button>
     </div>
 
-    <div class="row">
-      <div class="field" style="flex: 1">
-        <label>Chọn voice giọng đọc video reup</label>
-        <select id="voice-select"><option value="">Mặc định</option></select>
-        <div style="font-size:12px;color:var(--text-dim);margin-top:5px">Danh sách voice thay đổi theo ngôn ngữ voice &amp; subtitle ở phía trên.</div>
+    <section class="localization-step-panel active" data-localization-panel="1">
+      <div class="field">
+        <label>Dán link video — YouTube / Douyin / TikTok / Facebook / Instagram (mỗi dòng một link)</label>
+        <textarea id="url-input" rows="2" placeholder="https://www.youtube.com/watch?v=...&#10;https://v.douyin.com/...&#10;https://www.tiktok.com/@user/video/..."></textarea>
+        <div id="url-count-help" style="font-size:12px;color:var(--text-dim);margin-top:6px">Chưa có link nào.</div>
       </div>
-      <div class="field" style="flex: 2; display:flex; align-items:flex-end; padding-bottom: 10px;">
+      <div class="localization-step-actions">
+        <span></span>
+        <button class="btn gradient" type="button" data-localization-next="2">Tiếp theo: Ngôn ngữ &amp; giọng →</button>
+      </div>
+    </section>
+
+    <section class="localization-step-panel" data-localization-panel="2">
+      <div class="row reup-language-row">
+        <div class="field reup-language-field">
+        <label>Ngôn ngữ gốc video reup</label>
+        <select id="source-lang-select"></select>
+        </div>
+        <div class="field reup-language-field">
+        <label>Ngôn ngữ voice &amp; subtitle video reup</label>
+        <select id="lang-select"></select>
+        </div>
+      </div>
+
+      <details class="advanced-options compact-advanced-options" id="localization-output-advanced-options">
+        <summary>Tuỳ chỉnh thêm: dịch theo ngữ cảnh, glossary, hàng chờ</summary>
+        <div class="advanced-options-body">
+
+      <div class="row">
+        <div class="field" style="flex: 1">
+        <label>Chất lượng giọng đọc</label>
+        <select id="tts-provider-select">
+          <option value="edge">Miễn phí · Nhiều giọng hệ thống</option>
+          <option value="openai">Premium · OpenAI</option>
+          <option value="elevenlabs">Premium · ElevenLabs / voice clone</option>
+          <option value="playht">Premium · PlayHT</option>
+          <option value="cartesia">Premium · Cartesia</option>
+          <option value="xtts">Pro · Voice clone local</option>
+        </select>
+        <div id="tts-provider-status" class="muted-help">Edge chạy miễn phí, không cần API key.</div>
+        <a class="btn secondary small provider-connect-btn hidden" id="provider-connect-link" href="#" target="_blank" rel="noopener">Kết nối bằng mã provider</a>
+        </div>
+        <div class="field" style="flex: 1">
+        <label>Phong cách giọng đọc</label>
+        <select id="tts-style-select">
+          <option value="natural">Natural</option>
+          <option value="warm">Warm creator</option>
+          <option value="energetic">Energetic short video</option>
+          <option value="narration">Narration</option>
+          <option value="female_creator">Female creator</option>
+          <option value="male_documentary">Male documentary</option>
+        </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label>Model giọng đọc</label>
+          <select id="tts-model-select"><option value="">Theo provider/default</option></select>
+          <div class="muted-help">Free dùng được ngay. Premium chỉ cần kết nối khi bạn chọn provider trả phí.</div>
+        </div>
+      </div>
+
+      <div class="provider-settings-block hidden" id="provider-settings-panel">
+        <div class="template-library-heading">
+          <div><strong>Kết nối provider</strong><div class="muted-help">Dùng cho Premium TTS, voice clone hoặc dịch LLM.</div></div>
+        </div>
+        <div class="provider-connect-help">
+          Free mode không cần kết nối. Với provider trả phí, hệ thống không thể tự đọc API key sau khi bạn đăng nhập dashboard;
+          hãy mở trang provider, tạo/copy mã kết nối rồi dán vào đây một lần.
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Kết nối đã lưu</label>
+            <select id="saved-provider-select"><option value="">Chưa có kết nối đã lưu</option></select>
+            <div class="muted-help">Chọn kết nối đã lưu để dùng lại model/voice của provider đó.</div>
+          </div>
+          <div class="field" style="display:flex;align-items:flex-end">
+            <a class="btn secondary small hidden" id="provider-open-dashboard-link" href="#" target="_blank" rel="noopener">Mở trang tạo/lấy mã kết nối</a>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Dịch vụ cần kết nối</label>
+            <select id="provider-settings-select">
+              <option value="openai">OpenAI</option>
+              <option value="elevenlabs">ElevenLabs</option>
+              <option value="playht">PlayHT</option>
+              <option value="cartesia">Cartesia</option>
+              <option value="xtts">XTTS local</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Model mặc định sau khi kết nối</label>
+            <select id="provider-model-select"><option value="">Tự động sau khi kết nối</option></select>
+            <input id="provider-model-input" placeholder="Nếu model chưa hiện: nhập tên model">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Mã kết nối</label>
+            <input id="provider-api-key-input" type="password" autocomplete="off" placeholder="Dán mã kết nối từ trang provider">
+          </div>
+          <div class="field">
+            <label>Mã phụ trợ nếu provider yêu cầu</label>
+            <input id="provider-api-secret-input" type="password" autocomplete="off" placeholder="Ví dụ: User ID của PlayHT">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Giọng mặc định</label>
+            <input id="provider-voice-input" placeholder="Tùy chọn: để trống nếu muốn chọn từ danh sách tự động">
+          </div>
+        </div>
+        <div class="provider-settings-actions">
+          <button class="btn secondary small" id="provider-save-btn" type="button">Lưu kết nối</button>
+          <button class="btn secondary small" id="provider-delete-btn" type="button">Xóa kết nối</button>
+          <span id="provider-settings-status" class="muted-help"></span>
+        </div>
+        <div id="provider-list" class="provider-list"></div>
+      </div>
+
+      <div class="row">
+        <div class="field" style="flex: 1">
+        <label>Giọng đọc</label>
+        <select id="voice-select"><option value="">Mặc định</option></select>
+        <div id="voice-select-help" style="font-size:12px;color:var(--text-dim);margin-top:5px">Danh sách voice thay đổi theo ngôn ngữ, provider và kết nối đã lưu.</div>
+        <div class="voice-preview-row">
+          <button class="btn secondary small" id="voice-preview-btn" type="button">▶ Nghe thử giọng</button>
+          <span id="voice-preview-status" class="muted-help"></span>
+        </div>
+        <audio id="voice-preview-audio" class="hidden" controls preload="none"></audio>
+        </div>
+        <div class="field" style="flex: 2; display:flex; align-items:flex-end; padding-bottom: 10px;">
         <label style="margin:0">
           <input type="checkbox" id="review-mode-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
           Cho tôi xem &amp; sửa phụ đề dịch trước khi render (không phù hợp khi xử lý hàng loạt nhiều link)
         </label>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label>Chế độ xử lý</label>
+          <select id="processing-mode-select">
+            <option value="fast">Fast · nhanh, không OCR nâng cao</option>
+            <option value="quality">Quality · dịch/context + subtitle đẹp</option>
+            <option value="pro">Pro · dành cho premium voice/voice clone</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Chế độ dịch</label>
+          <select id="translation-mode-select">
+            <option value="faithful">Dịch sát</option>
+            <option value="contextual">Dịch theo ngữ cảnh bằng LLM</option>
+            <option value="adaptive">Viết lại tự nhiên theo audience</option>
+          </select>
+          <div id="translation-login-status" class="muted-help">Dịch sát dùng engine free. Contextual/adaptive cần một kết nối LLM đã lưu.</div>
+        </div>
+        <div class="field">
+          <label>Model dịch</label>
+          <select id="translation-model-select"><option value="">Dịch sát miễn phí</option></select>
+          <a class="btn secondary small provider-connect-btn hidden" id="translation-connect-link" href="#" target="_blank" rel="noopener">Kết nối LLM bằng mã</a>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label>Tone bản dịch</label>
+          <select id="translation-tone-select">
+            <option value="natural">Tự nhiên</option>
+            <option value="sales">Bán hàng</option>
+            <option value="funny">Hài hước</option>
+            <option value="education">Giáo dục</option>
+            <option value="review">Review</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Target audience</label>
+          <input id="translation-audience-input" placeholder="Ví dụ: người xem TikTok Việt Nam, dân văn phòng, mẹ bỉm...">
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Glossary / từ không được dịch sai</label>
+        <textarea id="translation-glossary-input" rows="3" placeholder="Mỗi dòng một quy tắc, ví dụ: Douyin = Douyin; 牛排 = steak; brand ABC giữ nguyên"></textarea>
+      </div>
+
+      <div class="field">
+        <label>
+          <input type="checkbox" id="queue-priority-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+          Ưu tiên xử lý hàng loạt này (high priority) ⚡
+        </label>
+      </div>
+    
+      <div class="field">
+        <label>Số lượng job chạy đồng thời tối đa</label>
+        <select id="max-concurrent-jobs">
+          <option value="1">1 (chậm, ít tài nguyên)</option>
+          <option value="2" selected>2 (khuyên dùng)</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5 (tải và trích audio nhanh hơn)</option>
+        </select>
+        <div style="font-size:12px;color:var(--text-dim);margin-top:5px">Whisper sẽ tự xếp hàng bước nhận dạng giọng nói để tránh xung đột model.</div>
+      </div>
+
+        </div>
+      </details>
+
+      <div class="localization-step-actions">
+        <button class="btn secondary" type="button" data-localization-back="1">← Quay lại</button>
+        <button class="btn gradient" type="button" data-localization-next="3">Tiếp theo: Cấu hình →</button>
+      </div>
+    </section>
+
+    <section class="localization-step-panel" data-localization-panel="3">
+    <div class="template-library-block">
+      <div class="template-library-heading">
+        <div><strong>Preset theo nền tảng</strong><div class="muted-help">Tự thiết lập subtitle, font và tỷ lệ phù hợp.</div></div>
+        <span id="platform-preset-status" class="muted-help"></span>
+      </div>
+      <div class="platform-preset-grid">
+        <button class="platform-preset-card active" type="button" data-platform-preset="tiktok">
+          <span class="preset-thumb preset-thumb-tiktok">♪</span><strong>TikTok</strong><small>9:16 · karaoke subtitle</small>
+        </button>
+        <button class="platform-preset-card" type="button" data-platform-preset="youtube">
+          <span class="preset-thumb preset-thumb-shorts">▶</span><strong>YouTube 16:9</strong><small>1920×1080 · subtitle sạch cho video ngang</small>
+        </button>
+        <button class="platform-preset-card" type="button" data-platform-preset="shorts">
+          <span class="preset-thumb preset-thumb-shorts">▶</span><strong>YouTube Shorts</strong><small>9:16 · subtitle rõ · vùng an toàn</small>
+        </button>
+        <button class="platform-preset-card" type="button" data-platform-preset="reels">
+          <span class="preset-thumb preset-thumb-reels">◎</span><strong>Instagram Reels</strong><small>9:16 · màu vibrant · chữ gọn</small>
+        </button>
+      </div>
+      <div class="template-library-heading subtitle-library-heading">
+        <div><strong>Thư viện mẫu phụ đề</strong><div class="muted-help">Chạm vào thumbnail để áp dụng phong cách.</div></div>
+        <span id="subtitle-template-status" class="muted-help"></span>
+      </div>
+      <div class="subtitle-template-grid">
+        <button class="subtitle-template-card" type="button" data-subtitle-template="minimal">
+          <span class="subtitle-template-thumb subtitle-minimal"><i>Phụ đề tối giản</i></span>
+          <strong>Minimal</strong><small>Dễ đọc, hợp video dài</small>
+        </button>
+        <button class="subtitle-template-card active" type="button" data-subtitle-template="karaoke">
+          <span class="subtitle-template-thumb subtitle-karaoke"><i>Karaoke năng động</i></span>
+          <strong>Karaoke</strong><small>Bắt mắt cho TikTok</small>
+        </button>
+        <button class="subtitle-template-card" type="button" data-subtitle-template="glow">
+          <span class="subtitle-template-thumb subtitle-glow"><i>Neon glow</i></span>
+          <strong>Glow</strong><small>Nổi bật trên nền tối</small>
+        </button>
+      </div>
+      <div class="field preset-output-field">
+        <label>Khung hình đầu ra</label>
+        <select id="output-aspect-ratio">
+          <option value="source">Giữ nguyên video nguồn</option>
+          <option value="9:16">Dọc 9:16 — 1080×1920</option>
+          <option value="16:9">Ngang 16:9 — 1920×1080</option>
+          <option value="1:1">Vuông 1:1 — 1080×1080</option>
+        </select>
       </div>
     </div>
 
-    <div class="field">
-      <label>
-        <input type="checkbox" id="queue-priority-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-        Ưu tiên xử lý hàng loạt này (high priority) ⚡
-      </label>
-    </div>
-    
-    <div class="field">
-      <label>Số lượng job chạy đồng thời tối đa</label>
-      <select id="max-concurrent-jobs">
-        <option value="1">1 (chậm, ít lỗi)</option>
-        <option value="2" selected>2 (khuyên dùng)</option>
-        <option value="3">3</option>
-        <option value="4">4</option>
-        <option value="5">5 (nhanh, có thể nặng)</option>
-      </select>
-    </div>
-
+    <details class="advanced-options" id="localization-advanced-options">
+      <summary>⚙️ Tùy chọn nâng cao</summary>
+      <div class="advanced-options-body">
     <div class="field">
       <label>
         <input type="checkbox" id="youtube-tools-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
@@ -843,11 +560,11 @@
 
     <div class="field">
       <label>
-        <input type="checkbox" id="video-template-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+          <input type="checkbox" id="video-template-checkbox" checked style="width:auto;vertical-align:middle;margin-right:6px">
         Sử dụng template video có sẵn 🎨
       </label>
     </div>
-    <div id="video-template-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+    <div id="video-template-panel" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
       <div class="field">
         <label title="Chọn preset video với các cài đặt màu sắc và hiệu ứng được tối ưu hóa sẵn">Chọn template ℹ️</label>
         <select id="video-template-select">
@@ -856,7 +573,7 @@
           <option value="cinematic">Cinematic (điện ảnh, dramatic)</option>
           <option value="vibrant">Vibrant (sôi động, màu sắc)</option>
           <option value="professional">Professional (chuyên nghiệp, business)</option>
-          <option value="social">Social Media (tối ưu cho TikTok/Reels)</option>
+          <option value="social" selected>Social Media (tối ưu cho TikTok/Reels)</option>
         </select>
       </div>
       <div class="field">
@@ -951,11 +668,11 @@
 
     <div class="field">
       <label>
-        <input type="checkbox" id="animated-subtitle-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
-        Bật hiệu ứng phụ đề động 🎬
+          <input type="checkbox" id="animated-subtitle-checkbox" checked style="width:auto;vertical-align:middle;margin-right:6px">
+        Bật hiệu ứng phụ đề động 🎬 <span class="muted-help">Mặc định Karaoke để video bắt mắt hơn.</span>
       </label>
     </div>
-    <div id="animated-subtitle-panel" class="hidden" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+    <div id="animated-subtitle-panel" style="margin-bottom: 14px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border);">
       <div class="row">
         <div class="field">
           <label>Hiệu ứng</label>
@@ -963,7 +680,7 @@
             <option value="none">Không hiệu ứng</option>
             <option value="fade_in">Fade In (mờ dần hiện)</option>
             <option value="fade_out">Fade Out (mờ dần ẩn)</option>
-            <option value="karaoke">Karaoke (tô màu từng ký tự)</option>
+            <option value="karaoke" selected>Karaoke (tô màu từng ký tự)</option>
             <option value="glow">Glow (phát sáng)</option>
             <option value="gradient">Gradient (nhiều màu)</option>
             <option value="bounce">Bounce (nảy)</option>
@@ -973,13 +690,13 @@
         </div>
         <div class="field">
           <label>Kích thước font (px)</label>
-          <input type="number" id="subtitle-font-size" value="24" min="12" max="72">
+          <input type="number" id="subtitle-font-size" value="34" min="12" max="72">
         </div>
       </div>
       <div class="row">
         <div class="field">
           <label>Màu chữ</label>
-          <input type="color" id="subtitle-font-color" value="#ffffff" style="height: 40px; padding: 2px;">
+          <input type="color" id="subtitle-font-color" value="#ffe600" style="height: 40px; padding: 2px;">
         </div>
         <div class="field">
           <label>Màu nền (hex)</label>
@@ -1099,9 +816,30 @@
         </div>
       </div>
     </div>
+      </div>
+    </details>
 
-    <button class="btn gradient" id="submit-btn">🚀 Bắt đầu xử lý</button>
-    <div id="submit-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+    <div class="localization-summary" id="localization-summary">
+      <div><small>Video</small><strong id="summary-video-count">0 link</strong></div>
+      <div><small>Ngôn ngữ</small><strong id="summary-language">—</strong></div>
+      <div><small>Giọng đọc</small><strong id="summary-voice">Mặc định</strong></div>
+    </div>
+    <div class="estimate-panel" id="job-estimate-panel">
+      <div><small>Chi phí dự kiến</small><strong id="estimate-credits">— credit</strong></div>
+      <div><small>Thời gian dự kiến</small><strong id="estimate-time">Đang tính…</strong></div>
+      <div id="estimate-note" class="muted-help">Ước tính thay đổi theo độ dài video và tải hệ thống.</div>
+    </div>
+    <div id="preflight-panel" class="preflight-panel">
+      <strong>Preflight check</strong>
+      <div id="preflight-status" class="muted-help">Hệ thống sẽ kiểm tra credit, provider và cấu hình trước khi tạo job.</div>
+      <ul id="preflight-list"></ul>
+    </div>
+    <div class="localization-step-actions">
+      <button class="btn secondary" type="button" data-localization-back="2">← Quay lại</button>
+      <button class="btn gradient" id="submit-btn">🚀 Bắt đầu xử lý</button>
+    </div>
+    </section>
+    <div id="submit-error" role="alert" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
 <div class="card">
     <h3 class="section-title">Product Ad Creative / Affiliate Mode</h3>
@@ -1507,8 +1245,18 @@
 <div id="preview-modal" class="modal-backdrop hidden">
   <div class="modal">
     <button class="modal-close" id="preview-close">×</button>
-    <h3>Xem trước</h3>
-    <video id="preview-video" controls></video>
+    <h3>So sánh Before / After</h3>
+    <div class="before-after-grid">
+      <div id="before-video-pane">
+        <div class="compare-label">Before · Video nguồn</div>
+        <video id="preview-source-video" controls preload="metadata"></video>
+      </div>
+      <div>
+        <div class="compare-label">After · Video đã bản địa hóa</div>
+        <video id="preview-video" controls preload="metadata"></video>
+      </div>
+    </div>
+    <div id="before-video-note" class="muted-help hidden">Video nguồn cũ không còn được lưu; các job mới sẽ có Before/After đầy đủ.</div>
     <div id="prepublish-result" class="hidden" style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:8px"></div>
     <div style="margin-top: 14px; display:flex; gap:10px;">
       <a class="btn" id="preview-download">📥 Tải xuống</a>
@@ -1608,2458 +1356,7 @@
   </div>
 </div>
 
-<script>
-const UI_TRANSLATIONS = {
-  "Đăng nhập": ["Sign in", "登录"],
-  "Đăng ký": ["Register", "注册"],
-  "Tạo tài khoản admin": ["Create administrator account", "创建管理员账户"],
-  "Tài khoản đầu tiên sẽ là quản trị viên hệ thống": ["The first account will be the system administrator", "第一个账户将成为系统管理员"],
-  "Tên đăng nhập / Email / Số điện thoại": ["Username / Email / Phone number", "用户名 / 邮箱 / 手机号"],
-  "Email / Số điện thoại": ["Email / Phone number", "邮箱 / 手机号"],
-  "Tên đăng nhập": ["Username", "用户名"],
-  "Mật khẩu": ["Password", "密码"],
-  "Mã giới thiệu (nếu có)": ["Referral code (optional)", "推荐码（可选）"],
-  "hoặc": ["or", "或"],
-  "Đăng nhập với Google": ["Sign in with Google", "使用 Google 登录"],
-  "Đăng nhập với GitHub": ["Sign in with GitHub", "使用 GitHub 登录"],
-  "Đăng nhập với Facebook": ["Sign in with Facebook", "使用 Facebook 登录"],
-  "Dịch & lồng tiếng video, xem trước, tải xuống, đăng lên mạng xã hội": ["Translate and dub videos, preview, download and publish", "翻译和配音视频、预览、下载并发布到社交平台"],
-  "Credit còn lại": ["Remaining credits", "剩余积分"],
-  "Nạp token": ["Top up tokens", "充值代币"],
-  "Phản hồi / Góp ý": ["Feedback", "反馈 / 建议"],
-  "Quản trị": ["Administration", "管理后台"],
-  "Đăng xuất": ["Sign out", "退出登录"],
-  "Sao chép link": ["Copy link", "复制链接"],
-  "Đã sao chép ✓": ["Copied ✓", "已复制 ✓"],
-  "Dịch & lồng tiếng video có sẵn": ["Translate and dub an existing video", "翻译并配音现有视频"],
-  "Đường link video — 1 link mỗi dòng để xử lý hàng loạt (TikTok / Douyin / v.v.)": ["Video links — one per line for batch processing (TikTok / Douyin / etc.)", "视频链接——每行一个，可批量处理（TikTok / 抖音等）"],
-  "Ngôn ngữ gốc video reup": ["Original video language", "原视频语言"],
-  "Ngôn ngữ voice & subtitle video reup": ["Dub and subtitle language", "配音和字幕语言"],
-  "Chọn voice giọng đọc video reup": ["Select dubbing voice", "选择配音音色"],
-  "Mặc định": ["Default", "默认"],
-  "Danh sách voice thay đổi theo ngôn ngữ voice & subtitle ở phía trên.": ["The voice list follows the dub and subtitle language selected above.", "音色列表会随上方选择的配音和字幕语言变化。"],
-  "Cho tôi xem & sửa phụ đề dịch trước khi render (không phù hợp khi xử lý hàng loạt nhiều link)": ["Let me review and edit translated subtitles before rendering (not suitable for large batches)", "渲染前让我检查并编辑翻译字幕（不适合大量批处理）"],
-  "Chèn logo riêng vào video": ["Add a custom logo to the video", "为视频添加自定义标志"],
-  "Ảnh logo (PNG/JPG/WEBP)": ["Logo image (PNG/JPG/WEBP)", "标志图片（PNG/JPG/WEBP）"],
-  "Kích thước (px)": ["Size (px)", "尺寸（像素）"],
-  "Vị trí": ["Position", "位置"],
-  "Góc trên trái": ["Top left", "左上角"],
-  "Góc trên phải": ["Top right", "右上角"],
-  "Góc dưới trái": ["Bottom left", "左下角"],
-  "Góc dưới phải": ["Bottom right", "右下角"],
-  "Bắt đầu xử lý": ["Start processing", "开始处理"],
-  "Tạo video AI từ ý tưởng/cảnh quay": ["Create an AI video from an idea or footage", "根据创意或素材创建 AI 视频"],
-  "Chủ đề": ["Topic", "主题"],
-  "Tỷ lệ": ["Aspect ratio", "画面比例"],
-  "Thời lượng": ["Duration", "时长"],
-  "Chuyển cảnh": ["Transition", "转场"],
-  "Dọc 9:16": ["Portrait 9:16", "竖屏 9:16"],
-  "Ngang 16:9": ["Landscape 16:9", "横屏 16:9"],
-  "30 giây": ["30 seconds", "30 秒"],
-  "45 giây": ["45 seconds", "45 秒"],
-  "60 giây": ["60 seconds", "60 秒"],
-  "2 phút": ["2 minutes", "2 分钟"],
-  "3 phút": ["3 minutes", "3 分钟"],
-  "5 phút": ["5 minutes", "5 分钟"],
-  "8 phút": ["8 minutes", "8 分钟"],
-  "10 phút": ["10 minutes", "10 分钟"],
-  "15 phút": ["15 minutes", "15 分钟"],
-  "20 phút": ["20 minutes", "20 分钟"],
-  "Mờ dần": ["Fade", "淡入淡出"],
-  "Trượt sang trái": ["Slide left", "向左滑动"],
-  "Trượt sang phải": ["Slide right", "向右滑动"],
-  "Trượt lên trên": ["Slide up", "向上滑动"],
-  "Trượt xuống dưới": ["Slide down", "向下滑动"],
-  "Phóng to chậm": ["Slow zoom in", "缓慢放大"],
-  "Thu nhỏ chậm": ["Slow zoom out", "缓慢缩小"],
-  "Không hiệu ứng": ["No effect", "无效果"],
-  "Ngôn ngữ voice & subtitle": ["Voice and subtitle language", "配音和字幕语言"],
-  "Giọng đọc video AI": ["AI video voice", "AI 视频音色"],
-  "Nguồn hình ảnh": ["Visual source", "画面来源"],
-  "AI Sinh Ảnh": ["AI image generation", "AI 生成图片"],
-  "AI Sinh Video (GPU)": ["AI video generation (GPU)", "AI 生成视频（GPU）"],
-  "Video keyword": ["Video keywords", "视频关键词"],
-  "Gen keyword": ["Generate keywords", "生成关键词"],
-  "Copy keyword": ["Copy keywords", "复制关键词"],
-  "Visual brief / ý tưởng cảnh quay (không bắt buộc, mỗi dòng là một cảnh)": ["Visual brief / shot ideas (optional, one scene per line)", "视觉说明 / 镜头创意（可选，每行一个场景）"],
-  "Gen visual brief từ chủ đề": ["Generate visual brief from topic", "根据主题生成视觉说明"],
-  "Kịch bản voice & subtitle (mỗi dòng là một câu thoại)": ["Voice and subtitle script (one sentence per line)", "配音和字幕脚本（每行一句）"],
-  "Gen kịch bản voice": ["Generate voice script", "生成配音脚本"],
-  "Tạo video AI": ["Create AI video", "创建 AI 视频"],
-  "Đang chuẩn bị...": ["Preparing...", "正在准备……"],
-  "Video đang xem": ["Current video", "当前视频"],
-  "Lịch sử": ["History", "历史记录"],
-  "Từ ngày": ["From date", "开始日期"],
-  "Đến ngày": ["To date", "结束日期"],
-  "Xoá lọc": ["Clear filters", "清除筛选"],
-  "Chọn tất cả": ["Select all", "全选"],
-  "Xoá mục đã chọn": ["Delete selected", "删除所选项"],
-  "Xác nhận": ["Confirm", "确认"],
-  "Hủy": ["Cancel", "取消"],
-  "Xóa": ["Delete", "删除"],
-  "Chỉnh sửa phụ đề trước khi render": ["Edit subtitles before rendering", "渲染前编辑字幕"],
-  "Lưu thay đổi": ["Save changes", "保存更改"],
-  "Lưu & Render": ["Save and render", "保存并渲染"],
-  "Góp ý / Báo lỗi": ["Feedback / Report an issue", "反馈 / 报告问题"],
-  "Gặp lỗi hay có ý tưởng cải thiện? Cho chúng tôi biết.": ["Found an issue or have an improvement idea? Let us know.", "遇到问题或有改进建议？请告诉我们。"],
-  "Gửi góp ý": ["Send feedback", "发送反馈"],
-  "Góp ý": ["Feedback", "反馈"],
-  "Ghi chú thanh toán": ["Payment note", "付款备注"],
-  "Gửi yêu cầu nạp": ["Submit top-up request", "提交充值申请"],
-  "Lịch sử nạp": ["Top-up history", "充值记录"],
-  "Gói": ["Package", "套餐"],
-  "Số tiền": ["Amount", "金额"],
-  "Trạng thái": ["Status", "状态"],
-  "Thời gian": ["Time", "时间"],
-  "Xem trước": ["Preview", "预览"],
-  "Tải xuống": ["Download", "下载"],
-  "Kiểm tra trước đăng": ["Pre-publish check", "发布前检查"],
-  "Đăng lên mạng xã hội": ["Publish to social media", "发布到社交平台"],
-  "Tiêu đề": ["Title", "标题"],
-  "Mô tả": ["Description", "描述"],
-  "Hashtag (cách nhau bằng dấu cách)": ["Hashtags (space separated)", "话题标签（用空格分隔）"],
-  "Hẹn giờ đăng (theo giờ trên thiết bị)": ["Schedule publishing (device time)", "定时发布（设备时间）"],
-  "Đăng ngay": ["Publish now", "立即发布"],
-  "Hẹn giờ đăng": ["Schedule", "定时发布"],
-  "Người dùng, credit, và thống kê hệ thống": ["Users, credits and system statistics", "用户、积分和系统统计"],
-  "Quay lại": ["Back", "返回"],
-  "Tổng quan": ["Overview", "概览"],
-  "Tạo tài khoản mới": ["Create a new account", "创建新账户"],
-  "Credit ban đầu": ["Initial credits", "初始积分"],
-  "Tạo tài khoản": ["Create account", "创建账户"],
-  "Người dùng": ["Users", "用户"],
-  "Vai trò": ["Role", "角色"],
-  "Điều chỉnh": ["Adjustment", "调整"],
-  "Yêu cầu nạp token": ["Token top-up requests", "代币充值申请"],
-  "Ghi chú": ["Note", "备注"],
-  "Thao tác": ["Actions", "操作"],
-  "Duyệt": ["Approve", "批准"],
-  "Từ chối": ["Reject", "拒绝"],
-  "Góp ý / Báo lỗi từ người dùng": ["User feedback / issue reports", "用户反馈 / 问题报告"],
-  "Nội dung": ["Content", "内容"],
-  "Trang": ["Page", "页面"],
-  "Đang chờ": ["Queued", "等待中"],
-  "Đang xử lý": ["Processing", "处理中"],
-  "Chờ sửa phụ đề": ["Awaiting subtitle review", "等待字幕审核"],
-  "Xong": ["Done", "完成"],
-  "Lỗi": ["Error", "错误"],
-  "Hoàn tất": ["Completed", "已完成"],
-  "Thử lại": ["Retry", "重试"],
-  "Chỉnh sửa phụ đề & Render": ["Edit subtitles and render", "编辑字幕并渲染"],
-  "Đăng lên MXH": ["Publish", "发布到社交平台"],
-  "Áp dụng": ["Apply", "应用"],
-  "Đã kết nối": ["Connected", "已连接"],
-  "Chưa kết nối": ["Not connected", "未连接"],
-  "Kết nối": ["Connect", "连接"],
-  "Ngắt kết nối": ["Disconnect", "断开连接"]
-};
-
-// Additional Asian locales. Missing future strings deliberately fall back to
-// English instead of leaking Vietnamese into an otherwise localized screen.
-const UI_ASIAN_TRANSLATIONS = {
-  "Đăng nhập": ["ログイン", "로그인", "เข้าสู่ระบบ"],
-  "Đăng ký": ["登録", "회원가입", "สมัครสมาชิก"],
-  "Tạo tài khoản admin": ["管理者アカウントを作成", "관리자 계정 만들기", "สร้างบัญชีผู้ดูแลระบบ"],
-  "Tài khoản đầu tiên sẽ là quản trị viên hệ thống": ["最初のアカウントがシステム管理者になります", "첫 번째 계정은 시스템 관리자가 됩니다", "บัญชีแรกจะเป็นผู้ดูแลระบบ"],
-  "Tên đăng nhập / Email / Số điện thoại": ["ユーザー名 / メール / 電話番号", "사용자 이름 / 이메일 / 전화번호", "ชื่อผู้ใช้ / อีเมล / เบอร์โทรศัพท์"],
-  "Email / Số điện thoại": ["メール / 電話番号", "이메일 / 전화번호", "อีเมล / เบอร์โทรศัพท์"],
-  "Tên đăng nhập": ["ユーザー名", "사용자 이름", "ชื่อผู้ใช้"],
-  "Mật khẩu": ["パスワード", "비밀번호", "รหัสผ่าน"],
-  "Mã giới thiệu (nếu có)": ["紹介コード（任意）", "추천 코드(선택)", "รหัสแนะนำ (ไม่บังคับ)"],
-  "hoặc": ["または", "또는", "หรือ"],
-  "Đăng nhập với Google": ["Googleでログイン", "Google로 로그인", "เข้าสู่ระบบด้วย Google"],
-  "Đăng nhập với GitHub": ["GitHubでログイン", "GitHub로 로그인", "เข้าสู่ระบบด้วย GitHub"],
-  "Đăng nhập với Facebook": ["Facebookでログイン", "Facebook으로 로그인", "เข้าสู่ระบบด้วย Facebook"],
-  "Dịch & lồng tiếng video, xem trước, tải xuống, đăng lên mạng xã hội": ["動画の翻訳・吹替・プレビュー・ダウンロード・SNS投稿", "동영상 번역·더빙·미리보기·다운로드·SNS 게시", "แปลและพากย์วิดีโอ ดูตัวอย่าง ดาวน์โหลด และเผยแพร่"],
-  "Credit còn lại": ["残りクレジット", "남은 크레딧", "เครดิตคงเหลือ"],
-  "Nạp token": ["トークンをチャージ", "토큰 충전", "เติมโทเคน"],
-  "Phản hồi / Góp ý": ["フィードバック", "피드백", "ข้อเสนอแนะ"],
-  "Quản trị": ["管理", "관리", "ผู้ดูแลระบบ"],
-  "Đăng xuất": ["ログアウト", "로그아웃", "ออกจากระบบ"],
-  "Sao chép link": ["リンクをコピー", "링크 복사", "คัดลอกลิงก์"],
-  "Đã sao chép ✓": ["コピーしました ✓", "복사됨 ✓", "คัดลอกแล้ว ✓"],
-  "Dịch & lồng tiếng video có sẵn": ["既存動画を翻訳・吹替", "기존 동영상 번역 및 더빙", "แปลและพากย์วิดีโอที่มีอยู่"],
-  "Đường link video — 1 link mỗi dòng để xử lý hàng loạt (TikTok / Douyin / v.v.)": ["動画リンク — 一括処理は1行に1件（TikTok / Douyinなど）", "동영상 링크 — 일괄 처리 시 한 줄에 하나(TikTok / Douyin 등)", "ลิงก์วิดีโอ — หนึ่งลิงก์ต่อบรรทัดสำหรับการประมวลผลแบบกลุ่ม"],
-  "Ngôn ngữ gốc video reup": ["元動画の言語", "원본 동영상 언어", "ภาษาต้นฉบับของวิดีโอ"],
-  "Ngôn ngữ voice & subtitle video reup": ["吹替・字幕の言語", "더빙 및 자막 언어", "ภาษาพากย์และคำบรรยาย"],
-  "Chọn voice giọng đọc video reup": ["吹替音声を選択", "더빙 음성 선택", "เลือกเสียงพากย์"],
-  "Mặc định": ["デフォルト", "기본값", "ค่าเริ่มต้น"],
-  "Danh sách voice thay đổi theo ngôn ngữ voice & subtitle ở phía trên.": ["音声一覧は上で選択した吹替・字幕言語に連動します。", "음성 목록은 위에서 선택한 더빙 및 자막 언어에 따라 변경됩니다.", "รายการเสียงจะเปลี่ยนตามภาษาพากย์และคำบรรยายที่เลือกด้านบน"],
-  "Cho tôi xem & sửa phụ đề dịch trước khi render (không phù hợp khi xử lý hàng loạt nhiều link)": ["レンダリング前に翻訳字幕を確認・編集する", "렌더링 전에 번역 자막 검토 및 편집", "ตรวจสอบและแก้ไขคำบรรยายก่อนเรนเดอร์"],
-  "Chèn logo riêng vào video": ["動画にロゴを追加", "동영상에 로고 추가", "เพิ่มโลโก้ลงในวิดีโอ"],
-  "Ảnh logo (PNG/JPG/WEBP)": ["ロゴ画像（PNG/JPG/WEBP）", "로고 이미지(PNG/JPG/WEBP)", "รูปโลโก้ (PNG/JPG/WEBP)"],
-  "Kích thước (px)": ["サイズ（px）", "크기(px)", "ขนาด (px)"],
-  "Vị trí": ["位置", "위치", "ตำแหน่ง"],
-  "Góc trên trái": ["左上", "왼쪽 위", "มุมซ้ายบน"],
-  "Góc trên phải": ["右上", "오른쪽 위", "มุมขวาบน"],
-  "Góc dưới trái": ["左下", "왼쪽 아래", "มุมซ้ายล่าง"],
-  "Góc dưới phải": ["右下", "오른쪽 아래", "มุมขวาล่าง"],
-  "Bắt đầu xử lý": ["処理を開始", "처리 시작", "เริ่มประมวลผล"],
-  "Tạo video AI từ ý tưởng/cảnh quay": ["アイデアや素材からAI動画を作成", "아이디어/영상으로 AI 동영상 만들기", "สร้างวิดีโอ AI จากไอเดียหรือฟุตเทจ"],
-  "Chủ đề": ["テーマ", "주제", "หัวข้อ"],
-  "Tỷ lệ": ["アスペクト比", "화면 비율", "อัตราส่วนภาพ"],
-  "Thời lượng": ["長さ", "길이", "ระยะเวลา"],
-  "Chuyển cảnh": ["トランジション", "전환 효과", "การเปลี่ยนฉาก"],
-  "Dọc 9:16": ["縦 9:16", "세로 9:16", "แนวตั้ง 9:16"],
-  "Ngang 16:9": ["横 16:9", "가로 16:9", "แนวนอน 16:9"],
-  "Ngôn ngữ voice & subtitle": ["音声・字幕の言語", "음성 및 자막 언어", "ภาษาพากย์และคำบรรยาย"],
-  "Giọng đọc video AI": ["AI動画の音声", "AI 동영상 음성", "เสียงวิดีโอ AI"],
-  "Nguồn hình ảnh": ["映像ソース", "이미지 소스", "แหล่งภาพ"],
-  "AI Sinh Ảnh": ["AI画像生成", "AI 이미지 생성", "สร้างภาพด้วย AI"],
-  "AI Sinh Video (GPU)": ["AI動画生成（GPU）", "AI 동영상 생성(GPU)", "สร้างวิดีโอ AI (GPU)"],
-  "Video keyword": ["動画キーワード", "동영상 키워드", "คีย์เวิร์ดวิดีโอ"],
-  "Gen keyword": ["キーワードを生成", "키워드 생성", "สร้างคีย์เวิร์ด"],
-  "Copy keyword": ["キーワードをコピー", "키워드 복사", "คัดลอกคีย์เวิร์ด"],
-  "Visual brief / ý tưởng cảnh quay (không bắt buộc, mỗi dòng là một cảnh)": ["ビジュアル概要 / ショット案（任意、1行1シーン）", "비주얼 브리프 / 장면 아이디어(선택, 한 줄에 한 장면)", "แนวคิดภาพ / ฉาก (ไม่บังคับ หนึ่งฉากต่อบรรทัด)"],
-  "Gen visual brief từ chủ đề": ["テーマからビジュアル概要を生成", "주제에서 비주얼 브리프 생성", "สร้างแนวคิดภาพจากหัวข้อ"],
-  "Kịch bản voice & subtitle (mỗi dòng là một câu thoại)": ["音声・字幕台本（1行1文）", "음성 및 자막 스크립트(한 줄에 한 문장)", "สคริปต์เสียงและคำบรรยาย (หนึ่งประโยคต่อบรรทัด)"],
-  "Gen kịch bản voice": ["音声台本を生成", "음성 스크립트 생성", "สร้างสคริปต์เสียง"],
-  "Tạo video AI": ["AI動画を作成", "AI 동영상 만들기", "สร้างวิดีโอ AI"],
-  "Đang chuẩn bị...": ["準備中...", "준비 중...", "กำลังเตรียม..."],
-  "Video đang xem": ["再生中の動画", "현재 동영상", "วิดีโอปัจจุบัน"],
-  "Lịch sử": ["履歴", "기록", "ประวัติ"],
-  "Từ ngày": ["開始日", "시작일", "จากวันที่"],
-  "Đến ngày": ["終了日", "종료일", "ถึงวันที่"],
-  "Xoá lọc": ["フィルターを解除", "필터 지우기", "ล้างตัวกรอง"],
-  "Chọn tất cả": ["すべて選択", "모두 선택", "เลือกทั้งหมด"],
-  "Xoá mục đã chọn": ["選択項目を削除", "선택 항목 삭제", "ลบรายการที่เลือก"],
-  "Xác nhận": ["確認", "확인", "ยืนยัน"],
-  "Hủy": ["キャンセル", "취소", "ยกเลิก"],
-  "Xóa": ["削除", "삭제", "ลบ"],
-  "Chỉnh sửa phụ đề trước khi render": ["レンダリング前に字幕を編集", "렌더링 전 자막 편집", "แก้ไขคำบรรยายก่อนเรนเดอร์"],
-  "Lưu thay đổi": ["変更を保存", "변경 사항 저장", "บันทึกการเปลี่ยนแปลง"],
-  "Lưu & Render": ["保存してレンダリング", "저장 및 렌더링", "บันทึกและเรนเดอร์"],
-  "Góp ý / Báo lỗi": ["フィードバック / 問題報告", "피드백 / 오류 신고", "ข้อเสนอแนะ / รายงานปัญหา"],
-  "Gửi góp ý": ["フィードバックを送信", "피드백 보내기", "ส่งข้อเสนอแนะ"],
-  "Góp ý": ["フィードバック", "피드백", "ข้อเสนอแนะ"],
-  "Ghi chú thanh toán": ["支払いメモ", "결제 메모", "หมายเหตุการชำระเงิน"],
-  "Gửi yêu cầu nạp": ["チャージ申請を送信", "충전 요청 보내기", "ส่งคำขอเติมเงิน"],
-  "Lịch sử nạp": ["チャージ履歴", "충전 내역", "ประวัติการเติมเงิน"],
-  "Gói": ["パッケージ", "패키지", "แพ็กเกจ"],
-  "Số tiền": ["金額", "금액", "จำนวนเงิน"],
-  "Trạng thái": ["状態", "상태", "สถานะ"],
-  "Thời gian": ["時刻", "시간", "เวลา"],
-  "Xem trước": ["プレビュー", "미리보기", "ดูตัวอย่าง"],
-  "Tải xuống": ["ダウンロード", "다운로드", "ดาวน์โหลด"],
-  "Kiểm tra trước đăng": ["投稿前チェック", "게시 전 확인", "ตรวจสอบก่อนเผยแพร่"],
-  "Đăng lên mạng xã hội": ["SNSに投稿", "SNS에 게시", "เผยแพร่ไปยังโซเชียลมีเดีย"],
-  "Tiêu đề": ["タイトル", "제목", "ชื่อเรื่อง"],
-  "Mô tả": ["説明", "설명", "คำอธิบาย"],
-  "Hashtag (cách nhau bằng dấu cách)": ["ハッシュタグ（スペース区切り）", "해시태그(공백으로 구분)", "แฮชแท็ก (คั่นด้วยช่องว่าง)"],
-  "Hẹn giờ đăng (theo giờ trên thiết bị)": ["投稿予約（端末時刻）", "게시 예약(기기 시간)", "ตั้งเวลาเผยแพร่ (เวลาของอุปกรณ์)"],
-  "Đăng ngay": ["今すぐ投稿", "지금 게시", "เผยแพร่ทันที"],
-  "Hẹn giờ đăng": ["予約投稿", "예약 게시", "ตั้งเวลาเผยแพร่"],
-  "Quản trị": ["管理", "관리", "ผู้ดูแลระบบ"],
-  "Quay lại": ["戻る", "뒤로", "กลับ"],
-  "Tổng quan": ["概要", "개요", "ภาพรวม"],
-  "Tạo tài khoản mới": ["新しいアカウントを作成", "새 계정 만들기", "สร้างบัญชีใหม่"],
-  "Tạo tài khoản": ["アカウントを作成", "계정 만들기", "สร้างบัญชี"],
-  "Người dùng": ["ユーザー", "사용자", "ผู้ใช้"],
-  "Vai trò": ["役割", "역할", "บทบาท"],
-  "Điều chỉnh": ["調整", "조정", "ปรับ"],
-  "Thao tác": ["操作", "작업", "การดำเนินการ"],
-  "Duyệt": ["承認", "승인", "อนุมัติ"],
-  "Từ chối": ["拒否", "거부", "ปฏิเสธ"],
-  "Nội dung": ["内容", "내용", "เนื้อหา"],
-  "Trang": ["ページ", "페이지", "หน้า"],
-  "Đang chờ": ["待機中", "대기 중", "กำลังรอ"],
-  "Đang xử lý": ["処理中", "처리 중", "กำลังประมวลผล"],
-  "Chờ sửa phụ đề": ["字幕確認待ち", "자막 검토 대기", "รอตรวจคำบรรยาย"],
-  "Xong": ["完了", "완료", "เสร็จแล้ว"],
-  "Lỗi": ["エラー", "오류", "ข้อผิดพลาด"],
-  "Hoàn tất": ["完了", "완료", "เสร็จสมบูรณ์"],
-  "Thử lại": ["再試行", "다시 시도", "ลองอีกครั้ง"],
-  "Áp dụng": ["適用", "적용", "นำไปใช้"],
-  "Đã kết nối": ["接続済み", "연결됨", "เชื่อมต่อแล้ว"],
-  "Chưa kết nối": ["未接続", "연결되지 않음", "ยังไม่เชื่อมต่อ"],
-  "Kết nối": ["接続", "연결", "เชื่อมต่อ"],
-  "Ngắt kết nối": ["切断", "연결 해제", "ยกเลิกการเชื่อมต่อ"]
-};
-
-const UI_LANG_INDEX = { en: 0, "zh-CN": 1 };
-const UI_ASIAN_LANG_INDEX = { ja: 0, ko: 1, th: 2 };
-const uiOriginalText = new WeakMap();
-const uiOriginalAttrs = new WeakMap();
-let currentUiLanguage = localStorage.getItem("ui-language") ||
-  (navigator.language.startsWith("zh") ? "zh-CN" :
-   navigator.language.startsWith("vi") ? "vi" :
-   navigator.language.startsWith("ja") ? "ja" :
-   navigator.language.startsWith("ko") ? "ko" :
-   navigator.language.startsWith("th") ? "th" : "en");
-if (!UI_LANG_INDEX.hasOwnProperty(currentUiLanguage) && !UI_ASIAN_LANG_INDEX.hasOwnProperty(currentUiLanguage) && currentUiLanguage !== "vi") currentUiLanguage = "en";
-
-function normalizedUiText(value) { return value.trim().replace(/\s+/g, " "); }
-function translatedUiText(original) {
-  if (currentUiLanguage === "vi") return original;
-  const key = normalizedUiText(original);
-  let translated = UI_ASIAN_LANG_INDEX.hasOwnProperty(currentUiLanguage)
-    ? UI_ASIAN_TRANSLATIONS[key]?.[UI_ASIAN_LANG_INDEX[currentUiLanguage]]
-    : UI_TRANSLATIONS[key]?.[UI_LANG_INDEX[currentUiLanguage]];
-  let decorativePrefix = "";
-  if (!translated) {
-    const prefixed = key.match(/^([^\p{L}\p{N}]*)(.*)$/u);
-    decorativePrefix = prefixed?.[1] || "";
-    translated = UI_ASIAN_LANG_INDEX.hasOwnProperty(currentUiLanguage)
-      ? UI_ASIAN_TRANSLATIONS[prefixed?.[2]]?.[UI_ASIAN_LANG_INDEX[currentUiLanguage]]
-      : UI_TRANSLATIONS[prefixed?.[2]]?.[UI_LANG_INDEX[currentUiLanguage]];
-  }
-  if (!translated && UI_ASIAN_LANG_INDEX.hasOwnProperty(currentUiLanguage)) {
-    const fallbackKey = key.replace(/^[^\p{L}\p{N}]*/u, "");
-    translated = UI_TRANSLATIONS[fallbackKey]?.[0];
-  }
-  if (!translated) return original;
-  const leading = original.match(/^\s*/)?.[0] || "";
-  const trailing = original.match(/\s*$/)?.[0] || "";
-  return leading + decorativePrefix + translated + trailing;
-}
-function uiLocale() { return { vi: "vi-VN", en: "en-US", "zh-CN": "zh-CN", ja: "ja-JP", ko: "ko-KR", th: "th-TH" }[currentUiLanguage] || "en-US"; }
-function translateUiNode(root) {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  while (walker.nextNode()) nodes.push(walker.currentNode);
-  for (const node of nodes) {
-    if (node.parentElement?.closest("script,style")) continue;
-    if (!uiOriginalText.has(node)) uiOriginalText.set(node, node.nodeValue);
-    node.nodeValue = translatedUiText(uiOriginalText.get(node));
-  }
-  const elements = root.nodeType === Node.ELEMENT_NODE ? [root, ...root.querySelectorAll("*")] : [...document.querySelectorAll("*")];
-  for (const element of elements) {
-    let originals = uiOriginalAttrs.get(element);
-    if (!originals) { originals = {}; uiOriginalAttrs.set(element, originals); }
-    for (const attr of ["placeholder", "title", "aria-label"]) {
-      if (!element.hasAttribute(attr)) continue;
-      if (!(attr in originals)) originals[attr] = element.getAttribute(attr);
-      element.setAttribute(attr, translatedUiText(originals[attr]));
-    }
-  }
-}
-function setUiLanguage(language) {
-  currentUiLanguage = language;
-  localStorage.setItem("ui-language", language);
-  document.documentElement.lang = language;
-  document.getElementById("ui-language-select").value = language;
-  translateUiNode(document.body);
-  document.dispatchEvent(new CustomEvent("ui-language-changed", { detail: { language } }));
-}
-
-const uiLanguageSelect = document.getElementById("ui-language-select");
-uiLanguageSelect.addEventListener("change", event => setUiLanguage(event.target.value));
-setUiLanguage(currentUiLanguage);
-new MutationObserver(mutations => {
-  for (const mutation of mutations) {
-    for (const node of mutation.addedNodes) {
-      if (node.nodeType === Node.ELEMENT_NODE) translateUiNode(node);
-      else if (node.nodeType === Node.TEXT_NODE && node.parentElement) translateUiNode(node.parentElement);
-    }
-  }
-}).observe(document.body, { childList: true, subtree: true });
-
-const $ = (sel) => document.querySelector(sel);
-const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, ch => ({
-  "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
-}[ch]));
-let currentJobId = null;
-let selectedPlatforms = new Set();
-let pollTimer = null;
-let pollTimer2 = null;
-let selectedTopupPackage = null;
-let selectedHistoryJobs = new Set();
-let latestResultJobId = null;
-let _confirmResolver = null;
-
-function showConfirmDialog(title, message, confirmLabel = "Xóa") {
-  $("#confirm-title").textContent = title;
-  $("#confirm-message").textContent = message;
-  $("#confirm-accept").textContent = confirmLabel;
-  $("#confirm-modal").classList.remove("hidden");
-  return new Promise(resolve => { _confirmResolver = resolve; });
-}
-
-function closeConfirmDialog(accepted) {
-  $("#confirm-modal").classList.add("hidden");
-  const resolve = _confirmResolver;
-  _confirmResolver = null;
-  if (resolve) resolve(accepted);
-}
-
-$("#confirm-cancel").onclick = () => closeConfirmDialog(false);
-$("#confirm-accept").onclick = () => closeConfirmDialog(true);
-$("#confirm-modal").addEventListener("click", ev => {
-  if (ev.target === $("#confirm-modal")) closeConfirmDialog(false);
-});
-
-function showHistoryVideo(job) {
-  if (!job || !job.has_video) return;
-  $("#latest-result-card").classList.remove("hidden");
-  $("#latest-result-title").textContent = job.title || job.source_url;
-  $("#latest-improve-btn").dataset.jobId = job.id;
-  if (latestResultJobId !== job.id) {
-    latestResultJobId = job.id;
-    $("#latest-result-video").src = `/api/jobs/${job.id}/video`;
-  }
-}
-const TOPUP_PACKAGES = [
-  { credits: 50, amount_vnd: 50000 },
-  { credits: 120, amount_vnd: 100000 },
-  { credits: 300, amount_vnd: 250000 },
-  { credits: 700, amount_vnd: 500000 },
-];
-
-async function api(path, opts = {}) {
-  const resp = await fetch(path, {
-    ...opts,
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-  });
-  if (!resp.ok) {
-    const body = await resp.json().catch(() => ({}));
-    throw new Error(body.detail || `HTTP ${resp.status}`);
-  }
-  return resp.status === 204 ? null : resp.json();
-}
-
-// ---------------- auth ----------------
-let needsRegistrationGlobal = false;
-
-async function initAuth() {
-  const boot = await api("/api/bootstrap");
-  needsRegistrationGlobal = boot.needs_registration;
-
-  if (needsRegistrationGlobal) {
-    $("#auth-title").textContent = "Tạo tài khoản admin";
-    $("#auth-sub").textContent = "Tài khoản đầu tiên sẽ là quản trị viên hệ thống";
-    // Keep both tabs visible even on a brand-new database. The first visit
-    // opens registration because an admin must be created, but an existing
-    // user can always switch back to Login (for example after changing the
-    // local database path or restoring a database).
-    $("#show-login-tab").classList.remove("hidden");
-    showAuthTab("register");
-  }
-
-  // Buttons always stay clickable — this way clicking one always DOES
-  // something. If the admin hasn't added that provider's Client ID/Secret
-  // to .env yet, the click still goes through to the server, which
-  // replies with a clear "here's what to configure" message shown right
-  // under the form (instead of silently disabling the button, which just
-  // looked broken/unresponsive with no explanation).
-  document.querySelectorAll("#social-login-row [data-provider]").forEach(btn => {
-    const provider = btn.dataset.provider;
-    const configured = !!(boot.identity_providers && boot.identity_providers[provider]);
-    if (!configured) btn.title = "Chưa cấu hình — bấm để xem cần thêm gì vào .env";
-    btn.onclick = () => startIdentityLogin(provider);
-  });
-
-  try {
-    const me = await api("/api/me");
-    showApp(me);
-  } catch {
-    $("#auth-view").classList.remove("hidden");
-  }
-
-  // Surface an error from a failed "Sign in with ..." redirect, if any.
-  const params = new URLSearchParams(location.search);
-  if (params.get("login_error")) {
-    $("#auth-error").textContent = "Đăng nhập thất bại: " + params.get("login_error");
-    history.replaceState(null, "", location.pathname);
-  }
-  // Someone followed a friend's invite link (?ref=CODE) — prefill it so
-  // they don't have to type/paste it manually.
-  if (params.get("ref")) {
-    $("#register-referral-code").value = params.get("ref");
-    showAuthTab("register");
-  }
-}
-
-function showAuthTab(tab) {
-  const isLogin = tab === "login";
-  $("#login-form").classList.toggle("hidden", !isLogin);
-  $("#register-form").classList.toggle("hidden", isLogin);
-  $("#show-login-tab").classList.toggle("active", isLogin);
-  $("#show-register-tab").classList.toggle("active", !isLogin);
-  $("#auth-title").textContent = isLogin ? "Đăng nhập" : (needsRegistrationGlobal ? "Tạo tài khoản admin" : "Đăng ký");
-  $("#auth-error").textContent = "";
-}
-
-$("#show-login-tab").onclick = () => showAuthTab("login");
-$("#show-register-tab").onclick = () => showAuthTab("register");
-$("#login-form").addEventListener("submit", (ev) => {
-  ev.preventDefault();
-  doLogin();
-});
-$("#register-form").addEventListener("submit", (ev) => {
-  ev.preventDefault();
-  doRegister();
-});
-
-async function doLogin() {
-  $("#auth-error").textContent = "";
-  try {
-    await api("/api/login", { method: "POST", body: JSON.stringify({
-      identifier: $("#login-identifier").value.trim(), password: $("#login-password").value,
-    })});
-    const me = await api("/api/me");
-    showApp(me);
-  } catch (e) { $("#auth-error").textContent = e.message; }
-}
-
-async function doRegister() {
-  $("#auth-error").textContent = "";
-  try {
-    await api("/api/register", { method: "POST", body: JSON.stringify({
-      contact_identifier: $("#register-contact").value.trim(),
-      username: $("#register-username").value.trim(),
-      password: $("#register-password").value,
-      referral_code: $("#register-referral-code").value.trim() || null,
-    })});
-    const me = await api("/api/me");
-    showApp(me);
-  } catch (e) { $("#auth-error").textContent = e.message; }
-}
-
-async function startIdentityLogin(provider) {
-  try {
-    const { authorize_url } = await api(`/api/identity/login/${provider}`);
-    location.href = authorize_url; // full-page redirect — this IS the login action, not a popup
-  } catch (e) { $("#auth-error").textContent = e.message; }
-}
-
-function showApp(me) {
-  $("#auth-view").classList.add("hidden");
-  $("#app-view").classList.remove("hidden");
-  $("#userbar-name").textContent = me.username;
-  $("#userbar-credits").textContent = `💳 ${me.credits}`;
-  $("#admin-btn").classList.toggle("hidden", !me.is_admin);
-  $("#feedback-fab").classList.remove("hidden");
-  $("#feedback-header-btn").classList.remove("hidden");
-
-  $("#referral-link").textContent = `${location.origin}/?ref=${me.referral_code}`;
-  loadLanguages();
-  loadPersonalStats();
-  refreshJobQueueStatus();
-  requestNotificationPermission();
-  refreshJobs();
-  pollTimer = setInterval(refreshJobs, 4000);
-  pollTimer2 = setInterval(refreshMe, 10000);
-}
-
-$("#referral-copy-btn").onclick = async () => {
-  try {
-    await navigator.clipboard.writeText($("#referral-link").textContent);
-    $("#referral-copy-btn").textContent = "Đã sao chép ✓";
-    setTimeout(() => { $("#referral-copy-btn").textContent = "Sao chép link"; }, 1500);
-  } catch { /* clipboard API unavailable (e.g. non-HTTPS) — link is still selectable by hand */ }
-};
-
-async function loadPersonalStats() {
-  try {
-    const stats = await api("/api/stats/me");
-    const by = stats.by_status || {};
-    $("#personal-stats").innerHTML = `
-      <div class="stat-box"><div class="num">${stats.total_jobs}</div><div class="label">Tổng số video đã xử lý</div></div>
-      <div class="stat-box"><div class="num">${by.done || 0}</div><div class="label">Hoàn tất</div></div>
-      <div class="stat-box"><div class="num">${by.error || 0}</div><div class="label">Lỗi</div></div>
-      <div class="stat-box"><div class="num">${stats.success_rate != null ? stats.success_rate + "%" : "—"}</div><div class="label">Tỷ lệ thành công</div></div>
-    `;
-  } catch (e) { /* non-critical widget, fail silently */ }
-}
-
-async function refreshJobQueueStatus() {
-  if (!$("#job-queue-card")) return;
-  try {
-    const status = await api("/api/job-queue/status");
-    $("#queue-active-count").textContent = status.active || 0;
-    $("#queue-waiting-count").textContent = status.queued || 0;
-    $("#queue-running-count").textContent = status.running || 0;
-    $("#queue-backend-label").textContent = status.backend || "-";
-    const redisState = status.redis_client_available ? "Redis client installed" : "Redis client missing";
-    $("#job-queue-note").textContent = `${status.phase || "Milestone 6"}: ${redisState}. Web runner: ${status.web_runner}. ${status.web_runner_note || ""}`;
-    $("#job-queue-note").style.color = "var(--text-dim)";
-  } catch (e) {
-    $("#job-queue-note").textContent = `Khong doc duoc trang thai queue: ${e.message}`;
-    $("#job-queue-note").style.color = "var(--err)";
-  }
-}
-
-$("#job-queue-refresh-btn").onclick = refreshJobQueueStatus;
-
-// ---------------- browser notifications ----------------
-// Fires a desktop notification when a job finishes (done or error) while
-// the tab isn't focused, so the person doesn't have to sit staring at the
-// page waiting — this is why refreshJobs() diffs against _lastKnownStatus
-// below instead of just re-rendering blindly.
-let _lastKnownStatus = {};
-
-function requestNotificationPermission() {
-  if (!("Notification" in window)) return;
-  if (Notification.permission === "default") {
-    Notification.requestPermission();
-  }
-}
-
-function _notifyJobStatusChange(job) {
-  if (!("Notification" in window) || Notification.permission !== "granted") return;
-  if (document.visibilityState === "visible") return; // no need to nag while they're already looking
-  if (job.status === "done") {
-    new Notification("Video đã xử lý xong 🎉", { body: job.title || job.source_url });
-  } else if (job.status === "error") {
-    new Notification("Xử lý video bị lỗi", { body: job.title || job.source_url });
-  }
-}
-
-async function refreshMe() {
-  try {
-    const me = await api("/api/me");
-    $("#userbar-credits").textContent = `💳 ${me.credits}`;
-    $("#stat-credits").textContent = me.credits;
-  } catch (e) { /* session likely expired; next job/history poll will surface it */ }
-}
-
-window.addEventListener("message", (ev) => {
-  if (ev.data === "social-connected") {
-    loadConnections();
-  }
-});
-
-$("#logout-btn").onclick = async () => {
-  await api("/api/logout", { method: "POST" });
-  clearInterval(pollTimer);
-  location.reload();
-};
-
-// ---------------- top-up requests ----------------
-function _formatVnd(amount) {
-  return new Intl.NumberFormat("vi-VN").format(amount) + "đ";
-}
-
-function _topupStatusLabel(status) {
-  return { pending: "Đang chờ", approved: "Đã duyệt", rejected: "Từ chối" }[status] || status;
-}
-
-function renderTopupPackages() {
-  selectedTopupPackage = selectedTopupPackage || TOPUP_PACKAGES[1];
-  $("#topup-packages").innerHTML = TOPUP_PACKAGES.map(pkg => `
-    <div class="topup-package ${pkg.credits === selectedTopupPackage.credits && pkg.amount_vnd === selectedTopupPackage.amount_vnd ? "active" : ""}"
-         data-credits="${pkg.credits}" data-amount="${pkg.amount_vnd}">
-      <div class="credits">${pkg.credits} token</div>
-      <div class="price">${_formatVnd(pkg.amount_vnd)}</div>
-    </div>
-  `).join("");
-  $("#topup-packages").querySelectorAll(".topup-package").forEach(el => {
-    el.onclick = () => {
-      selectedTopupPackage = { credits: parseInt(el.dataset.credits, 10), amount_vnd: parseInt(el.dataset.amount, 10) };
-      renderTopupPackages();
-    };
-  });
-}
-
-async function loadTopupHistory() {
-  const rows = await api("/api/top-up-requests");
-  $("#topup-history-body").innerHTML = rows.map(r => `
-    <tr>
-      <td>${r.credits} token</td>
-      <td>${_formatVnd(r.amount_vnd)}</td>
-      <td class="status-${r.status}">${_topupStatusLabel(r.status)}</td>
-      <td>${new Date(r.created_at * 1000).toLocaleString(uiLocale())}</td>
-    </tr>
-  `).join("") || `<tr><td colspan="4" style="color:var(--text-dim)">Chưa có yêu cầu nạp nào.</td></tr>`;
-}
-
-function renderPayment(payment, amount = 0, content = "") {
-  const box = $("#payment-box");
-  if (!payment || !payment.configured) {
-    box.innerHTML = `<div style="color:var(--warn)">Chưa cấu hình tài khoản nhận tiền. Admin cần thêm PAYMENT_BANK_ID, PAYMENT_ACCOUNT_NUMBER và PAYMENT_ACCOUNT_NAME vào .env rồi khởi động lại web.</div>`;
-    return;
-  }
-  box.innerHTML = `
-    <b>Chuyển khoản ngân hàng</b>
-    ${payment.qr_url ? `<img src="${escapeHtml(payment.qr_url)}" alt="QR thanh toán">` : ""}
-    <div class="payment-line"><span>Ngân hàng</span><b>${escapeHtml(payment.bank_name || payment.bank_id)}</b></div>
-    <div class="payment-line"><span>Số tài khoản</span><b>${escapeHtml(payment.account_number)}</b></div>
-    <div class="payment-line"><span>Chủ tài khoản</span><b>${escapeHtml(payment.account_name)}</b></div>
-    ${amount ? `<div class="payment-line"><span>Số tiền</span><b>${_formatVnd(amount)}</b></div>` : ""}
-    ${content ? `<div class="payment-line"><span>Nội dung CK</span><b>${escapeHtml(content)}</b></div>` : `<div style="color:var(--text-dim);font-size:12px;margin-top:8px">Chọn gói và gửi yêu cầu để tạo đúng số tiền, nội dung và mã QR.</div>`}
-  `;
-}
-
-$("#topup-btn").onclick = async () => {
-  $("#topup-status").textContent = "";
-  renderTopupPackages();
-  $("#topup-modal").classList.remove("hidden");
-  try {
-    const [payment] = await Promise.all([api("/api/payment-config"), loadTopupHistory()]);
-    renderPayment(payment);
-  } catch (e) {
-    $("#topup-status").style.color = "var(--err)";
-    $("#topup-status").textContent = e.message;
-  }
-};
-$("#topup-close").onclick = () => $("#topup-modal").classList.add("hidden");
-$("#topup-submit").onclick = async () => {
-  $("#topup-status").textContent = "";
-  const pkg = selectedTopupPackage || TOPUP_PACKAGES[1];
-  try {
-    const result = await api("/api/top-up-requests", { method: "POST", body: JSON.stringify({
-      credits: pkg.credits,
-      amount_vnd: pkg.amount_vnd,
-      payment_method: "bank_transfer",
-      note: $("#topup-note").value.trim() || null,
-    })});
-    $("#topup-note").value = "";
-    $("#topup-status").style.color = "var(--ok)";
-    renderPayment(result.payment, pkg.amount_vnd, result.transfer_content);
-    $("#topup-status").textContent = "Đã tạo yêu cầu. Quét QR/chuyển khoản đúng nội dung; admin duyệt xong token sẽ tự cộng.";
-    await loadTopupHistory();
-  } catch (e) {
-    $("#topup-status").style.color = "var(--err)";
-    $("#topup-status").textContent = e.message;
-  }
-};
-
-// ---------------- languages ----------------
-async function loadLanguages() {
-  try {
-    const { targets, sources } = await api("/api/languages");
-    $("#lang-select").innerHTML = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
-    $("#lang-select").value = "vi";
-    $("#creator-lang-select").innerHTML = targets.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
-    $("#creator-lang-select").value = "vi";
-    $("#source-lang-select").innerHTML = sources.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
-    $("#source-lang-select").value = "auto";
-    loadVoices();
-    loadCreatorVoices();
-    loadCreatorCapabilities();
-  } catch (e) { /* keep whatever was already in the selects if this fails */ }
-}
-
-async function loadVoices() {
-  try {
-    const { voices } = await api(`/api/voices?language=${encodeURIComponent($("#lang-select").value)}`);
-    $("#voice-select").innerHTML = `<option value="">Mặc định</option>` +
-      voices.map(v => `<option value="${v.id}">${v.label}</option>`).join("");
-  } catch (e) {
-    $("#voice-select").innerHTML = `<option value="">Mặc định</option>`;
-  }
-}
-$("#lang-select").addEventListener("change", loadVoices);
-
-async function loadCreatorVoices() {
-  try {
-    const { voices, language_label, default_voice } = await api(`/api/voices?language=${encodeURIComponent($("#creator-lang-select").value)}`);
-    $("#creator-voice-select").innerHTML = `<option value="">Mặc định · ${default_voice}</option>` +
-      voices.map(v => `<option value="${v.id}">${v.label}</option>`).join("");
-    $("#creator-voice-help").textContent = `${language_label}: ${voices.length} lựa chọn giọng đọc`;
-  } catch {
-    $("#creator-voice-select").innerHTML = `<option value="">Mặc định theo ngôn ngữ</option>`;
-    $("#creator-voice-help").textContent = "Không tải được danh sách giọng đọc";
-  }
-}
-
-async function loadCreatorCapabilities() {
-  const select = $("#creator-image-provider");
-  const help = $("#creator-image-provider-help");
-  try {
-    const data = await api("/api/creator/capabilities");
-    const videoOption = select.querySelector('option[value="ai_video"]');
-    if (videoOption) {
-      videoOption.disabled = !data.ai_video;
-      videoOption.textContent = data.ai_video
-        ? `AI Sinh Video (${data.ai_video_backend || "GPU"})`
-        : "AI Sinh Video (GPU không đủ VRAM)";
-    }
-    if (!data.ai_video && select.value === "ai_video") select.value = "cpu_ai";
-    help.textContent = data.gpu_name
-      ? `${data.gpu_name} · ${data.vram_gb} GB VRAM${data.ai_video ? ` · Video: ${data.ai_video_backend}` : " · Chỉ hỗ trợ AI Sinh Ảnh"}`
-      : "Không phát hiện GPU CUDA; AI Sinh Ảnh sẽ dùng CPU.";
-    help.title = data.ai_video_reason || "";
-  } catch (e) {
-    help.textContent = "Không kiểm tra được khả năng AI của máy chủ.";
-  }
-}
-$("#creator-lang-select").addEventListener("change", async () => {
-  await loadCreatorVoices();
-  $("#creator-keywords").value = "";
-  $("#creator-script").value = "";
-  $("#creator-narration").value = "";
-  window._creatorSuggestionCache = null;
-  window._creatorSuggestionPending = null;
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = "Đã đổi ngôn ngữ. Hãy gen lại nội dung để đồng nhất.";
-  updateCreatorSubmitState();
-});
-
-// ---------------- logo overlay ----------------
-let uploadedLogoId = null;
-
-$("#logo-enable-checkbox").onchange = (ev) => {
-  $("#logo-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-document.querySelectorAll(".corner-opt").forEach(el => {
-  el.onclick = () => {
-    document.querySelectorAll(".corner-opt").forEach(o => o.classList.remove("active"));
-    el.classList.add("active");
-  };
-});
-
-$("#logo-file-input").onchange = async (ev) => {
-  const file = ev.target.files[0];
-  if (!file) return;
-  $("#logo-upload-status").textContent = "Đang tải lên...";
-  const form = new FormData();
-  form.append("file", file);
-  try {
-    const resp = await fetch("/api/upload-logo", { method: "POST", body: form });
-    if (!resp.ok) throw new Error((await resp.json()).detail || "Tải logo thất bại");
-    const data = await resp.json();
-    uploadedLogoId = data.logo_path;
-    $("#logo-preview-box").classList.remove("hidden");
-    $("#logo-preview-img").src = data.preview_url;
-    $("#logo-upload-status").textContent = "Đã tải lên ✓";
-  } catch (e) {
-    $("#logo-upload-status").textContent = e.message;
-    uploadedLogoId = null;
-  }
-};
-
-// ---------------- animated subtitles ----------------
-$("#animated-subtitle-checkbox").onchange = (ev) => {
-  $("#animated-subtitle-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-function getAnimatedSubtitleConfig() {
-  if (!$("#animated-subtitle-checkbox").checked) {
-    return null;
-  }
-  return {
-    enabled: true,
-    effect: $("#subtitle-effect-select").value,
-    style: {
-      font_size: parseInt($("#subtitle-font-size").value, 10),
-      font_color: $("#subtitle-font-color").value,
-      background_color: $("#subtitle-bg-color").value,
-    },
-    effect_params: {
-      glow_color: $("#subtitle-glow-color").value,
-      gradient_colors: $("#subtitle-gradient-colors").value,
-    },
-  };
-}
-
-// ---------------- advanced script options ----------------
-$("#advanced-script-options-checkbox").onchange = (ev) => {
-  $("#advanced-script-options-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-function getAdvancedScriptOptions() {
-  if (!$("#advanced-script-options-checkbox").checked) {
-    return null;
-  }
-  return {
-    style: $("#script-style-select").value,
-    tone: $("#script-tone-select").value,
-    sentence_length: $("#script-sentence-length").value,
-    detail_level: $("#script-detail-level").value,
-    custom_instructions: $("#script-custom-instructions").value.trim() || null,
-  };
-}
-
-// ---------------- youtube tools ----------------
-$("#youtube-tools-checkbox").onchange = (ev) => {
-  $("#youtube-tools-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-function useYouTubeInPipeline() {
-  const url = $("#youtube-url").value.trim();
-  if (!url) {
-    alert("Vui long nhap URL YouTube");
-    return;
-  }
-  const input = $("#url-input");
-  const existing = input.value.trim();
-  input.value = existing ? `${existing}\n${url}` : url;
-  $("#youtube-result").style.display = "block";
-  $("#youtube-result").innerHTML = `<div style="color:var(--ok)">Da dua URL vao pipeline chinh. Hay chon ngon ngu/voice roi bam Bat dau xu ly.</div>`;
-  input.focus();
-  input.scrollIntoView({ behavior: "smooth", block: "center" });
-}
-
-async function downloadYouTubeVideo() {
-  const url = $("#youtube-url").value.trim();
-  if (!url) {
-    alert("Vui lòng nhập URL YouTube");
-    return;
-  }
-  
-  const resultDiv = $("#youtube-result");
-  resultDiv.style.display = "block";
-  resultDiv.innerHTML = "Đang tải video...";
-  
-  try {
-    const response = await fetch("/api/youtube/download", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, format: "best" }),
-    });
-    const data = await response.json();
-    
-    if (data.ok) {
-      resultDiv.innerHTML = `
-        <div style="color:var(--ok)">✓ Download thành công!</div>
-        <div style="margin-top:8px"><strong>Tên file:</strong> ${data.filename}</div>
-        <div><strong>Tiêu đề:</strong> ${data.title}</div>
-        <div><strong>Thời lượng:</strong> ${data.duration}s</div>
-      `;
-    } else {
-      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Download thất bại"}</div>`;
-    }
-  } catch (err) {
-    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
-  }
-}
-
-async function extractYouTubeAudio() {
-  const url = $("#youtube-url").value.trim();
-  if (!url) {
-    alert("Vui lòng nhập URL YouTube");
-    return;
-  }
-  
-  const resultDiv = $("#youtube-result");
-  resultDiv.style.display = "block";
-  resultDiv.innerHTML = "Đang extract audio...";
-  
-  try {
-    const response = await fetch("/api/youtube/audio", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await response.json();
-    
-    if (data.ok) {
-      resultDiv.innerHTML = `
-        <div style="color:var(--ok)">✓ Extract audio thành công!</div>
-        <div style="margin-top:8px"><strong>Tên file:</strong> ${data.filename}</div>
-        <div><strong>Tiêu đề:</strong> ${data.title}</div>
-        <div><strong>Thời lượng:</strong> ${data.duration}s</div>
-      `;
-    } else {
-      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Extract audio thất bại"}</div>`;
-    }
-  } catch (err) {
-    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
-  }
-}
-
-async function downloadYouTubeSubtitles() {
-  const url = $("#youtube-url").value.trim();
-  if (!url) {
-    alert("Vui lòng nhập URL YouTube");
-    return;
-  }
-  
-  const resultDiv = $("#youtube-result");
-  resultDiv.style.display = "block";
-  resultDiv.innerHTML = "Đang tải subtitles...";
-  
-  try {
-    const response = await fetch("/api/youtube/subtitles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await response.json();
-    
-    if (data.ok) {
-      const subsList = data.subtitles.map(s => 
-        `<div>• ${s.language}: <a href="${s.url}" target="_blank" style="color:var(--accent)">Download</a></div>`
-      ).join("");
-      resultDiv.innerHTML = `
-        <div style="color:var(--ok)">✓ Tìm thấy ${data.subtitles.length} subtitles!</div>
-        <div style="margin-top:8px"><strong>Tiêu đề:</strong> ${data.title}</div>
-        <div style="margin-top:8px">${subsList}</div>
-      `;
-    } else {
-      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Download subtitles thất bại"}</div>`;
-    }
-  } catch (err) {
-    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
-  }
-}
-
-async function downloadYouTubeThumbnail() {
-  const url = $("#youtube-url").value.trim();
-  if (!url) {
-    alert("Vui lòng nhập URL YouTube");
-    return;
-  }
-  
-  const resultDiv = $("#youtube-result");
-  resultDiv.style.display = "block";
-  resultDiv.innerHTML = "Đang tải thumbnail...";
-  
-  try {
-    const response = await fetch("/api/youtube/thumbnail", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await response.json();
-    
-    if (data.ok) {
-      resultDiv.innerHTML = `
-        <div style="color:var(--ok)">✓ Download thumbnail thành công!</div>
-        <div style="margin-top:8px"><strong>Tên file:</strong> ${data.filename}</div>
-        <div><strong>URL:</strong> <a href="${data.url}" target="_blank" style="color:var(--accent)">${data.url}</a></div>
-      `;
-    } else {
-      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${data.detail || "Download thumbnail thất bại"}</div>`;
-    }
-  } catch (err) {
-    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
-  }
-}
-
-async function getYouTubeMetadata() {
-  const url = $("#youtube-url").value.trim();
-  if (!url) {
-    alert("Vui lòng nhập URL YouTube");
-    return;
-  }
-  
-  const resultDiv = $("#youtube-result");
-  resultDiv.style.display = "block";
-  resultDiv.innerHTML = "Đang lấy metadata...";
-  
-  try {
-    const response = await fetch("/api/youtube/metadata", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await response.json();
-    
-    if (data.title) {
-      resultDiv.innerHTML = `
-        <div style="color:var(--ok)">✓ Metadata:</div>
-        <div style="margin-top:8px"><strong>Tiêu đề:</strong> ${data.title}</div>
-        <div><strong>Uploader:</strong> ${data.uploader}</div>
-        <div><strong>Thời lượng:</strong> ${data.duration}s</div>
-        <div><strong>Lượt xem:</strong> ${data.view_count}</div>
-        <div><strong>Upload date:</strong> ${data.upload_date}</div>
-        <div><strong>Tags:</strong> ${data.tags.slice(0, 10).join(", ")}</div>
-        <div style="margin-top:8px"><strong>Thumbnail:</strong> <a href="${data.thumbnail}" target="_blank" style="color:var(--accent)">Xem</a></div>
-      `;
-    } else {
-      resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: Không lấy được metadata</div>`;
-    }
-  } catch (err) {
-    resultDiv.innerHTML = `<div style="color:var(--err)">✗ Lỗi: ${err.message}</div>`;
-  }
-}
-
-// ---------------- video templates ----------------
-$("#video-template-checkbox").onchange = (ev) => {
-  $("#video-template-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-// Audio filter range sliders
-$("#audio-eq-bass").oninput = (ev) => {
-  $("#audio-eq-bass-value").textContent = ev.target.value;
-};
-
-$("#audio-eq-treble").oninput = (ev) => {
-  $("#audio-eq-treble-value").textContent = ev.target.value;
-};
-
-function getVideoTemplateConfig() {
-  if (!$("#video-template-checkbox").checked) {
-    return null;
-  }
-  
-  const audio_filters = {};
-  
-  // Equalizer
-  const bass = parseInt($("#audio-eq-bass").value);
-  const treble = parseInt($("#audio-eq-treble").value);
-  if (bass !== 0 || treble !== 0) {
-    audio_filters.equalizer = {};
-    if (bass !== 0) audio_filters.equalizer.bass = bass;
-    if (treble !== 0) audio_filters.equalizer.treble = treble;
-  }
-  
-  // Normalize
-  if ($("#audio-normalize-checkbox").checked) {
-    audio_filters.normalize = true;
-  }
-  
-  // Compressor
-  if ($("#audio-compressor-checkbox").checked) {
-    audio_filters.compressor = {
-      threshold: -20,
-      ratio: 4,
-      attack: 20,
-      release: 250
-    };
-  }
-  
-  return {
-    enabled: true,
-    template: $("#video-template-select").value,
-    transition: $("#template-transition").value,
-    color_effect: $("#template-color-effect").value,
-    video_quality: $("#template-video-quality").value,
-    audio_filters: audio_filters,
-  };
-}
-
-// ---------------- video transformations ----------------
-$("#video-transform-checkbox").onchange = (ev) => {
-  $("#video-transform-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-function getTransformConfig() {
-  if (!$("#video-transform-checkbox").checked) {
-    return null;
-  }
-  
-  const config = {
-    enabled: true,
-    enable_flip: $("#transform-flip-enable").checked,
-    flip_mode: $("#transform-flip-mode").value,
-    enable_border: $("#transform-border-enable").checked,
-    border_position: $("#transform-border-position").value,
-    border_px: parseInt($("#transform-border-px").value, 10),
-    border_color: $("#transform-border-color").value,
-    enable_split_screen: $("#transform-split-enable").checked,
-    split_mode: $("#transform-split-mode").value,
-    enable_randomization: $("#transform-random-enable").checked,
-    crop_percent: parseFloat($("#transform-crop-percent").value),
-    speed_factor: parseFloat($("#transform-speed-factor").value),
-    brightness_adjust: parseFloat($("#transform-brightness").value),
-    contrast_adjust: parseFloat($("#transform-contrast").value),
-  };
-  
-  // Only include overlay path if split screen is enabled
-  if (config.enable_split_screen && $("#transform-overlay-path").value.trim()) {
-    config.overlay_path = $("#transform-overlay-path").value.trim();
-  }
-  
-  return config;
-}
-
-// ---------------- onboarding wizard ----------------
-let currentOnboardingStep = 1;
-const totalOnboardingSteps = 4;
-
-function showOnboardingStep(step) {
-  // Hide all steps
-  document.querySelectorAll('.onboarding-step').forEach(el => {
-    el.classList.remove('active');
-  });
-  
-  // Show current step
-  const stepEl = document.querySelector(`.onboarding-step[data-step="${step}"]`);
-  if (stepEl) {
-    stepEl.classList.add('active');
-  }
-  
-  // Update progress dots
-  const dots = document.querySelectorAll('.onboarding-progress-dot');
-  dots.forEach((dot, index) => {
-    dot.classList.remove('active', 'completed');
-    if (index + 1 === step) {
-      dot.classList.add('active');
-    } else if (index + 1 < step) {
-      dot.classList.add('completed');
-    }
-  });
-  
-  currentOnboardingStep = step;
-}
-
-function nextOnboardingStep() {
-  if (currentOnboardingStep < totalOnboardingSteps) {
-    showOnboardingStep(currentOnboardingStep + 1);
-  }
-}
-
-function prevOnboardingStep() {
-  if (currentOnboardingStep > 1) {
-    showOnboardingStep(currentOnboardingStep - 1);
-  }
-}
-
-function skipOnboarding() {
-  const overlay = document.getElementById('onboarding-overlay');
-  if (overlay) {
-    overlay.classList.add('hidden');
-  }
-  localStorage.setItem('onboarding_completed', 'true');
-}
-
-function finishOnboarding() {
-  skipOnboarding();
-}
-
-function checkOnboarding() {
-  const completed = localStorage.getItem('onboarding_completed');
-  if (!completed) {
-    const overlay = document.getElementById('onboarding-overlay');
-    if (overlay) {
-      overlay.classList.remove('hidden');
-    }
-  }
-}
-
-// Check onboarding on page load
-document.addEventListener('DOMContentLoaded', () => {
-  checkOnboarding();
-});
-
-// ---------------- jobs ----------------
-$("#submit-btn").onclick = async () => {
-  $("#submit-error").textContent = "";
-  const urls = $("#url-input").value.split("\n").map(u => u.trim()).filter(Boolean);
-  if (urls.length === 0) { $("#submit-error").textContent = "Nhập ít nhất 1 đường link video"; return; }
-  const logoEnabled = $("#logo-enable-checkbox").checked;
-  if (logoEnabled && !uploadedLogoId) {
-    $("#submit-error").textContent = "Chọn ảnh logo trước (hoặc bỏ tick 'Chèn logo')";
-    return;
-  }
-  const reviewMode = $("#review-mode-checkbox").checked;
-  if (reviewMode && urls.length > 1) {
-    $("#submit-error").textContent = "Chế độ 'xem & sửa phụ đề' chỉ dùng được với 1 link mỗi lần, không dùng chung với xử lý hàng loạt";
-    return;
-  }
-  const activeCorner = document.querySelector(".corner-opt.active");
-  const commonBody = {
-    target_language: $("#lang-select").value,
-    source_language: $("#source-lang-select").value,
-    tts_voice: $("#voice-select").value || null,
-    logo_path: logoEnabled ? uploadedLogoId : null,
-    logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
-    logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
-    review_before_render: reviewMode,
-    animated_subtitle_config: getAnimatedSubtitleConfig(),
-    priority: $("#queue-priority-checkbox").checked ? "high" : "normal",
-    max_concurrent: parseInt($("#max-concurrent-jobs").value, 10) || 2,
-    video_template_config: getVideoTemplateConfig(),
-    transform_config: getTransformConfig(),
-  };
-
-  $("#submit-btn").disabled = true;
-  const failures = [];
-  try {
-    for (const url of urls) {
-      try {
-        await api("/api/jobs", { method: "POST", body: JSON.stringify({ url, ...commonBody }) });
-      } catch (e) {
-        failures.push(`${url}: ${e.message}`);
-      }
-    }
-    if (failures.length) {
-      $("#submit-error").textContent = `${failures.length}/${urls.length} link gửi thất bại — ${failures.join(" | ")}`;
-    } else {
-      $("#url-input").value = "";
-    }
-    refreshJobs();
-    refreshMe();
-  } finally { $("#submit-btn").disabled = false; }
-};
-
-let latestAffiliateReview = null;
-let affiliateProductMedia = [];
-
-$("#affiliate-advanced-checkbox").onchange = (ev) => {
-  $("#affiliate-advanced-panel").classList.toggle("hidden", !ev.target.checked);
-};
-
-function renderAffiliateProductMediaList() {
-  const box = $("#affiliate-product-media-list");
-  if (!affiliateProductMedia.length) {
-    box.textContent = "Chưa upload product media. Video sẽ dùng stock footage nếu có cấu hình Pexels/Pixabay.";
-    return;
-  }
-  box.innerHTML = affiliateProductMedia.map((item, idx) =>
-    `${idx + 1}. ${escapeHtml(item.filename)} (${escapeHtml(item.media_type)})`
-  ).join("<br>");
-}
-renderAffiliateProductMediaList();
-
-$("#affiliate-product-media-input").onchange = async (ev) => {
-  const files = Array.from(ev.target.files || []);
-  if (!files.length) return;
-  $("#affiliate-error").style.color = "var(--text-dim)";
-  $("#affiliate-error").textContent = "Đang upload product media...";
-  try {
-    for (const file of files.slice(0, 12 - affiliateProductMedia.length)) {
-      const form = new FormData();
-      form.append("file", file);
-      const resp = await fetch("/api/product-media/upload", { method: "POST", body: form });
-      if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
-        throw new Error(body.detail || `Upload failed: HTTP ${resp.status}`);
-      }
-      affiliateProductMedia.push(await resp.json());
-    }
-    renderAffiliateProductMediaList();
-    $("#affiliate-error").style.color = "var(--ok)";
-    $("#affiliate-error").textContent = "Đã upload product media. Hero/reveal sẽ dùng media thật; cảnh người mẫu sẽ ưu tiên Stock/AI context.";
-  } catch (e) {
-    $("#affiliate-error").style.color = "var(--err)";
-    $("#affiliate-error").textContent = e.message;
-  } finally {
-    ev.target.value = "";
-  }
-};
-
-function affiliatePayload() {
-  return {
-    product_url: $("#affiliate-product-url").value.trim() || null,
-    product_name: $("#affiliate-product-name").value.trim(),
-    product_claims: $("#affiliate-claims").value.trim(),
-    pros: $("#affiliate-pros").value.trim(),
-    cons: $("#affiliate-cons").value.trim(),
-    audience: $("#affiliate-audience").value.trim(),
-    real_experience: $("#affiliate-experience").value.trim(),
-    model_prompt: $("#affiliate-model-prompt").value.trim(),
-    target_language: ($("#creator-lang-select") && $("#creator-lang-select").value) || $("#lang-select").value || "vi",
-    duration_seconds: parseInt($("#affiliate-duration").value, 10) || 30,
-    platform: $("#affiliate-platform").value,
-    creative_format: $("#affiliate-creative-format").value,
-  };
-}
-
-function showAffiliateReview(data) {
-  latestAffiliateReview = data;
-  $("#affiliate-output").classList.remove("hidden");
-  $("#affiliate-narration-output").value = data.narration_script || "";
-  $("#affiliate-broll-output").value = data.broll_plan || "";
-  $("#affiliate-title-output").value = data.title || "";
-  $("#affiliate-caption-output").value = data.caption || "";
-  $("#affiliate-hashtags-output").value = (data.hashtags || []).join(", ");
-  const warnings = data.compliance_warnings || [];
-  const qualityNotes = data.quality_notes || [];
-  const qualityHtml = qualityNotes.length
-    ? `<br><strong>Quality upgrade:</strong><br>${qualityNotes.map(w => `- ${escapeHtml(w)}`).join("<br>")}`
-    : "";
-  $("#affiliate-warnings-output").innerHTML = warnings.length
-    ? `<strong>Compliance check:</strong><br>${warnings.map(w => `- ${escapeHtml(w)}`).join("<br>")}${qualityHtml}`
-    : `<span style="color:var(--ok)">Compliance check: OK. Ghi chú link sản phẩm đã được chèn vào caption.</span>${qualityHtml}`;
-  $("#affiliate-send-creator-btn").disabled = false;
-  $("#affiliate-copy-caption-btn").disabled = false;
-}
-
-$("#affiliate-generate-btn").onclick = async () => {
-  $("#affiliate-error").style.color = "var(--text-dim)";
-  $("#affiliate-error").textContent = "";
-  const button = $("#affiliate-generate-btn");
-  button.disabled = true;
-  button.classList.add("is-loading");
-  button.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span>Đang gen...</span>`;
-  try {
-    const payload = affiliatePayload();
-    if (!payload.product_name) throw new Error("Nhập tên sản phẩm");
-    if (!payload.real_experience) throw new Error("Nhập trải nghiệm thật / ghi chú bắt buộc");
-    const data = await api("/api/affiliate/review", { method: "POST", body: JSON.stringify(payload) });
-    showAffiliateReview(data);
-    $("#affiliate-error").style.color = "var(--ok)";
-    $("#affiliate-error").textContent = affiliateProductMedia.length
-      ? "Đã tạo product ad creative. Hero/reveal dùng product media; cảnh người mẫu dùng Stock/AI context nếu có."
-      : "Đã tạo product ad creative. Nên upload ảnh/video sản phẩm thật trước khi tạo video để tránh cảnh stock/AI bị giả.";
-  } catch (e) {
-    $("#affiliate-error").style.color = "var(--err)";
-    $("#affiliate-error").textContent = e.message;
-  } finally {
-    button.disabled = false;
-    button.classList.remove("is-loading");
-    button.textContent = "Gen product ad";
-  }
-};
-
-$("#affiliate-send-creator-btn").onclick = () => {
-  if (!latestAffiliateReview) return;
-  const product = $("#affiliate-product-name").value.trim();
-  $("#creator-topic").value = `Product ad: ${product}`;
-  $("#creator-duration").value = String(latestAffiliateReview.duration_seconds || $("#affiliate-duration").value || 30);
-  $("#creator-image-provider").value = "stock";
-  $("#creator-keywords").value = $("#affiliate-hashtags-output").value.replace(/#/g, "");
-  $("#creator-script").value = $("#affiliate-broll-output").value;
-  $("#creator-narration").value = $("#affiliate-narration-output").value;
-  $("#script-style-select").value = "review";
-  $("#script-tone-select").value = "casual";
-  window._creatorSuggestionCache = null;
-  window._creatorSuggestionPending = null;
-  updateCreatorSubmitState();
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = affiliateProductMedia.length
-    ? "Affiliate media đã sẵn sàng: hero/reveal dùng product ad mockup; cảnh người mẫu/problem/objection ưu tiên Stock/AI context."
-    : "Affiliate flow đang để visual source là Stock. Upload product media để cảnh review khớp sản phẩm hơn.";
-  $("#creator-topic").scrollIntoView({ behavior: "smooth", block: "center" });
-};
-
-$("#affiliate-copy-caption-btn").onclick = async () => {
-  const text = `${$("#affiliate-caption-output").value.trim()}\n${$("#affiliate-hashtags-output").value.trim()}`;
-  if (!text.trim()) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    $("#affiliate-error").style.color = "var(--ok)";
-    $("#affiliate-error").textContent = "Đã copy caption.";
-  } catch {
-    $("#affiliate-caption-output").select();
-    $("#affiliate-error").style.color = "var(--warn)";
-    $("#affiliate-error").textContent = "Trình duyệt không cho copy tự động, caption đã được bôi chọn.";
-  }
-};
-
-async function loadCreatorSuggestions() {
-  const topic = $("#creator-topic").value.trim();
-  if (!topic) throw new Error("Nhập chủ đề video trước");
-  const requestBody = {
-    topic,
-    target_language: $("#creator-lang-select").value || "vi",
-    aspect_ratio: $("#creator-aspect").value,
-    duration_seconds: parseInt($("#creator-duration").value, 10),
-    transition: $("#creator-transition").value,
-    advanced_options: getAdvancedScriptOptions(),
-  };
-  const cacheKey = JSON.stringify(requestBody);
-  if (window._creatorSuggestionCache && window._creatorSuggestionCache.key === cacheKey) {
-    return window._creatorSuggestionCache.data;
-  }
-  // Reuse an in-flight request too: clicking Keyword, Visual and Voice in
-  // quick succession must generate once, not spend three API quota units.
-  if (window._creatorSuggestionPending && window._creatorSuggestionPending.key === cacheKey) {
-    return window._creatorSuggestionPending.promise;
-  }
-  const promise = api("/api/creator/suggestions", { method: "POST", body: JSON.stringify(requestBody) })
-    .then(data => {
-      if (data.generator && data.generator !== "template") {
-        window._creatorSuggestionCache = { key: cacheKey, data };
-      }
-      return data;
-    })
-    .finally(() => {
-      if (window._creatorSuggestionPending && window._creatorSuggestionPending.key === cacheKey) {
-        window._creatorSuggestionPending = null;
-      }
-    });
-  window._creatorSuggestionPending = { key: cacheKey, promise };
-  return promise;
-}
-
-function creatorGeneratorMessage(data, successText) {
-  const timing = data.duration_seconds
-    ? ` · ${data.duration_seconds}s · ${data.scene_count || 0} cảnh · ${data.narration_word_count || 0} từ voice`
-    : "";
-  const quality = (data.quality_notes || []).length ? ` · Hook/SEO/visual đã được tối ưu` : "";
-  if (data.warning) return `${data.warning}${quality}${timing}`;
-  const searched = (data.search_queries || []).slice(0, 2).join(" · ");
-  const grounding = data.grounded ? " + Google Search" : "";
-  return `${successText} bằng ${data.model || "AI"}${grounding}${data.cached ? " (cache)" : ""}${searched ? ` (${searched})` : ""}.${quality}${timing}`;
-}
-
-function ensureCreatorSuggestionCurrent(data) {
-  const selectedDuration = parseInt($("#creator-duration").value, 10);
-  if (data.duration_seconds && Number(data.duration_seconds) !== selectedDuration) {
-    throw new Error("Thời lượng đã thay đổi trong lúc đang gen. Hãy gen lại nội dung mới.");
-  }
-  return data;
-}
-
-const creatorGenerateButtons = [
-  $("#creator-keywords-generate"),
-  $("#creator-script-generate"),
-  $("#creator-narration-generate"),
-];
-creatorGenerateButtons.forEach(button => { button.dataset.idleLabel = button.textContent; });
-
-function setCreatorGenerationLoading(activeButton, loading, loadingLabel = "Đang gen...") {
-  creatorGenerateButtons.forEach(button => { button.disabled = loading; });
-  if (loading) {
-    activeButton.classList.add("is-loading");
-    activeButton.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span>${loadingLabel}</span>`;
-    activeButton.setAttribute("aria-busy", "true");
-  } else {
-    creatorGenerateButtons.forEach(button => {
-      button.classList.remove("is-loading");
-      button.textContent = button.dataset.idleLabel;
-      button.removeAttribute("aria-busy");
-    });
-  }
-}
-
-let activeCreatorJobId = null;
-let creatorJobSubmitting = false;
-
-function creatorFormComplete() {
-  return Boolean(
-    $("#creator-topic").value.trim() &&
-    $("#creator-keywords").value.trim() &&
-    $("#creator-script").value.trim() &&
-    $("#creator-narration").value.trim()
-  );
-}
-
-function updateCreatorSubmitState() {
-  const button = $("#creator-submit-btn");
-  if (creatorJobSubmitting || activeCreatorJobId) return;
-  button.disabled = !creatorFormComplete();
-  button.title = button.disabled
-    ? "Cần đủ chủ đề, keyword, visual brief và kịch bản voice"
-    : "Tạo video từ nội dung đã chuẩn bị";
-}
-
-function setCreatorSubmitLoading(loading, label = "Đang tạo video...") {
-  const button = $("#creator-submit-btn");
-  creatorJobSubmitting = loading;
-  button.classList.toggle("is-loading", loading);
-  button.disabled = loading || !creatorFormComplete();
-  button.innerHTML = loading
-    ? `<span class="loading-spinner" aria-hidden="true"></span><span>${label}</span>`
-    : "Tạo video AI";
-  if (loading) button.setAttribute("aria-busy", "true");
-  else button.removeAttribute("aria-busy");
-}
-
-function jobProgress(job) {
-  if (!job) return 0;
-  if (job.status === "done") return 100;
-  if (job.status === "error") return 0;
-  if (job.status === "queued") return 2;
-  const note = (job.progress_note || "").toLowerCase();
-  const explicit = note.match(/^\[(\d{1,3})%\]/);
-  if (explicit) return Math.max(0, Math.min(100, Number(explicit[1])));
-  const scene = note.match(/(?:lấy|dựng) cảnh\s+(\d+)\/(\d+)/) || note.match(/khung hình\s+(\d+)\/(\d+)/);
-  if (scene) return Math.min(65, 10 + Math.round((Number(scene[1]) / Math.max(1, Number(scene[2]))) * 55));
-  if (note.includes("ghép") && note.includes("chuyển cảnh")) return 70;
-  if (note.includes("giọng đọc")) return 80;
-  if (note.includes("subtitle")) return 92;
-  if (note.includes("dựng video")) return 5;
-  if (note.includes("tải video")) return 5;
-  if (note.includes("dịch phụ đề")) return 45;
-  if (note.includes("dịch, lồng tiếng, render")) return 20;
-  if (note.includes("lồng tiếng") && note.includes("render")) return 70;
-  return job.status === "running" ? 5 : 0;
-}
-
-function jobProgressNote(job) {
-  return String(job.progress_note || "").replace(/^\[\d{1,3}%\]\s*/, "");
-}
-
-function showCreatorProgress(job) {
-  const percent = jobProgress(job);
-  $("#creator-progress").classList.remove("hidden");
-  $("#creator-progress-label").textContent = jobProgressNote(job) || "Đang xử lý video...";
-  $("#creator-progress-percent").textContent = `${percent}%`;
-  $("#creator-progress-fill").style.width = `${percent}%`;
-  setCreatorSubmitLoading(true, `Đang tạo ${percent}%`);
-}
-
-["creator-topic", "creator-keywords", "creator-script", "creator-narration"].forEach(id => {
-  $(`#${id}`).addEventListener("input", updateCreatorSubmitState);
-});
-
-$("#creator-duration").addEventListener("change", () => {
-  window._creatorSuggestionCache = null;
-  window._creatorSuggestionPending = null;
-  $("#creator-script").value = "";
-  $("#creator-narration").value = "";
-  const seconds = parseInt($("#creator-duration").value, 10);
-  const label = seconds >= 60 ? `${seconds / 60} phút` : `${seconds} giây`;
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = `Đã đổi thời lượng thành ${label}. Hãy gen lại visual brief và kịch bản voice.`;
-  updateCreatorSubmitState();
-});
-
-$("#creator-keywords-generate").onclick = async () => {
-  const button = $("#creator-keywords-generate");
-  setCreatorGenerationLoading(button, true, "Đang gen keyword...");
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = "Đang gen keyword...";
-  try {
-    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
-    $("#creator-keywords").value = data.keywords.join(", ");
-    $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen keyword");
-  } catch (e) {
-    $("#creator-error").style.color = "var(--err)";
-    $("#creator-error").textContent = e.message;
-  } finally {
-    setCreatorGenerationLoading(button, false);
-    updateCreatorSubmitState();
-  }
-};
-
-$("#creator-keywords-copy").onclick = async () => {
-  const text = $("#creator-keywords").value.trim();
-  if (!text) { $("#creator-error").textContent = "Chưa có keyword để copy"; return; }
-  try {
-    await navigator.clipboard.writeText(text);
-    $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = "Đã copy keyword.";
-  } catch {
-    $("#creator-keywords").select();
-    $("#creator-error").style.color = "var(--warn)";
-    $("#creator-error").textContent = "Trình duyệt không cho copy tự động, keyword đã được bôi chọn.";
-  }
-};
-
-$("#creator-script-generate").onclick = async () => {
-  const button = $("#creator-script-generate");
-  setCreatorGenerationLoading(button, true, "Đang gen visual brief...");
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = "Đang gen visual brief...";
-  try {
-    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
-    $("#creator-script").value = data.visual_brief || data.script;
-    if (!$("#creator-keywords").value.trim()) $("#creator-keywords").value = data.keywords.join(", ");
-    $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen visual brief");
-  } catch (e) {
-    $("#creator-error").style.color = "var(--err)";
-    $("#creator-error").textContent = e.message;
-  } finally {
-    setCreatorGenerationLoading(button, false);
-    updateCreatorSubmitState();
-  }
-};
-
-$("#creator-narration-generate").onclick = async () => {
-  const button = $("#creator-narration-generate");
-  setCreatorGenerationLoading(button, true, "Đang gen voice...");
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = "Đang gen kịch bản voice...";
-  try {
-    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
-    $("#creator-narration").value = data.narration_script;
-    $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = creatorGeneratorMessage(data, "Đã gen kịch bản voice");
-  } catch (e) {
-    $("#creator-error").style.color = "var(--err)";
-    $("#creator-error").textContent = e.message;
-  } finally {
-    setCreatorGenerationLoading(button, false);
-    updateCreatorSubmitState();
-  }
-};
-
-$("#creator-topic").addEventListener("blur", async () => {
-  if (!$("#creator-topic").value.trim() || $("#creator-keywords").value.trim()) return;
-  try {
-    const data = ensureCreatorSuggestionCurrent(await loadCreatorSuggestions());
-    $("#creator-keywords").value = data.keywords.join(", ");
-  } catch { /* non-critical convenience */ }
-  finally { updateCreatorSubmitState(); }
-});
-
-$("#creator-submit-btn").onclick = async () => {
-  $("#creator-error").style.color = "var(--text-dim)";
-  $("#creator-error").textContent = "";
-  const topic = $("#creator-topic").value.trim();
-  if (!creatorFormComplete()) {
-    $("#creator-error").textContent = "Cần nhập đủ keyword, visual brief và kịch bản voice trước khi tạo video.";
-    updateCreatorSubmitState();
-    return;
-  }
-  setCreatorSubmitLoading(true, "Đang gửi job...");
-  try {
-    $("#creator-error").textContent = "Đang gửi job tạo video...";
-    const job = await api("/api/creator/jobs", { method: "POST", body: JSON.stringify({
-      topic,
-      script: $("#creator-script").value.trim(),
-      narration_script: $("#creator-narration").value.trim(),
-      target_language: $("#creator-lang-select").value || "vi",
-      aspect_ratio: $("#creator-aspect").value,
-      duration_seconds: parseInt($("#creator-duration").value, 10) || 30,
-      transition: $("#creator-transition").value,
-      tts_voice: $("#creator-voice-select").value || null,
-      image_provider: $("#creator-image-provider").value,
-      product_media_paths: affiliateProductMedia.map(item => item.media_id),
-    })});
-    activeCreatorJobId = job.id;
-    showCreatorProgress(job);
-    $("#creator-error").style.color = "var(--ok)";
-    $("#creator-error").textContent = "Đã nhận job. Tiến độ sẽ được cập nhật tự động.";
-    refreshJobs();
-    refreshMe();
-  } catch (e) {
-    activeCreatorJobId = null;
-    $("#creator-error").style.color = "var(--err)";
-    $("#creator-error").textContent = e.message;
-  } finally {
-    if (!activeCreatorJobId) setCreatorSubmitLoading(false);
-  }
-};
-
-const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", review: "Chờ sửa phụ đề", done: "Xong", error: "Lỗi" };
-
-function _dateToUnix(dateStr, endOfDay) {
-  if (!dateStr) return null;
-  const d = new Date(dateStr + (endOfDay ? "T23:59:59" : "T00:00:00"));
-  return d.getTime() / 1000;
-}
-
-function updateStats(jobs) {
-  const total = jobs.length;
-  const completed = jobs.filter(j => j.status === "done").length;
-  const running = jobs.filter(j => j.status === "running").length;
-  const queued = jobs.filter(j => j.status === "queued").length;
-  const error = jobs.filter(j => j.status === "error").length;
-  const processing = running + queued;
-  
-  // Calculate total duration (in minutes)
-  const totalDuration = jobs.reduce((sum, job) => {
-    const duration = job.duration_seconds || 0;
-    return sum + duration;
-  }, 0) / 60;
-  
-  // Update stat boxes
-  $("#stat-total").textContent = total;
-  $("#stat-completed").textContent = completed;
-  $("#stat-processing").textContent = processing;
-  $("#stat-error").textContent = error;
-  $("#stat-duration").textContent = Math.round(totalDuration);
-  
-  // Update progress bar
-  if (total > 0) {
-    const donePercent = (completed / total) * 100;
-    const runningPercent = (running / total) * 100;
-    const queuedPercent = (queued / total) * 100;
-    const errorPercent = (error / total) * 100;
-    
-    $("#bar-done").style.flex = `${donePercent}`;
-    $("#bar-running").style.flex = `${runningPercent}`;
-    $("#bar-queued").style.flex = `${queuedPercent}`;
-    $("#bar-error").style.flex = `${errorPercent}`;
-  } else {
-    $("#bar-done").style.flex = "0";
-    $("#bar-running").style.flex = "0";
-    $("#bar-queued").style.flex = "0";
-    $("#bar-error").style.flex = "0";
-  }
-  
-  // Update labels
-  $("#label-done").textContent = completed;
-  $("#label-running").textContent = running;
-  $("#label-queued").textContent = queued;
-  $("#label-error").textContent = error;
-}
-
-async function refreshJobs() {
-  const q = $("#history-search").value.trim();
-  const dateFrom = _dateToUnix($("#history-date-from").value, false);
-  const dateTo = _dateToUnix($("#history-date-to").value, true);
-  const params = new URLSearchParams();
-  if (q) params.set("q", q);
-  if (dateFrom) params.set("date_from", dateFrom);
-  if (dateTo) params.set("date_to", dateTo);
-  const qs = params.toString();
-
-  const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
-  
-  // Update statistics
-  updateStats(jobs);
-  refreshJobQueueStatus();
-  if (!activeCreatorJobId) {
-    const runningCreator = jobs.find(job =>
-      String(job.source_url || "").startsWith("creator:") &&
-      (job.status === "queued" || job.status === "running")
-    );
-    if (runningCreator) activeCreatorJobId = runningCreator.id;
-  }
-  if (activeCreatorJobId) {
-    const activeCreatorJob = jobs.find(job => job.id === activeCreatorJobId);
-    if (activeCreatorJob && (activeCreatorJob.status === "queued" || activeCreatorJob.status === "running")) {
-      showCreatorProgress(activeCreatorJob);
-    } else if (activeCreatorJob) {
-      const succeeded = activeCreatorJob.status === "done";
-      const percent = succeeded ? 100 : 0;
-      $("#creator-progress").classList.remove("hidden");
-      $("#creator-progress-label").textContent = succeeded ? "Hoàn tất video" : "Tạo video không thành công";
-      $("#creator-progress-percent").textContent = `${percent}%`;
-      $("#creator-progress-fill").style.width = `${percent}%`;
-      activeCreatorJobId = null;
-      setCreatorSubmitLoading(false);
-      updateCreatorSubmitState();
-    }
-  }
-  const latestDone = jobs.find(job => job.status === "done" && job.has_video);
-  // Pick an initial video once. Polling must never replace a video the user
-  // is currently watching merely because a newer job just completed.
-  if (latestResultJobId === null && latestDone) {
-    showHistoryVideo(latestDone);
-  } else if (latestResultJobId === null && !latestDone) {
-    $("#latest-result-card").classList.add("hidden");
-  }
-  window._jobsById = Object.fromEntries(jobs.map(j => [j.id, j]));
-  for (const job of jobs) {
-    const prevStatus = _lastKnownStatus[job.id];
-    if (prevStatus && prevStatus !== job.status && (job.status === "done" || job.status === "error")) {
-      _notifyJobStatusChange(job);
-    }
-    _lastKnownStatus[job.id] = job.status;
-  }
-  const list = $("#job-list");
-  list.innerHTML = "";
-  $("#empty-history").classList.toggle("hidden", jobs.length > 0);
-  for (const job of jobs) {
-    const el = document.createElement("div");
-    el.className = "job";
-    const created = new Date(job.created_at * 1000).toLocaleString(uiLocale());
-    const hasSubtitles = job.segments && job.segments.length > 0;
-    el.innerHTML = `
-      <input type="checkbox" class="history-job-check" data-job-check="${job.id}" style="width:auto" ${selectedHistoryJobs.has(job.id) ? "checked" : ""}>
-      <div class="job-main">
-        <div class="job-head">
-          <div class="job-info">
-            <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
-            <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}</div>
-            ${(job.status === "queued" || job.status === "running" || job.status === "review" || job.status === "done") ? `
-              <div class="job-progress">
-                <div class="progress-track"><div class="progress-fill" style="width:${jobProgress(job)}%"></div></div>
-                <div class="job-progress-label">${jobProgress(job)}%</div>
-              </div>` : ""}
-          </div>
-          <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
-        </div>
-        <div class="job-actions">
-          ${job.status === "review" ? `<button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>` : ""}
-          ${job.has_video ? `
-            <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
-            <button class="btn gradient small" data-improve="${job.id}">Improve</button>
-            <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
-          ` : ""}
-          ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>Tải .srt</a>` : ""}
-          ${job.status === "error" ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
-        </div>
-      </div>
-      <button class="btn danger small job-delete" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
-    `;
-    list.appendChild(el);
-  }
-  list.querySelectorAll("[data-preview]").forEach(btn => {
-    btn.onclick = () => openPreview(btn.dataset.preview);
-  });
-  list.querySelectorAll("[data-improve]").forEach(btn => {
-    btn.onclick = () => openQualityReview(btn.dataset.improve);
-  });
-  list.querySelectorAll("[data-play-video]").forEach(title => {
-    title.onclick = () => showHistoryVideo(window._jobsById[title.dataset.playVideo]);
-  });
-  list.querySelectorAll("[data-job-check]").forEach(box => {
-    box.onchange = () => {
-      if (box.checked) selectedHistoryJobs.add(box.dataset.jobCheck);
-      else selectedHistoryJobs.delete(box.dataset.jobCheck);
-      updateHistorySelection(jobs);
-    };
-  });
-  updateHistorySelection(jobs);
-  list.querySelectorAll("[data-publish]").forEach(btn => {
-    btn.onclick = () => openPublish(btn.dataset.publish);
-  });
-  list.querySelectorAll("[data-review]").forEach(btn => {
-    btn.onclick = () => openReview(btn.dataset.review);
-  });
-  list.querySelectorAll("[data-retry]").forEach(btn => {
-    btn.onclick = async () => {
-      btn.disabled = true;
-      try { await api(`/api/jobs/${btn.dataset.retry}/retry`, { method: "POST" }); refreshJobs(); refreshMe(); }
-      catch (e) { alert(e.message); }
-      finally { btn.disabled = false; }
-    };
-  });
-  list.querySelectorAll("[data-delete]").forEach(btn => {
-    btn.onclick = async () => {
-      const job = window._jobsById[btn.dataset.delete];
-      const label = job ? (job.title || job.source_url) : "video này";
-      const accepted = await showConfirmDialog(
-        "Xóa video khỏi lịch sử?",
-        `Bạn có chắc muốn xóa “${label}”? Video và dữ liệu liên quan sẽ không thể khôi phục.`,
-        "Xóa video",
-      );
-      if (!accepted) return;
-      try {
-        await api(`/api/jobs/${btn.dataset.delete}`, { method: "DELETE" });
-        if (latestResultJobId === btn.dataset.delete) {
-          latestResultJobId = null;
-          $("#latest-result-video").removeAttribute("src");
-          $("#latest-result-video").load();
-        }
-        refreshJobs();
-      }
-      catch (e) { alert(e.message); }
-    };
-  });
-}
-
-function updateHistorySelection(jobs = []) {
-  const visibleIds = jobs.map(j => j.id);
-  const selectedVisible = visibleIds.filter(id => selectedHistoryJobs.has(id)).length;
-  $("#history-selected-count").textContent = selectedHistoryJobs.size ? `${selectedHistoryJobs.size} mục đã chọn` : "";
-  $("#history-bulk-delete").disabled = selectedHistoryJobs.size === 0;
-  $("#history-select-all").checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
-  $("#history-select-all").indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
-}
-
-$("#history-select-all").onchange = () => {
-  const ids = Object.keys(window._jobsById || {});
-  ids.forEach(id => $("#history-select-all").checked ? selectedHistoryJobs.add(id) : selectedHistoryJobs.delete(id));
-  refreshJobs();
-};
-$("#history-bulk-delete").onclick = async () => {
-  const ids = [...selectedHistoryJobs];
-  if (!ids.length) return;
-  const accepted = await showConfirmDialog(
-    `Xóa ${ids.length} video đã chọn?`,
-    "Tất cả video và dữ liệu liên quan trong những mục đã chọn sẽ bị xóa vĩnh viễn. Thao tác này không thể hoàn tác.",
-    `Xóa ${ids.length} video`,
-  );
-  if (!accepted) return;
-  try {
-    const result = await api("/api/jobs/bulk-delete", { method: "POST", body: JSON.stringify({ job_ids: ids }) });
-    if (latestResultJobId && ids.includes(latestResultJobId)) {
-      latestResultJobId = null;
-      $("#latest-result-video").removeAttribute("src");
-      $("#latest-result-video").load();
-    }
-    selectedHistoryJobs.clear();
-    await refreshJobs();
-  } catch (e) { alert(e.message); }
-};
-
-let _historySearchDebounce = null;
-$("#history-search").addEventListener("input", () => {
-  clearTimeout(_historySearchDebounce);
-  _historySearchDebounce = setTimeout(refreshJobs, 300);
-});
-$("#history-date-from").onchange = refreshJobs;
-$("#history-date-to").onchange = refreshJobs;
-$("#history-clear-btn").onclick = () => {
-  $("#history-search").value = "";
-  $("#history-date-from").value = "";
-  $("#history-date-to").value = "";
-  refreshJobs();
-};
-
-// ---------------- subtitle review editor ----------------
-let currentReviewJobId = null;
-
-async function openReview(jobId) {
-  currentReviewJobId = jobId;
-  $("#review-error").textContent = "";
-  const sourceVideo = $("#review-source-video");
-  sourceVideo.src = `/api/jobs/${jobId}/source-video`;
-  const { segments } = await api(`/api/jobs/${jobId}/segments`);
-  $("#review-segments-list").innerHTML = segments.map((s, i) => `
-    <div class="review-segment" data-segment-row="${i}" data-start="${s.start}" data-end="${s.end}">
-      <div class="seg-time">${_fmtTime(s.start)} → ${_fmtTime(s.end)}</div>
-      <textarea data-idx="${i}" data-start="${s.start}" data-end="${s.end}">${_escapeHtml(s.text)}</textarea>
-    </div>
-  `).join("");
-  $("#review-segments-list").querySelectorAll("[data-segment-row]").forEach(row => {
-    row.onclick = ev => {
-      if (ev.target.tagName === "TEXTAREA") return;
-      sourceVideo.currentTime = Number(row.dataset.start);
-      sourceVideo.play().catch(() => {});
-    };
-  });
-  sourceVideo.ontimeupdate = () => {
-    const current = sourceVideo.currentTime;
-    $("#review-segments-list").querySelectorAll("[data-segment-row]").forEach(row => {
-      row.classList.toggle("active", current >= Number(row.dataset.start) && current < Number(row.dataset.end));
-    });
-  };
-  $("#review-modal").classList.remove("hidden");
-}
-
-function _fmtTime(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
-}
-
-function _collectReviewSegments() {
-  return Array.from($("#review-segments-list").querySelectorAll("textarea")).map(ta => ({
-    start: parseFloat(ta.dataset.start), end: parseFloat(ta.dataset.end), text: ta.value,
-  }));
-}
-
-$("#review-close").onclick = () => {
-  $("#review-modal").classList.add("hidden");
-  $("#review-source-video").pause();
-  $("#review-source-video").removeAttribute("src");
-};
-
-$("#review-save-btn").onclick = async () => {
-  $("#review-error").textContent = "";
-  try {
-    await api(`/api/jobs/${currentReviewJobId}/segments`, {
-      method: "PUT", body: JSON.stringify({ segments: _collectReviewSegments() }),
-    });
-    $("#review-error").style.color = "var(--accent)";
-    $("#review-error").textContent = "Đã lưu.";
-  } catch (e) { $("#review-error").style.color = "var(--err)"; $("#review-error").textContent = e.message; }
-};
-
-$("#review-render-btn").onclick = async () => {
-  $("#review-error").textContent = "";
-  try {
-    await api(`/api/jobs/${currentReviewJobId}/segments`, {
-      method: "PUT", body: JSON.stringify({ segments: _collectReviewSegments() }),
-    });
-    await api(`/api/jobs/${currentReviewJobId}/render`, { method: "POST" });
-    $("#review-modal").classList.add("hidden");
-    $("#review-source-video").pause();
-    $("#review-source-video").removeAttribute("src");
-    refreshJobs();
-  } catch (e) { $("#review-error").textContent = e.message; }
-};
-
-// ---------------- feedback ----------------
-$("#feedback-fab").onclick = () => {
-  $("#feedback-status").textContent = "";
-  $("#feedback-message").value = "";
-  $("#feedback-modal").classList.remove("hidden");
-};
-$("#feedback-header-btn").onclick = () => $("#feedback-fab").click();
-$("#feedback-close").onclick = () => $("#feedback-modal").classList.add("hidden");
-$("#feedback-submit-btn").onclick = async () => {
-  const message = $("#feedback-message").value.trim();
-  if (!message) { $("#feedback-status").textContent = "Nhập nội dung góp ý trước đã."; return; }
-  try {
-    await api("/api/feedback", { method: "POST", body: JSON.stringify({ message, page: location.pathname }) });
-    $("#feedback-status").textContent = "Cảm ơn bạn! Đã gửi góp ý.";
-    setTimeout(() => $("#feedback-modal").classList.add("hidden"), 1200);
-  } catch (e) { $("#feedback-status").textContent = e.message; }
-};
-
-// ---------------- preview + publish ----------------
-function openPreview(jobId) {
-  currentJobId = jobId;
-  $("#preview-video").src = `/api/jobs/${jobId}/video`;
-  $("#preview-download").href = `/api/jobs/${jobId}/video?download=true`;
-  $("#prepublish-check-btn").dataset.jobId = jobId;
-  $("#preview-improve-btn").dataset.jobId = jobId;
-  $("#prepublish-result").classList.add("hidden");
-  $("#prepublish-result").innerHTML = "";
-  $("#preview-modal").classList.remove("hidden");
-  $("#preview-close").focus();
-}
-
-function closePreview() {
-  $("#preview-modal").classList.add("hidden");
-  $("#preview-video").pause();
-  $("#preview-video").src = "";
-}
-
-$("#preview-close").onclick = closePreview;
-$("#preview-modal").addEventListener("click", ev => {
-  if (ev.target === $("#preview-modal")) closePreview();
-});
-
-document.addEventListener("keydown", ev => {
-  const modal = $("#preview-modal");
-  if (modal.classList.contains("hidden")) return;
-  const target = ev.target;
-  const isEditing = target && (
-    target.matches?.("input, textarea, select") || target.isContentEditable
-  );
-  if (ev.key === "Escape") {
-    ev.preventDefault();
-    closePreview();
-    return;
-  }
-  if ((ev.code === "Space" || ev.key === " ") && !isEditing) {
-    ev.preventDefault();
-    const video = $("#preview-video");
-    if (video.paused || video.ended) video.play();
-    else video.pause();
-  }
-});
-
-$("#prepublish-check-btn").onclick = async () => {
-  const box = $("#prepublish-result");
-  box.classList.remove("hidden");
-  box.innerHTML = `<span style="color:var(--text-dim)">Đang đọc thông số video...</span>`;
-  try {
-    const report = await api(`/api/jobs/${$("#prepublish-check-btn").dataset.jobId}/prepublish-check`);
-    const facts = report.facts;
-    const issues = report.issues.length ? report.issues.map(item =>
-      `<div style="color:${item.severity === 'error' ? 'var(--err)' : 'var(--warn)'};margin-top:5px">• ${_escapeHtml(item.message)}</div>`
-    ).join("") : `<div style="color:var(--accent);margin-top:5px">Không phát hiện lỗi kỹ thuật cơ bản.</div>`;
-    const platforms = report.platforms.map(item =>
-      `<div style="margin-top:5px"><b>${_escapeHtml(item.platform)} · ${_escapeHtml(item.format_name)}</b>: ` +
-      `<span style="color:${item.status === 'ready' ? 'var(--accent)' : 'var(--warn)'}">${item.status === 'ready' ? 'Phù hợp' : 'Cần điều chỉnh'}</span>` +
-      `<div style="font-size:12px;color:var(--text-dim)">${_escapeHtml(item.message)}</div></div>`
-    ).join("");
-    box.innerHTML = `<div style="font-weight:600">${report.ready ? '✓ Có thể tiếp tục kiểm tra bằng mắt' : '⚠ Có lỗi cần xử lý'}</div>
-      <div style="font-size:12px;color:var(--text-dim);margin-top:4px">${facts.width}×${facts.height} · ${facts.fps} FPS · ${facts.duration}s · ${facts.video_codec}/${facts.audio_codec || 'không audio'}</div>
-      ${issues}<div style="margin-top:10px;font-weight:600">Độ phù hợp nền tảng</div>${platforms}`;
-  } catch (e) {
-    box.innerHTML = `<span style="color:var(--err)">${_escapeHtml(e.message)}</span>`;
-  }
-};
-
-function _qualitySeverityColor(severity) {
-  if (severity === "error") return "var(--err)";
-  if (severity === "warning") return "var(--warn)";
-  return "var(--text-dim)";
-}
-
-function renderQualityReport(report) {
-  const findings = report.findings || [];
-  const actions = report.next_actions || [];
-  const summary = report.summary || [];
-  const facts = (report.prepublish || {}).facts || {};
-  return `
-    <div style="display:grid;grid-template-columns:120px minmax(0,1fr);gap:14px;align-items:center">
-      <div class="stat-box" style="margin:0;text-align:center"><div class="num">${report.score}</div><div class="label">Quality score</div></div>
-      <div>
-        <div style="font-size:16px;font-weight:700;margin-bottom:6px">${_escapeHtml(report.verdict || "")}</div>
-        <div style="font-size:12px;color:var(--text-dim)">${summary.map(_escapeHtml).join(" · ")}</div>
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label>Findings</label>
-        <div style="display:grid;gap:8px">
-          ${findings.length ? findings.map(item => `
-            <div style="padding:10px 12px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px">
-              <div style="font-size:12px;font-weight:700;color:${_qualitySeverityColor(item.severity)}">${_escapeHtml(item.severity.toUpperCase())} · ${_escapeHtml(item.category)}</div>
-              <div style="font-size:13px;margin-top:4px">${_escapeHtml(item.message)}</div>
-              <div style="font-size:12px;color:var(--text-dim);margin-top:5px">${_escapeHtml(item.action)}</div>
-            </div>
-          `).join("") : `<div style="font-size:13px;color:var(--ok)">No automated findings. Still watch the video once before publishing.</div>`}
-        </div>
-      </div>
-      <div>
-        <label>Next actions</label>
-        <ul class="research-list">${actions.map(item => `<li>${_escapeHtml(item)}</li>`).join("")}</ul>
-        <label style="margin-top:14px">Platform facts</label>
-        <div style="font-size:12px;color:var(--text-dim);line-height:1.6">
-          ${facts.width || 0}x${facts.height || 0}<br>
-          ${facts.duration || 0}s · ${facts.fps || 0} FPS<br>
-          ${_escapeHtml(facts.video_codec || "unknown")} / ${_escapeHtml(facts.audio_codec || "no audio")}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function openQualityReview(jobId) {
-  $("#quality-report-box").innerHTML = `<div style="color:var(--text-dim)">Dang review video...</div>`;
-  $("#quality-modal").classList.remove("hidden");
-  try {
-    const report = await api(`/api/jobs/${jobId}/quality-review`);
-    $("#quality-report-box").innerHTML = renderQualityReport(report);
-  } catch (e) {
-    $("#quality-report-box").innerHTML = `<div style="color:var(--err)">${_escapeHtml(e.message)}</div>`;
-  }
-}
-
-$("#quality-close").onclick = () => $("#quality-modal").classList.add("hidden");
-$("#quality-modal").addEventListener("click", ev => {
-  if (ev.target === $("#quality-modal")) $("#quality-modal").classList.add("hidden");
-});
-$("#preview-improve-btn").onclick = () => openQualityReview($("#preview-improve-btn").dataset.jobId);
-$("#latest-improve-btn").onclick = () => openQualityReview($("#latest-improve-btn").dataset.jobId);
-
-$("#preview-publish-btn").onclick = () => {
-  closePreview();
-  openPublish(currentJobId);
-};
-
-function openPublish(jobId) {
-  currentJobId = jobId;
-  $("#publish-results").innerHTML = "";
-  $("#publish-modal").classList.remove("hidden");
-  loadConnections();
-  _prefillPublishSuggestions(jobId);
-  loadScheduledPosts();
-}
-$("#publish-close").onclick = () => $("#publish-modal").classList.add("hidden");
-
-// Pre-fills the title from the job's translated text and suggests a
-// handful of hashtag chips derived from its most distinctive words — a
-// starting point to tweak, not meant to be used verbatim untouched.
-const _VI_STOPWORDS = new Set([
-  "và","của","là","có","cho","trong","với","một","này","đã","không","được",
-  "cũng","để","khi","như","thì","tôi","bạn","anh","chị","nó","đó","các","những",
-  "vì","nên","nhưng","mà","về","trên","dưới","ra","vào","lại","rồi","sẽ","đang",
-]);
-
-function _suggestHashtags(text, max = 5) {
-  if (!text) return [];
-  const words = text
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter(w => w.length >= 3 && !_VI_STOPWORDS.has(w));
-  const freq = {};
-  for (const w of words) freq[w] = (freq[w] || 0) + 1;
-  return Object.entries(freq)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, max)
-    .map(([w]) => "#" + w.replace(/\s+/g, ""));
-}
-
-function _prefillPublishSuggestions(jobId) {
-  const job = (window._jobsById || {})[jobId];
-  if (!job) return;
-  if (!$("#publish-title").value) $("#publish-title").value = job.title || "";
-
-  const suggestions = _suggestHashtags(job.title || "");
-  const box = $("#publish-hashtag-suggestions");
-  if (!suggestions.length) { box.innerHTML = ""; return; }
-  box.innerHTML = `<span style="font-size:12px;color:var(--text-dim)">Gợi ý: </span>` +
-    suggestions.map(tag => `<span class="hashtag-chip" data-tag="${tag}">${tag}</span>`).join(" ");
-  box.querySelectorAll(".hashtag-chip").forEach(chip => {
-    chip.onclick = () => {
-      const current = $("#publish-hashtags").value.trim();
-      const tag = chip.dataset.tag;
-      if (!current.includes(tag)) {
-        $("#publish-hashtags").value = current ? `${current} ${tag}` : tag;
-      }
-    };
-  });
-}
-
-document.querySelectorAll(".chip").forEach(chip => {
-  chip.onclick = () => {
-    const p = chip.dataset.platform;
-    if (selectedPlatforms.has(p)) { selectedPlatforms.delete(p); chip.classList.remove("active"); }
-    else { selectedPlatforms.add(p); chip.classList.add("active"); }
-  };
-});
-
-const PLATFORM_LABEL = { tiktok: "TikTok", facebook: "Facebook Page", youtube: "YouTube" };
-
-async function loadConnections() {
-  const box = $("#connect-cards");
-  box.innerHTML = `<div style="color:var(--text-dim);font-size:13px">Đang tải trạng thái kết nối…</div>`;
-  let conns;
-  try { conns = await api("/api/social/connections"); }
-  catch (e) { box.innerHTML = ""; return; }
-
-  box.innerHTML = Object.entries(conns).map(([platform, info]) => `
-    <div class="connect-card" data-card="${platform}">
-      <div class="connect-head">
-        <div>
-          <span class="connect-name">${PLATFORM_LABEL[platform]}</span>
-          <span class="pill ${info.connected ? "on" : "off"}">${info.connected ? "Đã kết nối" : "Chưa kết nối"}</span>
-        </div>
-        ${info.connected
-          ? `<button class="btn secondary small" data-disconnect="${platform}">Ngắt kết nối</button>`
-          : `<button class="btn secondary small" data-connect="${platform}" ${info.configured ? "" : "disabled"}>Kết nối</button>`}
-      </div>
-      ${info.connected ? `<div class="connect-sub">Đăng dưới tên: ${info.account_name || "(không rõ tên)"}</div>` : ""}
-      ${!info.configured ? `<div class="connect-note">${info.not_configured_message}</div>` : ""}
-      <div class="connect-qr-box hidden" id="qr-${platform}"></div>
-    </div>
-  `).join("");
-
-  box.querySelectorAll("[data-connect]").forEach(btn => {
-    btn.onclick = () => startConnect(btn.dataset.connect);
-  });
-  box.querySelectorAll("[data-disconnect]").forEach(btn => {
-    btn.onclick = async () => {
-      await fetch(`/api/social/connections/${btn.dataset.disconnect}`, { method: "DELETE" });
-      loadConnections();
-    };
-  });
-}
-
-async function startConnect(platform) {
-  let data;
-  try { data = await api(`/api/social/connect/${platform}`); }
-  catch (e) { alert(e.message); return; }
-
-  window.open(data.authorize_url, "connect_" + platform, "width=520,height=680");
-
-  const qrBox = $(`#qr-${platform}`);
-  qrBox.classList.remove("hidden");
-  qrBox.innerHTML = `
-    <img src="${data.qr_code_url}" width="140" height="140" alt="QR đăng nhập ${platform}">
-    <div style="font-size:12px;color:var(--text-dim);max-width:260px">
-      Cửa sổ đăng nhập ${PLATFORM_LABEL[platform]} đã mở. Nếu bạn đang dùng máy tính nhưng đã
-      đăng nhập ${PLATFORM_LABEL[platform]} trên điện thoại, quét mã QR này bằng điện thoại để
-      xác nhận nhanh hơn — không cần gõ lại mật khẩu trên máy tính.
-    </div>`;
-}
-
-$("#publish-submit").onclick = async () => {
-  if (selectedPlatforms.size === 0) { alert("Chọn ít nhất 1 nền tảng"); return; }
-  const hashtags = $("#publish-hashtags").value.split(/\s+/).filter(Boolean);
-  $("#publish-results").innerHTML = "Đang đăng...";
-  try {
-    const { results } = await api(`/api/jobs/${currentJobId}/publish`, {
-      method: "POST", body: JSON.stringify({
-        platforms: [...selectedPlatforms],
-        title: $("#publish-title").value,
-        description: $("#publish-desc").value,
-        hashtags,
-      }),
-    });
-    $("#publish-results").innerHTML = results.map(r =>
-      `<div class="publish-result ${r.success ? "ok" : "fail"}"><b>${r.platform}:</b> ${r.message}</div>`
-    ).join("");
-  } catch (e) {
-    $("#publish-results").innerHTML = `<div class="publish-result fail">${e.message}</div>`;
-  }
-};
-
-async function loadScheduledPosts() {
-  try {
-    const rows = await api("/api/scheduled-posts");
-    $("#scheduled-posts").innerHTML = rows.slice(0, 5).map(r => `
-      <div class="connect-card"><b>${escapeHtml(r.title)}</b><div class="connect-sub">
-      ${r.platforms.map(p => PLATFORM_LABEL[p] || p).join(", ")} · ${new Date(r.scheduled_at * 1000).toLocaleString(uiLocale())} · ${r.status}
-      </div>${r.status === "pending" ? `<button class="btn danger small" data-cancel-schedule="${r.id}" style="margin-top:8px">Huỷ lịch</button>` : ""}</div>`).join("");
-    $("#scheduled-posts").querySelectorAll("[data-cancel-schedule]").forEach(btn => {
-      btn.onclick = async () => {
-        await api(`/api/scheduled-posts/${btn.dataset.cancelSchedule}`, { method: "DELETE" });
-        loadScheduledPosts();
-      };
-    });
-  } catch { $("#scheduled-posts").innerHTML = ""; }
-}
-
-$("#publish-schedule").onclick = async () => {
-  if (selectedPlatforms.size === 0) { alert("Chọn ít nhất 1 nền tảng"); return; }
-  const localValue = $("#publish-scheduled-at").value;
-  if (!localValue) { alert("Chọn ngày và giờ đăng"); return; }
-  const scheduledAt = new Date(localValue).getTime() / 1000;
-  try {
-    await api(`/api/jobs/${currentJobId}/schedule-publish`, {
-      method: "POST", body: JSON.stringify({
-        platforms: [...selectedPlatforms], title: $("#publish-title").value,
-        description: $("#publish-desc").value,
-        hashtags: $("#publish-hashtags").value.split(/\s+/).filter(Boolean),
-        scheduled_at: scheduledAt,
-      }),
-    });
-    $("#publish-results").innerHTML = `<div class="publish-result ok">Đã lên lịch đăng tự động.</div>`;
-    loadScheduledPosts();
-  } catch (e) { $("#publish-results").innerHTML = `<div class="publish-result fail">${escapeHtml(e.message)}</div>`; }
-};
-
-// ---------------- admin ----------------
-$("#admin-btn").onclick = () => {
-  $("#app-view").classList.add("hidden");
-  $("#admin-view").classList.remove("hidden");
-  loadAdmin();
-};
-$("#admin-back-btn").onclick = () => {
-  $("#admin-view").classList.add("hidden");
-  $("#app-view").classList.remove("hidden");
-};
-
-async function loadAdmin() {
-  const [stats, users, feedback, topups] = await Promise.all([
-    api("/api/admin/stats"), api("/api/admin/users"), api("/api/admin/feedback"), api("/api/admin/top-up-requests"),
-  ]);
-
-  $("#admin-stats").innerHTML = `
-    <div class="stat-box"><div class="num">${stats.total_users}</div><div class="label">Người dùng</div></div>
-    <div class="stat-box"><div class="num">${stats.total_jobs}</div><div class="label">Tổng số video</div></div>
-    <div class="stat-box"><div class="num">${stats.jobs_last_7d}</div><div class="label">Video (7 ngày qua)</div></div>
-    <div class="stat-box"><div class="num">${stats.jobs_by_status.done || 0}</div><div class="label">Hoàn tất</div></div>
-    <div class="stat-box"><div class="num">${stats.jobs_by_status.error || 0}</div><div class="label">Lỗi</div></div>
-    <div class="stat-box"><div class="num">${Object.values(stats.publishes_by_platform).reduce((a,b)=>a+b,0)}</div><div class="label">Đã đăng lên MXH</div></div>
-  `;
-
-  const body = $("#admin-users-body");
-  body.innerHTML = users.map(u => `
-    <tr>
-      <td>${u.username}</td>
-      <td>${u.is_admin ? "Admin" : "User"}</td>
-      <td>${u.credits}</td>
-      <td>
-        <div class="credit-adjust">
-          <input type="number" id="credit-input-${u.id}" placeholder="+/-">
-          <button class="btn secondary small" data-adjust="${u.id}">Áp dụng</button>
-        </div>
-      </td>
-    </tr>
-  `).join("");
-
-  body.querySelectorAll("[data-adjust]").forEach(btn => {
-    btn.onclick = async () => {
-      const uid = btn.dataset.adjust;
-      const val = parseInt($(`#credit-input-${uid}`).value, 10);
-      if (Number.isNaN(val)) return;
-      await api(`/api/admin/users/${uid}/credits`, { method: "POST", body: JSON.stringify({ delta: val }) });
-      loadAdmin();
-    };
-  });
-
-  $("#admin-topups-empty").classList.toggle("hidden", topups.length > 0);
-  $("#admin-topups-body").innerHTML = topups.map(r => `
-    <tr>
-      <td>${r.username || ("#" + r.user_id)}</td>
-      <td>${r.credits} token</td>
-      <td>${_formatVnd(r.amount_vnd)}</td>
-      <td style="max-width:260px;white-space:pre-wrap">${_escapeHtml(r.note || "")}</td>
-      <td class="status-${r.status}">${_topupStatusLabel(r.status)}</td>
-      <td>
-        ${r.status === "pending" ? `
-          <button class="btn secondary small" data-topup-approve="${r.id}">Duyệt</button>
-          <button class="btn secondary small" data-topup-reject="${r.id}">Từ chối</button>
-        ` : ""}
-      </td>
-    </tr>
-  `).join("");
-  $("#admin-topups-body").querySelectorAll("[data-topup-approve]").forEach(btn => {
-    btn.onclick = async () => {
-      await api(`/api/admin/top-up-requests/${btn.dataset.topupApprove}/approve`, {
-        method: "POST", body: JSON.stringify({ admin_note: null }),
-      });
-      loadAdmin();
-    };
-  });
-  $("#admin-topups-body").querySelectorAll("[data-topup-reject]").forEach(btn => {
-    btn.onclick = async () => {
-      const note = prompt("Lý do từ chối (không bắt buộc):") || null;
-      await api(`/api/admin/top-up-requests/${btn.dataset.topupReject}/reject`, {
-        method: "POST", body: JSON.stringify({ admin_note: note }),
-      });
-      loadAdmin();
-    };
-  });
-
-  $("#admin-feedback-empty").classList.toggle("hidden", feedback.length > 0);
-  $("#admin-feedback-body").innerHTML = feedback.map(f => `
-    <tr>
-      <td><b>${_escapeHtml(f.username || "(ẩn danh)")}</b><br><span style="color:var(--text-dim);font-size:12px">${_escapeHtml(f.email || f.phone || "Không có liên hệ")}</span></td>
-      <td style="max-width:400px;white-space:pre-wrap">${_escapeHtml(f.message)}</td>
-      <td>${f.page || ""}</td>
-      <td>${new Date(f.created_at * 1000).toLocaleString(uiLocale())}</td>
-    </tr>
-  `).join("");
-}
-
-function _escapeHtml(s) {
-  const div = document.createElement("div");
-  div.textContent = s;
-  return div.innerHTML;
-}
-
-$("#new-user-submit").onclick = async () => {
-  $("#new-user-error").textContent = "";
-  try {
-    await api("/api/admin/users", { method: "POST", body: JSON.stringify({
-      username: $("#new-user-username").value.trim(),
-      password: $("#new-user-password").value,
-      credits: parseInt($("#new-user-credits").value, 10) || 0,
-    })});
-    $("#new-user-username").value = "";
-    $("#new-user-password").value = "";
-    loadAdmin();
-  } catch (e) { $("#new-user-error").textContent = e.message; }
-};
-
-initAuth();
-</script>
+<script src="/assets/i18n.js?v=20260728" defer></script>
+<script src="/assets/app.js?v=20260728" defer></script>
 </body>
 </html>

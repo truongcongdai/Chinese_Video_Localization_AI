@@ -1,6 +1,7 @@
 # tests/test_orchestrator_service.py
+import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from universal_video_ai.orchestrator.service import LocalizationService, LocalizationConfig, LocalizationResult
@@ -10,8 +11,25 @@ from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.timeline.service import TimelineService, TimelineSegment
 from universal_video_ai.mixer.service import MixerService
-from universal_video_ai.render.renderer import Renderer
+from universal_video_ai.render.renderer import Renderer, RenderConfig, AnimatedSubtitleConfig
 from universal_video_ai.downloader.service import DownloadService
+
+
+@pytest.fixture(autouse=True)
+def _disable_global_download_rate_limit():
+    """Keep orchestrator unit tests deterministic and independent of Redis."""
+    limiter = MagicMock()
+    limiter.acquire = AsyncMock()
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+    with patch(
+        "universal_video_ai.orchestrator.service.get_rate_limiter",
+        return_value=limiter,
+    ), patch(
+        "universal_video_ai.orchestrator.service.asyncio.to_thread",
+        side_effect=run_inline,
+    ):
+        yield
 
 
 def test_localization_service_basic_flow(tmp_path: Path):
@@ -52,7 +70,7 @@ def test_localization_service_basic_flow(tmp_path: Path):
         mock_pipeline.process.return_value = audio_result
         mock_pipeline_factory.return_value = mock_pipeline
 
-        result = service.localize(str(tmp_path), tmp_path)
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
 
         assert isinstance(result, LocalizationResult)
         assert result.download_result == download_result
@@ -111,7 +129,7 @@ def test_localization_service_with_translation_and_tts(tmp_path: Path):
         mock_pipeline.process.return_value = audio_result
         mock_pipeline_factory.return_value = mock_pipeline
 
-        result = service.localize(str(tmp_path), tmp_path)
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
 
         assert result.translated_text == "Xin chào thế giới"
         assert result.tts_audio_path is not None
@@ -142,13 +160,22 @@ def test_localization_service_with_rendering(tmp_path: Path):
     # Mock TTS
     tts_audio = tmp_path / "tts_audio.wav"
     tts_audio.write_bytes(b"tts")
-    tts_service.synthesize.side_effect = lambda text, output_path, language: output_path.write_bytes(b"tts")
+    tts_service.synthesize.side_effect = (
+        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+    )
 
     # Mock subtitles
     # Mock subtitles
     segments = [TimelineSegment(start_time=0.0, end_time=5.0, text="Hello")]
     timeline.align_transcript.return_value = segments
     timeline.generate_srt.return_value = "1\n00:00:00,000 --> 00:00:05,000\nHello\n"
+    timeline.generate_ass_karaoke.return_value = (
+        "[Script Info]\nScriptType: v4.00+\n[V4+ Styles]\n[Events]\n"
+    )
+    renderer._get_video_dimensions.return_value = (1080, 1920)
+    renderer.config = RenderConfig(
+        animated_subtitle_config=AnimatedSubtitleConfig(enabled=True)
+    )
 
     # Mock mixer
     mixed_audio = tmp_path / "audio_mixed.wav"
@@ -156,7 +183,10 @@ def test_localization_service_with_rendering(tmp_path: Path):
 
     # Mock renderer
     final_video = tmp_path / "output_final.mp4"
-    renderer.render.side_effect = lambda video_path, audio_path, subtitles, output_path: output_path.write_bytes(b"final")
+    renderer.render.side_effect = (
+        lambda video_path, audio_path, subtitles, output_path, **kwargs:
+        output_path.write_bytes(b"final")
+    )
 
     config = LocalizationConfig(
         run_transcription=True,
@@ -190,11 +220,15 @@ def test_localization_service_with_rendering(tmp_path: Path):
         mock_pipeline.process.return_value = audio_result
         mock_pipeline_factory.return_value = mock_pipeline
 
-        result = service.localize(str(tmp_path), tmp_path)
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
 
         assert result.final_video_path is not None
         assert result.final_video_path.exists()
         renderer.render.assert_called_once()
+        assert renderer.render.call_args.kwargs["subtitles"] is None
+        assert renderer.render.call_args.kwargs["subtitle_segments"] == [
+            {"text": "Hello", "start": 0.0, "end": 5.0}
+        ]
 
 
 def test_localization_service_download_failure(tmp_path: Path):
@@ -208,7 +242,7 @@ def test_localization_service_download_failure(tmp_path: Path):
     service = LocalizationService(downloader=downloader, config=config)
 
     with pytest.raises(ValueError, match="Download failed"):
-        service.localize("http://invalid.url", tmp_path)
+        asyncio.run(service.localize("http://invalid.url", tmp_path))
 
 
 def test_localization_service_no_transcript(tmp_path: Path):
@@ -248,7 +282,7 @@ def test_localization_service_no_transcript(tmp_path: Path):
         mock_pipeline.process.return_value = audio_result
         mock_pipeline_factory.return_value = mock_pipeline
 
-        result = service.localize(str(tmp_path), tmp_path)
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
 
         # Translation, TTS, and subtitles should not be called
         translate_service.translate.assert_not_called()

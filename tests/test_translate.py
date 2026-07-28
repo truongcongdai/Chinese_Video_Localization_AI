@@ -1,4 +1,6 @@
 # tests/test_translate.py
+import asyncio
+
 from universal_video_ai.translate import (
     TranslatorConfig,
     TranslatorFactory,
@@ -17,14 +19,14 @@ def test_factory_default_noop():
 def test_noop_translator_returns_same_text():
     translator = NoOpTranslator()
     text = "Hello world!"
-    out = translator.translate(text, src_lang="en", dest_lang="vi")
+    out = asyncio.run(translator.translate(text, src_lang="en", dest_lang="vi"))
     assert out == text
 
 
 def test_noop_invalid_input():
     translator = NoOpTranslator()
     try:
-        translator.translate(123)  # type: ignore[arg-type]
+        asyncio.run(translator.translate(123))  # type: ignore[arg-type]
         assert False, "Expected TranslationError for non-string input"
     except TranslationError:
         pass

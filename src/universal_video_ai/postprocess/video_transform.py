@@ -27,6 +27,11 @@ class BorderPosition(Enum):
 @dataclass
 class TransformConfig:
     """Configuration for video transformations."""
+    # Optional delivery canvas. Content is fitted without stretching and
+    # padded into this frame, preserving subtitles and logos.
+    target_width: Optional[int] = None
+    target_height: Optional[int] = None
+
     # Flip settings
     enable_flip: bool = False
     flip_mode: FlipMode = FlipMode.HORIZONTAL
@@ -78,6 +83,15 @@ class VideoTransformer:
     def _build_filter_chain(self) -> str:
         """Build FFmpeg filter chain from config."""
         filters = []
+
+        if self.config.target_width and self.config.target_height:
+            width = max(2, int(self.config.target_width) // 2 * 2)
+            height = max(2, int(self.config.target_height) // 2 * 2)
+            filters.extend([
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
+                "setsar=1",
+            ])
         
         # Flip
         if self.config.enable_flip and self.config.flip_mode != FlipMode.NONE:

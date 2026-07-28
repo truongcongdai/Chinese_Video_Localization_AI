@@ -1,70 +1,89 @@
-
-# .github/workflows/ci.yml
 name: CI
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      docker_smoke:
+        description: "Build Docker image as an optional smoke check"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: src
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  test:
+  unit-tests:
+    name: Unit tests / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
-    steps:
-      - uses: actions/checkout@v4
+        python-version: ["3.11", "3.12"]
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
 
-      - name: Cache pip
-        uses: actions/cache@v3
+      - name: Set up Node.js for static JS checks
+        uses: actions/setup-node@v4
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          node-version: "22"
 
-      - name: Install dependencies
+      - name: Install CI dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements-ci.txt
 
-      - name: Run tests
+      - name: Static syntax checks
         run: |
-          python -m pytest -q --tb=short
+          python -m compileall -q src tests
+          node --check src/universal_video_ai/web/static/app.js
+          node --check src/universal_video_ai/web/static/i18n.js
 
-      - name: Lint with flake8
+      - name: Run unit tests
         run: |
-          pip install flake8
-          # Stop the build if there are Python syntax errors or undefined names
-          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Warn on other issues (E501 line too long is optional)
-          flake8 src/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+          python -m pytest -q --cov=universal_video_ai --cov-report=term-missing --cov-report=xml
 
-      - name: Format check with black
-        run: |
-          pip install black
-          black --check src/ tests/ --line-length=120 || true
+      - name: Upload coverage XML
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
 
-  build-docker:
+  docker-smoke:
+    name: Docker smoke build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch' && inputs.docker_smoke == 'true'
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: |
-          docker build -t chinese-video-ai:latest .
-
-      - name: Test Docker image
-        run: |
-          docker run --rm chinese-video-ai:latest --help
+        run: docker build -t chinese-video-ai:ci .

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import os
 import random
 import shutil
 import subprocess
@@ -209,12 +210,13 @@ class EdgeTTS:
             config: Optional[TTSConfig] = None,
             logger: Optional[logging.Logger] = None,
             max_retries: int = 5,
-            retry_backoff_seconds: float = 2.0,
+            retry_backoff_seconds: float = 0.6,
     ) -> None:
         self.config = config or TTSConfig(provider="edge")
         self.logger = logger or _logger
         self.max_retries = max(1, max_retries)
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.timeout_seconds = max(8, int(os.environ.get("EDGE_TTS_TIMEOUT_SECONDS", "28")))
         if not _check_edge_tts_available():
             self.logger.warning("edge-tts CLI not found in PATH; EdgeTTS may fail at runtime")
         self.logger.debug("EdgeTTS initialized with config=%s", self.config)
@@ -262,14 +264,16 @@ class EdgeTTS:
 
         # Keep one Edge websocket request active at a time in this Python process.
         with _EDGE_TTS_LOCK:
-            for effective_voice in voices:
+            for voice_index, effective_voice in enumerate(voices):
+                attempts_for_voice = self.max_retries if voice_index == len(voices) - 1 else min(2, self.max_retries)
                 self.logger.info(
-                    "EdgeTTS synthesizing to %s using voice=%s",
+                    "EdgeTTS synthesizing to %s using voice=%s attempts=%d",
                     output_path,
                     effective_voice,
+                    attempts_for_voice,
                 )
 
-                for attempt in range(1, self.max_retries + 1):
+                for attempt in range(1, attempts_for_voice + 1):
                     output_path.unlink(missing_ok=True)
                     temp_output = output_path.with_name(
                         f"{output_path.stem}.part{output_path.suffix}"
@@ -295,7 +299,7 @@ class EdgeTTS:
                             capture_output=True,
                             text=True,
                             check=False,
-                            timeout=120,
+                            timeout=self.timeout_seconds,
                         )
 
                         if result.returncode != 0:
@@ -317,7 +321,7 @@ class EdgeTTS:
                         return output_path
 
                     except subprocess.TimeoutExpired:
-                        last_error = "edge-tts synthesis timed out after 120 seconds"
+                        last_error = f"edge-tts synthesis timed out after {self.timeout_seconds} seconds"
                     except FileNotFoundError as exc:
                         self.logger.error("edge-tts not found: %s", exc)
                         raise RuntimeError(
@@ -332,24 +336,25 @@ class EdgeTTS:
                     temp_output.unlink(missing_ok=True)
                     output_path.unlink(missing_ok=True)
 
-                    if attempt < self.max_retries:
-                        delay = (
-                                self.retry_backoff_seconds * (2 ** (attempt - 1))
-                                + random.uniform(0.0, 1.0)
+                    if attempt < attempts_for_voice:
+                        delay = min(
+                            4.0,
+                            self.retry_backoff_seconds * (1.7 ** (attempt - 1))
+                            + random.uniform(0.0, 0.35),
                         )
-                        self.logger.warning(
-                            "edge-tts failed (voice=%s, attempt %d/%d): %s; "
+                        self.logger.info(
+                            "edge-tts transient failure (voice=%s, attempt %d/%d): %s; "
                             "retrying in %.1fs",
                             effective_voice,
                             attempt,
-                            self.max_retries,
+                            attempts_for_voice,
                             last_error,
                             delay,
                         )
                         time.sleep(delay)
                     else:
-                        self.logger.error(
-                            "edge-tts exhausted retries for voice=%s: %s",
+                        self.logger.warning(
+                            "edge-tts exhausted attempts for voice=%s: %s",
                             effective_voice,
                             last_error,
                         )

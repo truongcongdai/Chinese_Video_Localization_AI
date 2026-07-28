@@ -19,10 +19,12 @@ def test_create_localization_service_with_transcription():
     service = create_localization_service(
         run_transcription=True,
         transcription_language="en",
+        transcription_model="small",
     )
     assert service is not None
     assert service.config.run_transcription is True
     assert service.config.transcription_language == "en"
+    assert service.config.transcription_model == "small"
 
 
 def test_create_localization_service_with_translation():

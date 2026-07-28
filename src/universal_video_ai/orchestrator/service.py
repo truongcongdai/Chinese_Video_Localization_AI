@@ -18,6 +18,7 @@ from universal_video_ai.audio.audio_result import AudioResult
 from universal_video_ai.audio.background_music import BackgroundMusicLibrary
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.translate.service import TranslateService
+from universal_video_ai.translate.adapt import SegmentAdapter
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.timeline.service import TimelineService, TimelineConfig, TimelineSegment
 from universal_video_ai.mixer.service import (
@@ -50,6 +51,7 @@ class LocalizationConfig:
     run_demucs: bool = False
     run_transcription: bool = False
     transcription_language: Optional[str] = None
+    transcription_model: Optional[str] = None
     demucs_output_dir: Optional[Path] = None
 
     # Translation & TTS
@@ -260,6 +262,7 @@ class LocalizationService:
             self,
             downloader: Optional[DownloadService] = None,
             translate_service: Optional[TranslateService] = None,
+            segment_adapter: Optional[SegmentAdapter] = None,
             tts_service: Optional[TTSService] = None,
             timeline: Optional[TimelineService] = None,
             mixer: Optional[MixerService] = None,
@@ -274,6 +277,7 @@ class LocalizationService:
     ) -> None:
         self.downloader = downloader or DownloadService(user_id=user_id, use_cache=use_download_cache)
         self.translate_service = translate_service
+        self.segment_adapter = segment_adapter
         self.tts_service = tts_service
         self.timeline = timeline or TimelineService()
         self.mixer = mixer or MixerService()
@@ -400,6 +404,7 @@ class LocalizationService:
             run_demucs=self.config.run_demucs,
             run_transcription=self.config.run_transcription,
             transcription_language=self.config.transcription_language,
+            transcription_model=self.config.transcription_model,
             demucs_output_dir=self.config.demucs_output_dir,
             logger=self.logger,
         )
@@ -445,6 +450,14 @@ class LocalizationService:
                         translated_segments = await self.translate_service.translate_segments(
                             source_segments, source_lang=source_lang, target_lang=target_lang
                         )
+                        if self.segment_adapter is not None:
+                            self._progress(54, "Đang tối ưu bản dịch theo ngữ cảnh...")
+                            translated_segments = await self.segment_adapter.adapt_segments(
+                                source_segments,
+                                translated_segments,
+                                source_lang=source_lang,
+                                target_lang=target_lang,
+                            )
                         translated_text = " ".join(s.text for s in translated_segments if s.text)
                     else:
                         # Fallback: no real per-sentence timing available (e.g. a
@@ -741,9 +754,16 @@ class LocalizationService:
                     subtitle_segments_for_render = None
                     if self.renderer.config.animated_subtitle_config and self.renderer.config.animated_subtitle_config.enabled:
                         subtitle_segments_for_render = [
-                            {"text": seg.text, "start": seg.start, "end": seg.end}
+                            {"text": seg.text, "start": seg.start_time, "end": seg.end_time}
                             for seg in subtitle_segments
                         ] if subtitle_segments else None
+                        if subtitle_segments_for_render:
+                            if subtitles_for_render is not None:
+                                self.logger.info(
+                                    "LocalizationService: animated subtitles enabled; skipping separate "
+                                    "ASS/SRT burn to avoid duplicate subtitle layers"
+                                )
+                            subtitles_for_render = None
                     
                     async with _RENDER_SLOTS:
                         await asyncio.to_thread(

@@ -8,8 +8,10 @@ from typing import Callable, Optional, Tuple
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.translate.backend import TranslatorBackend
+from universal_video_ai.translate.adapt import AdaptationConfig, SegmentAdapter
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.tts.backend import EdgeTTSBackend
+from universal_video_ai.tts.premium import OpenAITTSBackend, ElevenLabsTTSBackend
 from universal_video_ai.timeline.service import TimelineService
 from universal_video_ai.mixer.service import MixerService, MixerConfig
 from universal_video_ai.render.renderer import Renderer, RenderConfig
@@ -26,12 +28,18 @@ _logger = logging.getLogger(__name__)
 def create_localization_service(
         run_transcription: bool = False,
         transcription_language: Optional[str] = None,
+        transcription_model: Optional[str] = None,
         run_demucs: bool = False,
         demucs_output_dir: Optional[Path] = None,
         run_translation: bool = False,
         target_language: Optional[str] = None,
         run_tts: bool = False,
         tts_voice: Optional[str] = None,
+        tts_provider: str = "edge",
+        tts_provider_api_key: Optional[str] = None,
+        tts_provider_model: Optional[str] = None,
+        tts_style: str = "natural",
+        translation_adaptation: Optional[AdaptationConfig] = None,
         generate_subtitles: bool = False,
         mix_audio: bool = False,
         replace_source_audio: bool = False,
@@ -63,6 +71,8 @@ def create_localization_service(
         per-sentence timestamps; without it, translation/TTS/subtitles fall
         back to whole-transcript, unaligned behavior)
     :param transcription_language: source language (default None auto-detect)
+    :param transcription_model: Whisper model name for speech recognition.
+        None keeps the speech backend default.
     :param run_demucs: enable Demucs audio stem separation
     :param demucs_output_dir: where to save Demucs outputs (optional)
     :param run_translation: enable translation
@@ -97,6 +107,7 @@ def create_localization_service(
 
     # Translation service (optional)
     translate_service = None
+    segment_adapter = None
     if run_translation:
         try:
             translate_backend = TranslatorBackend()
@@ -104,14 +115,40 @@ def create_localization_service(
             logger.info("TranslatorBackend available; translation enabled")
         except Exception as exc:
             logger.warning("TranslatorBackend not available; translation disabled: %s", exc)
+        if translation_adaptation and translation_adaptation.enabled:
+            segment_adapter = SegmentAdapter(translation_adaptation, logger=logger)
 
     # TTS service (optional)
     tts_service = None
     if run_tts:
         try:
-            tts_backend = EdgeTTSBackend(logger=logger)
+            provider = (tts_provider or "edge").strip().lower()
+            if provider == "openai":
+                if not tts_provider_api_key:
+                    raise RuntimeError("OpenAI API key is not configured for this user")
+                tts_backend = OpenAITTSBackend(
+                    api_key=tts_provider_api_key,
+                    model=tts_provider_model or "gpt-4o-mini-tts",
+                    default_voice=(tts_voice or "alloy").split(":", 1)[-1],
+                    style=tts_style,
+                    logger=logger,
+                )
+            elif provider == "elevenlabs":
+                if not tts_provider_api_key:
+                    raise RuntimeError("ElevenLabs API key is not configured for this user")
+                tts_backend = ElevenLabsTTSBackend(
+                    api_key=tts_provider_api_key,
+                    model=tts_provider_model or "eleven_multilingual_v2",
+                    default_voice=(tts_voice or "").split(":", 1)[-1],
+                    style=tts_style,
+                    logger=logger,
+                )
+            elif provider in {"playht", "cartesia", "xtts"}:
+                raise RuntimeError(f"{provider} TTS runtime is not wired yet; use Edge, OpenAI, or ElevenLabs")
+            else:
+                tts_backend = EdgeTTSBackend(logger=logger)
             tts_service = TTSService(backend=tts_backend, logger=logger)
-            logger.info("EdgeTTSBackend available; TTS enabled")
+            logger.info("%s TTS backend available; TTS enabled", provider)
         except Exception as exc:
             logger.warning("EdgeTTSBackend not available; TTS disabled: %s", exc)
 
@@ -153,6 +190,7 @@ def create_localization_service(
         run_demucs=run_demucs,
         run_transcription=run_transcription,
         transcription_language=transcription_language,
+        transcription_model=transcription_model,
         demucs_output_dir=demucs_output_dir,
         run_translation=run_translation,
         target_language=target_language or "en",
@@ -173,6 +211,7 @@ def create_localization_service(
     return LocalizationService(
         downloader=downloader,
         translate_service=translate_service,
+        segment_adapter=segment_adapter,
         tts_service=tts_service,
         timeline=timeline,
         mixer=mixer,

@@ -40,20 +40,23 @@ def test_edge_tts_subprocess_success(tmp_path: Path, monkeypatch):
 
     # Mock subprocess.run to simulate success and create output file
     def mock_run(cmd, capture_output, text, check, timeout):
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        if "--write-media" not in cmd:
+            result.stdout = "1.25\n"
+            return result
         # create the output file to simulate edge-tts behavior
         output_path = Path(cmd[cmd.index("--write-media") + 1])
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"audio data")
-        result = MagicMock()
-        result.returncode = 0
-        result.stderr = ""
         result.stdout = ""
         return result
 
     monkeypatch.setattr("subprocess.run", mock_run)
 
     cfg = TTSConfig(provider="edge", voice="en-US-JennyNeural", output_format="mp3")
-    tts = EdgeTTS(config=cfg)
+    tts = EdgeTTS(config=cfg, max_retries=1, retry_backoff_seconds=0)
     path = tts.synthesize(text, out)
     assert path.exists()
     assert path.read_bytes() == b"audio data"
@@ -70,7 +73,7 @@ def test_edge_tts_not_found(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("subprocess.run", mock_run_raise)
 
     cfg = TTSConfig(provider="edge")
-    tts = EdgeTTS(config=cfg)
+    tts = EdgeTTS(config=cfg, max_retries=1, retry_backoff_seconds=0)
     with pytest.raises(RuntimeError):
         tts.synthesize(text, out)
 
@@ -90,6 +93,6 @@ def test_edge_tts_failure(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("subprocess.run", mock_run_fail)
 
     cfg = TTSConfig(provider="edge")
-    tts = EdgeTTS(config=cfg)
+    tts = EdgeTTS(config=cfg, max_retries=1, retry_backoff_seconds=0)
     with pytest.raises(RuntimeError):
         tts.synthesize(text, out)

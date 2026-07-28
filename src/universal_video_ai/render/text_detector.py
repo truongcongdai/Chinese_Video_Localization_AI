@@ -176,6 +176,9 @@ class OnScreenTextDetector:
         max_single_box_height_ratio: float = 0.3,
         max_lines_per_region: float = 2.4,
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
+        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
+            0.08, 0.25, 0.92, 0.95,
+        ),
         fill_undetected_windows: bool = True,
     ) -> List[TextRegion]:
         """
@@ -248,6 +251,13 @@ class OnScreenTextDetector:
             A top-right exclusion is recommended for Chinese advertising
             banners, which are frequently present in every frame and can
             otherwise be mistaken for the subtitle band.
+        :param subtitle_candidate_region_fractional: region used for
+            learning the subtitle band, as (x0,y0,x1,y1) fractions of the
+            frame. OCR text whose center is in the extreme corners/top UI
+            is ignored before band clustering, because persistent labels,
+            watermarks, and counters can otherwise out-vote the real
+            subtitle. If this filter would remove every box, detection
+            falls back to the unfiltered boxes for compatibility.
         :param fill_undetected_windows: when a window's own sampled frames
             produced NO in-band OCR box (e.g. the on-screen text was on
             screen too briefly, in motion, or just missed by OCR on the
@@ -285,6 +295,8 @@ class OnScreenTextDetector:
 
         # ---- Pass 1: sample every window's frames once, keep raw per-window boxes ----
         per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]]]] = []
+        fallback_per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]]]] = []
+        candidate_filter_active = bool(subtitle_candidate_region_fractional and frame_w and frame_h)
 
         with tempfile.TemporaryDirectory(prefix="ocr_frames_") as tmp:
             tmp_dir = Path(tmp)
@@ -308,10 +320,23 @@ class OnScreenTextDetector:
                 )
                 if exclude_px:
                     raw_boxes = self._drop_excluded_boxes(raw_boxes, exclude_px)
+                fallback_per_window_boxes.append((start, end, list(raw_boxes)))
+                if candidate_filter_active and subtitle_candidate_region_fractional and frame_w and frame_h:
+                    candidate_boxes = self._keep_candidate_subtitle_boxes(
+                        raw_boxes, frame_w, frame_h, subtitle_candidate_region_fractional
+                    )
+                    raw_boxes = candidate_boxes
                 per_window_boxes.append((start, end, raw_boxes))
 
         # ---- Learn where this video's subtitle line actually sits ----
         all_boxes = [b for (_s, _e, boxes) in per_window_boxes for b in boxes]
+        if not all_boxes and candidate_filter_active:
+            self.logger.info(
+                "OnScreenTextDetector: subtitle candidate region removed every OCR box; "
+                "falling back to unfiltered OCR boxes for this video"
+            )
+            per_window_boxes = fallback_per_window_boxes
+            all_boxes = [b for (_s, _e, boxes) in per_window_boxes for b in boxes]
         band_center, typical_line_height = self._learn_subtitle_band(all_boxes)
         self.last_typical_line_height = typical_line_height
 
@@ -446,6 +471,32 @@ class OnScreenTextDetector:
             if any(ex0 <= cx <= ex1 and ey0 <= cy <= ey1 for (ex0, ey0, ex1, ey1) in exclude_px):
                 continue
             kept.append(b)
+        return kept
+
+    def _keep_candidate_subtitle_boxes(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        frame_w: int,
+        frame_h: int,
+        region_fractional: Tuple[float, float, float, float],
+    ) -> List[Tuple[int, int, int, int]]:
+        """Keep boxes whose centers are in the plausible subtitle area.
+
+        This is deliberately based on box center, not full overlap: real
+        subtitles can be wide, but their center usually remains near the
+        content-safe middle of the frame. Corner UI/watermark text has a
+        center near the edge and should not participate in subtitle-band
+        learning.
+        """
+        fx0, fy0, fx1, fy1 = region_fractional
+        x0, y0 = fx0 * frame_w, fy0 * frame_h
+        x1, y1 = fx1 * frame_w, fy1 * frame_h
+        kept = []
+        for b in boxes:
+            cx = (b[0] + b[2]) / 2.0
+            cy = (b[1] + b[3]) / 2.0
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                kept.append(b)
         return kept
 
     def _learn_subtitle_band(

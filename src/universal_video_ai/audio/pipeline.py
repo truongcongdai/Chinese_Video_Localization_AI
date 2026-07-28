@@ -27,6 +27,7 @@ class AudioPipelineConfig:
     demucs_output_dir: Optional[Path] = None
     run_transcription: bool = False
     transcription_language: Optional[str] = None
+    transcription_model: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,5 @@
 # tests/test_translate_service.py
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,14 +11,14 @@ from universal_video_ai.translate.exceptions import TranslationBackendUnavailabl
 
 @dataclass
 class DummyTranslateBackend:
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         return f"translated:{text}:{source_lang}:{target_lang}"
 
 
 def test_translate_service_success():
     backend = DummyTranslateBackend()
     svc = TranslateService(backend=backend)
-    result = svc.translate("hello", "en", "vi")
+    result = asyncio.run(svc.translate("hello", "en", "vi"))
     assert "translated" in result
     assert "hello" in result
 
@@ -25,4 +26,4 @@ def test_translate_service_success():
 def test_translate_service_no_backend_raises():
     svc = TranslateService(backend=None)
     with pytest.raises(TranslationBackendUnavailable):
-        svc.translate("hello", "en", "vi")
+        asyncio.run(svc.translate("hello", "en", "vi"))

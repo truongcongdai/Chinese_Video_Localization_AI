@@ -51,7 +51,7 @@ class OpportunityAnalyzeBody(BaseModel):
 
 
 @router.get("/status")
-def youtube_research_status() -> dict:
+async def youtube_research_status() -> dict:
     return {
         "enabled": True,
         "max_concurrent_jobs": YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS,
@@ -67,7 +67,7 @@ def youtube_research_status() -> dict:
 
 
 @router.post("/analyze/opportunity")
-def analyze_opportunity(body: OpportunityAnalyzeBody) -> dict:
+async def analyze_opportunity(body: OpportunityAnalyzeBody) -> dict:
     if not body.videos:
         raise HTTPException(status_code=400, detail="videos must not be empty")
     if len(body.videos) > YOUTUBE_RESEARCH_MAX_RESULTS:

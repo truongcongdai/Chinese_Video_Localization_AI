@@ -12,8 +12,9 @@ from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
 __all__ = ["WhisperTranscriber", "WhisperConfig"]
 
 _logger = logging.getLogger(__name__)
-_MODEL_CACHE: dict[tuple[str, Optional[str]], object] = {}
+_MODEL_CACHE: dict[tuple[str, Optional[str], bool], object] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_INFERENCE_LOCKS: dict[tuple[str, Optional[str], bool], threading.Lock] = {}
 
 
 def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str], fp16: bool = False):
@@ -32,6 +33,22 @@ def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str]
                 model = model.half()
             _MODEL_CACHE[key] = model
     return model
+
+
+def _whisper_inference_lock(
+    model_name: str, device: Optional[str], fp16: bool
+) -> threading.Lock:
+    """Return the lock guarding one cached model's mutable decode state.
+
+    ``openai-whisper`` installs and removes KV-cache hooks on the model while
+    decoding. A cached model therefore cannot safely serve two Python threads
+    at once: concurrent calls corrupt that cache and fail with ``KeyError:
+    Linear(...)`` or zero-length tensor errors. Loading/extraction can remain
+    concurrent; only the actual model inference is serialized.
+    """
+    key = (model_name, device, fp16)
+    with _MODEL_CACHE_LOCK:
+        return _MODEL_INFERENCE_LOCKS.setdefault(key, threading.Lock())
 
 
 @dataclass
@@ -171,23 +188,29 @@ class WhisperTranscriber:
             if use_fp16:
                 whisper_kwargs["fp16"] = True
 
-            try:
-                result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
-            except (ValueError, RuntimeError) as decode_exc:
-                # Retry with fp16=False if fp16 failed (dtype mismatch or NaN)
-                message = str(decode_exc)
-                if use_fp16 and ("dtype" in message.lower() or "invalid values" in message.lower()):
-                    self.logger.warning(
-                        "Whisper fp16 decoding failed on %s with %s; "
-                        "retrying once with fp16=False",
-                        audio_path,
-                        type(decode_exc).__name__,
-                    )
-                    retry_kwargs = dict(whisper_kwargs)
-                    retry_kwargs["fp16"] = False
-                    result = model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
-                else:
-                    raise
+            inference_lock = _whisper_inference_lock(
+                self.config.model, self.config.device, bool(use_fp16)
+            )
+            with inference_lock:
+                try:
+                    result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
+                except (ValueError, RuntimeError) as decode_exc:
+                    # Retry with fp16=False if fp16 failed (dtype mismatch or NaN).
+                    # Keep the same lock for the retry because it uses the same
+                    # cached model and mutable decoder hooks.
+                    message = str(decode_exc)
+                    if use_fp16 and ("dtype" in message.lower() or "invalid values" in message.lower()):
+                        self.logger.warning(
+                            "Whisper fp16 decoding failed on %s with %s; "
+                            "retrying once with fp16=False",
+                            audio_path,
+                            type(decode_exc).__name__,
+                        )
+                        retry_kwargs = dict(whisper_kwargs)
+                        retry_kwargs["fp16"] = False
+                        result = model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
+                    else:
+                        raise
             if not isinstance(result, dict):
                 # Defensive: some mocks/backends might return a plain string.
                 result = {"text": str(result), "segments": []}

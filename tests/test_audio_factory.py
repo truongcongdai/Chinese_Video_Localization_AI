@@ -16,10 +16,15 @@ def test_create_pipeline_basic():
 
 def test_create_pipeline_with_transcription():
     """Test pipeline creation with transcription requested."""
-    pipeline = create_audio_pipeline(run_transcription=True, transcription_language="en")
+    pipeline = create_audio_pipeline(
+        run_transcription=True,
+        transcription_language="en",
+        transcription_model="small",
+    )
     assert pipeline is not None
     assert pipeline.config.run_transcription is True
     assert pipeline.config.transcription_language == "en"
+    assert pipeline.config.transcription_model == "small"
     # Note: speech_service may be None if whisper not available; factory logged warning
     # We don't assert speech_service is not None here — test machines may not have whisper
 

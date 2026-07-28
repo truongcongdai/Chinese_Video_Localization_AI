@@ -1,33 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+import pytest
+from fastapi import HTTPException
 
-from universal_video_ai.web.youtube_research import router
-
-
-def _client() -> TestClient:
-    app = FastAPI()
-    app.include_router(router)
-    return TestClient(app)
+from universal_video_ai.web.youtube_research import (
+    OpportunityAnalyzeBody,
+    analyze_opportunity,
+    youtube_research_status,
+)
 
 
 def test_youtube_research_status_endpoint() -> None:
-    response = _client().get("/api/youtube-research/status")
-
-    assert response.status_code == 200
-    payload = response.json()
+    payload = asyncio.run(youtube_research_status())
     assert payload["enabled"] is True
     assert payload["collector_enabled"] is False
     assert payload["database_enabled"] is True
 
 
 def test_youtube_research_opportunity_endpoint() -> None:
-    response = _client().post(
-        "/api/youtube-research/analyze/opportunity",
-        json={
+    payload = asyncio.run(
+        analyze_opportunity(
+            OpportunityAnalyzeBody.model_validate({
             "videos": [
                 {
                     "video_id": "v1",
@@ -51,11 +47,9 @@ def test_youtube_research_opportunity_endpoint() -> None:
             "content_gap_score": 75,
             "evergreen_score": 80,
             "monetization_potential_score": 60,
-        },
+            })
+        )
     )
-
-    assert response.status_code == 200
-    payload = response.json()
     assert 0 <= payload["trend"]["trend_score"] <= 100
     assert 0 <= payload["competition"]["competition_score"] <= 100
     assert 0 <= payload["opportunity"]["adjusted_score"] <= payload["opportunity"]["raw_score"]
@@ -63,9 +57,6 @@ def test_youtube_research_opportunity_endpoint() -> None:
 
 
 def test_youtube_research_opportunity_rejects_empty_sample() -> None:
-    response = _client().post(
-        "/api/youtube-research/analyze/opportunity",
-        json={"videos": []},
-    )
-
-    assert response.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(analyze_opportunity(OpportunityAnalyzeBody(videos=[])))
+    assert exc.value.status_code == 400

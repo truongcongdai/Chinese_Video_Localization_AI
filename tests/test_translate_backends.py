@@ -1,4 +1,5 @@
 # tests/test_translate_backends.py
+import asyncio
 import pytest
 from pathlib import Path
 
@@ -16,7 +17,7 @@ def test_noop_translator():
     config = TranslatorConfig(provider="noop")
     translator = NoOpTranslator(config=config)
     
-    result = translator.translate("Hello world", src_lang="en", dest_lang="vi")
+    result = asyncio.run(translator.translate("Hello world", src_lang="en", dest_lang="vi"))
     assert result == "Hello world"
 
 
@@ -26,7 +27,7 @@ def test_noop_translator_invalid_input():
     translator = NoOpTranslator(config=config)
     
     with pytest.raises(TranslationError):
-        translator.translate(123)  # type: ignore
+        asyncio.run(translator.translate(123))  # type: ignore
 
 
 def test_translator_factory_noop():
@@ -35,7 +36,7 @@ def test_translator_factory_noop():
     translator = TranslatorFactory.create(config=config)
     
     assert isinstance(translator, NoOpTranslator)
-    assert translator.translate("test") == "test"
+    assert asyncio.run(translator.translate("test")) == "test"
 
 
 def test_translator_factory_google_unavailable():

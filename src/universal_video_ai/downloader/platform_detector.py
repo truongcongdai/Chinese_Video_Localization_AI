@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from urllib.parse import urlparse
+import re
 
 from .platform import Platform
 
@@ -35,6 +36,9 @@ class PlatformDetector:
     }
 
     def detect(self, url: str) -> Platform:
+        url_match = re.search(r"https?://[^\s<>'\"]+", url or "")
+        if url_match:
+            url = url_match.group(0).rstrip(".,;:!?)]}】》”’\"'")
 
         hostname = urlparse(url).hostname
 
