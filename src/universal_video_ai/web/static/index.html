@@ -6,7 +6,7 @@
 <title>Video Localization AI</title>
 <meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/assets/app.css?v=20260728">
+<link rel="stylesheet" href="/assets/app.css?v=20260729">
 </head>
 <body>
 
@@ -307,6 +307,7 @@
         </select>
         <div id="tts-provider-status" class="muted-help">Edge chạy miễn phí, không cần API key.</div>
         <a class="btn secondary small provider-connect-btn hidden" id="provider-connect-link" href="#" target="_blank" rel="noopener">Kết nối bằng mã provider</a>
+        <button class="btn secondary small provider-connect-btn" id="provider-manage-btn" type="button">Quản lý provider</button>
         </div>
         <div class="field" style="flex: 1">
         <label>Phong cách giọng đọc</label>
@@ -331,11 +332,11 @@
 
       <div class="provider-settings-block hidden" id="provider-settings-panel">
         <div class="template-library-heading">
-          <div><strong>Kết nối provider</strong><div class="muted-help">Dùng cho Premium TTS, voice clone hoặc dịch LLM.</div></div>
+          <div><strong>Kết nối provider</strong><div class="muted-help">Lưu API key/model cho TTS premium, Gemini hoặc LLM.</div></div>
+          <button class="btn secondary small" id="provider-close-btn" type="button">Ẩn</button>
         </div>
         <div class="provider-connect-help">
-          Free mode không cần kết nối. Với provider trả phí, hệ thống không thể tự đọc API key sau khi bạn đăng nhập dashboard;
-          hãy mở trang provider, tạo/copy mã kết nối rồi dán vào đây một lần.
+          Free mode không cần key. Với Gemini/provider trả phí, tạo key ở dashboard rồi dán một lần; hệ thống sẽ kiểm tra và tải model/voice khả dụng.
         </div>
         <div class="row">
           <div class="field">
@@ -352,6 +353,7 @@
             <label>Dịch vụ cần kết nối</label>
             <select id="provider-settings-select">
               <option value="openai">OpenAI</option>
+              <option value="gemini">Gemini</option>
               <option value="elevenlabs">ElevenLabs</option>
               <option value="playht">PlayHT</option>
               <option value="cartesia">Cartesia</option>
@@ -369,17 +371,20 @@
             <label>Mã kết nối</label>
             <input id="provider-api-key-input" type="password" autocomplete="off" placeholder="Dán mã kết nối từ trang provider">
           </div>
-          <div class="field">
-            <label>Mã phụ trợ nếu provider yêu cầu</label>
-            <input id="provider-api-secret-input" type="password" autocomplete="off" placeholder="Ví dụ: User ID của PlayHT">
-          </div>
         </div>
-        <div class="row">
-          <div class="field">
-            <label>Giọng mặc định</label>
-            <input id="provider-voice-input" placeholder="Tùy chọn: để trống nếu muốn chọn từ danh sách tự động">
+        <details class="provider-advanced-fields">
+          <summary>Nâng cao: secret phụ trợ, voice thủ công</summary>
+          <div class="row">
+            <div class="field">
+              <label>Mã phụ trợ nếu provider yêu cầu</label>
+              <input id="provider-api-secret-input" type="password" autocomplete="off" placeholder="Ví dụ: User ID của PlayHT">
+            </div>
+            <div class="field">
+              <label>Giọng mặc định</label>
+              <input id="provider-voice-input" placeholder="Tùy chọn: để trống nếu muốn chọn từ danh sách tự động">
+            </div>
           </div>
-        </div>
+        </details>
         <div class="provider-settings-actions">
           <button class="btn secondary small" id="provider-save-btn" type="button">Lưu kết nối</button>
           <button class="btn secondary small" id="provider-delete-btn" type="button">Xóa kết nối</button>
@@ -422,8 +427,9 @@
             <option value="faithful">Dịch sát</option>
             <option value="contextual">Dịch theo ngữ cảnh bằng LLM</option>
             <option value="adaptive">Viết lại tự nhiên theo audience</option>
+            <option value="gemini">Gemini</option>
           </select>
-          <div id="translation-login-status" class="muted-help">Dịch sát dùng engine free. Contextual/adaptive cần một kết nối LLM đã lưu.</div>
+          <div id="translation-login-status" class="muted-help">Dịch sát dùng engine free. Contextual/adaptive cần một kết nối LLM đã lưu. Gemini cần lưu key riêng.</div>
         </div>
         <div class="field">
           <label>Model dịch</label>
@@ -1164,12 +1170,21 @@
     <h3 style="margin-top:0">Lịch sử</h3>
     <div class="history-toolbar">
       <input id="history-search" placeholder="Tìm theo tên hoặc link...">
+      <select id="history-status-filter">
+        <option value="">Tất cả trạng thái</option>
+        <option value="done">Hoàn tất</option>
+        <option value="running">Đang chạy</option>
+        <option value="queued">Đang chờ</option>
+        <option value="review">Chờ chỉnh phụ đề</option>
+        <option value="error">Lỗi</option>
+      </select>
       <div><label>Từ ngày</label><input type="date" id="history-date-from"></div>
       <div><label>Đến ngày</label><input type="date" id="history-date-to"></div>
       <button class="btn secondary small" id="history-clear-btn">🔄 Xoá lọc</button>
     </div>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
       <label style="margin:0"><input type="checkbox" id="history-select-all" style="width:auto"> Chọn tất cả</label>
+      <button class="btn secondary small" id="history-bulk-download" disabled>Tải ZIP mục đã chọn</button>
       <button class="btn danger small" id="history-bulk-delete" disabled>🗑️ Xoá mục đã chọn</button>
       <span id="history-selected-count" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
@@ -1191,6 +1206,16 @@
       <button class="btn secondary" id="confirm-cancel">❌ Hủy</button>
       <button class="btn danger" id="confirm-accept">🗑️ Xóa</button>
     </div>
+  </div>
+</div>
+
+<div id="subtitle-viewer-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" id="subtitle-viewer-close">×</button>
+    <h3>Xem phụ đề</h3>
+    <p class="sub" style="margin-top:-8px">Đối chiếu phụ đề gốc và phụ đề dịch trực tiếp trên web.</p>
+    <div id="subtitle-viewer-quality" class="muted-help" style="margin-bottom:10px"></div>
+    <div id="subtitle-viewer-list"></div>
   </div>
 </div>
 
@@ -1356,7 +1381,7 @@
   </div>
 </div>
 
-<script src="/assets/i18n.js?v=20260728" defer></script>
-<script src="/assets/app.js?v=20260728" defer></script>
+<script src="/assets/i18n.js?v=20260729" defer></script>
+<script src="/assets/app.js?v=20260729" defer></script>
 </body>
 </html>

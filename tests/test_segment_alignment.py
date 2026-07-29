@@ -12,10 +12,12 @@ from unittest.mock import MagicMock
 import asyncio
 
 import pytest
+import requests
 
 from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
 from universal_video_ai.speech.whisper import WhisperTranscriber, WhisperConfig
 from universal_video_ai.translate.service import TranslateService
+from universal_video_ai.translate.adapt import AdaptationConfig, SegmentAdapter
 from universal_video_ai.timeline.service import TimelineService
 from universal_video_ai.mixer.service import MixerService, TimedAudioClip
 from universal_video_ai.render.renderer import Renderer, TextOverlay
@@ -113,6 +115,327 @@ def test_translate_segments_limits_concurrency():
     assert backend.peak <= 3
 
 
+def test_segment_adapter_prompt_includes_duration_fit_constraints(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"output_text": '{"segments":[{"i":0,"text":"Bản ngắn"}]}'}
+
+    def fake_post(url, headers, json, timeout):
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("universal_video_ai.translate.adapt.requests.post", fake_post)
+
+    adapter = SegmentAdapter(AdaptationConfig(enabled=True, api_key="test-key"))
+    result = adapter._adapt_with_openai(
+        [TranscriptSegment(start=1.0, end=3.0, text="Original sentence")],
+        [TranscriptSegment(start=1.0, end=3.0, text="Bản dịch nháp quá dài")],
+        source_lang="en",
+        target_lang="vi",
+    )
+
+    user_content = captured["payload"]["input"][1]["content"]
+    assert result == ["Bản ngắn"]
+    assert "duration_seconds" in user_content
+    assert "target_speech_seconds" in user_content
+    assert "max_chars" in user_content
+    assert "entire source script context" in user_content
+    assert "Preserve subject/object relationships" in user_content
+    assert "unreliable machine-translation hint" in user_content
+    assert "Translate from the source text" in user_content
+
+
+def test_segment_adapter_uses_ollama_without_api_key(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"message": {"content": '{"segments":[{"i":0,"text":"Con không thích mẹ"}]}'}}
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("universal_video_ai.translate.adapt.requests.post", fake_post)
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="ollama",
+            model="qwen3:8b",
+            base_url="http://127.0.0.1:11434",
+        )
+    )
+    result = adapter._adapt_with_ollama(
+        [TranscriptSegment(start=0.0, end=1.6, text="我不喜欢妈妈")],
+        [TranscriptSegment(start=0.0, end=1.6, text="tôi không thích mẹ")],
+        source_lang="zh-cn",
+        target_lang="vi",
+    )
+
+    assert result == ["Con không thích mẹ"]
+    assert captured["url"] == "http://127.0.0.1:11434/api/chat"
+    assert captured["payload"]["format"] == "json"
+    assert captured["payload"]["model"] == "qwen3:8b"
+
+
+def test_segment_adapter_uses_gemini_with_api_key(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": '{"segments":[{"i":0,"text":"Con không thích mẹ"}]}'}
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("universal_video_ai.translate.adapt.requests.post", fake_post)
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test-key",
+            model="gemini-3.1-flash-lite",
+        )
+    )
+    result = adapter._adapt_with_gemini(
+        [TranscriptSegment(start=0.0, end=1.6, text="我不喜欢妈妈")],
+        [TranscriptSegment(start=0.0, end=1.6, text="tôi không thích mẹ")],
+        source_lang="zh-cn",
+        target_lang="vi",
+    )
+
+    assert result == ["Con không thích mẹ"]
+    assert captured["url"].endswith("/models/gemini-3.1-flash-lite:generateContent")
+    assert captured["headers"]["x-goog-api-key"] == "test-key"
+    assert captured["payload"]["generationConfig"]["responseMimeType"] == "application/json"
+
+
+def test_segment_adapter_strict_gemini_rejects_unchanged_output(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": (
+                                        '{"segments":['
+                                        '{"i":0,"text":"tôi không thích mẹ"},'
+                                        '{"i":1,"text":"Tôi không muốn đi về phía nam"},'
+                                        '{"i":2,"text":"Hãy ngoan"}'
+                                        ']}'
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        "universal_video_ai.translate.adapt.requests.post",
+        lambda url, headers, json, timeout: FakeResponse(),
+    )
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test-key",
+            fallback_on_error=False,
+        )
+    )
+    source = [
+        TranscriptSegment(start=0.0, end=1.0, text="我不喜欢妈妈"),
+        TranscriptSegment(start=1.0, end=2.0, text="我不要去南方"),
+        TranscriptSegment(start=2.0, end=3.0, text="乖"),
+    ]
+    draft = [
+        TranscriptSegment(start=0.0, end=1.0, text="tôi không thích mẹ"),
+        TranscriptSegment(start=1.0, end=2.0, text="Tôi không muốn đi về phía nam"),
+        TranscriptSegment(start=2.0, end=3.0, text="Hãy ngoan"),
+    ]
+
+    with pytest.raises(RuntimeError, match="unchanged from draft"):
+        asyncio.run(adapter.adapt_segments(source, draft, source_lang="zh-cn", target_lang="vi"))
+
+
+def test_segment_adapter_allows_repeated_output_when_source_repeats(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": (
+                                        '{"segments":['
+                                        '{"i":0,"text":"Đi đi đi."},'
+                                        '{"i":1,"text":"Đi đi đi."},'
+                                        '{"i":2,"text":"Đi đi đi."},'
+                                        '{"i":3,"text":"Đi đi đi."}'
+                                        ']}'
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        "universal_video_ai.translate.adapt.requests.post",
+        lambda url, headers, json, timeout: FakeResponse(),
+    )
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test-key",
+            fallback_on_error=False,
+        )
+    )
+    source = [
+        TranscriptSegment(start=float(i), end=float(i + 1), text="走 走 走")
+        for i in range(4)
+    ]
+    draft = [
+        TranscriptSegment(start=float(i), end=float(i + 1), text=f"Nháp {i}")
+        for i in range(4)
+    ]
+
+    result = asyncio.run(adapter.adapt_segments(source, draft, source_lang="zh-cn", target_lang="vi"))
+
+    assert [segment.text for segment in result] == ["Đi đi đi."] * 4
+
+
+def test_segment_adapter_strict_mode_rejects_repeated_ollama_output(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "message": {
+                    "content": (
+                        '{"segments":['
+                        '{"i":0,"text":"Có chuyện gì vậy bạn"},'
+                        '{"i":1,"text":"Có chuyện gì vậy bạn"},'
+                        '{"i":2,"text":"Có chuyện gì vậy bạn"},'
+                        '{"i":3,"text":"Có chuyện gì vậy bạn"}'
+                        ']}'
+                    )
+                }
+            }
+
+    monkeypatch.setattr(
+        "universal_video_ai.translate.adapt.requests.post",
+        lambda url, json, timeout: FakeResponse(),
+    )
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="ollama",
+            fallback_on_error=False,
+        )
+    )
+    source = [
+        TranscriptSegment(start=float(i), end=float(i + 1), text=f"源句{i}")
+        for i in range(4)
+    ]
+    draft = [
+        TranscriptSegment(start=float(i), end=float(i + 1), text=f"Nháp {i}")
+        for i in range(4)
+    ]
+
+    with pytest.raises(RuntimeError, match="quality gate"):
+        asyncio.run(adapter.adapt_segments(source, draft, source_lang="zh-cn", target_lang="vi"))
+
+
+def test_segment_adapter_reports_ollama_connection_error_clearly(monkeypatch):
+    def fake_post(url, json, timeout):
+        raise requests.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr("universal_video_ai.translate.adapt.requests.post", fake_post)
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="ollama",
+            fallback_on_error=False,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="ollama serve"):
+        asyncio.run(
+            adapter.adapt_segments(
+                [TranscriptSegment(start=0.0, end=1.0, text="我不喜欢妈妈")],
+                [TranscriptSegment(start=0.0, end=1.0, text="tôi không thích mẹ")],
+                source_lang="zh-cn",
+                target_lang="vi",
+            )
+        )
+
+
+def test_segment_adapter_falls_back_when_ollama_times_out(monkeypatch):
+    def fake_post(url, json, timeout):
+        raise requests.exceptions.Timeout("slow")
+
+    monkeypatch.setattr("universal_video_ai.translate.adapt.requests.post", fake_post)
+
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="ollama",
+            request_timeout_seconds=12,
+            fallback_on_error=True,
+        )
+    )
+    source = [TranscriptSegment(start=0.0, end=1.0, text="我不喜欢妈妈")]
+    draft = [TranscriptSegment(start=0.0, end=1.0, text="tôi không thích mẹ")]
+
+    result = asyncio.run(adapter.adapt_segments(source, draft, source_lang="zh-cn", target_lang="vi"))
+
+    assert result == draft
+
+
 def test_timeline_from_segments_uses_real_timestamps_not_even_split():
     """This is the exact bug report: subtitles must NOT be evenly re-split."""
     service = TimelineService()
@@ -163,6 +486,41 @@ def test_mixer_build_dubbed_track_places_clips_at_original_timestamps(tmp_path: 
     # clip at start=10.0 must be delayed by 10000ms, not concatenated at 2000ms
     assert "adelay=10000|10000" in filter_complex
     assert "adelay=0|0" in filter_complex
+
+
+def test_mixer_clamps_tts_tempo_for_more_even_reading_speed(tmp_path: Path, monkeypatch):
+    short_clip = tmp_path / "short.wav"
+    long_clip = tmp_path / "long.wav"
+    short_clip.write_bytes(b"\x00")
+    long_clip.write_bytes(b"\x00")
+
+    mixer = MixerService()
+    monkeypatch.setattr(mixer, "_ffmpeg_available", True)
+
+    durations = {
+        short_clip: 1.0,
+        long_clip: 4.0,
+    }
+    monkeypatch.setattr(mixer, "_probe_duration", lambda path: durations[Path(path)])
+
+    captured_cmd = {}
+
+    def fake_run_ffmpeg(cmd, op_name):
+        captured_cmd["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"mixed")
+
+    monkeypatch.setattr(mixer, "_run_ffmpeg", fake_run_ffmpeg)
+
+    clips = [
+        TimedAudioClip(start=0.0, end=3.0, audio_path=short_clip),
+        TimedAudioClip(start=4.0, end=6.0, audio_path=long_clip),
+    ]
+    mixer.build_dubbed_track(clips, total_duration=8.0, output_path=tmp_path / "dubbed.wav")
+
+    filter_complex = captured_cmd["cmd"][captured_cmd["cmd"].index("-filter_complex") + 1]
+    assert "atempo=0." not in filter_complex
+    assert "atempo=1.3000" in filter_complex
+    assert "atempo=2.0000" not in filter_complex
 
 
 def test_renderer_builds_per_segment_overlay_filters():

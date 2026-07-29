@@ -852,6 +852,7 @@ class Store:
         self,
         user_id: int,
         query: Optional[str] = None,
+        status: Optional[str] = None,
         date_from: Optional[float] = None,
         date_to: Optional[float] = None,
         limit: int = 200,
@@ -870,6 +871,9 @@ class Store:
             clauses.append("(title LIKE ? OR source_url LIKE ?)")
             like = f"%{query}%"
             params.extend([like, like])
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
         if date_from is not None:
             clauses.append("created_at >= ?")
             params.append(date_from)

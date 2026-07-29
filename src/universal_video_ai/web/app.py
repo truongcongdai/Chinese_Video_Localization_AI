@@ -25,6 +25,9 @@ import unicodedata
 import inspect
 import threading
 import gc
+import tempfile
+import zipfile
+import io
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -38,7 +41,7 @@ except ImportError:
 import requests
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
@@ -155,6 +158,7 @@ WEB_RENDER_TIMEOUT_SECONDS = int(os.environ.get("WEB_RENDER_TIMEOUT_SECONDS", "1
 WEB_WHISPER_FAST_MODEL = os.environ.get("WEB_WHISPER_FAST_MODEL", "base")
 WEB_WHISPER_QUALITY_MODEL = os.environ.get("WEB_WHISPER_QUALITY_MODEL", "small")
 WEB_WHISPER_PRO_MODEL = os.environ.get("WEB_WHISPER_PRO_MODEL", "medium")
+DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
@@ -406,6 +410,19 @@ def _env_first(*names: str) -> str:
         if value:
             return value
     return ""
+
+
+def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
 def _payment_config(amount_vnd: int = 0, transfer_content: str = "") -> Dict[str, Any]:
@@ -761,6 +778,10 @@ def _build_service_for_job(job):
     tts_provider = (getattr(job, "tts_provider", None) or "edge").strip().lower()
     provider_settings = store.get_provider_settings(job.user_id, tts_provider) if tts_provider != "edge" else None
     openai_settings = store.get_provider_settings(job.user_id, "openai")
+    animated_subtitle_requested = bool(
+        job.animated_subtitle_config
+        and job.animated_subtitle_config.get("enabled")
+    )
 
     render_config = RenderConfig(
         preset=WEB_RENDER_PRESET,
@@ -861,17 +882,55 @@ def _build_service_for_job(job):
             transform_config=transform_config,
         )
 
-    adaptation_enabled = (getattr(job, "translation_mode", "faithful") or "faithful") in {"contextual", "adaptive"}
+    translation_mode = getattr(job, "translation_mode", "faithful") or "faithful"
+    use_contextual_translation = translation_mode != "faithful"
+    if translation_mode == "gemini":
+        gemini_settings = store.get_provider_settings(job.user_id, "gemini")
+        if not gemini_settings or not gemini_settings.get("api_key"):
+            raise RuntimeError("Chưa kết nối Gemini API key")
+        translation_provider = "gemini"
+        translation_api_key = gemini_settings.get("api_key")
+        requested_model = getattr(job, "translation_model", None) or ""
+        available_models = (gemini_settings.get("extra") or {}).get("llm_models") or (gemini_settings.get("extra") or {}).get("models") or []
+        translation_model = requested_model if requested_model in available_models else (
+            gemini_settings.get("default_model") or (available_models[0] if available_models else "gemini-3.1-flash-lite")
+        )
+        translation_base_url = None
+    elif use_contextual_translation and openai_settings and openai_settings.get("api_key"):
+        translation_provider = "openai"
+        translation_api_key = openai_settings.get("api_key")
+        translation_model = getattr(job, "translation_model", None) or openai_settings.get("default_model") or "gpt-5.6-luna"
+        translation_base_url = None
+    elif use_contextual_translation:
+        translation_provider = "ollama"
+        translation_api_key = None
+        translation_model = getattr(job, "translation_model", None) or _env_first("OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL
+        translation_base_url = _env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434"
+    else:
+        translation_provider = "none"
+        translation_api_key = None
+        translation_model = getattr(job, "translation_model", None) or ""
+        translation_base_url = None
+
+    strict_translation_adapter = translation_provider == "gemini"
     translation_adaptation = AdaptationConfig(
-        enabled=bool(adaptation_enabled and openai_settings and openai_settings.get("api_key")),
-        provider="openai",
-        api_key=openai_settings.get("api_key") if openai_settings else None,
-        model=getattr(job, "translation_model", None)
-        or "gpt-5.6-luna",
+        enabled=use_contextual_translation,
+        provider=translation_provider,
+        api_key=translation_api_key,
+        model=translation_model,
+        base_url=translation_base_url,
         mode=getattr(job, "translation_mode", "faithful") or "faithful",
         tone=getattr(job, "translation_tone", "natural") or "natural",
         audience=getattr(job, "translation_audience", None),
         glossary=getattr(job, "translation_glossary", None),
+        fallback_on_error=not strict_translation_adapter,
+        request_timeout_seconds=(
+            _env_int("GEMINI_TRANSLATION_TIMEOUT", 180, minimum=10, maximum=1800)
+            if translation_provider == "gemini"
+            else _env_int("OLLAMA_TRANSLATION_TIMEOUT", 90, minimum=10, maximum=1800)
+        ),
+        ollama_num_ctx=_env_int("OLLAMA_TRANSLATION_NUM_CTX", 8192, minimum=2048, maximum=131072),
+        ollama_num_predict=_env_int("OLLAMA_TRANSLATION_NUM_PREDICT", 0, minimum=0, maximum=32768),
     )
 
     return create_localization_service(
@@ -893,15 +952,38 @@ def _build_service_for_job(job):
         replace_source_audio=os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"},
         background_music_dir=Path(os.getenv("LICENSED_MUSIC_DIR", "./local_data/music")),
         replacement_music_volume=float(os.getenv("REPLACEMENT_MUSIC_VOLUME", "0.16")),
+        source_effects_volume=float(os.getenv("SOURCE_EFFECTS_VOLUME", "1.0")),
+        tts_min_tempo=float(os.getenv("TTS_MIN_TEMPO", "1.0")),
+        tts_max_tempo=float(os.getenv("TTS_MAX_TEMPO", "1.30")),
         render_video=True,
         render_config=render_config,
-        enable_text_cover=processing_mode in {"quality", "pro"},
+        enable_text_cover=processing_mode in {"quality", "pro"} or animated_subtitle_requested,
         ocr_languages=ocr_languages,
         logger=logger,
         progress_callback=lambda percent, message: store.update_job(
             job.id, progress_note=f"[{percent}%] {message}"
         ),
+        cancellation_checker=lambda: _is_job_cancelled(job.id),
         user_id=job.user_id,
+    )
+
+
+def _is_job_cancelled(job_id: str) -> bool:
+    job = store.get_job(job_id)
+    return bool(job and job.status == "cancelled")
+
+
+def _is_non_retryable_job_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in (
+            "Ollama local chưa chạy",
+            "Ollama model chưa có",
+            "missing_tts_provider_connection",
+            "Chưa kết nối",
+            "Provider này cần API key",
+        )
     )
 
 
@@ -957,8 +1039,17 @@ async def _run_job(job_id: str) -> None:
             return  # Success, exit retry loop
 
         except Exception as exc:
+            current = store.get_job(job_id)
+            if current and current.status == "cancelled":
+                logger.info("Job %s cancelled; stopping without retry", job_id)
+                return
             last_error = exc
             logger.exception("Job %s failed (attempt %d/%d)", job_id, retry_count + 1, MAX_JOB_RETRIES + 1)
+
+            if _is_non_retryable_job_error(exc):
+                store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
+                _refund_job_credits(job)
+                return
 
             retry_count += 1
             if retry_count <= MAX_JOB_RETRIES:
@@ -980,10 +1071,20 @@ async def _run_job(job_id: str) -> None:
 
 
 def _finish_job_from_result(job_id: str, job, result) -> None:
+    current = store.get_job(job_id)
+    if current and current.status == "cancelled":
+        logger.info("Job %s produced a result after cancellation; leaving it cancelled", job_id)
+        return
     if result.final_video_path and Path(result.final_video_path).exists():
         title = (result.translated_text or job.source_url)[:80]
         source_segments = []
-        if result.audio_pipeline_result and result.audio_pipeline_result.segments:
+        if getattr(result, "source_segments", None):
+            source_segments = [
+                {"start": s.start, "end": s.end, "text": s.text}
+                for s in result.source_segments
+                if getattr(s, "has_timing", False)
+            ]
+        elif result.audio_pipeline_result and result.audio_pipeline_result.segments:
             source_segments = [
                 {"start": s.start, "end": s.end, "text": s.text}
                 for s in result.audio_pipeline_result.segments
@@ -1004,6 +1105,7 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
             store.set_job_source_segments(job_id, source_segments)
         if translated_segments:
             store.set_job_segments(job_id, translated_segments)
+        _write_job_srt_artifacts(job_id, source_segments, translated_segments)
         # Best-effort automated sanity check (quiet audio, wrong duration).
         # Never fails the job over this — it's an informational warning
         # badge in the UI, not a hard gate on publishing.
@@ -1020,6 +1122,23 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         store.update_job(job_id, status="error",
                          error="Không tạo được video đầu ra (final_video_path rỗng)")
         _refund_job_credits(job)
+
+
+def _write_job_srt_artifacts(
+    job_id: str,
+    source_segments: List[Dict[str, Any]],
+    translated_segments: List[Dict[str, Any]],
+) -> None:
+    job_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    if translated_segments:
+        (job_dir / "subtitles.srt").write_text(
+            _segments_to_srt_text(translated_segments), encoding="utf-8",
+        )
+    if source_segments:
+        (job_dir / "source-subtitles.srt").write_text(
+            _segments_to_srt_text(source_segments), encoding="utf-8",
+        )
 
 
 async def _run_render_from_review(job_id: str) -> None:
@@ -1666,7 +1785,7 @@ def _ollama_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     tags.raise_for_status()
     names = [str(item.get("name", "")) for item in tags.json().get("models", []) if item.get("name")]
     if not names:
-        raise RuntimeError("Ollama chưa có model; hãy chạy: ollama pull qwen3:8b")
+        raise RuntimeError(f"Ollama chưa có model; hãy chạy: ollama pull {DEFAULT_OLLAMA_TRANSLATION_MODEL}")
     model = configured_model if configured_model in names else names[0]
     if configured_model and configured_model not in names:
         logger.warning(
@@ -3727,12 +3846,36 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
             "message": f"Chưa kết nối {tts_provider}. Hãy lưu mã provider trước khi tạo job.",
         })
 
-    if body.translation_mode in {"contextual", "adaptive"} and not store.get_provider_settings(user_id, "openai"):
-        issues.append({
-            "severity": "error",
-            "code": "missing_llm_connection",
-            "message": "Dịch theo ngữ cảnh/audience cần kết nối LLM trước.",
-        })
+    if body.translation_mode == "gemini":
+        gemini_settings = store.get_provider_settings(user_id, "gemini")
+        if gemini_settings and gemini_settings.get("api_key"):
+            model = body.translation_model or gemini_settings.get("default_model") or "Gemini"
+            issues.append({
+                "severity": "ok",
+                "code": "contextual_translation_gemini",
+                "message": f"Dịch theo ngữ cảnh sẽ dùng Gemini API ({model}).",
+            })
+        else:
+            issues.append({
+                "severity": "error",
+                "code": "missing_gemini_connection",
+                "message": "Chọn Gemini thì cần lưu và kiểm tra Gemini API key trước.",
+            })
+    elif body.translation_mode in {"contextual", "adaptive"}:
+        openai_settings = store.get_provider_settings(user_id, "openai")
+        if openai_settings and openai_settings.get("api_key"):
+            issues.append({
+                "severity": "ok",
+                "code": "contextual_translation_openai",
+                "message": "Dịch theo ngữ cảnh/audience sẽ dùng LLM đã kết nối.",
+            })
+        else:
+            ok, message = _check_ollama_for_translation(body.translation_model)
+            issues.append({
+                "severity": "ok" if ok else "warning",
+                "code": "contextual_translation_ollama" if ok else "ollama_unavailable",
+                "message": message if ok else f"{message} Job vẫn chạy bằng bản dịch segment-level nếu bước ngữ cảnh bị bỏ qua.",
+            })
 
     if body.review_before_render and url_count > 1:
         issues.append({
@@ -3764,6 +3907,29 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
         issues.append({"severity": "warning", "code": "subtitle_disabled", "message": "Subtitle động đang tắt; video có thể kém bắt mắt hơn."})
 
     return {"ok": not any(issue["severity"] == "error" for issue in issues), "issues": issues}
+
+
+def _check_ollama_for_translation(requested_model: Optional[str] = None) -> tuple[bool, str]:
+    base_url = (_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+    model = (requested_model or _env_first("OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL).strip()
+    try:
+        response = requests.get(f"{base_url}/api/tags", timeout=2)
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        return False, (
+            f"Ollama local chưa chạy tại {base_url}. Mở terminal chạy `ollama serve`, "
+            f"rồi chạy `ollama pull {model}` nếu chưa có model."
+        )
+    except requests.exceptions.Timeout:
+        return False, f"Ollama local tại {base_url} không phản hồi kịp. Kiểm tra `ollama serve`."
+    except Exception as exc:
+        return False, f"Không kiểm tra được Ollama local tại {base_url}: {exc}"
+
+    names = {str(item.get("name") or "") for item in response.json().get("models", [])}
+    if model not in names:
+        available = ", ".join(sorted(name for name in names if name)) or "chưa có model nào"
+        return False, f"Ollama chưa có model {model}. Chạy `ollama pull {model}`. Model hiện có: {available}."
+    return True, f"Dịch theo ngữ cảnh/audience sẽ dùng Ollama local ({model}), không cần API key."
 
 
 @app.post("/api/jobs/preflight")
@@ -4548,6 +4714,24 @@ PROVIDER_CATALOG = {
         "models": ["xtts-v2"],
         "voices": [],
     },
+    "gemini": {
+        "label": "Gemini API",
+        "tier": "free-tier",
+        "requires_key": True,
+        "status": "ready",
+        "connect_url": "https://aistudio.google.com/app/apikey",
+        "models": [_env_first("GEMINI_MODEL") or "gemini-3.1-flash-lite"],
+        "voices": [],
+    },
+    "ollama": {
+        "label": "Ollama local LLM",
+        "tier": "free-local",
+        "requires_key": False,
+        "status": "ready",
+        "connect_url": "",
+        "models": [_env_first("OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL],
+        "voices": [],
+    },
 }
 
 
@@ -4583,6 +4767,16 @@ def _probe_provider(provider: str, api_key: Optional[str], api_secret: Optional[
         models = tts_models or PROVIDER_CATALOG["openai"]["models"]
         voices = [{"id": f"openai:{voice}", "label": voice.title(), "gender": "neutral"} for voice in OPENAI_BUILTIN_VOICES]
         return {"models": models, "llm_models": llm_models or ["gpt-5.6-luna"], "voices": voices}
+    if provider == "gemini":
+        if not api_key:
+            raise HTTPException(400, "Gemini cần API key")
+        try:
+            models = _available_gemini_models(api_key)
+        except Exception as exc:
+            raise HTTPException(400, f"Gemini không xác thực được key hoặc không lấy được model: {exc}") from exc
+        if not models:
+            raise HTTPException(400, "Gemini API key không có model generateContent khả dụng")
+        return {"models": models, "llm_models": models, "voices": []}
     if provider == "elevenlabs":
         if not api_key:
             raise HTTPException(400, "ElevenLabs cần API key")
@@ -4650,12 +4844,12 @@ def provider_settings(user_id: int = Depends(get_current_user_id)):
         providers.append({
             **meta,
             "provider": key,
-            "connected": bool(saved and (saved.get("api_key") or key in {"xtts"})),
+            "connected": bool(saved and (saved.get("api_key") or key in {"xtts"})) or key == "ollama",
             "api_key_masked": _mask_secret(saved.get("api_key")) if saved else None,
             "default_model": saved.get("default_model") if saved else (meta["models"][0] if meta["models"] else None),
             "default_voice": saved.get("default_voice") if saved else None,
             "available_models": (saved.get("extra", {}) if saved else {}).get("models") or meta["models"],
-            "available_llm_models": (saved.get("extra", {}) if saved else {}).get("llm_models") or [],
+            "available_llm_models": (saved.get("extra", {}) if saved else {}).get("llm_models") or (meta["models"] if key in {"gemini"} else []),
             "available_voices": (saved.get("extra", {}) if saved else {}).get("voices") or meta["voices"],
             "connect_url": meta.get("connect_url"),
             "extra": saved.get("extra", {}) if saved else {},
@@ -4673,16 +4867,19 @@ def save_provider_settings(body: ProviderSettingsBody, user_id: int = Depends(ge
     api_key = body.api_key.strip() if body.api_key and body.api_key.strip() else None
     if meta["requires_key"] and not api_key and not (current and current.get("api_key")):
         raise HTTPException(400, "Provider này cần API key")
-    extra = dict(body.extra or {})
+    extra = dict((current or {}).get("extra") or {})
+    extra.update(body.extra or {})
     if api_key or (provider == "xtts"):
         discovery = _probe_provider(provider, api_key or (current or {}).get("api_key"), body.api_secret or (current or {}).get("api_secret"))
         extra.update(discovery)
+    discovered_models = extra.get("llm_models") or extra.get("models") or []
+    default_model = body.default_model or (discovered_models[0] if discovered_models else (meta["models"][0] if meta["models"] else None))
     store.upsert_provider_settings(
         user_id=user_id,
         provider=provider,
         api_key=api_key,
         api_secret=body.api_secret.strip() if body.api_secret and body.api_secret.strip() else None,
-        default_model=body.default_model or (meta["models"][0] if meta["models"] else None),
+        default_model=default_model,
         default_voice=body.default_voice or None,
         extra=extra,
     )
@@ -4915,6 +5112,7 @@ def delete_video_preset(preset_id: int, user_id: int = Depends(get_current_user_
 @app.get("/api/jobs")
 def list_jobs(
         q: Optional[str] = None,
+        status: Optional[str] = None,
         date_from: Optional[float] = None,
         date_to: Optional[float] = None,
         user_id: int = Depends(get_current_user_id),
@@ -4922,8 +5120,14 @@ def list_jobs(
     """History list for the logged-in user only. Optional `q` (matches
     title/source URL), `date_from`/`date_to` (unix timestamps) narrow it
     down — used by the history panel's search + date-range filter."""
-    if q or date_from is not None or date_to is not None:
-        jobs = store.search_jobs_for_user(user_id, query=q, date_from=date_from, date_to=date_to)
+    if q or status or date_from is not None or date_to is not None:
+        jobs = store.search_jobs_for_user(
+            user_id,
+            query=q,
+            status=status,
+            date_from=date_from,
+            date_to=date_to,
+        )
     else:
         jobs = store.list_jobs_for_user(user_id)
     return [j.to_dict() for j in jobs]
@@ -4969,6 +5173,68 @@ def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_us
     if not body.job_ids:
         raise HTTPException(400, "Chưa chọn video cần xoá")
     return {"ok": True, "deleted": store.delete_jobs(body.job_ids, user_id)}
+
+
+@app.post("/api/jobs/bulk-download")
+def bulk_download_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
+    if not body.job_ids:
+        raise HTTPException(400, "Chưa chọn video cần tải")
+
+    jobs = []
+    for job_id in list(dict.fromkeys(body.job_ids))[:200]:
+        job = store.get_job(job_id)
+        if job and job.user_id == user_id and job.status == "done":
+            video_path = Path(job.final_video_path or "")
+            if video_path.is_file():
+                jobs.append((job, video_path))
+
+    if not jobs:
+        raise HTTPException(404, "Không có video hoàn tất nào để tải")
+
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    zip_file = tempfile.NamedTemporaryFile(
+        prefix="localized_videos_",
+        suffix=".zip",
+        delete=False,
+        dir=str(TEMP_DIR),
+    )
+    zip_path = Path(zip_file.name)
+    zip_file.close()
+
+    used_names: set[str] = set()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, (job, video_path) in enumerate(jobs, start=1):
+            base = re.sub(r"[^A-Za-z0-9._ -]+", "_", job.title or job.id).strip(" ._") or job.id
+            name = f"{base}.mp4"
+            if name in used_names:
+                name = f"{base}_{index:03d}.mp4"
+            used_names.add(name)
+            archive.write(video_path, arcname=name)
+            segments = json.loads(job.segments_json) if job.segments_json else []
+            source_segments = json.loads(job.source_segments_json) if job.source_segments_json else []
+            if segments:
+                archive.writestr(f"{Path(name).stem}.vi.srt", _segments_to_srt_text(segments))
+            if source_segments:
+                archive.writestr(f"{Path(name).stem}.source.srt", _segments_to_srt_text(source_segments))
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"localized_videos_{int(time.time())}.zip",
+        background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True)),
+    )
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    if job.status not in {"queued", "running", "review"}:
+        raise HTTPException(400, "Chỉ có thể dừng job đang chờ, đang chạy hoặc chờ render")
+    store.update_job(job_id, status="cancelled", progress_note="Đã dừng theo yêu cầu người dùng")
+    task = _running_tasks.get(job_id)
+    if task:
+        task.cancel()
+    return {"ok": True}
 
 
 def _get_owned_job(job_id: str, user_id: int):
@@ -5096,8 +5362,9 @@ def get_job_segments(job_id: str, user_id: int = Depends(get_current_user_id)):
     actually said). Powers the subtitle-editor panel."""
     job = _get_owned_job(job_id, user_id)
     segments = json.loads(job.segments_json) if job.segments_json else []
+    source_segments = json.loads(job.source_segments_json) if job.source_segments_json else []
     quality = _segment_quality_report(segments)
-    return {"status": job.status, "segments": segments, "quality": quality}
+    return {"status": job.status, "segments": segments, "source_segments": source_segments, "quality": quality}
 
 
 def _segment_quality_report(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -5170,7 +5437,7 @@ def get_job_source_subtitles_srt(job_id: str, user_id: int = Depends(get_current
     return _segments_to_srt_response(segments, f"{(job.title or job_id)[:60]}_source.srt")
 
 
-def _segments_to_srt_response(segments: List[Dict[str, Any]], filename: str) -> HTMLResponse:
+def _segments_to_srt_text(segments: List[Dict[str, Any]]) -> str:
     def _srt_timestamp(seconds: float) -> str:
         seconds = max(0.0, seconds)
         hours, remainder = divmod(seconds, 3600)
@@ -5184,12 +5451,19 @@ def _segments_to_srt_response(segments: List[Dict[str, Any]], filename: str) -> 
         lines.append(f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}")
         lines.append(seg["text"])
         lines.append("")
-    srt_content = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def _segments_to_srt_response(segments: List[Dict[str, Any]], filename: str) -> Response:
+    srt_content = _segments_to_srt_text(segments)
 
     filename = filename.replace("/", "_")
-    return HTMLResponse(
-        content=srt_content, media_type="application/x-subrip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    fallback = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("_") or "subtitles.srt"
+    encoded = urllib.parse.quote(filename)
+    return Response(
+        content=srt_content,
+        media_type="application/x-subrip; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"},
     )
 
 

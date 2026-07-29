@@ -23,13 +23,14 @@ skip it, exactly like this codebase already does for optional providers
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 import logging
 import shutil
 import subprocess
 import tempfile
 import warnings
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # easyocr runs PyTorch on CPU in most deployments (no GPU in the container).
 # PyTorch then emits two purely cosmetic warnings that have nothing to do
@@ -41,7 +42,7 @@ from typing import List, Optional, Sequence, Tuple
 warnings.filterwarnings("ignore", message=".*pin_memory.*no accelerator.*")
 warnings.filterwarnings("ignore", message=".*quantize_per_tensor.*deprecated.*")
 
-__all__ = ["TextRegion", "OnScreenTextDetector", "OCR_AVAILABLE"]
+__all__ = ["TextRegion", "SubtitleOffsetEstimate", "OnScreenTextDetector", "OCR_AVAILABLE"]
 
 _logger = logging.getLogger(__name__)
 
@@ -70,6 +71,16 @@ class TextRegion:
     y: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class SubtitleOffsetEstimate:
+    """Estimated visual subtitle timing offset relative to ASR/audio timing."""
+
+    offset: float
+    confidence: float
+    matches: int
+    apply_after: Optional[float] = None
 
 
 class OnScreenTextDetector:
@@ -164,6 +175,425 @@ class OnScreenTextDetector:
             ys = [p[1] for p in points]
             boxes.append((int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))))
         return boxes
+
+    def _read_text_in_frame(
+        self,
+        frame_path: Path,
+        frame_w: Optional[int],
+        frame_h: Optional[int],
+        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]],
+        exclude_px: Sequence[Tuple[int, int, int, int]] = (),
+    ) -> str:
+        """Run OCR on one frame and return plausible subtitle text only."""
+        frame_for_ocr = frame_path
+        origin_x = 0
+        origin_y = 0
+        cropped_to_candidate = False
+        if subtitle_candidate_region_fractional and frame_w and frame_h:
+            try:
+                from PIL import Image
+
+                fx0, fy0, fx1, fy1 = subtitle_candidate_region_fractional
+                x0 = max(0, int(fx0 * frame_w))
+                y0 = max(0, int(fy0 * frame_h))
+                x1 = min(frame_w, int(fx1 * frame_w))
+                y1 = min(frame_h, int(fy1 * frame_h))
+                if x1 > x0 and y1 > y0:
+                    cropped = frame_path.with_name(f"{frame_path.stem}_subtitle_crop.png")
+                    with Image.open(frame_path) as image:
+                        image.crop((x0, y0, x1, y1)).save(cropped)
+                    frame_for_ocr = cropped
+                    origin_x = x0
+                    origin_y = y0
+                    cropped_to_candidate = True
+            except Exception:
+                frame_for_ocr = frame_path
+                origin_x = 0
+                origin_y = 0
+                cropped_to_candidate = False
+
+        reader = self._get_reader()
+        try:
+            results = reader.readtext(str(frame_for_ocr))
+        except Exception as exc:
+            self.logger.warning("OCR failed on frame %s: %s", frame_for_ocr, exc)
+            return ""
+
+        entries: List[Tuple[int, int, str]] = []
+        for detection in results:
+            points, text, confidence = detection
+            if confidence < 0.25 or not str(text).strip():
+                continue
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            box = (
+                int(min(xs)) + origin_x,
+                int(min(ys)) + origin_y,
+                int(max(xs)) + origin_x,
+                int(max(ys)) + origin_y,
+            )
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            if exclude_px and any(ex0 <= cx <= ex1 and ey0 <= cy <= ey1 for (ex0, ey0, ex1, ey1) in exclude_px):
+                continue
+            if subtitle_candidate_region_fractional and frame_w and frame_h and not cropped_to_candidate:
+                fx0, fy0, fx1, fy1 = subtitle_candidate_region_fractional
+                if not (fx0 * frame_w <= cx <= fx1 * frame_w and fy0 * frame_h <= cy <= fy1 * frame_h):
+                    continue
+            entries.append((box[1], box[0], str(text).strip()))
+
+        entries.sort()
+        return " ".join(text for (_y, _x, text) in entries)
+
+    def read_subtitle_text_at(
+        self,
+        video_path: Path,
+        at_seconds: float,
+        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
+            0.08, 0.25, 0.92, 0.95,
+        ),
+        exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
+    ) -> str:
+        """Return OCR text from the likely subtitle area at one timestamp."""
+        video_path = Path(video_path).resolve()
+        dims = self._get_video_dimensions(video_path)
+        frame_w, frame_h = dims if dims else (None, None)
+        exclude_px: List[Tuple[int, int, int, int]] = []
+        if exclude_regions_fractional and frame_w and frame_h:
+            for (fx0, fy0, fx1, fy1) in exclude_regions_fractional:
+                exclude_px.append((
+                    int(fx0 * frame_w), int(fy0 * frame_h),
+                    int(fx1 * frame_w), int(fy1 * frame_h),
+                ))
+
+        with tempfile.TemporaryDirectory(prefix="ocr_text_") as tmp:
+            frame_path = Path(tmp) / "frame.png"
+            if not self._extract_frame(video_path, at_seconds, frame_path):
+                return ""
+            return self._read_text_in_frame(
+                frame_path,
+                frame_w,
+                frame_h,
+                subtitle_candidate_region_fractional,
+                exclude_px,
+            )
+
+    def estimate_subtitle_time_offset(
+        self,
+        video_path: Path,
+        source_segments: Sequence[Tuple[float, float, str]],
+        search_radius: float = 12.0,
+        coarse_step: float = 1.5,
+        refine_step: float = 0.5,
+        max_anchors: int = 2,
+        min_score: float = 0.72,
+        min_matches: int = 2,
+        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
+            0.08, 0.25, 0.92, 0.95,
+        ),
+        exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
+        use_text_ocr_fallback: bool = False,
+    ) -> Optional[SubtitleOffsetEstimate]:
+        """Estimate hard-sub visual offset from ASR timestamps.
+
+        Some short-video sources have audio/transcript timing that does not
+        match the burned-in subtitle layer. This samples a few distinctive
+        source-language segments, finds where their text actually appears on
+        screen, and returns the median visual offset. It is best-effort: if
+        OCR cannot find enough confident matches, callers should keep the
+        original ASR timing.
+        """
+        visual_estimate = self._estimate_subtitle_time_offset_by_presence(
+            video_path,
+            source_segments,
+            search_radius=search_radius,
+        )
+        if visual_estimate is not None:
+            return visual_estimate
+        if not use_text_ocr_fallback:
+            return None
+
+        video_path = Path(video_path).resolve()
+        dims = self._get_video_dimensions(video_path)
+        frame_w, frame_h = dims if dims else (None, None)
+        exclude_px: List[Tuple[int, int, int, int]] = []
+        if exclude_regions_fractional and frame_w and frame_h:
+            for (fx0, fy0, fx1, fy1) in exclude_regions_fractional:
+                exclude_px.append((
+                    int(fx0 * frame_w), int(fy0 * frame_h),
+                    int(fx1 * frame_w), int(fy1 * frame_h),
+                ))
+
+        anchors = self._select_offset_anchors(source_segments, max_anchors=max_anchors)
+        if not anchors:
+            return None
+
+        offsets: List[float] = []
+        scores: List[float] = []
+        text_cache: Dict[float, str] = {}
+
+        def text_at(t: float, tmp_dir: Path) -> str:
+            key = round(max(0.0, t), 2)
+            if key in text_cache:
+                return text_cache[key]
+            frame_path = tmp_dir / f"frame_{len(text_cache)}.png"
+            if not self._extract_frame(video_path, key, frame_path):
+                text_cache[key] = ""
+                return ""
+            text_cache[key] = self._read_text_in_frame(
+                frame_path,
+                frame_w,
+                frame_h,
+                subtitle_candidate_region_fractional,
+                exclude_px,
+            )
+            return text_cache[key]
+
+        coarse_offsets = self._offset_candidates(search_radius, coarse_step)
+        with tempfile.TemporaryDirectory(prefix="ocr_offset_") as tmp:
+            tmp_dir = Path(tmp)
+            for start, end, source_text in anchors:
+                midpoint = (start + end) / 2.0
+                source_norm = _normalize_ocr_match_text(source_text)
+                best_offset = 0.0
+                best_score = 0.0
+
+                for offset in coarse_offsets:
+                    score = _subtitle_text_match_score(source_norm, text_at(midpoint + offset, tmp_dir))
+                    if score > best_score:
+                        best_score = score
+                        best_offset = offset
+
+                refined_offsets = [
+                    best_offset + (i * refine_step)
+                    for i in range(int(round(-1.0 / refine_step)), int(round(1.0 / refine_step)) + 1)
+                ]
+                for offset in refined_offsets:
+                    if abs(offset) > search_radius:
+                        continue
+                    score = _subtitle_text_match_score(source_norm, text_at(midpoint + offset, tmp_dir))
+                    if score > best_score:
+                        best_score = score
+                        best_offset = offset
+
+                if best_score >= min_score:
+                    offsets.append(best_offset)
+                    scores.append(best_score)
+
+        if len(offsets) < min_matches:
+            self.logger.info(
+                "OnScreenTextDetector: subtitle offset estimate skipped; only %d/%d anchor(s) matched",
+                len(offsets), len(anchors),
+            )
+            return None
+
+        sorted_offsets = sorted(offsets)
+        median_offset = sorted_offsets[len(sorted_offsets) // 2]
+        confidence = sum(scores) / len(scores)
+        estimate = SubtitleOffsetEstimate(
+            offset=round(median_offset, 3),
+            confidence=round(confidence, 3),
+            matches=len(offsets),
+        )
+        self.logger.info(
+            "OnScreenTextDetector: estimated hard-sub offset %.2fs from %d anchor(s), confidence=%.2f",
+            estimate.offset, estimate.matches, estimate.confidence,
+        )
+        return estimate
+
+    def _estimate_subtitle_time_offset_by_presence(
+        self,
+        video_path: Path,
+        source_segments: Sequence[Tuple[float, float, str]],
+        search_radius: float = 12.0,
+        step: float = 0.5,
+        refine_step: float = 0.1,
+        max_segments: int = 8,
+        min_visual_score: float = 0.003,
+        min_best_to_zero_delta: float = 0.004,
+        min_visible_matches: int = 2,
+    ) -> Optional[SubtitleOffsetEstimate]:
+        """Fast visual hard-sub offset estimate without OCR text recognition."""
+        anchors = self._select_presence_offset_anchors(source_segments, max_segments=max_segments)
+        if not anchors:
+            return None
+
+        offsets = self._offset_candidates(search_radius, step)
+        scores_by_offset: Dict[float, Tuple[float, int]] = {}
+        frame_cache: Dict[float, float] = {}
+
+        def score_at(t: float, tmp_dir: Path) -> float:
+            key = round(max(0.0, t), 2)
+            if key in frame_cache:
+                return frame_cache[key]
+            frame_path = tmp_dir / f"presence_{len(frame_cache)}.jpg"
+            if not self._extract_frame(video_path, key, frame_path):
+                frame_cache[key] = 0.0
+                return 0.0
+            frame_cache[key] = self._subtitle_presence_score(frame_path)
+            return frame_cache[key]
+
+        with tempfile.TemporaryDirectory(prefix="subtitle_presence_") as tmp:
+            tmp_dir = Path(tmp)
+            for offset in offsets:
+                scores: List[float] = []
+                visible = 0
+                for start, end, _text in anchors:
+                    score = score_at(((start + end) / 2.0) + offset, tmp_dir)
+                    scores.append(score)
+                    if score >= min_visual_score:
+                        visible += 1
+                avg_score = sum(scores) / len(scores) if scores else 0.0
+                scores_by_offset[offset] = (avg_score, visible)
+
+            coarse_best = max(scores_by_offset.items(), key=lambda item: item[1][0])[0]
+            refine_count = int(round(1.5 / refine_step))
+            for idx in range(-refine_count, refine_count + 1):
+                offset = round(coarse_best + (idx * refine_step), 3)
+                if abs(offset) > search_radius or offset in scores_by_offset:
+                    continue
+                scores = []
+                visible = 0
+                for start, end, _text in anchors:
+                    score = score_at(((start + end) / 2.0) + offset, tmp_dir)
+                    scores.append(score)
+                    if score >= min_visual_score:
+                        visible += 1
+                avg_score = sum(scores) / len(scores) if scores else 0.0
+                scores_by_offset[offset] = (avg_score, visible)
+
+        zero_score, _zero_visible = scores_by_offset.get(0.0, (0.0, 0))
+        best_offset, (best_score, best_visible) = max(
+            scores_by_offset.items(),
+            key=lambda item: item[1][0],
+        )
+        if abs(best_offset) < 0.12:
+            return None
+        if best_visible < min_visible_matches or best_score < min_visual_score:
+            return None
+        if (best_score - zero_score) < min_best_to_zero_delta:
+            return None
+
+        confidence = min(1.0, max(0.0, (best_score - zero_score) / 0.02))
+        estimate = SubtitleOffsetEstimate(
+            offset=round(best_offset, 3),
+            confidence=round(confidence, 3),
+            matches=best_visible,
+            apply_after=anchors[0][0],
+        )
+        self.logger.info(
+            "OnScreenTextDetector: estimated hard-sub visual offset %.2fs "
+            "(presence %.4f vs zero %.4f, visible=%d/%d)",
+            estimate.offset, best_score, zero_score, best_visible, len(anchors),
+        )
+        return estimate
+
+    def _select_presence_offset_anchors(
+        self,
+        source_segments: Sequence[Tuple[float, float, str]],
+        max_segments: int,
+        min_gap: float = 4.0,
+    ) -> List[Tuple[float, float, str]]:
+        """Choose a compact subtitle cluster after a transcript gap.
+
+        Presence-only matching cannot identify *which* subtitle is on screen;
+        it only knows that a hard-sub line is visible. Anchoring on one compact
+        cluster after a large gap avoids matching arbitrary later subtitles in
+        dense dialogue sections.
+        """
+        cleaned = [
+            (start, end, text)
+            for start, end, text in source_segments
+            if end > start and len(_normalize_ocr_match_text(text)) >= 2
+        ]
+        if not cleaned:
+            return []
+
+        best_index = 0
+        best_gap = 0.0
+        previous_end = cleaned[0][1]
+        for index, (start, end, _text) in enumerate(cleaned[1:], start=1):
+            gap = start - previous_end
+            if gap > best_gap:
+                best_gap = gap
+                best_index = index
+            previous_end = max(previous_end, end)
+
+        if best_gap < min_gap:
+            return self._select_offset_anchors(cleaned, max_anchors=max_segments)
+
+        cluster: List[Tuple[float, float, str]] = []
+        previous_end = cleaned[best_index][0]
+        for start, end, text in cleaned[best_index:]:
+            if cluster and (start - previous_end) > min_gap:
+                break
+            cluster.append((start, end, text))
+            previous_end = max(previous_end, end)
+            if len(cluster) >= max_segments:
+                break
+        return cluster
+
+    def _subtitle_presence_score(
+        self,
+        frame_path: Path,
+        region_fractional: Tuple[float, float, float, float] = (0.10, 0.55, 0.90, 0.92),
+    ) -> float:
+        """Measure likely white hard-sub text density in the subtitle band."""
+        try:
+            from PIL import Image
+
+            with Image.open(frame_path) as image:
+                rgb = image.convert("RGB")
+                w, h = rgb.size
+                fx0, fy0, fx1, fy1 = region_fractional
+                crop = rgb.crop((
+                    int(fx0 * w), int(fy0 * h),
+                    int(fx1 * w), int(fy1 * h),
+                ))
+                data = (
+                    crop.get_flattened_data()
+                    if hasattr(crop, "get_flattened_data")
+                    else crop.getdata()
+                )
+                bright = 0
+                total = 0
+                for r, g, b in data:
+                    total += 1
+                    if r > 185 and g > 185 and b > 185 and (max(r, g, b) - min(r, g, b)) < 80:
+                        bright += 1
+                return bright / total if total else 0.0
+        except Exception:
+            return 0.0
+
+    def _select_offset_anchors(
+        self,
+        source_segments: Sequence[Tuple[float, float, str]],
+        max_anchors: int,
+    ) -> List[Tuple[float, float, str]]:
+        candidates: List[Tuple[int, float, float, str]] = []
+        seen: set[str] = set()
+        for start, end, text in source_segments:
+            norm = _normalize_ocr_match_text(text)
+            if len(norm) < 5 or norm in seen:
+                continue
+            seen.add(norm)
+            if end <= start:
+                continue
+            # Prefer distinctive, longer subtitle lines but avoid spending
+            # all anchors on the same opening scene.
+            score = len(norm) + int(start >= 8.0) * 4
+            candidates.append((score, start, end, text))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [(start, end, text) for (_score, start, end, text) in candidates[:max_anchors]]
+
+    @staticmethod
+    def _offset_candidates(search_radius: float, step: float) -> List[float]:
+        count = int(round(search_radius / step))
+        offsets = [0.0]
+        for idx in range(1, count + 1):
+            value = round(idx * step, 3)
+            offsets.extend([value, -value])
+        return offsets
 
     def detect_regions_for_windows(
         self,
@@ -558,3 +988,25 @@ class OnScreenTextDetector:
         typical_line_height = max(int(typical_line_height), 10)
 
         return band_center, typical_line_height
+
+
+def _normalize_ocr_match_text(text: str) -> str:
+    """Normalize OCR/source text for fuzzy subtitle matching."""
+    lowered = text.lower()
+    # Keep letters/numbers from any script, especially CJK. Drop spaces and
+    # punctuation because OCR often inserts/removes them unpredictably.
+    return "".join(ch for ch in lowered if ch.isalnum())
+
+
+def _subtitle_text_match_score(source_norm: str, ocr_text: str) -> float:
+    ocr_norm = _normalize_ocr_match_text(ocr_text)
+    if not source_norm or not ocr_norm:
+        return 0.0
+    if source_norm in ocr_norm:
+        return 1.0
+    if ocr_norm in source_norm and len(ocr_norm) >= max(4, int(len(source_norm) * 0.55)):
+        return 0.9
+    ratio = SequenceMatcher(None, source_norm, ocr_norm).ratio()
+    common_chars = sum(1 for ch in set(source_norm) if ch in ocr_norm)
+    coverage = common_chars / max(1, len(set(source_norm)))
+    return max(ratio, coverage * 0.85)

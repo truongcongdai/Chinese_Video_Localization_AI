@@ -9,7 +9,10 @@ from typing import Optional, List
 import subprocess
 import shutil
 
-__all__ = ["MixerService", "MixerConfig", "AudioMix", "TimedAudioClip", "DubbedBackgroundMix"]
+__all__ = [
+    "MixerService", "MixerConfig", "AudioMix", "TimedAudioClip",
+    "DubbedBackgroundMix", "DubbedSourceBackgroundMix",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -68,12 +71,31 @@ class DubbedBackgroundMix:
     fade_seconds: float = 0.75
 
 
+@dataclass(frozen=True)
+class DubbedSourceBackgroundMix:
+    """Dub mixed with ducked original ambience/SFX and optional new music."""
+
+    voice_audio: Path
+    source_audio: Path
+    total_duration: float
+    source_volume: float = 1.0
+    background_audio: Optional[Path] = None
+    background_volume: float = 0.16
+    fade_seconds: float = 0.75
+
+
 @dataclass
 class MixerConfig:
     """Configuration for mixer service."""
 
     output_format: str = "wav"
     sample_rate: int = 44100
+    # Keep dubbed speech cadence natural. The old behavior stretched every
+    # clip exactly into its source timestamp slot, which made short translated
+    # lines drag slowly and long lines rush. By default we never slow TTS down
+    # and only allow mild speed-up for overcrowded slots.
+    min_tts_tempo: float = 1.0
+    max_tts_tempo: float = 1.30
 
 
 class MixerService:
@@ -197,6 +219,74 @@ class MixerService:
         self._run_ffmpeg(cmd, "mix_dub_with_background")
         return output_path
 
+    def mix_dub_with_source_and_background(self, spec: DubbedSourceBackgroundMix, output_path: Path) -> Path:
+        """Keep source ambience/SFX under the dub and optionally add replacement music.
+
+        This is intentionally not a promise of perfect music removal. Without
+        a reliable source-separation model, source SFX and source music live in
+        the same mixed audio. The safest default is to preserve that source
+        bed quietly, heavily ducked under the translated voice, and add a
+        licensed replacement track when available.
+        """
+        if not self._ffmpeg_available:
+            raise RuntimeError("FFmpeg not available in PATH")
+        if not 0.0 <= spec.source_volume <= 1.0:
+            raise ValueError("source_volume must be between 0 and 1")
+        if not 0.0 <= spec.background_volume <= 1.0:
+            raise ValueError("background_volume must be between 0 and 1")
+
+        output_path = Path(output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        duration = max(0.01, spec.total_duration)
+
+        inputs = [
+            "-i", str(spec.voice_audio),
+            "-i", str(spec.source_audio),
+        ]
+        filter_parts = [
+            f"[0:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS,asplit=2[voice][sidechain]",
+            f"[1:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS,volume={spec.source_volume:.4f}[srcquiet]",
+            "[srcquiet][sidechain]sidechaincompress=threshold=0.020:ratio=12:attack=15:release=350[srcduck]",
+        ]
+        mix_inputs = "[voice][srcduck]"
+        input_count = 2
+
+        if spec.background_audio is not None:
+            fade = max(0.0, min(spec.fade_seconds, duration / 2.0))
+            fade_out_start = max(0.0, duration - fade)
+            music_filters = [
+                f"atrim=duration={duration:.3f}",
+                "asetpts=PTS-STARTPTS",
+                f"volume={spec.background_volume:.4f}",
+            ]
+            if fade > 0:
+                music_filters.extend([
+                    f"afade=t=in:st=0:d={fade:.3f}",
+                    f"afade=t=out:st={fade_out_start:.3f}:d={fade:.3f}",
+                ])
+            inputs.extend(["-stream_loop", "-1", "-i", str(spec.background_audio)])
+            filter_parts.append(f"[2:a]{','.join(music_filters)}[music]")
+            filter_parts.append(
+                "[music][sidechain]sidechaincompress=threshold=0.025:ratio=10:attack=20:release=450[duckedmusic]"
+            )
+            mix_inputs += "[duckedmusic]"
+            input_count += 1
+
+        filter_parts.append(
+            f"{mix_inputs}amix=inputs={input_count}:duration=first:normalize=0,"
+            "alimiter=limit=0.95:attack=5:release=50[out]"
+        )
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[out]", "-t", f"{duration:.3f}",
+            "-ar", str(self.config.sample_rate), "-y", str(output_path),
+        ]
+        self._run_ffmpeg(cmd, "mix_dub_with_source_and_background")
+        return output_path
+
     def _probe_duration(self, audio_path: Path) -> float:
         """Return duration in seconds of `audio_path` via ffprobe, or 0.0 if unknown."""
         if shutil.which("ffprobe") is None:
@@ -239,6 +329,13 @@ class MixerService:
             remaining /= 0.5
         parts.append(f"atempo={remaining:.4f}")
         return parts
+
+    def _bounded_tts_tempo(self, factor: float) -> float:
+        min_tempo = max(0.25, float(self.config.min_tts_tempo))
+        max_tempo = min(4.0, float(self.config.max_tts_tempo))
+        if min_tempo > max_tempo:
+            min_tempo, max_tempo = max_tempo, min_tempo
+        return max(min_tempo, min(max_tempo, factor))
 
     def build_dubbed_track(
         self,
@@ -298,6 +395,18 @@ class MixerService:
             stage_label = f"[{idx}:a]"
             if slot_duration > 0.05 and actual_duration > 0.05:
                 factor = actual_duration / slot_duration
+                bounded_factor = self._bounded_tts_tempo(factor)
+                if abs(bounded_factor - factor) > 0.01:
+                    self.logger.debug(
+                        "Clamped TTS tempo for clip %d from %.3fx to %.3fx "
+                        "(actual=%.3fs slot=%.3fs)",
+                        idx,
+                        factor,
+                        bounded_factor,
+                        actual_duration,
+                        slot_duration,
+                    )
+                factor = bounded_factor
                 # Only bother stretching if the mismatch is meaningfully audible.
                 if abs(factor - 1.0) > 0.03:
                     atempo_filters = self._atempo_chain(factor)

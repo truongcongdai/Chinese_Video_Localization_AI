@@ -58,3 +58,10 @@ def test_create_localization_service_full_pipeline():
     assert service.config.run_tts is True
     assert service.config.generate_subtitles is True
     assert service.config.mix_audio is True
+
+
+def test_create_localization_service_configures_tts_tempo():
+    service = create_localization_service(tts_min_tempo=1.0, tts_max_tempo=1.3)
+
+    assert service.mixer.config.min_tts_tempo == 1.0
+    assert service.mixer.config.max_tts_tempo == 1.3

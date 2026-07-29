@@ -21,6 +21,8 @@ Flask>=3.0.0
 requests>=2.31.0
 python-telegram-bot>=21.0
 googletrans>=4.0.0
+librosa>=0.10.2
+mutagen>=1.47.0
 # Needed for LocalizationConfig.enable_text_cover (now default-enabled):
 # OCR-based detection of burned-in on-screen text (e.g. Chinese subtitles
 # baked into the video pixels) so they can be covered with a white box and

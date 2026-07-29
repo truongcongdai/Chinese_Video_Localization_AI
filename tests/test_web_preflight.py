@@ -1,0 +1,174 @@
+from types import SimpleNamespace
+
+from universal_video_ai.web import app as web_app
+
+
+def test_preflight_allows_contextual_translation_with_running_ollama(monkeypatch):
+    monkeypatch.setattr(web_app.store, "get_provider_settings", lambda user_id, provider: None)
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "qwen3:8b"}]}
+
+    monkeypatch.setattr(web_app.requests, "get", lambda url, timeout: FakeResponse())
+
+    report = web_app._job_preflight_report(
+        1,
+        web_app.NewJobBody(
+            url="https://example.com/video.mp4",
+            translation_mode="contextual",
+            translation_model="qwen3:8b",
+            tts_provider="edge",
+        ),
+        url_count=1,
+    )
+
+    assert report["ok"] is True
+    assert "missing_llm_connection" not in {issue["code"] for issue in report["issues"]}
+    assert "contextual_translation_ollama" in {issue["code"] for issue in report["issues"]}
+
+
+def test_preflight_warns_when_contextual_translation_ollama_is_down(monkeypatch):
+    monkeypatch.setattr(web_app.store, "get_provider_settings", lambda user_id, provider: None)
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
+
+    def fake_get(url, timeout):
+        raise web_app.requests.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    report = web_app._job_preflight_report(
+        1,
+        web_app.NewJobBody(
+            url="https://example.com/video.mp4",
+            translation_mode="contextual",
+            translation_model="qwen3:8b",
+            tts_provider="edge",
+        ),
+        url_count=1,
+    )
+
+    assert report["ok"] is True
+    assert "ollama_unavailable" in {issue["code"] for issue in report["issues"]}
+    issue = next(issue for issue in report["issues"] if issue["code"] == "ollama_unavailable")
+    assert issue["severity"] == "warning"
+
+
+def test_preflight_blocks_gemini_mode_without_saved_key(monkeypatch):
+    monkeypatch.setattr(web_app.store, "get_provider_settings", lambda user_id, provider: None)
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
+
+    report = web_app._job_preflight_report(
+        1,
+        web_app.NewJobBody(
+            url="https://example.com/video.mp4",
+            translation_mode="gemini",
+            tts_provider="edge",
+        ),
+        url_count=1,
+    )
+
+    assert report["ok"] is False
+    assert "missing_gemini_connection" in {issue["code"] for issue in report["issues"]}
+
+
+def test_preflight_uses_saved_gemini_connection_for_gemini_mode(monkeypatch):
+    def fake_provider_settings(user_id, provider):
+        if provider == "gemini":
+            return {
+                "api_key": "test-key",
+                "default_model": "gemini-3.1-flash-lite",
+                "extra": {"llm_models": ["gemini-3.1-flash-lite"]},
+            }
+        return None
+
+    monkeypatch.setattr(web_app.store, "get_provider_settings", fake_provider_settings)
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
+
+    report = web_app._job_preflight_report(
+        1,
+        web_app.NewJobBody(
+            url="https://example.com/video.mp4",
+            translation_mode="gemini",
+            translation_model="gemini-3.1-flash-lite",
+            tts_provider="edge",
+        ),
+        url_count=1,
+    )
+
+    assert report["ok"] is True
+    assert "contextual_translation_gemini" in {issue["code"] for issue in report["issues"]}
+
+
+def test_probe_provider_gemini_lists_generate_content_models(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "models": [
+                    {
+                        "name": "models/gemini-3.1-flash-lite",
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                    {
+                        "name": "models/text-embedding-004",
+                        "supportedGenerationMethods": ["embedContent"],
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(web_app.requests, "get", lambda url, headers, params, timeout: FakeResponse())
+
+    result = web_app._probe_provider("gemini", "test-key")
+
+    assert result["models"] == ["gemini-3.1-flash-lite"]
+    assert result["llm_models"] == ["gemini-3.1-flash-lite"]
+
+
+def test_build_service_uses_strict_gemini_adapter(monkeypatch):
+    def fake_provider_settings(user_id, provider):
+        if provider == "gemini":
+            return {
+                "api_key": "test-key",
+                "default_model": "gemini-3.1-flash-lite",
+                "extra": {"llm_models": ["gemini-3.1-flash-lite"]},
+            }
+        return None
+
+    monkeypatch.setattr(web_app.store, "get_provider_settings", fake_provider_settings)
+    job = SimpleNamespace(
+        user_id=1,
+        logo_path=None,
+        logo_corner=None,
+        logo_size_px=None,
+        animated_subtitle_config=None,
+        video_template_config=None,
+        transform_config=None,
+        processing_mode="quality",
+        source_language="auto",
+        target_language="vi",
+        tts_provider="edge",
+        tts_voice=None,
+        tts_style="natural",
+        tts_model=None,
+        translation_mode="gemini",
+        translation_model="gemini-3.1-flash-lite",
+        translation_tone="natural",
+        translation_audience=None,
+        translation_glossary=None,
+    )
+
+    service = web_app._build_service_for_job(job)
+
+    assert service.segment_adapter.config.provider == "gemini"
+    assert service.segment_adapter.config.model == "gemini-3.1-flash-lite"
+    assert service.segment_adapter.config.fallback_on_error is False

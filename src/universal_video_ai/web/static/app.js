@@ -595,10 +595,26 @@ function renderProviderChoices() {
     ? optionList(meta.available_models || ["edge-free-neural"], "Free · Edge neural")
     : optionList(meta.available_models || [], "Theo provider/default");
   const openai = providerMeta("openai");
+  const gemini = providerMeta("gemini");
+  const ollamaModel = (providerSettings.ollama && providerSettings.ollama.default_model) || "qwen3:1.7b";
+  const geminiModel = (gemini.available_llm_models && gemini.available_llm_models[0]) || gemini.default_model || "gemini-3.1-flash-lite";
   const translationMode = $("#translation-mode-select").value;
+  let connectProvider = "openai";
   if (translationMode === "faithful") {
     $("#translation-model-select").innerHTML = optionList(["free-segment-translate"], "Dịch sát miễn phí");
     $("#translation-model-select").value = "";
+  } else if (translationMode === "gemini") {
+    connectProvider = "gemini";
+    if (gemini.connected) {
+      $("#translation-model-select").innerHTML = optionList(
+        gemini.available_llm_models || [geminiModel],
+        "Gemini model",
+      );
+      $("#translation-model-select").value = gemini.default_model || geminiModel;
+    } else {
+      $("#translation-model-select").innerHTML = optionList([], "Kết nối Gemini để tải model");
+      $("#translation-model-select").value = "";
+    }
   } else {
     if (openai.connected && (openai.available_llm_models || []).length) {
       $("#translation-model-select").innerHTML = optionList(
@@ -606,22 +622,28 @@ function renderProviderChoices() {
         translationMode === "adaptive" ? "Adaptive theo audience" : "LLM theo ngữ cảnh",
       );
     } else {
-      $("#translation-model-select").innerHTML = `
-        <option value="">${translationMode === "adaptive" ? "Adaptive theo audience" : "LLM theo ngữ cảnh"} · cần kết nối LLM để tải model</option>
-        <option value="" disabled>Hiện runtime đã hỗ trợ OpenAI-compatible LLM; lưu mã kết nối trước</option>
-      `;
+      $("#translation-model-select").innerHTML = optionList(
+        [ollamaModel],
+        translationMode === "adaptive" ? "Ollama local · adaptive" : "Ollama local · theo ngữ cảnh",
+      );
+      $("#translation-model-select").value = ollamaModel;
     }
   }
-  const needsOpenAI = translationMode !== "faithful";
-  $("#translation-connect-link").classList.toggle("hidden", !needsOpenAI || !!openai.connected);
+  const needsConnection = translationMode !== "faithful" && (translationMode === "gemini" ? !gemini.connected : !openai.connected);
+  $("#translation-connect-link").classList.toggle("hidden", !needsConnection);
   $("#translation-connect-link").href = "#";
-  $("#translation-connect-link").textContent = "Kết nối LLM bằng mã";
+  $("#translation-connect-link").dataset.provider = connectProvider;
+  $("#translation-connect-link").textContent = translationMode === "gemini" ? "Kết nối Gemini" : "Tùy chọn: kết nối OpenAI";
   $("#translation-login-status").textContent =
     translationMode === "faithful"
       ? "Dịch sát dùng engine miễn phí, không cần kết nối."
+      : (translationMode === "gemini"
+        ? (gemini.connected
+          ? `Đang dùng Gemini API (${gemini.default_model || geminiModel}).`
+          : "Gemini cần API key. Lưu kết nối Gemini để hệ thống kiểm tra key và tải model khả dụng.")
       : (openai.connected
         ? "Đã có kết nối LLM; có thể dịch theo ngữ cảnh/audience."
-        : "Chế độ này cần một kết nối LLM đã lưu. Bấm Kết nối LLM bằng mã, tạo/copy key từ provider rồi lưu.");
+        : `Không có API key: app sẽ dùng Ollama local CPU (${ollamaModel}). Cần chạy Ollama và pull model trước.`));
 }
 
 function renderProviderList() {
@@ -756,6 +778,19 @@ function openProviderConnect(provider, openDashboard = true) {
   $("#provider-api-key-input").focus();
 }
 
+$("#provider-manage-btn").addEventListener("click", event => {
+  event.preventDefault();
+  const provider = $("#translation-mode-select").value === "gemini"
+    ? "gemini"
+    : ($("#tts-provider-select").value === "edge" ? "gemini" : $("#tts-provider-select").value);
+  openProviderConnect(provider, false);
+});
+
+$("#provider-close-btn").addEventListener("click", event => {
+  event.preventDefault();
+  $("#provider-settings-panel").classList.add("hidden");
+});
+
 $("#provider-connect-link").addEventListener("click", event => {
   event.preventDefault();
   const provider = $("#tts-provider-select").value;
@@ -769,7 +804,7 @@ $("#provider-open-dashboard-link").addEventListener("click", event => {
 });
 $("#translation-connect-link").addEventListener("click", event => {
   event.preventDefault();
-  openProviderConnect("openai", false);
+  openProviderConnect($("#translation-connect-link").dataset.provider || "openai", false);
 });
 $("#translation-mode-select").addEventListener("change", () => {
   renderProviderChoices();
@@ -1884,6 +1919,7 @@ function jobProgress(job) {
   if (!job) return 0;
   if (job.status === "done") return 100;
   if (job.status === "error") return 0;
+  if (job.status === "cancelled") return 0;
   if (job.status === "queued") return 2;
   const note = (job.progress_note || "").toLowerCase();
   const explicit = note.match(/^\[(\d{1,3})%\]/);
@@ -2050,7 +2086,7 @@ $("#creator-submit-btn").onclick = async () => {
   }
 };
 
-const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", review: "Chờ sửa phụ đề", done: "Xong", error: "Lỗi" };
+const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", review: "Chờ sửa phụ đề", done: "Xong", error: "Lỗi", cancelled: "Đã dừng" };
 
 function _dateToUnix(dateStr, endOfDay) {
   if (!dateStr) return null;
@@ -2106,10 +2142,12 @@ function updateStats(jobs) {
 
 async function refreshJobs() {
   const q = $("#history-search").value.trim();
+  const status = $("#history-status-filter").value;
   const dateFrom = _dateToUnix($("#history-date-from").value, false);
   const dateTo = _dateToUnix($("#history-date-to").value, true);
   const params = new URLSearchParams();
   if (q) params.set("q", q);
+  if (status) params.set("status", status);
   if (dateFrom) params.set("date_from", dateFrom);
   if (dateTo) params.set("date_to", dateTo);
   const qs = params.toString();
@@ -2174,7 +2212,7 @@ async function refreshJobs() {
           <div class="job-info">
             <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
             <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}</div>
-            ${(job.status === "queued" || job.status === "running" || job.status === "review" || job.status === "done") ? `
+            ${(job.status === "queued" || job.status === "running" || job.status === "review" || job.status === "done" || job.status === "cancelled") ? `
               <div class="job-progress">
                 <div class="progress-track"><div class="progress-fill" style="width:${jobProgress(job)}%"></div></div>
                 <div class="job-progress-label">${jobProgress(job)}%</div>
@@ -2183,14 +2221,17 @@ async function refreshJobs() {
           <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
         </div>
         <div class="job-actions">
+          ${(job.status === "queued" || job.status === "running" || job.status === "review") ? `<button class="btn danger small" data-cancel="${job.id}">Dừng</button>` : ""}
           ${job.status === "review" ? `<button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>` : ""}
           ${job.has_video ? `
             <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
+            <button class="btn secondary small" data-download-zip="${job.id}">Tải ZIP</button>
             <button class="btn gradient small" data-improve="${job.id}">Improve</button>
             <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
           ` : ""}
           ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>SRT dịch</a>` : ""}
           ${hasSourceSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/source-subtitles.srt" download>SRT gốc</a>` : ""}
+          ${hasSubtitles || hasSourceSubtitles ? `<button class="btn secondary small" data-subtitle-view="${job.id}">Xem phụ đề</button>` : ""}
           ${job.status === "error" ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
         </div>
       </div>
@@ -2200,6 +2241,12 @@ async function refreshJobs() {
   }
   list.querySelectorAll("[data-preview]").forEach(btn => {
     btn.onclick = () => openPreview(btn.dataset.preview);
+  });
+  list.querySelectorAll("[data-subtitle-view]").forEach(btn => {
+    btn.onclick = () => openSubtitleViewer(btn.dataset.subtitleView);
+  });
+  list.querySelectorAll("[data-download-zip]").forEach(btn => {
+    btn.onclick = () => downloadJobsZip([btn.dataset.downloadZip]);
   });
   list.querySelectorAll("[data-improve]").forEach(btn => {
     btn.onclick = () => openQualityReview(btn.dataset.improve);
@@ -2220,6 +2267,25 @@ async function refreshJobs() {
   });
   list.querySelectorAll("[data-review]").forEach(btn => {
     btn.onclick = () => openReview(btn.dataset.review);
+  });
+  list.querySelectorAll("[data-cancel]").forEach(btn => {
+    btn.onclick = async () => {
+      const accepted = await showConfirmDialog(
+        "Dừng xử lý video?",
+        "Job sẽ được đánh dấu đã dừng. Nếu tiến trình nền đang ở bước không thể ngắt tức thì, hệ thống sẽ bỏ kết quả khi nó quay lại điểm kiểm tra.",
+        "Dừng xử lý",
+      );
+      if (!accepted) return;
+      btn.disabled = true;
+      try {
+        await api(`/api/jobs/${btn.dataset.cancel}/cancel`, { method: "POST" });
+        await refreshJobs();
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
   });
   list.querySelectorAll("[data-retry]").forEach(btn => {
     btn.onclick = async () => {
@@ -2258,6 +2324,7 @@ function updateHistorySelection(jobs = []) {
   const selectedVisible = visibleIds.filter(id => selectedHistoryJobs.has(id)).length;
   $("#history-selected-count").textContent = selectedHistoryJobs.size ? `${selectedHistoryJobs.size} mục đã chọn` : "";
   $("#history-bulk-delete").disabled = selectedHistoryJobs.size === 0;
+  $("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;
   $("#history-select-all").checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
   $("#history-select-all").indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
 }
@@ -2287,23 +2354,83 @@ $("#history-bulk-delete").onclick = async () => {
     await refreshJobs();
   } catch (e) { alert(e.message); }
 };
+$("#history-bulk-download").onclick = async () => {
+  const ids = [...selectedHistoryJobs];
+  if (!ids.length) return;
+  await downloadJobsZip(ids);
+};
+
+async function downloadJobsZip(ids) {
+  try {
+    const resp = await fetch("/api/jobs/bulk-download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_ids: ids }),
+    });
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try {
+        const body = await resp.json();
+        detail = body.detail || detail;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `localized_videos_${Date.now()}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { alert(e.message); }
+}
 
 let _historySearchDebounce = null;
 $("#history-search").addEventListener("input", () => {
   clearTimeout(_historySearchDebounce);
   _historySearchDebounce = setTimeout(refreshJobs, 300);
 });
+$("#history-status-filter").onchange = refreshJobs;
 $("#history-date-from").onchange = refreshJobs;
 $("#history-date-to").onchange = refreshJobs;
 $("#history-clear-btn").onclick = () => {
   $("#history-search").value = "";
   $("#history-date-from").value = "";
   $("#history-date-to").value = "";
+  $("#history-status-filter").value = "";
   refreshJobs();
 };
 
 // ---------------- subtitle review editor ----------------
 let currentReviewJobId = null;
+
+async function openSubtitleViewer(jobId) {
+  const { segments, source_segments: sourceSegments, quality } = await api(`/api/jobs/${jobId}/segments`);
+  const sourceByTime = new Map((sourceSegments || []).map(s => [`${s.start}:${s.end}`, s]));
+  const rows = (segments && segments.length ? segments : sourceSegments || []).map((segment, index) => {
+    const source = sourceByTime.get(`${segment.start}:${segment.end}`) || (sourceSegments || [])[index] || {};
+    const translated = (segments || [])[index] || {};
+    return `
+      <div class="review-segment">
+        <div class="seg-time">${_fmtTime(segment.start)} → ${_fmtTime(segment.end)}</div>
+        ${source.text ? `<div style="font-size:12px;color:var(--text-dim);white-space:pre-wrap">${_escapeHtml(source.text)}</div>` : ""}
+        ${translated.text ? `<div style="font-size:14px;margin-top:5px;white-space:pre-wrap">${_escapeHtml(translated.text)}</div>` : ""}
+      </div>
+    `;
+  }).join("");
+  const warnings = (quality?.warnings || []).join(" ");
+  $("#subtitle-viewer-quality").textContent = quality
+    ? `Quality score: ${quality.score}/100${warnings ? ` · ${warnings}` : ""}`
+    : "";
+  $("#subtitle-viewer-list").innerHTML = rows || `<div class="muted-help">Job này chưa có phụ đề.</div>`;
+  $("#subtitle-viewer-modal").classList.remove("hidden");
+}
+
+$("#subtitle-viewer-close").onclick = () => {
+  $("#subtitle-viewer-modal").classList.add("hidden");
+};
 
 async function openReview(jobId) {
   currentReviewJobId = jobId;

@@ -45,6 +45,9 @@ def create_localization_service(
         replace_source_audio: bool = False,
         background_music_dir: Optional[Path] = None,
         replacement_music_volume: float = 0.16,
+        source_effects_volume: float = 1.0,
+        tts_min_tempo: float = 1.0,
+        tts_max_tempo: float = 1.30,
         render_video: bool = False,
         render_config: Optional[RenderConfig] = None,
         enable_text_cover: bool = True,
@@ -56,6 +59,7 @@ def create_localization_service(
         ),
         logger: Optional[logging.Logger] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
         user_id: Optional[int] = None,
         use_download_cache: bool = True,
 ) -> LocalizationService:
@@ -156,7 +160,10 @@ def create_localization_service(
     timeline = TimelineService(logger=logger)
 
     # Mixer service
-    mixer = MixerService(config=MixerConfig(), logger=logger)
+    mixer = MixerService(
+        config=MixerConfig(min_tts_tempo=tts_min_tempo, max_tts_tempo=tts_max_tempo),
+        logger=logger,
+    )
     background_music_library = BackgroundMusicLibrary(
         BackgroundMusicConfig(library_dir=background_music_dir), logger=logger,
     ) if replace_source_audio else None
@@ -200,6 +207,7 @@ def create_localization_service(
         mix_audio=mix_audio,
         replace_source_audio=replace_source_audio,
         replacement_music_volume=replacement_music_volume,
+        source_effects_volume=source_effects_volume,
         render_video=render_video,
         render_config=render_config,
         enable_text_cover=enable_text_cover,
@@ -221,6 +229,7 @@ def create_localization_service(
         config=config,
         logger=logger,
         progress_callback=progress_callback,
+        cancellation_checker=cancellation_checker,
         user_id=user_id,
         use_download_cache=use_download_cache,
     )

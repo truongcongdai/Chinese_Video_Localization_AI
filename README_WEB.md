@@ -71,14 +71,34 @@ sudo docker compose -f docker-compose.prod.yml up -d
 
 ## Gen nội dung bằng AI miễn phí
 
-Phương án không mất phí API là Ollama chạy model ngay trên máy. Cài Ollama,
-chạy `ollama pull qwen3:8b`, sau đó thêm vào `.env`:
+Phương án không mất phí API là Ollama chạy model ngay trên máy. Máy CPU/no-GPU
+nên bắt đầu với model nhỏ:
+
+```bash
+ollama serve
+ollama pull qwen3:1.7b
+```
+
+Sau đó thêm vào `.env`:
 
 ```env
 CREATOR_AI_PROVIDER=ollama
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3:8b
+OLLAMA_MODEL=qwen3:1.7b
+OLLAMA_TRANSLATION_TIMEOUT=90
+OLLAMA_TRANSLATION_NUM_CTX=8192
+OLLAMA_TRANSLATION_NUM_PREDICT=0
 ```
+
+Nếu máy có GPU/RAM tốt, đổi lên `qwen3:4b` hoặc `qwen3:8b` để dịch tự nhiên hơn.
+Nếu Ollama chạy trên máy khác, đặt `OLLAMA_BASE_URL=http://IP_MAY_GPU:11434`.
+`OLLAMA_TRANSLATION_NUM_PREDICT=0` nghĩa là tự tính theo số segment; tăng timeout/context
+khi dùng model lớn hoặc video dài.
+
+Trong màn hình dịch, option `Gemini` là một mode riêng. Chọn `Gemini`, mở
+`Kết nối provider`, dán Gemini API key, bấm lưu để hệ thống kiểm tra key và
+tải danh sách model `generateContent`; sau đó chọn model Gemini cần dùng cho
+bước sửa bản dịch theo ngữ cảnh.
 
 Nếu máy yếu hoặc không muốn chạy model local, có thể dùng OpenRouter Free
 (có giới hạn request/ngày):

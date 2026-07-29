@@ -1,7 +1,7 @@
 # src/universal_video_ai/render/renderer.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import logging
 import shutil
@@ -297,8 +297,8 @@ class Renderer:
         # sans-serif font (incl. Vietnamese diacritics/wide glyphs) — a
         # deliberately conservative estimate so text more often fits with
         # room to spare than overflows.
-        avg_char_width_ratio = 0.58
-        box_padding_x = 20  # px of breathing room inside the box, each side
+        avg_char_width_ratio = 0.72
+        box_padding_x = 28  # px of breathing room inside the box, each side
         # Allow long translated OCR overlays to shrink enough to stay
         # inside the horizontal safe area instead of clipping off-screen.
         min_font_size = 8
@@ -317,6 +317,7 @@ class Renderer:
                 else max(min_font_size, int(overlay.height * 0.6))
             )
             font_size = min(font_size, max_font_size)
+            font_size = min(font_size, max(min_font_size, int(overlay.height * 0.48)))
 
             box_cx = overlay.x + overlay.width / 2.0
             # Don't let the cover box balloon past ~92% of the frame width
@@ -502,6 +503,99 @@ class Renderer:
         """
         return f"crop={w}:{h}:{x}:{y},boxblur=10:1,overlay={x}:{y}"
 
+    @staticmethod
+    def _should_use_filter_complex_script(filter_graph: str, filters_count: int) -> bool:
+        """
+        Avoid passing very large drawtext-heavy filter graphs through argv.
+        Hundreds of animated subtitle segments can exceed the OS argument
+        length limit before ffmpeg even starts.
+        """
+        return filters_count >= 100 or len(filter_graph.encode("utf-8")) >= 24000
+
+    def _write_filter_complex_script(self, output: Path, filter_graph: str) -> Path:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        script_path = output.with_suffix(".filter_complex.txt")
+        script_path.write_text(filter_graph, encoding="utf-8")
+        self.logger.info(
+            "Wrote FFmpeg filter graph script: %s (%d bytes)",
+            script_path,
+            len(filter_graph.encode("utf-8")),
+        )
+        return script_path
+
+    def _build_pre_subtitle_transform_filters(self) -> List[str]:
+        """
+        Apply source-video transforms that must happen before subtitles are
+        drawn. Flip belongs here; applying it after render mirrors the newly
+        burned subtitles too.
+        """
+        transform_config = self.config.transform_config
+        if not transform_config or not transform_config.enable_flip:
+            return []
+        if transform_config.flip_mode.value == "none":
+            return []
+        return [transform_config.flip_mode.value]
+
+    def _post_subtitle_transform_config(self) -> Optional[TransformConfig]:
+        """
+        Return remaining transformations that are still safe to run after
+        subtitles are burned. Flip is intentionally removed because it is
+        already applied to the source video before subtitle drawing.
+        """
+        transform_config = self.config.transform_config
+        if not transform_config:
+            return None
+
+        post_config = replace(transform_config, enable_flip=False)
+        if (
+            not post_config.target_width
+            and not post_config.target_height
+            and not post_config.enable_border
+            and not post_config.enable_split_screen
+            and not post_config.enable_randomization
+        ):
+            return None
+        return post_config
+
+    def _transform_text_overlays_for_pre_filters(
+        self,
+        text_overlays: List[TextOverlay],
+        frame_w: Optional[int],
+        frame_h: Optional[int],
+    ) -> List[TextOverlay]:
+        """
+        TextOverlay coordinates are detected on the original source frame.
+        If the source is flipped before subtitles are drawn, mirror the cover
+        boxes too so they still cover the same visual region after the flip.
+        """
+        transform_config = self.config.transform_config
+        if not text_overlays or not transform_config or not transform_config.enable_flip:
+            return text_overlays
+
+        flip_value = transform_config.flip_mode.value
+        if flip_value == "none":
+            return text_overlays
+
+        needs_w = "hflip" in flip_value
+        needs_h = "vflip" in flip_value
+        if (needs_w and frame_w is None) or (needs_h and frame_h is None):
+            self.logger.warning(
+                "Flip is enabled but video dimensions could not be determined; "
+                "text-cover overlay coordinates cannot be mirrored reliably."
+            )
+            return text_overlays
+
+        transformed: List[TextOverlay] = []
+        for overlay in text_overlays:
+            x = overlay.x
+            y = overlay.y
+            if needs_w and frame_w is not None:
+                x = max(0, frame_w - overlay.x - overlay.width)
+            if needs_h and frame_h is not None:
+                y = max(0, frame_h - overlay.y - overlay.height)
+            transformed.append(replace(overlay, x=x, y=y))
+        return transformed
+
     def _build_command(
         self,
         input_video: Path,
@@ -553,6 +647,7 @@ class Renderer:
             or bool(text_overlays)
             or self.config.watermark_box_fractional is not None
             or logo_configured
+            or bool(self._build_pre_subtitle_transform_filters())
             or (self.config.animated_subtitle_config and self.config.animated_subtitle_config.enabled and bool(subtitle_segments))
             or (self.config.video_template_config and self.config.video_template_config.enabled)
         )
@@ -570,7 +665,7 @@ class Renderer:
 
         if needs_reencode:
             # Build video filter chain
-            filters = []
+            filters = self._build_pre_subtitle_transform_filters()
 
             frame_w: Optional[int] = None
             frame_h: Optional[int] = None
@@ -578,6 +673,12 @@ class Renderer:
                 dims = self._get_video_dimensions(input_video)
                 if dims is not None:
                     frame_w, frame_h = dims
+
+            text_overlays_for_render = self._transform_text_overlays_for_pre_filters(
+                text_overlays,
+                frame_w,
+                frame_h,
+            )
 
             # Permanently blur a platform watermark (logo/@username/reup
             # title), independent of blur_text/text_overlays — it's not a
@@ -643,7 +744,7 @@ class Renderer:
 
             # Add per-sentence text-cover + translated-text overlays, each
             # only active during its own [start, end) window.
-            filters.extend(self._build_text_overlay_filters(text_overlays, frame_w=frame_w))
+            filters.extend(self._build_text_overlay_filters(text_overlays_for_render, frame_w=frame_w))
 
             # Add animated subtitle filters if enabled
             filters.extend(self._build_animated_subtitle_filters(subtitle_segments))
@@ -690,12 +791,22 @@ class Renderer:
                     f"[2:v]scale={self.config.logo_size_px}:-1[wm];"
                     f"[base][wm]overlay={x_expr}:{y_expr}:shortest=1[outv]"
                 )
-                cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
+                if self._should_use_filter_complex_script(filter_complex, len(filters)):
+                    script_path = self._write_filter_complex_script(output, filter_complex)
+                    cmd.extend(["-filter_complex_script", str(script_path), "-map", "[outv]"])
+                else:
+                    cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
             else:
-                cmd.extend(["-map", "0:v"])
                 vf = ",".join(filters) if filters else None
                 if vf:
-                    cmd.extend(["-vf", vf])
+                    if self._should_use_filter_complex_script(vf, len(filters)):
+                        filter_complex = f"[0:v]{vf}[outv]"
+                        script_path = self._write_filter_complex_script(output, filter_complex)
+                        cmd.extend(["-filter_complex_script", str(script_path), "-map", "[outv]"])
+                    else:
+                        cmd.extend(["-map", "0:v", "-vf", vf])
+                else:
+                    cmd.extend(["-map", "0:v"])
 
             # Build audio filter chain
             audio_filters = self._build_audio_template_filters()
@@ -815,8 +926,9 @@ class Renderer:
             self.logger.info("Rendering completed successfully: %s", output)
             
             # Apply video transformations if configured
-            if self.config.transform_config:
-                output = self._apply_transformations(output)
+            post_transform_config = self._post_subtitle_transform_config()
+            if post_transform_config:
+                output = self._apply_transformations(output, post_transform_config)
             
             return output
 
@@ -831,23 +943,20 @@ class Renderer:
             self.logger.exception("Unexpected error during rendering: %s", exc)
             raise RuntimeError(f"Rendering failed: {exc}") from exc
     
-    def _apply_transformations(self, video_path: Path) -> Path:
+    def _apply_transformations(self, video_path: Path, transform_config: TransformConfig) -> Path:
         """
         Apply video transformations (flip, border, split-screen, etc.) to the rendered video.
         
         :param video_path: Path to the rendered video
         :return: Path to the transformed video
         """
-        if not self.config.transform_config:
-            return video_path
-        
         # Create output path for transformed video
         transformed_path = video_path.parent / f"{video_path.stem}.transformed{video_path.suffix}"
         
         self.logger.info("Applying video transformations to %s", video_path)
         
         transformer = VideoTransformer(
-            config=self.config.transform_config,
+            config=transform_config,
             logger=self.logger
         )
         

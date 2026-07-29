@@ -19,11 +19,14 @@ from universal_video_ai.audio.background_music import BackgroundMusicLibrary
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.translate.adapt import SegmentAdapter
+from universal_video_ai.translate.speech_fit import SpeechFitConfig, fit_translated_segments
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.timeline.service import TimelineService, TimelineConfig, TimelineSegment
 from universal_video_ai.mixer.service import (
     MixerService, MixerConfig, AudioMix, TimedAudioClip, DubbedBackgroundMix,
+    DubbedSourceBackgroundMix,
 )
+from universal_video_ai.render.animated_subtitles import SubtitleEffect
 from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverlay
 from universal_video_ai.render.text_detector import OnScreenTextDetector
 from universal_video_ai.render import ocr_language_map
@@ -87,6 +90,12 @@ class LocalizationConfig:
     # localized render. This avoids re-introducing source music after TTS.
     replace_source_audio: bool = False
     replacement_music_volume: float = 0.16
+    source_effects_volume: float = 1.0
+    # Keep translated captions in a stable bottom subtitle layer by default.
+    # OCR/text-cover boxes are only used to hide the original hard subtitles;
+    # placing the translation inside OCR boxes is fragile when detection is
+    # partially wrong and can make otherwise valid SRT cues appear missing.
+    place_subtitles_in_text_cover_boxes: bool = False
 
     # Rendering
     render_video: bool = False
@@ -120,6 +129,20 @@ class LocalizationConfig:
         (0.80, 0.72, 1.0, 1.0),
     )
     text_cover_samples_per_segment: int = 2
+    # If the source video has burned-in subtitles whose visual timing differs
+    # from ASR/audio timing, estimate a single OCR-based offset and shift the
+    # per-segment timeline before translation/TTS/render. This keeps dubbed
+    # audio, translated subtitles, and cover boxes aligned to what viewers see.
+    align_to_burned_subtitles: bool = True
+    max_subtitle_alignment_offset: float = 12.0
+    # Offsets this small are usually decoder/ASR boundary lead-in rather than
+    # a separate hard-subtitle layer delay, so shift TTS too. Larger offsets
+    # stay visual-only to avoid moving dubbed speech away from the real audio.
+    max_audio_sync_offset: float = 1.0
+    # Duration-aware subtitle/dub guardrail. This runs after base translation
+    # and optional LLM adaptation so every segment is checked against its
+    # original timestamp before subtitles and TTS are generated.
+    speech_fit: SpeechFitConfig = field(default_factory=SpeechFitConfig)
 
 
 @dataclass(frozen=True)
@@ -129,11 +152,16 @@ class LocalizationResult:
     download_result: DownloadResult
     audio_pipeline_result: AudioPipelineResult
     translated_text: Optional[str] = None
+    source_segments: Optional[List[TranscriptSegment]] = None
     # Per-sentence translated segments with the ORIGINAL sentence's start/end
     # timestamps preserved. This is what keeps dubbing/subtitles/text-cover
     # aligned with the source video; `translated_text` is kept only for
     # backward compatibility with callers that just want the flat string.
     translated_segments: Optional[List[TranscriptSegment]] = None
+    # Audio-clock copy used for TTS placement. `translated_segments` is the
+    # viewer/subtitle clock and may be shifted to match burned-in subtitle
+    # frames, while this stays anchored to the original spoken audio.
+    tts_segments: Optional[List[TranscriptSegment]] = None
     tts_audio_path: Optional[Path] = None
     subtitle_segments: Optional[List[TimelineSegment]] = None
     mixed_audio_path: Optional[Path] = None
@@ -153,6 +181,7 @@ class PreparedLocalization:
     audio_result: AudioPipelineResult
     source_segments: List[TranscriptSegment]
     translated_segments: Optional[List[TranscriptSegment]]
+    tts_segments: Optional[List[TranscriptSegment]]
     translated_text: Optional[str]
     target_language: str
     output_dir: Path
@@ -183,6 +212,9 @@ def prepared_localization_to_dict(prepared: PreparedLocalization) -> Dict[str, A
         ],
         "translated_segments": [
             {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.translated_segments or [])
+        ],
+        "tts_segments": [
+            {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.tts_segments or [])
         ],
         "translated_text": prepared.translated_text,
     }
@@ -216,11 +248,16 @@ def prepared_localization_from_dict(data: Dict[str, Any]) -> PreparedLocalizatio
         TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
         for s in data.get("translated_segments", [])
     ] or None
+    tts_segments = [
+        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        for s in data.get("tts_segments", [])
+    ] or None
     return PreparedLocalization(
         download_result=download_result,
         audio_result=audio_pipeline_result,
         source_segments=source_segments,
         translated_segments=translated_segments,
+        tts_segments=tts_segments,
         translated_text=data.get("translated_text"),
         target_language=data["target_language"],
         output_dir=Path(data["output_dir"]),
@@ -272,6 +309,7 @@ class LocalizationService:
             config: Optional[LocalizationConfig] = None,
             logger: Optional[logging.Logger] = None,
             progress_callback: Optional[Callable[[int, str], None]] = None,
+            cancellation_checker: Optional[Callable[[], bool]] = None,
             user_id: Optional[int] = None,
             use_download_cache: bool = True,
     ) -> None:
@@ -287,7 +325,9 @@ class LocalizationService:
         self.config = config or LocalizationConfig()
         self.logger = logger or _logger
         self.progress_callback = progress_callback
+        self.cancellation_checker = cancellation_checker
         self.user_id = user_id
+        self._last_subtitle_alignment_estimate = None
 
         self.logger.debug(
             "LocalizationService initialized run_transcription=%s run_translation=%s run_tts=%s run_render=%s "
@@ -300,11 +340,16 @@ class LocalizationService:
         )
 
     def _progress(self, percent: int, message: str) -> None:
+        self._raise_if_cancelled()
         if self.progress_callback:
             try:
                 self.progress_callback(max(0, min(100, percent)), message)
             except Exception:
                 self.logger.exception("Progress callback failed")
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancellation_checker and self.cancellation_checker():
+            raise RuntimeError("Job cancelled by user")
 
     async def localize(self, url: str, output_dir: Path, target_language: Optional[str] = None) -> LocalizationResult:
         """Execute full video localization workflow, start to finish, with
@@ -417,12 +462,20 @@ class LocalizationService:
         self.logger.info("LocalizationService: audio processing complete")
         self._progress(40, "Đã nhận diện lời nói ✓")
 
-        source_segments: List[TranscriptSegment] = [
+        audio_source_segments: List[TranscriptSegment] = [
             s for s in (audio_result.segments or []) if s.has_timing
         ]
+        self._last_subtitle_alignment_estimate = None
+        visual_source_segments = self._align_source_segments_to_burned_subtitles(
+            video_path=download_result.video_path,
+            source_segments=audio_source_segments,
+            detected_language=audio_result.detected_language,
+            audio_duration=audio_result.audio_result.duration,
+        )
 
         translated_text: Optional[str] = None
         translated_segments: Optional[List[TranscriptSegment]] = None
+        tts_segments: Optional[List[TranscriptSegment]] = None
 
         # Step 3: Translate transcript — prefer segment-level translation so
         # every sentence keeps the timestamp it had in the source video.
@@ -442,22 +495,39 @@ class LocalizationService:
                 source_lang = self.config.transcription_language or "auto"
                 target_lang = effective_target_language
                 try:
-                    if source_segments:
+                    if audio_source_segments:
                         self.logger.info(
                             "LocalizationService: translating %d timed segments to %s",
-                            len(source_segments), target_lang,
+                            len(audio_source_segments), target_lang,
                         )
                         translated_segments = await self.translate_service.translate_segments(
-                            source_segments, source_lang=source_lang, target_lang=target_lang
+                            audio_source_segments, source_lang=source_lang, target_lang=target_lang
                         )
                         if self.segment_adapter is not None:
-                            self._progress(54, "Đang tối ưu bản dịch theo ngữ cảnh...")
+                            adapter_config = getattr(self.segment_adapter, "config", None)
+                            adapter_provider = getattr(adapter_config, "provider", "LLM")
+                            adapter_model = getattr(adapter_config, "model", "")
+                            adapter_label = f"{adapter_provider} {adapter_model}".strip()
+                            self.logger.info("LocalizationService: adapting translation with %s", adapter_label)
+                            self._progress(54, f"Đang tối ưu bản dịch bằng {adapter_label}...")
                             translated_segments = await self.segment_adapter.adapt_segments(
-                                source_segments,
+                                audio_source_segments,
                                 translated_segments,
                                 source_lang=source_lang,
                                 target_lang=target_lang,
                             )
+                        translated_segments = fit_translated_segments(
+                            translated_segments,
+                            self.config.speech_fit,
+                        )
+                        tts_segments = self._maybe_apply_audio_sync_offset(
+                            translated_segments,
+                            audio_duration=audio_result.audio_result.duration,
+                        )
+                        translated_segments = self._retime_segments(
+                            translated_segments,
+                            visual_source_segments,
+                        )
                         translated_text = " ".join(s.text for s in translated_segments if s.text)
                     else:
                         # Fallback: no real per-sentence timing available (e.g. a
@@ -486,12 +556,127 @@ class LocalizationService:
         return PreparedLocalization(
             download_result=download_result,
             audio_result=audio_result,
-            source_segments=source_segments,
+            source_segments=visual_source_segments,
             translated_segments=translated_segments,
+            tts_segments=tts_segments,
             translated_text=translated_text,
             target_language=effective_target_language,
             output_dir=output_dir,
         )
+
+    @staticmethod
+    def _retime_segments(
+        text_segments: Optional[List[TranscriptSegment]],
+        timing_segments: Optional[List[TranscriptSegment]],
+    ) -> Optional[List[TranscriptSegment]]:
+        if not text_segments or not timing_segments or len(text_segments) != len(timing_segments):
+            return text_segments
+        return [
+            TranscriptSegment(start=timing.start, end=timing.end, text=text.text)
+            for text, timing in zip(text_segments, timing_segments)
+        ]
+
+    def _maybe_apply_audio_sync_offset(
+        self,
+        segments: Optional[List[TranscriptSegment]],
+        audio_duration: float,
+    ) -> Optional[List[TranscriptSegment]]:
+        if not segments:
+            return segments
+        estimate = self._last_subtitle_alignment_estimate
+        if estimate is None:
+            return segments
+        offset = float(getattr(estimate, "offset", 0.0) or 0.0)
+        apply_after = getattr(estimate, "apply_after", None)
+        if apply_after not in (None, 0, 0.0):
+            return segments
+        if abs(offset) < 0.12 or abs(offset) > self.config.max_audio_sync_offset:
+            return segments
+        self.logger.info(
+            "LocalizationService: applying small global audio sync offset %.2fs to TTS timeline",
+            offset,
+        )
+        return [
+            TranscriptSegment(
+                start=max(0.0, min(audio_duration, s.start + offset)),
+                end=max(0.0, min(audio_duration, s.end + offset)),
+                text=s.text,
+            )
+            for s in segments
+        ]
+
+    def _align_source_segments_to_burned_subtitles(
+        self,
+        video_path: Optional[Path],
+        source_segments: List[TranscriptSegment],
+        detected_language: Optional[str],
+        audio_duration: float,
+    ) -> List[TranscriptSegment]:
+        """Shift ASR segment timing to match burned-in subtitle timing.
+
+        Whisper timestamps are anchored to audio. That is usually correct,
+        but some short-drama/reup videos have a burned-in subtitle layer that
+        appears later or earlier than the audio transcript. Since the render
+        covers/replaces the burned-in text, the viewer-visible timeline must
+        match that text layer. We estimate one whole-video offset via OCR and
+        apply it to every segment; if OCR cannot prove a reliable offset, the
+        original ASR timing is kept.
+        """
+        if (
+            not self.config.align_to_burned_subtitles
+            or not self.config.enable_text_cover
+            or not video_path
+            or not source_segments
+        ):
+            return source_segments
+
+        if self.text_detector is not None:
+            detector = self.text_detector
+        else:
+            resolved_ocr_languages = ocr_language_map.resolve_ocr_languages(
+                self.config.ocr_languages, detected_language
+            )
+            detector = OnScreenTextDetector(languages=resolved_ocr_languages)
+
+        try:
+            estimate = detector.estimate_subtitle_time_offset(
+                video_path,
+                [(s.start, s.end, s.text) for s in source_segments],
+                search_radius=self.config.max_subtitle_alignment_offset,
+                exclude_regions_fractional=self.config.watermark_exclude_regions_fractional,
+            )
+        except Exception as exc:
+            self.logger.warning("Burned-subtitle timing alignment failed; keeping ASR timing: %s", exc)
+            return source_segments
+
+        if estimate is None or abs(estimate.offset) < 0.12:
+            return source_segments
+        self._last_subtitle_alignment_estimate = estimate
+
+        self.logger.info(
+            "LocalizationService: shifting %d segment timestamp(s) by %.2fs to match burned-in subtitles "
+            "(OCR confidence=%.2f, matches=%d)",
+            len(source_segments), estimate.offset, estimate.confidence, estimate.matches,
+        )
+        self._progress(
+            42,
+            f"Đã căn lại timing phụ đề nguồn ({estimate.offset:+.1f}s)",
+        )
+        return [
+            TranscriptSegment(
+                start=max(0.0, min(audio_duration, s.start + self._segment_alignment_offset(s, estimate))),
+                end=max(0.0, min(audio_duration, s.end + self._segment_alignment_offset(s, estimate))),
+                text=s.text,
+            )
+            for s in source_segments
+        ]
+
+    @staticmethod
+    def _segment_alignment_offset(segment: TranscriptSegment, estimate) -> float:
+        apply_after = getattr(estimate, "apply_after", None)
+        if apply_after is not None and segment.start < apply_after:
+            return 0.0
+        return estimate.offset
 
     async def _finalize(
         self,
@@ -510,9 +695,11 @@ class LocalizationService:
         if edited_segments is not None:
             translated_segments = edited_segments
             translated_text = " ".join(s.text for s in translated_segments if s.text)
+            tts_segments = self._retime_segments(translated_segments, prepared.tts_segments) or translated_segments
         else:
             translated_segments = prepared.translated_segments
             translated_text = prepared.translated_text
+            tts_segments = prepared.tts_segments or translated_segments
 
         tts_audio_path: Optional[Path] = None
 
@@ -524,10 +711,10 @@ class LocalizationService:
                 self.logger.warning("TTS requested but no TTSService injected; skipping")
             else:
                 try:
-                    if translated_segments:
+                    if tts_segments:
                         tts_audio_path = await asyncio.to_thread(
                             self._synthesize_timed_track,
-                            translated_segments,
+                            tts_segments,
                             total_duration=audio_result.audio_result.duration,
                             output_dir=output_dir,
                             target_language=effective_target_language,
@@ -599,25 +786,25 @@ class LocalizationService:
                 detected_language=audio_result.detected_language,
             )
             if text_overlays and subtitles_path and subtitle_segments:
-                # ASS owns all translated text so every cue keeps the karaoke
-                # fill effect. Detected cues are middle-centred at their OCR
-                # box; unmatched cues remain bottom-centred as a safety net.
-                # One explicit size is shared by every cue in this video.
                 common_font_size = text_overlays[0].font_size or 48
-                positions = {
-                    (round(overlay.start, 3), round(overlay.end, 3)): (
-                        round(overlay.x + overlay.width / 2),
-                        round(overlay.y + overlay.height / 2),
-                    )
-                    for overlay in text_overlays
-                }
+                positions = None
+                font_size = None
+                if self.config.place_subtitles_in_text_cover_boxes:
+                    positions = {
+                        (round(overlay.start, 3), round(overlay.end, 3)): (
+                            round(overlay.x + overlay.width / 2),
+                            round(overlay.y + overlay.height / 2),
+                        )
+                        for overlay in text_overlays
+                    }
+                    font_size = common_font_size
                 subtitles_path.write_text(
                     self.timeline.generate_ass_karaoke(
                         subtitle_segments,
                         frame_width=frame_width,
                         frame_height=frame_height,
                         positions=positions,
-                        font_size=common_font_size,
+                        font_size=font_size,
                     ),
                     encoding="utf-8",
                 )
@@ -642,27 +829,28 @@ class LocalizationService:
             self.logger.info("LocalizationService: mixing audio streams")
             if self.config.replace_source_audio:
                 replacement_track = (
-                    self.background_music_library.select(str(download_result.video_path))
+                    self.background_music_library.select_like(
+                        audio_result.audio_result.audio_path,
+                        selection_key=str(download_result.video_path),
+                    )
                     if self.background_music_library is not None else None
                 )
-                if replacement_track is not None:
-                    mixed_audio_path = output_dir / "audio_safe_mix.wav"
-                    self.mixer.mix_dub_with_background(
-                        DubbedBackgroundMix(
-                            voice_audio=tts_audio_path,
-                            background_audio=replacement_track,
-                            total_duration=audio_result.audio_result.duration,
-                            background_volume=self.config.replacement_music_volume,
-                        ),
-                        mixed_audio_path,
-                    )
-                else:
-                    # Failing closed is intentional: an empty licensed library
-                    # yields clean TTS, never a fallback to claimed source audio.
-                    mixed_audio_path = tts_audio_path
+                mixed_audio_path = output_dir / "audio_safe_mix.wav"
+                self.mixer.mix_dub_with_source_and_background(
+                    DubbedSourceBackgroundMix(
+                        voice_audio=tts_audio_path,
+                        source_audio=audio_result.audio_result.audio_path,
+                        background_audio=replacement_track,
+                        total_duration=audio_result.audio_result.duration,
+                        source_volume=self.config.source_effects_volume,
+                        background_volume=self.config.replacement_music_volume,
+                    ),
+                    mixed_audio_path,
+                )
+                if replacement_track is None:
                     self.logger.warning(
                         "Copyright-safe audio enabled but no licensed replacement track is available; "
-                        "rendering clean TTS without source audio"
+                        "keeping original ambience/effects quietly under the dub instead of rendering silent-background TTS"
                     )
             else:
                 mixed_audio_path = output_dir / "audio_mixed.wav"
@@ -708,9 +896,20 @@ class LocalizationService:
                     # the in-place overlay where OCR succeeded, or the
                     # bottom .srt caption as a fallback where it didn't —
                     # never neither.
+                    animated_config = (
+                        self.renderer.config.animated_subtitle_config
+                        if self.renderer and self.renderer.config else None
+                    )
+                    use_ass_karaoke = bool(
+                        animated_config
+                        and animated_config.enabled
+                        and animated_config.effect == SubtitleEffect.KARAOKE
+                    )
+
                     subtitles_for_render = subtitles_path
                     if (
-                        self.config.skip_srt_when_text_overlays_present
+                        not use_ass_karaoke
+                        and self.config.skip_srt_when_text_overlays_present
                         and subtitles_path is not None
                         and text_overlays
                         and any(overlay.text for overlay in text_overlays)
@@ -750,9 +949,14 @@ class LocalizationService:
 
                     final_video_path = output_dir / "output_final.mp4"
                     
-                    # Prepare subtitle segments for animated effects if enabled
+                    # Prepare subtitle segments for drawtext-based animated
+                    # effects. Karaoke is special: the ASS subtitle file we
+                    # generated above already contains real \kf karaoke timing,
+                    # while the drawtext karaoke fallback only renders a
+                    # static full-color line. Keep ASS for karaoke and only use
+                    # drawtext for the other animation effects.
                     subtitle_segments_for_render = None
-                    if self.renderer.config.animated_subtitle_config and self.renderer.config.animated_subtitle_config.enabled:
+                    if animated_config and animated_config.enabled and not use_ass_karaoke:
                         subtitle_segments_for_render = [
                             {"text": seg.text, "start": seg.start_time, "end": seg.end_time}
                             for seg in subtitle_segments
@@ -762,8 +966,13 @@ class LocalizationService:
                                 self.logger.info(
                                     "LocalizationService: animated subtitles enabled; skipping separate "
                                     "ASS/SRT burn to avoid duplicate subtitle layers"
-                                )
+                            )
                             subtitles_for_render = None
+                    elif use_ass_karaoke and subtitles_for_render is not None:
+                        self.logger.info(
+                            "LocalizationService: karaoke subtitles enabled; using ASS karaoke "
+                            "burn-in and text-cover boxes, not static drawtext subtitles"
+                        )
                     
                     async with _RENDER_SLOTS:
                         await asyncio.to_thread(
@@ -785,7 +994,9 @@ class LocalizationService:
             download_result=download_result,
             audio_pipeline_result=audio_result,
             translated_text=translated_text,
+            source_segments=source_segments,
             translated_segments=translated_segments,
+            tts_segments=tts_segments,
             tts_audio_path=tts_audio_path,
             subtitle_segments=subtitle_segments,
             mixed_audio_path=mixed_audio_path,
@@ -815,15 +1026,24 @@ class LocalizationService:
 
         clips: List[TimedAudioClip] = []
         for idx, seg in enumerate(translated_segments):
+            self._raise_if_cancelled()
             if not seg.text.strip():
                 continue
             clip_path = segments_dir / f"segment_{idx:04d}.wav"
-            self.tts_service.synthesize(
-                seg.text,
-                output_path=clip_path,
-                language=target_language,
-                voice=voice,
-            )
+            try:
+                self.tts_service.synthesize(
+                    seg.text,
+                    output_path=clip_path,
+                    language=target_language,
+                    voice=voice,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Skipping TTS for segment %d after synthesis failed; subtitles remain: %s",
+                    idx,
+                    exc,
+                )
+                continue
             if seg.has_timing:
                 clips.append(TimedAudioClip(start=seg.start, end=seg.end, audio_path=clip_path))
             else:

@@ -28,7 +28,8 @@ def test_provider_connect_buttons_do_not_directly_redirect_outside_panel() -> No
     assert 'id="provider-open-dashboard-link"' in html
     assert '$("#translation-connect-link").href = "#";' in app_js
     assert 'connectLink.href = "#";' in app_js
-    assert 'openProviderConnect("openai", false)' in app_js
+    assert '$("#translation-connect-link").dataset.provider = connectProvider;' in app_js
+    assert 'openProviderConnect($("#translation-connect-link").dataset.provider || "openai", false)' in app_js
 
 
 def test_recommended_defaults_use_tiktok_karaoke_subtitles() -> None:
@@ -57,3 +58,21 @@ def test_youtube_16_9_preset_and_preflight_are_available() -> None:
     assert "youtube: { aspect: \"16:9\"" in app_js
     assert 'target_aspect_ratio: $("#output-aspect-ratio").value' in app_js
     assert 'api("/api/jobs/preflight"' in app_js
+
+
+def test_history_bulk_download_and_status_filter_are_available() -> None:
+    html = _read_static_file("index.html")
+    app_js = _read_static_file("app.js")
+
+    assert 'id="history-status-filter"' in html
+    assert '<option value="done">Hoàn tất</option>' in html
+    assert 'data-history-status=' not in html
+    assert 'id="history-bulk-download"' in html
+    assert 'params.set("status", status)' in app_js
+    assert 'fetch("/api/jobs/bulk-download"' in app_js
+    assert 'data-download-zip="${job.id}"' in app_js
+    assert "downloadJobsZip([btn.dataset.downloadZip])" in app_js
+    assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
+    assert 'data-cancel="${job.id}"' in app_js
+    assert '/cancel`' in app_js
+    assert 'app.js?v=20260729' in html
