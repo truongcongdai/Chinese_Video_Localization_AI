@@ -83,3 +83,32 @@ def test_mix_dub_with_background_rejects_invalid_volume(tmp_path: Path, monkeypa
             ),
             tmp_path / "output.wav",
         )
+
+
+def test_build_source_effects_bed_mixes_non_vocal_stems(tmp_path: Path, monkeypatch) -> None:
+    stems = []
+    for name in ("drums.wav", "bass.wav", "other.wav"):
+        path = tmp_path / name
+        path.write_bytes(b"stem")
+        stems.append(path)
+    output = tmp_path / "source_effects.wav"
+
+    service = MixerService()
+    monkeypatch.setattr(service, "_ffmpeg_available", True)
+    captured = {}
+
+    def fake_run(cmd, op_name):
+        captured["cmd"] = cmd
+        captured["op_name"] = op_name
+        output.write_bytes(b"effects")
+
+    monkeypatch.setattr(service, "_run_ffmpeg", fake_run)
+
+    result = service.build_source_effects_bed(stems, 9.5, output, volume=0.7)
+
+    command = captured["cmd"]
+    filter_graph = command[command.index("-filter_complex") + 1]
+    assert result == output.resolve()
+    assert captured["op_name"] == "build_source_effects_bed"
+    assert "amix=inputs=3" in filter_graph
+    assert "volume=0.7000" in filter_graph

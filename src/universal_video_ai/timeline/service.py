@@ -370,17 +370,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     @staticmethod
     def _format_timestamp_srt(seconds: float) -> str:
         """Convert seconds to SRT timestamp format HH:MM:SS,mmm"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds % 1) * 1000)
+        total_millis = max(0, int(round(seconds * 1000)))
+        hours, remainder = divmod(total_millis, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, millis = divmod(remainder, 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     @staticmethod
     def _format_timestamp_vtt(seconds: float) -> str:
         """Convert seconds to VTT timestamp format HH:MM:SS.mmm"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds % 1) * 1000)
+        total_millis = max(0, int(round(seconds * 1000)))
+        hours, remainder = divmod(total_millis, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, millis = divmod(remainder, 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"

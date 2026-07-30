@@ -362,7 +362,7 @@ class Renderer:
                     f"{font_clause}"
                     f"text='{_escape_drawtext(overlay.text)}':"
                     f"x={box_x}+({box_width}-text_w)/2:"
-                    f"y={overlay.y}+({overlay.height}-text_h)/2:"
+                    f"y={overlay.y}+({overlay.height}-ascent+descent)/2:"
                     f"fontsize={font_size}:fontcolor={overlay.font_color}:"
                     f"enable='{enable_expr}'"
                 )

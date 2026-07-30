@@ -172,22 +172,26 @@ class DemucsProcessor:
 
         self.logger.info("Separating audio %s using Demucs model=%s", audio_path, self.config.model)
 
-        # Build demucs command
-        # -n: model name
-        # -d: device (cpu, cuda)
-        # -o: output directory
-        # --format: output format (wav, mp3, etc.)
+        # Build demucs command.
+        # Demucs writes WAV by default. Current releases do not accept
+        # `--format wav`; MP3/FLAC are selected with dedicated flags.
         cmd = [
             "demucs",
             "-n", self.config.model,
             "-d", self.config.device,
             "-o", str(output_dir),
-            "--format", self.config.output_format,
         ]
+        output_format = self.config.output_format.lower()
+        if output_format == "mp3":
+            cmd.append("--mp3")
+        elif output_format == "flac":
+            cmd.append("--flac")
+        elif output_format != "wav":
+            raise ValueError("Demucs output_format must be one of: wav, mp3, flac")
 
         # Optional: segment length
         if self.config.segment_length is not None:
-            cmd.extend(["--segment-length", str(self.config.segment_length)])
+            cmd.extend(["--segment", str(self.config.segment_length)])
 
         cmd.append(str(audio_path))
 

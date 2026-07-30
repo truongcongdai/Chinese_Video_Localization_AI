@@ -84,6 +84,67 @@ def test_separate_success(tmp_path: Path, monkeypatch):
     assert output.vocals.name == "vocals.wav"
 
 
+def test_wav_command_uses_demucs_default_format_and_segment_flag(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"dummy audio")
+    captured = {}
+
+    def mock_run(*args, **kwargs):
+        cmd = kwargs.get("args", args[0])
+        captured["cmd"] = cmd
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        result.stdout = ""
+
+        output_dir = Path(cmd[cmd.index("-o") + 1])
+        stems_dir = output_dir / "htdemucs" / "audio"
+        stems_dir.mkdir(parents=True, exist_ok=True)
+        for stem in ["vocals", "drums", "bass", "other"]:
+            (stems_dir / f"{stem}.wav").write_bytes(b"stem content")
+        return result
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+
+    processor = DemucsProcessor(DemucsConfig(output_format="wav", segment_length=12))
+    processor.separate(audio_file)
+
+    cmd = captured["cmd"]
+    assert "--format" not in cmd
+    assert "--segment-length" not in cmd
+    assert cmd[cmd.index("--segment") + 1] == "12"
+
+
+def test_mp3_command_uses_demucs_mp3_flag(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"dummy audio")
+    captured = {}
+
+    def mock_run(*args, **kwargs):
+        cmd = kwargs.get("args", args[0])
+        captured["cmd"] = cmd
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        result.stdout = ""
+
+        output_dir = Path(cmd[cmd.index("-o") + 1])
+        stems_dir = output_dir / "htdemucs" / "audio"
+        stems_dir.mkdir(parents=True, exist_ok=True)
+        for stem in ["vocals", "drums", "bass", "other"]:
+            (stems_dir / f"{stem}.mp3").write_bytes(b"stem content")
+        return result
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+
+    processor = DemucsProcessor(DemucsConfig(output_format="mp3"))
+    processor.separate(audio_file)
+
+    cmd = captured["cmd"]
+    assert "--mp3" in cmd
+    assert "--format" not in cmd
+
+
 def test_separate_demucs_error(tmp_path: Path, monkeypatch):
     audio_file = tmp_path / "audio.wav"
     audio_file.write_bytes(b"dummy audio")

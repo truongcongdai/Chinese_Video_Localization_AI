@@ -933,7 +933,14 @@ def _build_service_for_job(job):
         ollama_num_predict=_env_int("OLLAMA_TRANSLATION_NUM_PREDICT", 0, minimum=0, maximum=32768),
     )
 
+    replace_source_audio = os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"}
+    run_demucs_for_effects = (
+        os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
+        and shutil.which("demucs") is not None
+    )
+
     return create_localization_service(
+        run_demucs=replace_source_audio and run_demucs_for_effects,
         run_transcription=True,
         transcription_language=transcription_language,
         transcription_model=transcription_model,
@@ -949,7 +956,7 @@ def _build_service_for_job(job):
         translation_adaptation=translation_adaptation,
         generate_subtitles=True,
         mix_audio=True,
-        replace_source_audio=os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"},
+        replace_source_audio=replace_source_audio,
         background_music_dir=Path(os.getenv("LICENSED_MUSIC_DIR", "./local_data/music")),
         replacement_music_volume=float(os.getenv("REPLACEMENT_MUSIC_VOLUME", "0.16")),
         source_effects_volume=float(os.getenv("SOURCE_EFFECTS_VOLUME", "1.0")),

@@ -9,6 +9,7 @@ from universal_video_ai.orchestrator.service import (
 )
 from universal_video_ai.downloader.download_result import DownloadResult
 from universal_video_ai.audio.pipeline import AudioPipelineResult, AudioResult
+from universal_video_ai.audio.demucs import DemucsOutput
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.timeline.service import TimelineService, TimelineSegment
@@ -314,7 +315,7 @@ def test_localization_service_uses_ass_for_karaoke_rendering(tmp_path: Path):
         assert renderer.render.call_args.kwargs["subtitle_segments"] is None
 
 
-def test_text_cover_keeps_ass_captions_bottom_center_by_default(tmp_path: Path):
+def test_text_cover_places_ass_captions_in_cover_box_by_default(tmp_path: Path):
     download_result = MagicMock(spec=DownloadResult)
     download_result.video_path = tmp_path / "video.mp4"
 
@@ -354,10 +355,117 @@ def test_text_cover_keeps_ass_captions_bottom_center_by_default(tmp_path: Path):
     result = asyncio.run(service._finalize(prepared))
 
     assert timeline.generate_ass_karaoke.call_count == 2
-    assert timeline.generate_ass_karaoke.call_args.kwargs["positions"] is None
-    assert timeline.generate_ass_karaoke.call_args.kwargs["font_size"] is None
+    assert timeline.generate_ass_karaoke.call_args.kwargs["positions"] == {
+        (0.0, 1.0): (110, 60)
+    }
+    assert timeline.generate_ass_karaoke.call_args.kwargs["font_size"] == 36
     assert result.text_overlays is not None
     assert result.text_overlays[0].text == ""
+
+
+def test_replace_source_audio_uses_demucs_non_vocal_bed(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    source_audio = tmp_path / "source.wav"
+    for path in (video, source_audio):
+        path.write_bytes(b"x")
+    stems = {}
+    for name in ("vocals", "drums", "bass", "other"):
+        path = tmp_path / f"{name}.wav"
+        path.write_bytes(name.encode())
+        stems[name] = path
+
+    tts_service = MagicMock(spec=TTSService)
+    tts_service.synthesize.side_effect = (
+        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+    )
+    mixer = MagicMock(spec=MixerService)
+    mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
+    mixer.build_source_effects_bed.side_effect = lambda stems, total_duration, output_path, volume: output_path.write_bytes(b"bed")
+    mixer.mix_dub_with_source_and_background.side_effect = lambda spec, output_path: output_path.write_bytes(b"mixed")
+
+    service = LocalizationService(
+        tts_service=tts_service,
+        mixer=mixer,
+        config=LocalizationConfig(
+            run_tts=True,
+            mix_audio=True,
+            replace_source_audio=True,
+        ),
+    )
+    audio_result = AudioPipelineResult(
+        audio_result=AudioResult(True, source_audio, 5.0, 44100, 2, None, "wav", 1),
+        demucs_output=DemucsOutput(
+            vocals=stems["vocals"],
+            drums=stems["drums"],
+            bass=stems["bass"],
+            other=stems["other"],
+        ),
+        transcript="hello",
+    )
+    prepared = PreparedLocalization(
+        download_result=DownloadResult(True, platform=None, original_url="", final_url="", video_path=video),
+        audio_result=audio_result,
+        source_segments=[],
+        translated_segments=[TranscriptSegment(start=0.0, end=1.0, text="Xin chào")],
+        tts_segments=[TranscriptSegment(start=0.0, end=1.0, text="Xin chào")],
+        translated_text="Xin chào",
+        target_language="vi",
+        output_dir=tmp_path,
+    )
+
+    result = asyncio.run(service._finalize(prepared))
+
+    mixer.build_source_effects_bed.assert_called_once()
+    used_stems = mixer.build_source_effects_bed.call_args.args[0]
+    assert used_stems == [stems["drums"], stems["bass"], stems["other"]]
+    mix_spec = mixer.mix_dub_with_source_and_background.call_args.args[0]
+    assert mix_spec.source_audio.name == "source_effects_bed.wav"
+    assert result.mixed_audio_path == tmp_path / "audio_safe_mix.wav"
+
+
+def test_replace_source_audio_without_demucs_does_not_mix_original_voice(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    source_audio = tmp_path / "source.wav"
+    for path in (video, source_audio):
+        path.write_bytes(b"x")
+
+    tts_service = MagicMock(spec=TTSService)
+    tts_service.synthesize.side_effect = (
+        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+    )
+    mixer = MagicMock(spec=MixerService)
+    mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
+
+    service = LocalizationService(
+        tts_service=tts_service,
+        mixer=mixer,
+        config=LocalizationConfig(
+            run_tts=True,
+            mix_audio=True,
+            replace_source_audio=True,
+        ),
+    )
+    audio_result = AudioPipelineResult(
+        audio_result=AudioResult(True, source_audio, 5.0, 44100, 2, None, "wav", 1),
+        demucs_output=None,
+        transcript="hello",
+    )
+    prepared = PreparedLocalization(
+        download_result=DownloadResult(True, platform=None, original_url="", final_url="", video_path=video),
+        audio_result=audio_result,
+        source_segments=[],
+        translated_segments=[TranscriptSegment(start=0.0, end=1.0, text="Xin chào")],
+        tts_segments=[TranscriptSegment(start=0.0, end=1.0, text="Xin chào")],
+        translated_text="Xin chào",
+        target_language="vi",
+        output_dir=tmp_path,
+    )
+
+    result = asyncio.run(service._finalize(prepared))
+
+    mixer.mix.assert_not_called()
+    mixer.mix_dub_with_source_and_background.assert_not_called()
+    assert result.mixed_audio_path == tmp_path / "tts_audio.wav"
 
 
 def test_localization_service_download_failure(tmp_path: Path):

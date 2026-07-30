@@ -91,11 +91,10 @@ class LocalizationConfig:
     replace_source_audio: bool = False
     replacement_music_volume: float = 0.16
     source_effects_volume: float = 1.0
-    # Keep translated captions in a stable bottom subtitle layer by default.
-    # OCR/text-cover boxes are only used to hide the original hard subtitles;
-    # placing the translation inside OCR boxes is fragile when detection is
-    # partially wrong and can make otherwise valid SRT cues appear missing.
-    place_subtitles_in_text_cover_boxes: bool = False
+    # Place translated captions inside the OCR cover boxes by default, so the
+    # new subtitle sits centered in the white box that covers the original
+    # hard subtitle.
+    place_subtitles_in_text_cover_boxes: bool = True
 
     # Rendering
     render_video: bool = False
@@ -135,9 +134,11 @@ class LocalizationConfig:
     # audio, translated subtitles, and cover boxes aligned to what viewers see.
     align_to_burned_subtitles: bool = True
     max_subtitle_alignment_offset: float = 12.0
-    # Offsets this small are usually decoder/ASR boundary lead-in rather than
-    # a separate hard-subtitle layer delay, so shift TTS too. Larger offsets
-    # stay visual-only to avoid moving dubbed speech away from the real audio.
+    # Offsets below this are usually decoder/ASR boundary noise rather than a
+    # separate hard-subtitle layer delay.
+    min_subtitle_alignment_offset: float = 0.05
+    # Small offsets are shifted on the TTS clock too. Larger offsets stay
+    # visual-only to avoid moving dubbed speech away from the real audio.
     max_audio_sync_offset: float = 1.0
     # Duration-aware subtitle/dub guardrail. This runs after base translation
     # and optional LLM adaptation so every segment is checked against its
@@ -590,7 +591,7 @@ class LocalizationService:
         apply_after = getattr(estimate, "apply_after", None)
         if apply_after not in (None, 0, 0.0):
             return segments
-        if abs(offset) < 0.12 or abs(offset) > self.config.max_audio_sync_offset:
+        if abs(offset) < self.config.min_subtitle_alignment_offset or abs(offset) > self.config.max_audio_sync_offset:
             return segments
         self.logger.info(
             "LocalizationService: applying small global audio sync offset %.2fs to TTS timeline",
@@ -649,7 +650,7 @@ class LocalizationService:
             self.logger.warning("Burned-subtitle timing alignment failed; keeping ASR timing: %s", exc)
             return source_segments
 
-        if estimate is None or abs(estimate.offset) < 0.12:
+        if estimate is None or abs(estimate.offset) < self.config.min_subtitle_alignment_offset:
             return source_segments
         self._last_subtitle_alignment_estimate = estimate
 
@@ -835,23 +836,50 @@ class LocalizationService:
                     )
                     if self.background_music_library is not None else None
                 )
-                mixed_audio_path = output_dir / "audio_safe_mix.wav"
-                self.mixer.mix_dub_with_source_and_background(
-                    DubbedSourceBackgroundMix(
-                        voice_audio=tts_audio_path,
-                        source_audio=audio_result.audio_result.audio_path,
-                        background_audio=replacement_track,
+                source_effects_bed: Optional[Path] = None
+                if audio_result.demucs_output is not None:
+                    source_effects_bed = output_dir / "source_effects_bed.wav"
+                    self.mixer.build_source_effects_bed(
+                        [
+                            audio_result.demucs_output.drums,
+                            audio_result.demucs_output.bass,
+                            audio_result.demucs_output.other,
+                        ],
                         total_duration=audio_result.audio_result.duration,
-                        source_volume=self.config.source_effects_volume,
-                        background_volume=self.config.replacement_music_volume,
-                    ),
-                    mixed_audio_path,
-                )
-                if replacement_track is None:
-                    self.logger.warning(
-                        "Copyright-safe audio enabled but no licensed replacement track is available; "
-                        "keeping original ambience/effects quietly under the dub instead of rendering silent-background TTS"
+                        output_path=source_effects_bed,
+                        volume=self.config.source_effects_volume,
                     )
+                else:
+                    self.logger.warning(
+                        "replace_source_audio is enabled but Demucs stems are unavailable; "
+                        "not mixing source audio because it would keep the original voice."
+                    )
+
+                mixed_audio_path = output_dir / "audio_safe_mix.wav"
+                if source_effects_bed is not None:
+                    self.mixer.mix_dub_with_source_and_background(
+                        DubbedSourceBackgroundMix(
+                            voice_audio=tts_audio_path,
+                            source_audio=source_effects_bed,
+                            background_audio=replacement_track,
+                            total_duration=audio_result.audio_result.duration,
+                            source_volume=1.0,
+                            background_volume=self.config.replacement_music_volume,
+                        ),
+                        mixed_audio_path,
+                    )
+                elif replacement_track is not None:
+                    self.mixer.mix_dub_with_background(
+                        DubbedBackgroundMix(
+                            voice_audio=tts_audio_path,
+                            background_audio=replacement_track,
+                            total_duration=audio_result.audio_result.duration,
+                            background_volume=self.config.replacement_music_volume,
+                        ),
+                        mixed_audio_path,
+                    )
+                else:
+                    mixed_audio_path = tts_audio_path
             else:
                 mixed_audio_path = output_dir / "audio_mixed.wav"
                 self.mixer.mix(

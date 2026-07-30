@@ -189,6 +189,29 @@ def test_flip_mirrors_text_cover_overlay_coordinates(tmp_path: Path, monkeypatch
     assert vf.startswith("hflip,drawbox=x=490:y=20:w=100:h=40")
 
 
+def test_text_overlay_drawtext_uses_baseline_vertical_center(tmp_path: Path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+    overlay = TextOverlay(
+        start=0.0,
+        end=1.0,
+        x=50,
+        y=20,
+        width=220,
+        height=80,
+        text="Xin chào",
+    )
+
+    renderer = Renderer()
+    monkeypatch.setattr(renderer, "_get_video_dimensions", lambda path: (640, 360))
+
+    cmd = renderer._build_command(video, audio, output, text_overlays=[overlay])
+
+    vf = cmd[cmd.index("-vf") + 1]
+    assert "y=20+(80-ascent+descent)/2" in vf
+
+
 def test_render_ffmpeg_error(tmp_path: Path, monkeypatch):
     video = tmp_path / "video.mp4"
     audio = tmp_path / "audio.mp3"

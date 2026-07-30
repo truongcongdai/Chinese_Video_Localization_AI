@@ -287,6 +287,56 @@ class MixerService:
         self._run_ffmpeg(cmd, "mix_dub_with_source_and_background")
         return output_path
 
+    def build_source_effects_bed(
+        self,
+        stems: List[Path],
+        total_duration: float,
+        output_path: Path,
+        volume: float = 1.0,
+    ) -> Path:
+        """Mix non-vocal Demucs stems into one source ambience/SFX bed.
+
+        Callers should pass only stems that do not contain lead vocals, e.g.
+        drums, bass, and other. This keeps source effects/music without
+        reintroducing the original spoken voice.
+        """
+        if not self._ffmpeg_available:
+            raise RuntimeError("FFmpeg not available in PATH")
+        if not stems:
+            raise ValueError("stems must not be empty")
+        if not 0.0 <= volume <= 1.0:
+            raise ValueError("volume must be between 0 and 1")
+
+        output_path = Path(output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        duration = max(0.01, total_duration)
+
+        inputs: List[str] = []
+        labels: List[str] = []
+        filter_parts: List[str] = []
+        for idx, stem in enumerate(stems):
+            inputs.extend(["-i", str(stem)])
+            label = f"[s{idx}]"
+            filter_parts.append(
+                f"[{idx}:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS{label}"
+            )
+            labels.append(label)
+
+        filter_parts.append(
+            f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0,"
+            f"volume={volume:.4f},alimiter=limit=0.95:attack=5:release=50[out]"
+        )
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[out]", "-t", f"{duration:.3f}",
+            "-ar", str(self.config.sample_rate), "-y", str(output_path),
+        ]
+        self._run_ffmpeg(cmd, "build_source_effects_bed")
+        return output_path
+
     def _probe_duration(self, audio_path: Path) -> float:
         """Return duration in seconds of `audio_path` via ffprobe, or 0.0 if unknown."""
         if shutil.which("ffprobe") is None:
