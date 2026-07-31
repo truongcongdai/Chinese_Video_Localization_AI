@@ -223,6 +223,192 @@ CREATE TABLE IF NOT EXISTS trend_items (
     updated_at REAL NOT NULL,
     UNIQUE(user_id, platform, source_url)
 );
+
+-- Content OS tables (feature-flagged content creation workflow)
+CREATE TABLE IF NOT EXISTS content_os_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_name TEXT NOT NULL,
+    platforms_json TEXT NOT NULL,
+    niche TEXT,
+    target_audience TEXT,
+    target_market TEXT NOT NULL DEFAULT 'Vietnam',
+    default_language TEXT NOT NULL DEFAULT 'vi',
+    tone TEXT,
+    visual_identity_json TEXT,
+    default_voice TEXT,
+    subtitle_profile_json TEXT,
+    content_rules_json TEXT,
+    forbidden_topics_json TEXT,
+    preferred_formats_json TEXT,
+    publishing_notes TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS content_os_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id INTEGER,
+    channel_name TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'ai_video',
+    topic TEXT NOT NULL,
+    objective TEXT,
+    target_platform TEXT NOT NULL,
+    target_duration_seconds INTEGER NOT NULL,
+    target_language TEXT NOT NULL DEFAULT 'vi',
+    content_style TEXT,
+    visual_style TEXT,
+    voice_id TEXT,
+    subtitle_style_id TEXT,
+    background_music_enabled INTEGER NOT NULL DEFAULT 0,
+    user_instructions TEXT,
+    settings_json TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(channel_id) REFERENCES content_os_channels(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    workflow_version TEXT NOT NULL DEFAULT '1.0',
+    status TEXT NOT NULL DEFAULT 'created',
+    current_stage TEXT NOT NULL DEFAULT 'created',
+    progress_percent INTEGER NOT NULL DEFAULT 0,
+    revision_count INTEGER NOT NULL DEFAULT 0,
+    warning_json TEXT,
+    error_json TEXT,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES content_os_projects(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    input_artifact_ids_json TEXT,
+    output_artifact_ids_json TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    started_at REAL,
+    completed_at REAL,
+    error_json TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES content_os_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    artifact_type TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    schema_version TEXT NOT NULL DEFAULT '1.0',
+    path TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    metadata_json TEXT,
+    created_by_agent TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES content_os_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    title TEXT,
+    author TEXT,
+    thumbnail_url TEXT,
+    metrics_json TEXT,
+    trend_score REAL NOT NULL DEFAULT 0.0,
+    selected INTEGER NOT NULL DEFAULT 0,
+    download_status TEXT NOT NULL DEFAULT 'not_downloaded',
+    local_path TEXT,
+    risk_json TEXT,
+    raw_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES content_os_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    artifact_id INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    scores_json TEXT,
+    issues_json TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES content_os_runs(id),
+    FOREIGN KEY(artifact_id) REFERENCES content_os_artifacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    approval_type TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    note TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES content_os_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS content_os_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_key TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    memory_key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    source_run_id INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(source_run_id) REFERENCES content_os_runs(id)
+);
+
+-- Content OS indexes
+CREATE INDEX IF NOT EXISTS idx_content_os_projects_user_id ON content_os_projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_projects_status ON content_os_projects(status);
+CREATE INDEX IF NOT EXISTS idx_content_os_projects_created_at ON content_os_projects(created_at);
+CREATE INDEX IF NOT EXISTS idx_content_os_runs_project_id ON content_os_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_runs_user_id ON content_os_runs(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_runs_status ON content_os_runs(status);
+CREATE INDEX IF NOT EXISTS idx_content_os_runs_current_stage ON content_os_runs(current_stage);
+CREATE INDEX IF NOT EXISTS idx_content_os_steps_run_id ON content_os_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_steps_status ON content_os_steps(status);
+CREATE INDEX IF NOT EXISTS idx_content_os_channels_user_id ON content_os_channels(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_channels_active ON content_os_channels(active);
+CREATE INDEX IF NOT EXISTS idx_content_os_memories_user_id ON content_os_memories(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_memories_channel_key ON content_os_memories(channel_key);
+CREATE INDEX IF NOT EXISTS idx_content_os_memories_memory_type ON content_os_memories(memory_type);
+CREATE INDEX IF NOT EXISTS idx_content_os_artifacts_run_id ON content_os_artifacts(run_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_artifacts_user_id ON content_os_artifacts(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_artifacts_type ON content_os_artifacts(artifact_type);
+CREATE INDEX IF NOT EXISTS idx_content_os_sources_run_id ON content_os_sources(run_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_sources_user_id ON content_os_sources(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_sources_selected ON content_os_sources(selected);
+CREATE INDEX IF NOT EXISTS idx_content_os_reviews_run_id ON content_os_reviews(run_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_reviews_artifact_id ON content_os_reviews(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_approvals_run_id ON content_os_approvals(run_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_approvals_user_id ON content_os_approvals(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_memories_user_id ON content_os_memories(user_id);
+CREATE INDEX IF NOT EXISTS idx_content_os_memories_channel_key ON content_os_memories(channel_key);
+CREATE INDEX IF NOT EXISTS idx_content_os_memories_active ON content_os_memories(active);
 """
 
 _MIGRATIONS = [
@@ -428,7 +614,12 @@ class Store:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
-            conn.executescript(SCHEMA)
+            try:
+                conn.executescript(SCHEMA)
+                conn.commit()
+            except Exception as e:
+                print(f"Error executing schema: {e}")
+                raise
             existing_cols = {
                 table: {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                 for table in ("users", "jobs")

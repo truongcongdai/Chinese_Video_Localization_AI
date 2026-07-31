@@ -2904,11 +2904,432 @@ document.addEventListener("DOMContentLoaded", () => {
         if (panel.dataset.feature === feature) {
           panel.classList.add("active");
           console.log("Panel shown:", feature);
+          
+          // Initialize Content OS if switching to that tab
+          if (feature === "content-os") {
+            initContentOS();
+          }
         }
       });
     };
   });
 });
+
+// ---------------- Content OS ----------------
+let contentOSProjects = [];
+let contentOSRuns = [];
+let selectedProjectId = null;
+let selectedRunId = null;
+
+async function initContentOS() {
+  console.log("Initializing Content OS");
+  
+  try {
+    const health = await api("/api/content-os/health");
+    console.log("Content OS health:", health);
+    
+    if (!health.enabled) {
+      $("#content-os-feature-disabled").classList.remove("hidden");
+      $("#content-os-enabled").classList.add("hidden");
+      return;
+    }
+    
+    $("#content-os-feature-disabled").classList.add("hidden");
+    $("#content-os-enabled").classList.remove("hidden");
+    
+    // Load projects
+    await loadContentOSProjects();
+  } catch (e) {
+    console.error("Failed to initialize Content OS:", e);
+    $("#content-os-status").textContent = "Lỗi kết nối";
+  }
+}
+
+async function loadContentOSProjects() {
+  try {
+    contentOSProjects = await api("/api/content-os/projects");
+    renderContentOSProjects();
+  } catch (e) {
+    console.error("Failed to load projects:", e);
+    $("#content-os-projects-list").innerHTML = `<div style="color:var(--err);font-size:13px">Lỗi tải dự án: ${e.message}</div>`;
+  }
+}
+
+function renderContentOSProjects() {
+  const list = $("#content-os-projects-list");
+  const select = $("#content-os-project-select");
+  
+  if (contentOSProjects.length === 0) {
+    list.innerHTML = `<div style="font-size: 13px; color: var(--text-dim);">Chưa có dự án nào.</div>`;
+    select.innerHTML = `<option value="">-- Chọn dự án --</option>`;
+    return;
+  }
+  
+  list.innerHTML = contentOSProjects.map(p => `
+    <div style="padding: 8px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="selectContentOSProject(${p.id})">
+      <div>
+        <div style="font-weight: 600; font-size: 13px;">${escapeHtml(p.channel_name)}</div>
+        <div style="font-size: 12px; color: var(--text-dim);">${escapeHtml(p.topic)}</div>
+        <div style="font-size: 11px; color: var(--text-dim);">Định dạng: ${p.content_format}</div>
+      </div>
+      <button class="btn secondary small" onclick="event.stopPropagation(); deleteContentOSProject(${p.id})" style="margin-left: 8px;">🗑️</button>
+    </div>
+  `).join("");
+  
+  select.innerHTML = `<option value="">-- Chọn dự án --</option>` + 
+    contentOSProjects.map(p => `<option value="${p.id}">${escapeHtml(p.channel_name)} - ${escapeHtml(p.topic)}</option>`).join("");
+}
+
+function selectContentOSProject(projectId) {
+  selectedProjectId = projectId;
+  $("#content-os-project-select").value = projectId;
+  $("#content-os-create-run-btn").disabled = false;
+  
+  // Load runs for this project
+  loadContentOSRuns(projectId);
+}
+
+async function deleteContentOSProject(projectId) {
+  if (!confirm("Bạn có chắc muốn xóa dự án này và tất cả runs liên quan?")) return;
+  
+  try {
+    await api(`/api/content-os/projects/${projectId}`, { method: "DELETE" });
+    await loadContentOSProjects();
+    
+    // Clear selection if deleted project was selected
+    if (selectedProjectId === projectId) {
+      selectedProjectId = null;
+      $("#content-os-project-select").value = "";
+      $("#content-os-create-run-btn").disabled = true;
+      contentOSRuns = [];
+      renderContentOSRuns();
+    }
+  } catch (e) {
+    console.error("Failed to delete project:", e);
+    alert(`Lỗi xóa dự án: ${e.message}`);
+  }
+}
+
+async function loadContentOSRuns(projectId) {
+  try {
+    contentOSRuns = await api(`/api/content-os/runs?project_id=${projectId}`);
+    renderContentOSRuns();
+  } catch (e) {
+    console.error("Failed to load runs:", e);
+    $("#content-os-runs-list").innerHTML = `<div style="color:var(--err);font-size:13px">Lỗi tải run: ${e.message}</div>`;
+  }
+}
+
+function renderContentOSRuns() {
+  const list = $("#content-os-runs-list");
+  
+  if (contentOSRuns.length === 0) {
+    list.innerHTML = `<div style="font-size: 13px; color: var(--text-dim);">Chưa có run nào.</div>`;
+    return;
+  }
+  
+  list.innerHTML = contentOSRuns.map(r => `
+    <div style="padding: 8px; border-bottom: 1px solid var(--border);">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div style="cursor: pointer; flex: 1;" onclick="selectContentOSRun(${r.id})">
+          <div style="font-weight: 600; font-size: 13px;">Run #${r.id}</div>
+          <div style="font-size: 12px; color: var(--text-dim);">Giai đoạn: ${escapeHtml(r.current_stage)}</div>
+          <div style="font-size: 11px; color: var(--text-dim);">Tiến độ: ${r.progress_percent}%</div>
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px;">
+          <div style="font-size: 11px; color: ${getRunStatusColor(r.status)}; font-weight: 600;">${escapeHtml(r.status)}</div>
+          <div style="display: flex; gap: 4px;">
+            ${r.status === 'created' ? `<button class="btn secondary small" onclick="event.stopPropagation(); startContentOSRun(${r.id})">▶️</button>` : ''}
+            ${r.status === 'running' ? `<button class="btn secondary small" onclick="event.stopPropagation(); cancelContentOSRun(${r.id})">⏸️</button>` : ''}
+            ${r.current_stage === 'awaiting_approval' ? `<button class="btn gradient small" onclick="event.stopPropagation(); approveContentOSRun(${r.id})">✅</button>` : ''}
+            ${r.current_stage === 'ready_for_localization' ? `<button class="btn gradient small" onclick="event.stopPropagation(); createContentOSJob(${r.id})">🎬</button>` : ''}
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join("");
+}
+
+function getRunStatusColor(status) {
+  const colors = {
+    "created": "var(--text-dim)",
+    "running": "var(--accent)",
+    "paused": "var(--warn)",
+    "completed": "var(--ok)",
+    "failed": "var(--err)",
+    "cancelled": "var(--text-dim)",
+  };
+  return colors[status] || "var(--text-dim)";
+}
+
+function selectContentOSRun(runId) {
+  selectedRunId = runId;
+  const run = contentOSRuns.find(r => r.id === runId);
+  
+  if (run) {
+    $("#content-os-run-actions").style.display = "block";
+    $("#content-os-run-status").innerHTML = `
+      <div><strong>Run #${run.id}</strong></div>
+      <div>Giai đoạn: ${escapeHtml(run.current_stage)}</div>
+      <div>Trạng thái: ${escapeHtml(run.status)}</div>
+      <div>Tiến độ: ${run.progress_percent}%</div>
+    `;
+    
+    // Remove existing view script button if any
+    const existingBtn = document.querySelector("#content-os-view-script-btn");
+    if (existingBtn) existingBtn.remove();
+    
+    // Add view script button if script is available
+    if (run.current_stage === "awaiting_approval" || run.current_stage === "ready_for_localization" || run.current_stage === "completed") {
+      const scriptBtn = document.createElement("button");
+      scriptBtn.id = "content-os-view-script-btn";
+      scriptBtn.className = "btn secondary";
+      scriptBtn.textContent = "📄 Xem Script";
+      scriptBtn.onclick = () => viewContentOSScript(run.id);
+      $("#content-os-run-actions").appendChild(scriptBtn);
+    }
+    
+    // Enable/disable buttons based on run state
+    $("#content-os-start-run-btn").disabled = run.status === "running" || run.status === "completed";
+    $("#content-os-cancel-run-btn").disabled = run.status === "completed" || run.status === "cancelled";
+    $("#content-os-approve-run-btn").disabled = run.current_stage !== "awaiting_approval" && run.current_stage !== "script_audit";
+    $("#content-os-create-job-btn").disabled = run.current_stage !== "ready_for_localization" && run.current_stage !== "approved";
+  }
+}
+
+async function viewContentOSScript(runId) {
+  try {
+    console.log("Fetching script for run:", runId);
+    const script = await api(`/api/content-os/runs/${runId}/artifacts/script`);
+    console.log("Script data received:", script);
+    
+    if (!script) {
+      alert("Không tìm thấy script cho run này");
+      return;
+    }
+    
+    // The actual script data is in the 'data' field
+    const scriptContent = script.data || script;
+    console.log("Script content:", scriptContent);
+    
+    // Display script in the run detail area instead of modal
+    const scriptDiv = document.createElement("div");
+    scriptDiv.id = "content-os-script-display";
+    scriptDiv.style.cssText = "margin-top: 20px; padding: 15px; background: #f9f9f9; border-radius: 8px; border: 1px solid #ddd; color: #333;";
+    
+    scriptDiv.innerHTML = `
+      <h3 style="margin-top: 0; color: #333;">📄 Script Details</h3>
+      <div style="margin-bottom: 15px; color: #333;">
+        <strong>Title:</strong> ${escapeHtml(scriptContent.title_options?.[0] || scriptContent.title || "N/A")}
+      </div>
+      <div style="margin-bottom: 15px; color: #333;">
+        <strong>Narration:</strong><br>
+        ${escapeHtml(scriptContent.narration_text || scriptContent.narration || "N/A")}
+      </div>
+      <div style="margin-bottom: 15px; color: #333;">
+        <strong>Segments:</strong>
+        ${scriptContent.segments && scriptContent.segments.length > 0 ? 
+          scriptContent.segments.map((seg, i) => `
+            <div style="margin: 10px 0; padding: 10px; background: #fff; border-radius: 4px; border: 1px solid #eee; color: #333;">
+              <div><strong>Segment ${i + 1}:</strong></div>
+              <div>Start: ${seg.start_second}s - End: ${seg.end_second}s</div>
+              <div>Narration: ${escapeHtml(seg.narration || "")}</div>
+              <div>Subtitle: ${escapeHtml(seg.subtitle_text || "")}</div>
+              <div>Visual: ${escapeHtml(seg.visual_instruction || "")}</div>
+            </div>
+          `).join('') : 
+          '<div style="color: #666;">No segments available</div>'
+        }
+      </div>
+      <div style="margin-top: 15px;">
+        <button class="btn secondary" onclick="document.getElementById('content-os-script-display').remove()">Đóng</button>
+      </div>
+    `;
+    
+    // Remove existing script display if any
+    const existing = document.getElementById("content-os-script-display");
+    if (existing) existing.remove();
+    
+    // Add to run detail area
+    $("#content-os-run-actions").appendChild(scriptDiv);
+    
+  } catch (e) {
+    console.error("Failed to load script:", e);
+    alert(`Lỗi tải script: ${e.message}`);
+  }
+}
+
+// Content OS event handlers
+$("#content-os-create-project-btn").onclick = async () => {
+  const channelName = $("#content-os-channel-name").value.trim();
+  const topic = $("#content-os-topic").value.trim();
+  const targetPlatform = $("#content-os-target-platforms").value;
+  const targetMarket = $("#content-os-target-market").value.trim();
+  const targetLanguage = $("#content-os-target-language").value;
+  const duration = parseInt($("#content-os-duration").value);
+  const format = $("#content-os-format").value;
+  const instructions = $("#content-os-instructions").value.trim();
+  
+  if (!channelName || !topic) {
+    $("#content-os-project-error").textContent = "Vui lòng nhập tên kênh và chủ đề.";
+    return;
+  }
+  
+  try {
+    const project = await api("/api/content-os/projects", {
+      method: "POST",
+      body: JSON.stringify({
+        channel_name: channelName,
+        topic: topic,
+        target_platforms: [targetPlatform],
+        source_platforms: ["youtube"],
+        target_market: targetMarket,
+        target_language: targetLanguage,
+        target_duration_seconds: duration,
+        content_format: format,
+        max_source_items: 10,
+        user_instructions: instructions,
+        auto_download_sources: false,
+      }),
+    });
+    
+    $("#content-os-project-error").textContent = "";
+    $("#content-os-channel-name").value = "";
+    $("#content-os-topic").value = "";
+    $("#content-os-instructions").value = "";
+    
+    await loadContentOSProjects();
+  } catch (e) {
+    $("#content-os-project-error").textContent = `Lỗi: ${e.message}`;
+  }
+};
+
+$("#content-os-project-select").onchange = (e) => {
+  const projectId = parseInt(e.target.value);
+  if (projectId) {
+    selectContentOSProject(projectId);
+    $("#content-os-create-run-btn").disabled = false;
+  } else {
+    $("#content-os-create-run-btn").disabled = true;
+  }
+};
+
+$("#content-os-create-run-btn").onclick = async () => {
+  if (!selectedProjectId) return;
+  
+  try {
+    const run = await api("/api/content-os/runs", {
+      method: "POST",
+      body: JSON.stringify({ project_id: selectedProjectId }),
+    });
+    
+    await loadContentOSRuns(selectedProjectId);
+    selectContentOSRun(run.id);
+  } catch (e) {
+    console.error("Failed to create run:", e);
+    alert(`Lỗi tạo run: ${e.message}`);
+  }
+};
+
+let contentOSPollingInterval = null;
+
+$("#content-os-start-run-btn").onclick = async () => {
+  if (!selectedRunId) return;
+  
+  try {
+    await api(`/api/content-os/runs/${selectedRunId}/start`, { method: "POST" });
+    await loadContentOSRuns(selectedProjectId);
+    selectContentOSRun(selectedRunId);
+    
+    // Start polling for updates
+    startContentOSPolling();
+  } catch (e) {
+    console.error("Failed to start run:", e);
+    alert(`Lỗi chạy run: ${e.message}`);
+  }
+};
+
+function startContentOSPolling() {
+  if (contentOSPollingInterval) {
+    clearInterval(contentOSPollingInterval);
+  }
+  
+  contentOSPollingInterval = setInterval(async () => {
+    if (!selectedProjectId) return;
+    
+    try {
+      await loadContentOSRuns(selectedProjectId);
+      
+      // Check if run is still running
+      const run = contentOSRuns.find(r => r.id === selectedRunId);
+      if (run && (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled')) {
+        stopContentOSPolling();
+      }
+    } catch (e) {
+      console.error("Polling error:", e);
+    }
+  }, 2000); // Poll every 2 seconds
+}
+
+function stopContentOSPolling() {
+  if (contentOSPollingInterval) {
+    clearInterval(contentOSPollingInterval);
+    contentOSPollingInterval = null;
+  }
+}
+
+$("#content-os-cancel-run-btn").onclick = async () => {
+  if (!selectedRunId) return;
+  
+  if (!confirm("Bạn có chắc muốn hủy run này?")) return;
+  
+  try {
+    await api(`/api/content-os/runs/${selectedRunId}/cancel`, { method: "POST" });
+    await loadContentOSRuns(selectedProjectId);
+    selectContentOSRun(selectedRunId);
+  } catch (e) {
+    console.error("Failed to cancel run:", e);
+    alert(`Lỗi hủy run: ${e.message}`);
+  }
+};
+
+$("#content-os-approve-run-btn").onclick = async () => {
+  if (!selectedRunId) return;
+  
+  try {
+    await api(`/api/content-os/runs/${selectedRunId}/approve`, {
+      method: "POST",
+      body: JSON.stringify({
+        approval_type: "script",
+        decision: "approved",
+        note: "",
+      }),
+    });
+    await loadContentOSRuns(selectedProjectId);
+    selectContentOSRun(selectedRunId);
+  } catch (e) {
+    console.error("Failed to approve run:", e);
+    alert(`Lỗi phê duyệt: ${e.message}`);
+  }
+};
+
+$("#content-os-create-job-btn").onclick = async () => {
+  if (!selectedRunId) return;
+  
+  try {
+    const result = await api(`/api/content-os/runs/${selectedRunId}/create-job`, {
+      method: "POST",
+      body: JSON.stringify({ source_url: null }),
+    });
+    
+    alert(`Đã tạo job: ${result.job_id}\nJob sẽ hiển thị trong danh sách Jobs.`);
+    // Refresh job list to show the new job
+    refreshJobs();
+  } catch (e) {
+    console.error("Failed to create job:", e);
+    alert(`Lỗi tạo job: ${e.message}`);
+  }
+};
 
 document.querySelectorAll(".chip").forEach(chip => {
   chip.onclick = () => {

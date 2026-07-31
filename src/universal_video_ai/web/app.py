@@ -88,6 +88,7 @@ from .auth import (
 )
 from . import oauth as oauth_module
 from . import identity_oauth
+from .content_os_router import router as content_os_router
 
 logger = logging.getLogger("universal_video_ai.web")
 
@@ -6139,3 +6140,6 @@ def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# Include Content OS router
+app.include_router(content_os_router)

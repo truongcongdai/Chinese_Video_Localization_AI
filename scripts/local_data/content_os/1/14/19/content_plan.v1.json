@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "content_plan",
+  "version": 1,
+  "created_by_agent": "content_planner",
+  "created_at": "2026-07-31T17:02:30.547661",
+  "metadata": {},
+  "data": {
+    "content_angle": "Educational tutorial",
+    "target_platforms": [
+      "youtube_shorts"
+    ],
+    "target_duration_seconds": 45,
+    "target_audience": "Beginners",
+    "core_message": "Learn this skill in 45 seconds",
+    "hook": "Want to master this skill?",
+    "beats": [
+      {
+        "order": 1,
+        "start_second": 0.0,
+        "end_second": 3.0,
+        "purpose": "hook",
+        "narration_goal": "Grab attention",
+        "visual_goal": "Show result"
+      },
+      {
+        "order": 2,
+        "start_second": 3.0,
+        "end_second": 15.0,
+        "purpose": "explanation",
+        "narration_goal": "Explain the concept",
+        "visual_goal": "Show demonstration"
+      }
+    ],
+    "must_include": [
+      "Clear explanation",
+      "Visual demonstration"
+    ],
+    "must_avoid": [
+      "Jargon",
+      "Long pauses"
+    ],
+    "source_usage_plan": [
+      "Use source as reference"
+    ],
+    "original_value_add": [
+      "Simplify explanation",
+      "Add practical tips"
+    ],
+    "call_to_action": "Follow for more tips"
+  }
+}

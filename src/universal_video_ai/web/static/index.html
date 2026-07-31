@@ -259,6 +259,10 @@
       <span>🔍</span>
       <span>Quét Trend</span>
     </button>
+    <button class="feature-tab" data-feature="content-os">
+      <span>🚀</span>
+      <span>Content OS</span>
+    </button>
     <button class="feature-tab" data-feature="ai-video">
       <span>🤖</span>
       <span>Tạo Video AI</span>
@@ -1249,6 +1253,116 @@
   </div>
   </div>
 
+  <!-- Content OS Panel -->
+  <div class="feature-panel" data-feature="content-os">
+    <div class="card">
+    <div class="template-library-heading">
+      <h3 class="section-title">🚀 Content OS</h3>
+      <span id="content-os-status" class="muted-help">Workflow tạo nội dung AI</span>
+    </div>
+    
+    <div id="content-os-feature-disabled" class="hidden" style="padding: 20px; text-align: center; color: var(--text-dim);">
+      <p>Content OS hiện đang bị tắt.</p>
+      <p style="font-size: 13px;">Để bật tính năng này, hãy đặt CONTENT_OS_ENABLED=true trong file .env</p>
+    </div>
+    
+    <div id="content-os-enabled">
+      <!-- Project Creation -->
+      <div class="field">
+        <label>Tên kênh</label>
+        <input id="content-os-channel-name" placeholder="VD: Tech Review VN">
+      </div>
+      <div class="field">
+        <label>Chủ đề nội dung</label>
+        <input id="content-os-topic" placeholder="VD: AI gadgets, công nghệ mới...">
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Platform đích</label>
+          <select id="content-os-target-platforms">
+            <option value="youtube_shorts">YouTube Shorts</option>
+            <option value="tiktok">TikTok</option>
+            <option value="facebook_reels">Facebook Reels</option>
+            <option value="instagram_reels">Instagram Reels</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Thị trường đích</label>
+          <input id="content-os-target-market" placeholder="VD: Vietnam">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Ngôn ngữ đích</label>
+          <select id="content-os-target-language">
+            <option value="vi">Tiếng Việt</option>
+            <option value="en">English</option>
+            <option value="zh-CN">中文</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="th">ไทย</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Thời lượng (giây)</label>
+          <input type="number" id="content-os-duration" value="45" min="15" max="180">
+        </div>
+      </div>
+      <div class="field">
+        <label>Định dạng nội dung</label>
+        <select id="content-os-format">
+          <option value="trend_decode">Trend Decode</option>
+          <option value="youtube_short">YouTube Short</option>
+          <option value="facebook_reel">Facebook Reel</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Hướng dẫn thêm (tùy chọn)</label>
+        <textarea id="content-os-instructions" rows="2" placeholder="VD: Tập trung vào tính năng thực tế, thêm ví dụ cụ thể..."></textarea>
+      </div>
+      <button class="btn gradient" id="content-os-create-project-btn" type="button">📝 Tạo dự án</button>
+      <div id="content-os-project-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+      
+      <!-- Project List -->
+      <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);">
+        <h4 style="font-size: 14px; margin-bottom: 12px;">Dự án của bạn</h4>
+        <div id="content-os-projects-list" style="max-height: 200px; overflow-y: auto;">
+          <div style="font-size: 13px; color: var(--text-dim);">Chưa có dự án nào.</div>
+        </div>
+      </div>
+      
+      <!-- Run Management -->
+      <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);">
+        <h4 style="font-size: 14px; margin-bottom: 12px;">Chạy workflow</h4>
+        <div class="field">
+          <label>Chọn dự án</label>
+          <select id="content-os-project-select">
+            <option value="">-- Chọn dự án --</option>
+          </select>
+        </div>
+        <button class="btn gradient" id="content-os-create-run-btn" type="button" disabled>▶️ Tạo run mới</button>
+        
+        <!-- Run List -->
+        <div id="content-os-runs-list" style="margin-top: 16px; max-height: 250px; overflow-y: auto;">
+          <div style="font-size: 13px; color: var(--text-dim);">Chưa có run nào.</div>
+        </div>
+      </div>
+      
+      <!-- Run Actions -->
+      <div id="content-os-run-actions" style="margin-top: 16px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border); display: none;">
+        <h4 style="font-size: 14px; margin-bottom: 12px;">Thao tác run</h4>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="btn secondary small" id="content-os-start-run-btn" type="button">▶️ Chạy</button>
+          <button class="btn secondary small" id="content-os-cancel-run-btn" type="button">⏹️ Hủy</button>
+          <button class="btn secondary small" id="content-os-approve-run-btn" type="button" disabled>✅ Phê duyệt</button>
+          <button class="btn secondary small" id="content-os-create-job-btn" type="button" disabled>🎬 Tạo job</button>
+        </div>
+        <div id="content-os-run-status" style="margin-top: 12px; font-size: 13px;"></div>
+      </div>
+    </div>
+    </div>
+  </div>
+
   </main>
   <aside class="result-column">
   <div class="card latest-result hidden" id="latest-result-card">
@@ -1518,7 +1632,7 @@
   </div>
 </div>
 
-<script src="/assets/i18n.js?v=20260731b" defer></script>
-<script src="/assets/app.js?v=20260731b" defer></script>
+<script src="/assets/i18n.js?v=20260801g" defer></script>
+<script src="/assets/app.js?v=20260801g" defer></script>
 </body>
 </html>

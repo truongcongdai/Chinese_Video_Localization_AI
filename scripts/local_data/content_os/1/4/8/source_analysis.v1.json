@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "source_analysis",
+  "version": 1,
+  "created_by_agent": "source_analyzer",
+  "created_at": "2026-07-31T15:45:03.415246",
+  "metadata": {},
+  "data": {
+    "selected_sources": [],
+    "rejected_sources": [],
+    "warnings": []
+  }
+}
