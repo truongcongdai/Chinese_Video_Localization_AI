@@ -614,12 +614,7 @@ class Store:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
-            try:
-                conn.executescript(SCHEMA)
-                conn.commit()
-            except Exception as e:
-                print(f"Error executing schema: {e}")
-                raise
+            conn.executescript(SCHEMA)
             existing_cols = {
                 table: {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                 for table in ("users", "jobs")

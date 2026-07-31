@@ -225,45 +225,99 @@ class ContentOSRepository:
     
     def get_project(self, project_id: int, user_id: int) -> Optional[ContentOSProject]:
         with self._connect() as conn:
+            # Check actual columns in the table
+            cur = conn.execute("PRAGMA table_info(content_os_projects)")
+            actual_columns = {row["name"] for row in cur.fetchall()}
+            
+            # Build SELECT query with only columns that exist
+            all_columns = [
+                "id", "user_id", "channel_id", "channel_name", "mode", "topic", "objective",
+                "target_platform", "target_duration_seconds", "target_language",
+                "content_style", "visual_style", "voice_id", "subtitle_style_id",
+                "background_music_enabled", "user_instructions", "settings_json",
+                "status", "created_at", "updated_at"
+            ]
+            select_columns = [col for col in all_columns if col in actual_columns]
+            
             cur = conn.execute(
-                """
-                SELECT id, user_id, channel_name, mode, topic, objective, 
-                       target_platform, target_duration_seconds, target_language, 
-                       content_style, visual_style, voice_id, subtitle_style_id, 
-                       background_music_enabled, user_instructions, settings_json, 
-                       status, created_at, updated_at
-                FROM content_os_projects WHERE id = ? AND user_id = ?
-                """,
+                f"SELECT {', '.join(select_columns)} FROM content_os_projects WHERE id = ? AND user_id = ?",
                 (project_id, user_id),
             )
             row = cur.fetchone()
             if not row:
                 return None
-            # Handle missing channel_id in older schema
+            # Handle missing columns in older schema
             row_dict = dict(row)
             if 'channel_id' not in row_dict:
                 row_dict['channel_id'] = None
+            if 'mode' not in row_dict:
+                row_dict['mode'] = 'ai_video'
+            if 'objective' not in row_dict:
+                row_dict['objective'] = ''
+            if 'target_platform' not in row_dict:
+                row_dict['target_platform'] = 'youtube_shorts'
+            if 'content_style' not in row_dict:
+                row_dict['content_style'] = ''
+            if 'visual_style' not in row_dict:
+                row_dict['visual_style'] = ''
+            if 'voice_id' not in row_dict:
+                row_dict['voice_id'] = ''
+            if 'subtitle_style_id' not in row_dict:
+                row_dict['subtitle_style_id'] = ''
+            if 'background_music_enabled' not in row_dict:
+                row_dict['background_music_enabled'] = 0
+            if 'user_instructions' not in row_dict:
+                row_dict['user_instructions'] = ''
+            if 'settings_json' not in row_dict:
+                row_dict['settings_json'] = None
             return ContentOSProject(**row_dict)
     
     def list_projects(self, user_id: int, limit: int = 100) -> List[ContentOSProject]:
         with self._connect() as conn:
+            # Check actual columns in the table
+            cur = conn.execute("PRAGMA table_info(content_os_projects)")
+            actual_columns = {row["name"] for row in cur.fetchall()}
+            
+            # Build SELECT query with only columns that exist
+            all_columns = [
+                "id", "user_id", "channel_id", "channel_name", "mode", "topic", "objective",
+                "target_platform", "target_duration_seconds", "target_language",
+                "content_style", "visual_style", "voice_id", "subtitle_style_id",
+                "background_music_enabled", "user_instructions", "settings_json",
+                "status", "created_at", "updated_at"
+            ]
+            select_columns = [col for col in all_columns if col in actual_columns]
+            
             cur = conn.execute(
-                """
-                SELECT id, user_id, channel_name, mode, topic, objective, 
-                       target_platform, target_duration_seconds, target_language, 
-                       content_style, visual_style, voice_id, subtitle_style_id, 
-                       background_music_enabled, user_instructions, settings_json, 
-                       status, created_at, updated_at
-                FROM content_os_projects WHERE user_id = ? ORDER BY created_at DESC LIMIT ?
-                """,
+                f"SELECT {', '.join(select_columns)} FROM content_os_projects WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
                 (user_id, limit),
             )
-            # Handle missing channel_id in older schema
+            # Handle missing columns in older schema
             projects = []
             for row in cur.fetchall():
                 row_dict = dict(row)
                 if 'channel_id' not in row_dict:
                     row_dict['channel_id'] = None
+                if 'mode' not in row_dict:
+                    row_dict['mode'] = 'ai_video'
+                if 'objective' not in row_dict:
+                    row_dict['objective'] = ''
+                if 'target_platform' not in row_dict:
+                    row_dict['target_platform'] = 'youtube_shorts'
+                if 'content_style' not in row_dict:
+                    row_dict['content_style'] = ''
+                if 'visual_style' not in row_dict:
+                    row_dict['visual_style'] = ''
+                if 'voice_id' not in row_dict:
+                    row_dict['voice_id'] = ''
+                if 'subtitle_style_id' not in row_dict:
+                    row_dict['subtitle_style_id'] = ''
+                if 'background_music_enabled' not in row_dict:
+                    row_dict['background_music_enabled'] = 0
+                if 'user_instructions' not in row_dict:
+                    row_dict['user_instructions'] = ''
+                if 'settings_json' not in row_dict:
+                    row_dict['settings_json'] = None
                 projects.append(ContentOSProject(**row_dict))
             return projects
     
