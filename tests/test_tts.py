@@ -96,3 +96,27 @@ def test_edge_tts_failure(tmp_path: Path, monkeypatch):
     tts = EdgeTTS(config=cfg, max_retries=1, retry_backoff_seconds=0)
     with pytest.raises(RuntimeError):
         tts.synthesize(text, out)
+
+
+def test_edge_tts_retries_vietnamese_with_same_voice(tmp_path: Path, monkeypatch):
+    out = tmp_path / "out.mp3"
+    used_voices = []
+
+    def mock_run_fail(cmd, capture_output, text, check, timeout):
+        result = MagicMock()
+        result.returncode = 1
+        result.stderr = "temporary edge failure"
+        result.stdout = ""
+        if "--voice" in cmd:
+            used_voices.append(cmd[cmd.index("--voice") + 1])
+        return result
+
+    monkeypatch.setattr("subprocess.run", mock_run_fail)
+
+    cfg = TTSConfig(provider="edge", voice="vi-VN-HoaiMyNeural")
+    tts = EdgeTTS(config=cfg, max_retries=2, retry_backoff_seconds=0)
+    with pytest.raises(RuntimeError):
+        tts.synthesize("Xin chào", out)
+
+    assert used_voices == ["vi-VN-HoaiMyNeural", "vi-VN-HoaiMyNeural"]
+    assert "vi-VN-NamMinhNeural" not in used_voices

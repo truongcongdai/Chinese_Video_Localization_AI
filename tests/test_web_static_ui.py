@@ -75,4 +75,28 @@ def test_history_bulk_download_and_status_filter_are_available() -> None:
     assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
     assert 'data-cancel="${job.id}"' in app_js
     assert '/cancel`' in app_js
-    assert 'app.js?v=20260729' in html
+    assert 'app.js?v=20260731b' in html
+
+
+def test_remix_panel_is_toggleable_and_cache_busted() -> None:
+    html = _read_static_file("index.html")
+    app_js = _read_static_file("app.js")
+
+    assert 'id="remix-enable-checkbox"' in html
+    assert 'id="remix-panel" class="hidden"' in html
+    assert 'id="remix-goal-select"' in html
+    assert 'id="remix-strength-select"' in html
+    assert 'id="subtitle-offset-input"' in html
+    assert 'value="youtube_long"' in html
+    assert 'value="facebook_long"' in html
+    assert "function syncRemixPanel()" in app_js
+    assert '$("#remix-panel").classList.toggle("hidden", !ev.target.checked);' not in app_js
+    assert 'subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0' in app_js
+    assert 'app.js?v=20260731b' in html
+
+
+def test_subtitle_time_display_keeps_tenths() -> None:
+    app_js = _read_static_file("app.js")
+
+    assert "Math.round(Number(seconds || 0) * 10)" in app_js
+    assert "`${m}:${String(s).padStart(2, \"0\")}${tenth ? `.${tenth}` : \"\"}`" in app_js

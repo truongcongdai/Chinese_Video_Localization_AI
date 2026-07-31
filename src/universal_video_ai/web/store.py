@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     qc_warnings_json TEXT,
     animated_subtitle_config TEXT,
     video_template_config TEXT,
+    remix_enabled INTEGER NOT NULL DEFAULT 0,
+    remix_platforms_json TEXT,
+    remix_goal TEXT DEFAULT 'viral',
+    remix_strength TEXT DEFAULT 'balanced',
+    subtitle_offset_seconds REAL DEFAULT 0.0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -177,6 +182,47 @@ CREATE TABLE IF NOT EXISTS user_provider_settings (
     updated_at REAL NOT NULL,
     UNIQUE(user_id, provider)
 );
+
+CREATE TABLE IF NOT EXISTS trend_scans (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    topic TEXT NOT NULL,
+    platforms_json TEXT NOT NULL,
+    providers_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    progress_note TEXT,
+    warnings_json TEXT,
+    error TEXT,
+    max_results INTEGER NOT NULL DEFAULT 20,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trend_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    title TEXT,
+    author TEXT,
+    thumbnail_url TEXT,
+    duration_seconds REAL,
+    view_count INTEGER,
+    like_count INTEGER,
+    comment_count INTEGER,
+    share_count INTEGER,
+    published_at TEXT,
+    trend_score REAL,
+    raw_json TEXT,
+    download_status TEXT DEFAULT 'found',
+    local_path TEXT,
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, platform, source_url)
+);
 """
 
 _MIGRATIONS = [
@@ -231,6 +277,11 @@ _MIGRATIONS = [
     ("jobs", "animated_subtitle_config", "ALTER TABLE jobs ADD COLUMN animated_subtitle_config TEXT"),
     # Video template configuration (template, transition, color_effect, etc.) as JSON.
     ("jobs", "video_template_config", "ALTER TABLE jobs ADD COLUMN video_template_config TEXT"),
+    ("jobs", "remix_enabled", "ALTER TABLE jobs ADD COLUMN remix_enabled INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "remix_platforms_json", "ALTER TABLE jobs ADD COLUMN remix_platforms_json TEXT"),
+    ("jobs", "remix_goal", "ALTER TABLE jobs ADD COLUMN remix_goal TEXT DEFAULT 'viral'"),
+    ("jobs", "remix_strength", "ALTER TABLE jobs ADD COLUMN remix_strength TEXT DEFAULT 'balanced'"),
+    ("jobs", "subtitle_offset_seconds", "ALTER TABLE jobs ADD COLUMN subtitle_offset_seconds REAL DEFAULT 0.0"),
     # Persist the downloaded source so completed jobs can offer a secure,
     # owner-scoped Before/After comparison instead of only the final render.
     ("jobs", "source_video_path", "ALTER TABLE jobs ADD COLUMN source_video_path TEXT"),
@@ -245,7 +296,62 @@ _MIGRATIONS = [
     ("jobs", "translation_tone", "ALTER TABLE jobs ADD COLUMN translation_tone TEXT DEFAULT 'natural'"),
     ("jobs", "translation_audience", "ALTER TABLE jobs ADD COLUMN translation_audience TEXT"),
     ("jobs", "translation_glossary", "ALTER TABLE jobs ADD COLUMN translation_glossary TEXT"),
+    # Trend Scanner tables (new feature, no migration needed for fresh installs)
 ]
+
+@dataclass
+class TrendScan:
+    id: str
+    user_id: int
+    topic: str
+    platforms: List[str]
+    providers: List[str]
+    status: str = "pending"
+    progress_note: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    max_results: int = 20
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = self.__dict__.copy()
+        d["platforms_json"] = json.dumps(d.pop("platforms", []))
+        d["providers_json"] = json.dumps(d.pop("providers", []))
+        d["warnings_json"] = json.dumps(d.pop("warnings", []))
+        return d
+
+
+@dataclass
+class TrendItem:
+    id: Optional[int]
+    scan_id: str
+    user_id: int
+    platform: str
+    provider: str
+    source_url: str
+    title: Optional[str] = None
+    author: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    view_count: Optional[int] = None
+    like_count: Optional[int] = None
+    comment_count: Optional[int] = None
+    share_count: Optional[int] = None
+    published_at: Optional[str] = None
+    trend_score: float = 0.0
+    raw: Dict[str, Any] = field(default_factory=dict)
+    download_status: str = "found"
+    local_path: Optional[str] = None
+    error: Optional[str] = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = self.__dict__.copy()
+        d["raw_json"] = json.dumps(d.pop("raw", {}))
+        return d
+
 
 @dataclass
 class Job:
@@ -283,6 +389,11 @@ class Job:
     translation_tone: str = "natural"
     translation_audience: Optional[str] = None
     translation_glossary: Optional[str] = None
+    remix_enabled: int = 0
+    remix_platforms_json: Optional[str] = None
+    remix_goal: str = "viral"
+    remix_strength: str = "balanced"
+    subtitle_offset_seconds: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -299,6 +410,8 @@ class Job:
         d["source_segments"] = json.loads(source_segments_json) if source_segments_json else None
         qc_warnings_json = d.pop("qc_warnings_json", None)
         d["qc_warnings"] = json.loads(qc_warnings_json) if qc_warnings_json else []
+        remix_platforms_json = d.pop("remix_platforms_json", None)
+        d["remix_platforms"] = json.loads(remix_platforms_json) if remix_platforms_json else []
         return d
 
 
@@ -483,6 +596,11 @@ class Store:
         translation_tone: str = "natural",
         translation_audience: Optional[str] = None,
         translation_glossary: Optional[str] = None,
+        remix_enabled: bool = False,
+        remix_platforms: Optional[List[str]] = None,
+        remix_goal: str = "viral",
+        remix_strength: str = "balanced",
+        subtitle_offset_seconds: float = 0.0,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -506,22 +624,30 @@ class Store:
             translation_tone=translation_tone,
             translation_audience=translation_audience,
             translation_glossary=translation_glossary,
+            remix_enabled=int(remix_enabled),
+            remix_platforms_json=json.dumps(remix_platforms or [], ensure_ascii=False),
+            remix_goal=remix_goal,
+            remix_strength=remix_strength,
+            subtitle_offset_seconds=float(subtitle_offset_seconds or 0.0),
         )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
                 "progress_note, error, title, final_video_path, source_video_path, logo_path, logo_corner, logo_size_px, "
                 "tts_voice, review_mode, review_state_json, segments_json, source_segments_json, qc_warnings_json, "
-                "animated_subtitle_config, video_template_config, transform_config, processing_mode, tts_provider, "
+                "animated_subtitle_config, video_template_config, remix_enabled, remix_platforms_json, remix_goal, "
+                "remix_strength, subtitle_offset_seconds, transform_config, processing_mode, tts_provider, "
                 "tts_style, tts_model, translation_mode, translation_model, translation_tone, "
                 "translation_audience, translation_glossary, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
                  job.status, job.progress_note, job.error, job.title, job.final_video_path, job.source_video_path,
                  job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
                  None, None, None, None,
                  json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
                  json.dumps(job.video_template_config) if job.video_template_config else None,
+                 job.remix_enabled, job.remix_platforms_json, job.remix_goal, job.remix_strength,
+                 job.subtitle_offset_seconds,
                  json.dumps(job.transform_config) if job.transform_config else None,
                  job.processing_mode, job.tts_provider, job.tts_style, job.tts_model,
                  job.translation_mode, job.translation_model, job.translation_tone,
@@ -556,6 +682,11 @@ class Store:
             translation_tone=old.translation_tone,
             translation_audience=old.translation_audience,
             translation_glossary=old.translation_glossary,
+            remix_enabled=bool(old.remix_enabled),
+            remix_platforms=json.loads(old.remix_platforms_json or "[]"),
+            remix_goal=old.remix_goal,
+            remix_strength=old.remix_strength,
+            subtitle_offset_seconds=old.subtitle_offset_seconds,
         )
 
     # ---- provider settings ----

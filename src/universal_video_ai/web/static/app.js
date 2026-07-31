@@ -891,6 +891,56 @@ $("#logo-file-input").onchange = async (ev) => {
   }
 };
 
+// ---------------- remix flow ----------------
+function getRemixPlatforms() {
+  return Array.from(document.querySelectorAll(".remix-platform-checkbox:checked")).map(cb => cb.value);
+}
+
+async function updateRemixPlanPreview() {
+  if (!$("#remix-enable-checkbox") || !$("#remix-enable-checkbox").checked) return;
+  const platforms = getRemixPlatforms();
+  try {
+    const plan = await api("/api/remix/plan", { method: "POST", body: JSON.stringify({
+      remix_enabled: true,
+      remix_platforms: platforms,
+      remix_goal: $("#remix-goal-select").value,
+      remix_strength: $("#remix-strength-select").value,
+      free_mode: true,
+    })});
+    $("#remix-plan-preview").textContent =
+      `Flow: ${plan.primary_format} · ${plan.processing_mode} · ${plan.translation_mode} · ` +
+      `${plan.pipeline_steps.length} bước · QA ${plan.qa_checks.length} mục · không watermark hệ thống.`;
+  } catch (e) {
+    $("#remix-plan-preview").textContent = "Chưa lấy được remix plan.";
+  }
+}
+
+function syncRemixPanel() {
+  const checkbox = $("#remix-enable-checkbox");
+  const panel = $("#remix-panel");
+  if (!checkbox || !panel) return;
+  panel.classList.toggle("hidden", !checkbox.checked);
+  if (checkbox.checked) {
+    updateRemixPlanPreview();
+  }
+}
+
+$("#remix-enable-checkbox")?.addEventListener("change", syncRemixPanel);
+$("#remix-enable-checkbox")?.addEventListener("click", () => setTimeout(syncRemixPanel, 0));
+syncRemixPanel();
+
+document.querySelectorAll(".remix-platform-checkbox").forEach(cb => {
+  cb.onchange = () => {
+    cb.closest(".corner-opt")?.classList.toggle("active", cb.checked);
+    updateRemixPlanPreview();
+  };
+});
+
+["#remix-goal-select", "#remix-strength-select"].forEach(selector => {
+  const el = $(selector);
+  if (el) el.onchange = updateRemixPlanPreview;
+});
+
 // ---------------- animated subtitles ----------------
 $("#animated-subtitle-checkbox").onchange = (ev) => {
   $("#animated-subtitle-panel").classList.toggle("hidden", !ev.target.checked);
@@ -1619,6 +1669,11 @@ $("#submit-btn").onclick = async () => {
     translation_tone: $("#translation-tone-select").value,
     translation_audience: $("#translation-audience-input").value || null,
     translation_glossary: $("#translation-glossary-input").value || null,
+    remix_enabled: $("#remix-enable-checkbox").checked,
+    remix_platforms: $("#remix-enable-checkbox").checked ? getRemixPlatforms() : [],
+    remix_goal: $("#remix-goal-select").value,
+    remix_strength: $("#remix-strength-select").value,
+    subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0,
     logo_path: logoEnabled ? uploadedLogoId : null,
     logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
     logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
@@ -2086,6 +2141,108 @@ $("#creator-submit-btn").onclick = async () => {
   }
 };
 
+// Trend Scanner functionality
+$("#trend-scan-btn").onclick = async () => {
+  let topic = $("#trend-topic").value.trim();
+  // Clean up topic - remove common UI text that might be accidentally included
+  topic = topic.replace(/VN\s*Bỏ qua điều hướng Tìm kiếm.*$/, '').trim();
+  topic = topic.replace(/Tạo\s*Hình ảnh đại diện.*$/, '').trim();
+  topic = topic.replace(/Official Audio Video.*$/, '').trim();
+  
+  if (!topic) {
+    $("#trend-error").style.color = "var(--err)";
+    $("#trend-error").textContent = "Vui lòng nhập chủ đề cần quét";
+    return;
+  }
+
+  const platforms = Array.from(
+    document.querySelectorAll('[data-feature="trend"] input[type="checkbox"][value]:checked')
+  ).map(cb => cb.value);
+  if (platforms.length === 0) {
+    $("#trend-error").style.color = "var(--err)";
+    $("#trend-error").textContent = "Vui lòng chọn ít nhất một platform";
+    return;
+  }
+
+  const maxResults = parseInt($("#trend-max-results").value, 10) || 20;
+  const useAgentReach = $("#trend-agent-reach-fallback").checked;
+
+  $("#trend-progress").classList.remove("hidden");
+  $("#trend-progress-label").textContent = "Đang quét...";
+  $("#trend-progress-fill").style.width = "0%";
+  $("#trend-error").textContent = "";
+  $("#trend-warnings").style.display = "none";
+  $("#trend-results").style.display = "none";
+  $("#trend-scan-btn").disabled = true;
+
+  try {
+    const result = await api("/api/trends/scan", {
+      method: "POST",
+      body: JSON.stringify({
+        topic,
+        platforms,
+        max_results: maxResults,
+        use_agent_reach_fallback: useAgentReach,
+      }),
+    });
+
+    $("#trend-progress-fill").style.width = "100%";
+    $("#trend-progress-label").textContent = "Hoàn thành";
+
+    if (result.warnings && result.warnings.length > 0) {
+      $("#trend-warnings").textContent = result.warnings.join("; ");
+      $("#trend-warnings").style.display = "block";
+    }
+
+    if (result.items && result.items.length > 0) {
+      const itemsList = $("#trend-items-list");
+      itemsList.innerHTML = result.items.map(item => `
+        <div style="padding:8px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center">
+          <div style="flex:1">
+            <div style="font-weight:600;font-size:13px">${escapeHtml(item.title || item.source_url)}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${item.platform} · ${item.author || 'Unknown'}</div>
+            <div style="font-size:11px;color:var(--text-dim)">Score: ${item.trend_score?.toFixed(2) || 'N/A'}</div>
+          </div>
+          <button class="btn secondary small" data-url="${escapeHtml(item.source_url)}" data-platform="${escapeHtml(item.platform)}">Dùng</button>
+        </div>
+      `).join("");
+
+      // Add click handlers for "Dùng" buttons
+      itemsList.querySelectorAll("button").forEach(btn => {
+        btn.onclick = () => {
+          const url = btn.dataset.url;
+          $("#url-input").value = url;
+          $("#url-count-help").textContent = "Đã chọn 1 link";
+          alert("Đã thêm link vào form dịch video");
+        };
+      });
+
+      $("#trend-results").style.display = "block";
+    } else {
+      $("#trend-error").style.color = "var(--warn)";
+      $("#trend-error").textContent = "Không tìm thấy kết quả nào";
+    }
+  } catch (e) {
+    $("#trend-error").style.color = "var(--err)";
+    $("#trend-error").textContent = e.message || "Lỗi khi quét trend";
+  } finally {
+    $("#trend-progress").classList.add("hidden");
+    $("#trend-scan-btn").disabled = false;
+  }
+};
+
+// Check Agent-Reach availability on load
+(async () => {
+  try {
+    const providers = await api("/api/trends/providers");
+    if (!providers.agent_reach_available) {
+      $("#trend-agent-reach-warning").style.display = "block";
+    }
+  } catch (e) {
+    console.warn("Failed to check trend providers:", e);
+  }
+})();
+
 const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", review: "Chờ sửa phụ đề", done: "Xong", error: "Lỗi", cancelled: "Đã dừng" };
 
 function _dateToUnix(dateStr, endOfDay) {
@@ -2466,9 +2623,11 @@ async function openReview(jobId) {
 }
 
 function _fmtTime(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
+  const totalTenths = Math.max(0, Math.round(Number(seconds || 0) * 10));
+  const m = Math.floor(totalTenths / 600);
+  const s = Math.floor((totalTenths % 600) / 10);
+  const tenth = totalTenths % 10;
+  return `${m}:${String(s).padStart(2, "0")}${tenth ? `.${tenth}` : ""}`;
 }
 
 function _collectReviewSegments() {
@@ -2726,6 +2885,30 @@ function _prefillPublishSuggestions(jobId) {
     };
   });
 }
+
+// Feature tab switching - ensure DOM is loaded
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".feature-tab").forEach(tab => {
+    tab.onclick = () => {
+      const feature = tab.dataset.feature;
+      
+      console.log("Tab clicked:", feature);
+      
+      // Update tab active state
+      document.querySelectorAll(".feature-tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      
+      // Update panel visibility
+      document.querySelectorAll(".feature-panel").forEach(panel => {
+        panel.classList.remove("active");
+        if (panel.dataset.feature === feature) {
+          panel.classList.add("active");
+          console.log("Panel shown:", feature);
+        }
+      });
+    };
+  });
+});
 
 document.querySelectorAll(".chip").forEach(chip => {
   chip.onclick = () => {

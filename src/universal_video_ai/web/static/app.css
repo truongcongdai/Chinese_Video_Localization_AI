@@ -96,6 +96,46 @@
     box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
     position: relative; overflow: hidden;
   }
+  /* Feature Tabs */
+  .feature-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+    padding: 8px;
+    background: var(--panel-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+  }
+  .feature-tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    color: var(--text-dim);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .feature-tab:hover {
+    color: var(--text);
+    background: rgba(99, 102, 241, 0.1);
+  }
+  .feature-tab.active {
+    background: var(--accent);
+    color: white;
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+  }
+  .feature-panel {
+    display: none;
+  }
+  .feature-panel.active {
+    display: block;
+  }
+
   .btn::before {
     content: '';
     position: absolute; top: 0; left: -100%;

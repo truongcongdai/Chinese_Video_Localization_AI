@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.translate.service import TranslateService
@@ -47,16 +47,17 @@ def create_localization_service(
         replacement_music_volume: float = 0.16,
         source_effects_volume: float = 1.0,
         tts_min_tempo: float = 1.0,
-        tts_max_tempo: float = 1.30,
+        tts_max_tempo: float = 1.35,
         render_video: bool = False,
         render_config: Optional[RenderConfig] = None,
         enable_text_cover: bool = True,
-        ocr_languages: Tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL,
+        ocr_languages: tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL,
         text_cover_samples_per_segment: int = 2,
-        watermark_exclude_regions_fractional: Tuple[Tuple[float, float, float, float], ...] = (
+        watermark_exclude_regions_fractional: tuple[tuple[float, float, float, float], ...] = (
             (0.65, 0.00, 1.00, 0.35),
             (0.80, 0.72, 1.0, 1.0),
         ),
+        global_subtitle_offset: float = 0.0,
         logger: Optional[logging.Logger] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -214,6 +215,7 @@ def create_localization_service(
         ocr_languages=tuple(ocr_languages),
         text_cover_samples_per_segment=text_cover_samples_per_segment,
         watermark_exclude_regions_fractional=watermark_exclude_regions_fractional,
+        global_subtitle_offset=global_subtitle_offset,
     )
 
     return LocalizationService(

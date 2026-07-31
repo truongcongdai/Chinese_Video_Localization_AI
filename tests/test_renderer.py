@@ -85,6 +85,45 @@ def test_render_success_copy_video(tmp_path: Path, monkeypatch):
     assert out.read_bytes() == b"final video"
 
 
+def test_default_render_does_not_add_platform_watermark(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+
+    cmd = Renderer()._build_command(video, audio, output)
+
+    assert "-filter_complex" not in cmd
+    assert "-filter_complex_script" not in cmd
+    assert "overlay=" not in " ".join(cmd)
+    assert cmd[cmd.index("-c:v") + 1] == "copy"
+
+
+def test_user_logo_overlay_is_opt_in_brand_watermark(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+    logo = tmp_path / "my-logo.png"
+    logo.write_bytes(b"logo")
+
+    renderer = Renderer(
+        RenderConfig(
+            logo_path=str(logo),
+            logo_corner="top_left",
+            logo_size_px=96,
+            logo_margin_px=12,
+        )
+    )
+
+    cmd = renderer._build_command(video, audio, output)
+
+    assert cmd.count("-i") == 3
+    assert str(logo) in cmd
+    assert "-filter_complex" in cmd
+    filter_complex = cmd[cmd.index("-filter_complex") + 1]
+    assert "[2:v]scale=96:-1[wm]" in filter_complex
+    assert "overlay=12:12:shortest=1" in filter_complex
+
+
 def test_render_with_subtitles(tmp_path: Path, monkeypatch):
     video = tmp_path / "video.mp4"
     audio = tmp_path / "audio.mp3"
@@ -210,6 +249,46 @@ def test_text_overlay_drawtext_uses_baseline_vertical_center(tmp_path: Path, mon
 
     vf = cmd[cmd.index("-vf") + 1]
     assert "y=20+(80-ascent+descent)/2" in vf
+
+
+def test_multiple_fractional_watermark_boxes_are_blurred(tmp_path: Path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+
+    renderer = Renderer(
+        RenderConfig(
+            watermark_boxes_fractional=(
+                (0.0, 0.0, 0.25, 0.10),
+                (0.30, 0.40, 0.70, 0.55),
+            )
+        )
+    )
+    monkeypatch.setattr(renderer, "_get_video_dimensions", lambda path: (1000, 500))
+
+    cmd = renderer._build_command(video, audio, output)
+
+    vf = cmd[cmd.index("-vf") + 1]
+    assert "delogo=x=1:y=1:w=250:h=50:show=0" in vf
+    assert "delogo=x=300:y=200:w=399:h=75:show=0" in vf
+
+
+def test_fractional_watermark_box_at_frame_edge_is_clamped_for_delogo(tmp_path: Path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+
+    renderer = Renderer(
+        RenderConfig(
+            watermark_boxes_fractional=((0.0, 0.0, 1.0, 1.0),)
+        )
+    )
+    monkeypatch.setattr(renderer, "_get_video_dimensions", lambda path: (1280, 720))
+
+    cmd = renderer._build_command(video, audio, output)
+
+    vf = cmd[cmd.index("-vf") + 1]
+    assert "delogo=x=1:y=1:w=1278:h=718:show=0" in vf
 
 
 def test_render_ffmpeg_error(tmp_path: Path, monkeypatch):

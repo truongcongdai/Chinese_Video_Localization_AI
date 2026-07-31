@@ -220,6 +220,11 @@ class RenderConfig:
     # videos. Example: (0.80, 0.72, 1.0, 1.0) covers the bottom-right ~20%
     # width x ~28% height corner.
     watermark_box_fractional: Optional[Tuple[float, float, float, float]] = None
+    # Additional static watermark/text boxes to blur for the entire video,
+    # using the same fractional coordinate format. Use this when a source has
+    # more than one persistent non-subtitle text layer, such as a channel name
+    # in the top corner plus a faint center watermark.
+    watermark_boxes_fractional: Tuple[Tuple[float, float, float, float], ...] = ()
 
     # ---- Brand logo overlay (user-supplied image burned into every frame) ----
     # Path to a logo/watermark image (PNG with alpha transparency recommended)
@@ -493,15 +498,25 @@ class Renderer:
 
     @staticmethod
     def _region_blur_filter(x: int, y: int, w: int, h: int) -> str:
-        """Build an ffmpeg filter that blurs only the pixel region
-        (x, y, w, h) for the whole video, leaving everything else sharp.
+        """Build a single-input/single-output filter for a static text region.
 
-        IMPORTANT: ffmpeg's `crop` filter takes `w:h:x:y` (width, height,
-        x, y) — NOT `x:y:w:h`. Passing our x/y/w/h straight through in the
-        wrong order silently crops (and then blurs/overlays) the wrong
-        region of the frame.
+        This intentionally uses `delogo` instead of a crop+boxblur+overlay
+        subgraph. The latter needs two labeled video inputs and breaks when
+        the whole video filter chain is emitted as a filter_complex script;
+        `delogo` composes cleanly inside the existing linear chain.
         """
-        return f"crop={w}:{h}:{x}:{y},boxblur=10:1,overlay={x}:{y}"
+        return f"delogo=x={x}:y={y}:w={w}:h={h}:show=0"
+
+    @staticmethod
+    def _clamp_delogo_box(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
+        """Keep delogo boxes inside FFmpeg's stricter non-edge bounds."""
+        if frame_w <= 4 or frame_h <= 4:
+            return x, y, w, h
+        x = max(1, min(x, frame_w - 3))
+        y = max(1, min(y, frame_h - 3))
+        w = max(2, min(w, frame_w - x - 1))
+        h = max(2, min(h, frame_h - y - 1))
+        return x, y, w, h
 
     @staticmethod
     def _should_use_filter_complex_script(filter_graph: str, filters_count: int) -> bool:
@@ -646,6 +661,7 @@ class Renderer:
             or self.config.blur_text
             or bool(text_overlays)
             or self.config.watermark_box_fractional is not None
+            or bool(self.config.watermark_boxes_fractional)
             or logo_configured
             or bool(self._build_pre_subtitle_transform_filters())
             or (self.config.animated_subtitle_config and self.config.animated_subtitle_config.enabled and bool(subtitle_segments))
@@ -669,7 +685,11 @@ class Renderer:
 
             frame_w: Optional[int] = None
             frame_h: Optional[int] = None
-            if self.config.watermark_box_fractional is not None or text_overlays:
+            if (
+                self.config.watermark_box_fractional is not None
+                or self.config.watermark_boxes_fractional
+                or text_overlays
+            ):
                 dims = self._get_video_dimensions(input_video)
                 if dims is not None:
                     frame_w, frame_h = dims
@@ -684,18 +704,23 @@ class Renderer:
             # title), independent of blur_text/text_overlays — it's not a
             # translatable subtitle, it's baked into every single frame, so
             # it's covered for the whole video rather than per-sentence.
+            watermark_boxes: List[Tuple[float, float, float, float]] = []
             if self.config.watermark_box_fractional is not None:
+                watermark_boxes.append(self.config.watermark_box_fractional)
+            watermark_boxes.extend(self.config.watermark_boxes_fractional)
+            if watermark_boxes:
                 if frame_w is None or frame_h is None:
                     self.logger.warning(
-                        "watermark_box_fractional is set but video dimensions could not be "
+                        "watermark boxes are set but video dimensions could not be "
                         "determined; skipping watermark cover for this render."
                     )
                 else:
-                    fx0, fy0, fx1, fy1 = self.config.watermark_box_fractional
-                    wx, wy = int(fx0 * frame_w), int(fy0 * frame_h)
-                    ww = max(2, int((fx1 - fx0) * frame_w))
-                    wh = max(2, int((fy1 - fy0) * frame_h))
-                    filters.append(self._region_blur_filter(wx, wy, ww, wh))
+                    for fx0, fy0, fx1, fy1 in watermark_boxes:
+                        wx, wy = int(fx0 * frame_w), int(fy0 * frame_h)
+                        ww = max(2, int((fx1 - fx0) * frame_w))
+                        wh = max(2, int((fy1 - fy0) * frame_h))
+                        wx, wy, ww, wh = self._clamp_delogo_box(wx, wy, ww, wh, frame_w, frame_h)
+                        filters.append(self._region_blur_filter(wx, wy, ww, wh))
 
             # Add blur filter only as a LAST-RESORT fallback for covering
             # burned-in text — and only when we have no better option.
@@ -718,9 +743,9 @@ class Renderer:
             # actively make the video worse.
             if self.config.blur_text and not text_overlays:
                 if self.config.blur_box:
-                    # blur_box is documented/entered as "x:y:w:h"; convert to
-                    # the crop filter's actual w:h:x:y order (see
-                    # _region_blur_filter docstring).
+                    # blur_box is documented/entered as "x:y:w:h"; pass those
+                    # pixels into the same single-input region filter used for
+                    # static watermark boxes.
                     try:
                         bx, by, bw, bh = (int(v) for v in self.config.blur_box.split(":"))
                         filters.append(self._region_blur_filter(bx, by, bw, bh))

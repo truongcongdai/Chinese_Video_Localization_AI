@@ -575,6 +575,24 @@ def test_align_source_segments_keeps_asr_timing_without_confident_offset(tmp_pat
     assert aligned is segments
 
 
+def test_subtitle_alignment_passes_small_offset_threshold_to_detector(tmp_path: Path):
+    detector = MagicMock()
+    detector.estimate_subtitle_time_offset.return_value = None
+    service = LocalizationService(
+        text_detector=detector,
+        config=LocalizationConfig(enable_text_cover=True, min_subtitle_alignment_offset=0.05),
+    )
+
+    service._align_source_segments_to_burned_subtitles(
+        video_path=tmp_path / "video.mp4",
+        source_segments=[TranscriptSegment(start=0.0, end=1.0, text="柳夫人")],
+        detected_language="zh",
+        audio_duration=10.0,
+    )
+
+    assert detector.estimate_subtitle_time_offset.call_args.kwargs["min_offset"] == 0.05
+
+
 def test_align_source_segments_applies_offset_only_after_detected_cluster(tmp_path: Path):
     detector = MagicMock()
     detector.estimate_subtitle_time_offset.return_value = SubtitleOffsetEstimate(
@@ -739,3 +757,212 @@ def test_small_global_subtitle_offset_also_syncs_tts_clock(tmp_path: Path):
     assert result.translated_segments == [
         TranscriptSegment(start=0.3, end=2.3, text="Mật danh của ngươi là Độc Xà.")
     ]
+
+
+def test_global_subtitle_offset_is_applied_once(tmp_path: Path):
+    downloader = MagicMock(spec=DownloadService)
+    download_result = MagicMock(spec=DownloadResult)
+    download_result.success = True
+    download_result.video_path = tmp_path / "video.mp4"
+    downloader.download.return_value = download_result
+
+    translate_service = MagicMock(spec=TranslateService)
+    translate_service.translate_segments.return_value = [
+        TranscriptSegment(start=0.0, end=1.0, text="Xin chào.")
+    ]
+
+    tts_service = MagicMock(spec=TTSService)
+    tts_service.synthesize.side_effect = (
+        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+    )
+
+    mixer = MagicMock(spec=MixerService)
+    mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
+
+    service = LocalizationService(
+        downloader=downloader,
+        translate_service=translate_service,
+        tts_service=tts_service,
+        mixer=mixer,
+        config=LocalizationConfig(
+            run_transcription=True,
+            run_translation=True,
+            target_language="vi",
+            run_tts=True,
+            global_subtitle_offset=0.2,
+        ),
+    )
+
+    with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
+        audio_result_obj = MagicMock()
+        audio_result_obj.audio_path = tmp_path / "audio.wav"
+        audio_result_obj.duration = 10.0
+
+        audio_result = MagicMock(spec=AudioPipelineResult)
+        audio_result.transcript = "hello"
+        audio_result.detected_language = "en"
+        audio_result.audio_result = audio_result_obj
+        audio_result.segments = [TranscriptSegment(start=0.0, end=1.0, text="hello")]
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.process.return_value = audio_result
+        mock_pipeline_factory.return_value = mock_pipeline
+
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
+
+    assert result.source_segments == [TranscriptSegment(start=0.2, end=1.2, text="hello")]
+    assert result.translated_segments == [TranscriptSegment(start=0.2, end=1.2, text="Xin chào.")]
+
+
+def test_small_detected_offset_moves_first_subtitle_and_tts_segment(tmp_path: Path):
+    downloader = MagicMock(spec=DownloadService)
+    download_result = MagicMock(spec=DownloadResult)
+    download_result.success = True
+    download_result.video_path = tmp_path / "video.mp4"
+    downloader.download.return_value = download_result
+
+    translate_service = MagicMock(spec=TranslateService)
+    translate_service.translate_segments.return_value = [
+        TranscriptSegment(start=0.0, end=1.0, text="Liễu phu nhân.")
+    ]
+
+    tts_service = MagicMock(spec=TTSService)
+    tts_service.synthesize.side_effect = (
+        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+    )
+
+    mixer = MagicMock(spec=MixerService)
+    mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
+
+    detector = MagicMock()
+    detector.estimate_subtitle_time_offset.return_value = SubtitleOffsetEstimate(
+        offset=0.2,
+        confidence=0.44,
+        matches=8,
+    )
+
+    service = LocalizationService(
+        downloader=downloader,
+        translate_service=translate_service,
+        tts_service=tts_service,
+        mixer=mixer,
+        text_detector=detector,
+        config=LocalizationConfig(
+            run_transcription=True,
+            run_translation=True,
+            target_language="vi",
+            run_tts=True,
+            enable_text_cover=True,
+        ),
+    )
+
+    with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
+        audio_result_obj = MagicMock()
+        audio_result_obj.audio_path = tmp_path / "audio.wav"
+        audio_result_obj.duration = 10.0
+
+        audio_result = MagicMock(spec=AudioPipelineResult)
+        audio_result.transcript = "柳夫人"
+        audio_result.detected_language = "zh"
+        audio_result.audio_result = audio_result_obj
+        audio_result.segments = [TranscriptSegment(start=0.0, end=1.0, text="柳夫人")]
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.process.return_value = audio_result
+        mock_pipeline_factory.return_value = mock_pipeline
+
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
+
+    tts_clips = mixer.build_dubbed_track.call_args.args[0]
+    assert tts_clips[0].start == pytest.approx(0.2)
+    assert tts_clips[0].end == pytest.approx(1.2)
+    assert result.translated_segments == [
+        TranscriptSegment(start=0.2, end=1.2, text="Liễu phu nhân.")
+    ]
+    assert result.source_segments == [
+        TranscriptSegment(start=0.2, end=1.2, text="柳夫人")
+    ]
+
+
+def test_default_visual_timing_padding_does_not_pull_subtitle_start_back() -> None:
+    service = LocalizationService(config=LocalizationConfig())
+    service._last_subtitle_alignment_estimate = SubtitleOffsetEstimate(
+        offset=0.2,
+        confidence=0.8,
+        matches=8,
+    )
+
+    segments = [TranscriptSegment(start=0.2, end=1.2, text="Liễu phu nhân.")]
+
+    padded = service._pad_visual_segments(
+        segments,
+        audio_duration=10.0,
+        padding=service._visual_timing_padding_for_current_video(),
+    )
+
+    assert padded == segments
+
+
+def test_visual_subtitle_padding_does_not_overlap_or_move_tts_clock():
+    segments = [
+        TranscriptSegment(start=1.0, end=2.0, text="Một"),
+        TranscriptSegment(start=2.05, end=3.0, text="Hai"),
+    ]
+
+    padded = LocalizationService._pad_visual_segments(
+        segments,
+        audio_duration=5.0,
+        padding=0.08,
+    )
+
+    assert padded[0].start == pytest.approx(0.92)
+    assert padded[0].end <= padded[1].start
+    assert padded[1].end == pytest.approx(3.08)
+    assert segments[0].start == 1.0
+
+
+def test_visual_timing_padding_only_applies_after_detected_offset():
+    service = LocalizationService(config=LocalizationConfig())
+
+    assert service._visual_timing_padding_for_current_video() == 0.0
+
+    service._last_subtitle_alignment_estimate = SubtitleOffsetEstimate(
+        offset=0.1,
+        confidence=0.8,
+        matches=2,
+    )
+
+    assert service._visual_timing_padding_for_current_video() == 0.0
+
+    service = LocalizationService(config=LocalizationConfig(visual_subtitle_timing_padding=0.08))
+    service._last_subtitle_alignment_estimate = SubtitleOffsetEstimate(
+        offset=0.1,
+        confidence=0.8,
+        matches=2,
+    )
+
+    assert service._visual_timing_padding_for_current_video() == pytest.approx(0.08)
+
+
+def test_static_text_watermark_boxes_are_added_to_render_config(tmp_path: Path):
+    detector = MagicMock()
+    detector.detect_persistent_text_regions.return_value = (
+        (0.0, 0.02, 0.25, 0.12),
+        (0.14, 0.18, 0.34, 0.31),
+    )
+    service = LocalizationService(
+        text_detector=detector,
+        config=LocalizationConfig(enable_text_cover=True, auto_blur_static_text=True),
+    )
+
+    boxes = service._detect_static_text_watermark_boxes(
+        video_path=tmp_path / "video.mp4",
+        detected_language="zh",
+        duration=120.0,
+    )
+
+    assert boxes == (
+        (0.0, 0.02, 0.25, 0.12),
+        (0.14, 0.18, 0.34, 0.31),
+    )
+    detector.detect_persistent_text_regions.assert_called_once()

@@ -24,6 +24,7 @@ End-to-end video localization platform: download → transcribe → translate �
 - **Queue Management**: Batch processing with priority and concurrency control
 - **Statistics Dashboard**: Real-time job statistics and progress tracking
 - **Video Presets**: Save and load custom video configuration presets
+- **Trend Scanner**: Discover trending content across platforms with optional Agent-Reach integration
 
 ## Installation
 
@@ -45,6 +46,11 @@ pip install edge-tts
 
 # Install OpenAI for GPT-4 integration (optional)
 pip install openai
+
+# Install Agent-Reach for Trend Scanner (optional)
+pip install https://github.com/Panniantong/agent-reach/archive/main.zip
+agent-reach install --env=auto --safe
+agent-reach doctor
 ```
 
 ## Configuration

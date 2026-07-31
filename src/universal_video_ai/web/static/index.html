@@ -249,7 +249,29 @@
   <div class="dashboard-grid">
   <main class="tool-column">
 
-  <div class="card">
+  <!-- Feature Tabs Navigation -->
+  <div class="feature-tabs">
+    <button class="feature-tab active" data-feature="localization">
+      <span>🎬</span>
+      <span>Dịch Video</span>
+    </button>
+    <button class="feature-tab" data-feature="trend">
+      <span>🔍</span>
+      <span>Quét Trend</span>
+    </button>
+    <button class="feature-tab" data-feature="ai-video">
+      <span>🤖</span>
+      <span>Tạo Video AI</span>
+    </button>
+    <button class="feature-tab" data-feature="affiliate">
+      <span>📦</span>
+      <span>Product Ad</span>
+    </button>
+  </div>
+
+  <!-- Localization Panel -->
+  <div class="feature-panel active" data-feature="localization">
+    <div class="card">
     <div class="template-library-heading">
       <h3 class="section-title">Dịch &amp; lồng tiếng video có sẵn</h3>
       <span id="draft-status" class="muted-help">Tự động lưu bản nháp</span>
@@ -534,6 +556,51 @@
           <option value="16:9">Ngang 16:9 — 1920×1080</option>
           <option value="1:1">Vuông 1:1 — 1080×1080</option>
         </select>
+      </div>
+      <div class="field">
+        <label>
+          <input type="checkbox" id="remix-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+          Bật AI Remix flow
+        </label>
+      </div>
+      <div id="remix-panel" class="hidden" style="margin-bottom:14px;padding:16px;background:var(--panel-2);border-radius:var(--radius-sm);border:1px solid var(--border);">
+        <div class="row">
+          <div class="field">
+            <label>Mục tiêu</label>
+            <select id="remix-goal-select">
+              <option value="viral">Viral / giữ retention</option>
+              <option value="education">Giáo dục</option>
+              <option value="sales">Bán hàng / CTA</option>
+              <option value="review">Review</option>
+              <option value="story">Kể chuyện</option>
+              <option value="news">Tin tức</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Mức biến đổi</label>
+            <select id="remix-strength-select">
+              <option value="balanced">Vừa phải</option>
+              <option value="light">Nhẹ</option>
+              <option value="strong">Mạnh</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Nền tảng đầu ra</label>
+          <div class="corner-grid">
+            <label class="corner-opt active"><input type="checkbox" class="remix-platform-checkbox" value="tiktok" checked> TikTok</label>
+            <label class="corner-opt active"><input type="checkbox" class="remix-platform-checkbox" value="reels" checked> Reels</label>
+            <label class="corner-opt active"><input type="checkbox" class="remix-platform-checkbox" value="youtube_shorts" checked> Shorts</label>
+            <label class="corner-opt"><input type="checkbox" class="remix-platform-checkbox" value="youtube_long"> YouTube dài</label>
+            <label class="corner-opt"><input type="checkbox" class="remix-platform-checkbox" value="facebook_long"> Facebook dài</label>
+          </div>
+        </div>
+        <div id="remix-plan-preview" class="muted-help">Remix sẽ tự bật review phụ đề, contextual rewrite, QA và asset publish phù hợp nền tảng.</div>
+      </div>
+      <div class="field">
+        <label>Chỉnh lệch phụ đề (giây)</label>
+        <input type="number" id="subtitle-offset-input" value="0" min="-2" max="2" step="0.05">
+        <div class="muted-help">Mặc định 0 để khớp subtitle gốc. Nhập số âm nếu phụ đề mới trễ, số dương nếu phụ đề mới sớm.</div>
       </div>
     </div>
 
@@ -847,7 +914,11 @@
     </section>
     <div id="submit-error" role="alert" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
-<div class="card">
+  </div>
+
+  <!-- Affiliate Panel -->
+  <div class="feature-panel" data-feature="affiliate">
+    <div class="card">
     <h3 class="section-title">Product Ad Creative / Affiliate Mode</h3>
     <div class="row">
       <div class="field" style="flex: 2">
@@ -965,8 +1036,11 @@
       <div id="affiliate-warnings-output" style="font-size:12px;color:var(--warn)"></div>
     </div>
   </div>
+  </div>
 
-  <div class="card">
+  <!-- AI Video Panel -->
+  <div class="feature-panel" data-feature="ai-video">
+    <div class="card">
     <h3 class="section-title">Tạo video AI từ ý tưởng/cảnh quay</h3>
     <div class="row">
       <div class="field" style="flex: 2">
@@ -1110,6 +1184,69 @@
       <div class="progress-track"><div class="progress-fill" id="creator-progress-fill"></div></div>
     </div>
     <div id="creator-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
+  </div>
+
+  <!-- Trend Panel -->
+  <div class="feature-panel" data-feature="trend">
+    <div class="card">
+    <div class="template-library-heading">
+      <h3 class="section-title">🔍 Quét Trend</h3>
+      <span id="trend-status" class="muted-help">Khám phá nội dung đang hot</span>
+    </div>
+    <div class="field">
+      <label>Chủ đề cần quét</label>
+      <input id="trend-topic" placeholder="VD: học tiếng Trung, nấu ăn, du lịch...">
+    </div>
+    <div class="field">
+      <label>Platform</label>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" value="youtube" checked> YouTube
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" value="tiktok"> TikTok
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" value="douyin"> Douyin
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" value="reddit"> Reddit
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" value="bilibili"> Bilibili
+        </label>
+      </div>
+    </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+        <input type="checkbox" id="trend-agent-reach-fallback">
+        Dùng Agent-Reach fallback nếu có
+      </label>
+      <div id="trend-agent-reach-warning" style="font-size:11px;color:var(--warn);margin-top:5px;display:none">
+        Agent-Reach chưa được cài hoặc chưa bật. Tool vẫn quét bằng native providers.
+      </div>
+    </div>
+    <div class="field">
+      <label>Số kết quả tối đa</label>
+      <select id="trend-max-results">
+        <option value="10">10</option>
+        <option value="20" selected>20</option>
+        <option value="50">50</option>
+      </select>
+    </div>
+    <button class="btn gradient" id="trend-scan-btn" type="button">🔍 Quét trend</button>
+    <div id="trend-warnings" style="font-size:12px;color:var(--warn);margin-top:8px;display:none"></div>
+    <div id="trend-results" style="margin-top:16px;display:none">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">Kết quả quét:</div>
+      <div id="trend-items-list" style="max-height:300px;overflow-y:auto"></div>
+    </div>
+    <div class="trend-progress hidden" id="trend-progress" aria-live="polite">
+      <div class="trend-progress-head"><span id="trend-progress-label">Đang quét...</span></div>
+      <div class="progress-track"><div class="progress-fill" id="trend-progress-fill"></div></div>
+    </div>
+    <div id="trend-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
+  </div>
   </div>
 
   </main>
@@ -1381,7 +1518,7 @@
   </div>
 </div>
 
-<script src="/assets/i18n.js?v=20260729" defer></script>
-<script src="/assets/app.js?v=20260729" defer></script>
+<script src="/assets/i18n.js?v=20260731b" defer></script>
+<script src="/assets/app.js?v=20260731b" defer></script>
 </body>
 </html>

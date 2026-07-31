@@ -519,7 +519,7 @@ def test_mixer_clamps_tts_tempo_for_more_even_reading_speed(tmp_path: Path, monk
 
     filter_complex = captured_cmd["cmd"][captured_cmd["cmd"].index("-filter_complex") + 1]
     assert "atempo=0." not in filter_complex
-    assert "atempo=1.3000" in filter_complex
+    assert "atempo=1.3500" in filter_complex
     assert "atempo=2.0000" not in filter_complex
 
 
@@ -552,7 +552,7 @@ def test_overlay_text_is_centered_inside_detected_cover_box():
 
     assert "text='Mới'" in drawtext
     assert "x=100+(240-text_w)/2" in drawtext
-    assert "y=300+(56-text_h)/2" in drawtext
+    assert "y=300+(56-ascent+descent)/2" in drawtext
 
 
 def test_gap_fill_only_returns_segments_without_an_overlay():

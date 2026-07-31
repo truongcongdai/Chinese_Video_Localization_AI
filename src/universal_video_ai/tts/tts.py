@@ -28,7 +28,7 @@ _EDGE_TTS_LOCK = threading.Lock()
 # Vietnamese text to "en-US-JennyNeural". Keys are lowercased language
 # codes as used throughout this project (e.g. "vi", "en", "zh").
 DEFAULT_VOICES_BY_LANGUAGE = {
-    "vi": "vi-VN-HoaiMyNeural|rate=-6%|pitch=+2Hz",
+    "vi": "vi-VN-HoaiMyNeural|rate=-3%|pitch=+2Hz",
     "en": "en-US-JennyNeural",
     "zh": "zh-CN-XiaoxiaoNeural",
     "zh-cn": "zh-CN-XiaoxiaoNeural",
@@ -229,9 +229,10 @@ class EdgeTTS:
         Synthesize ``text`` to ``output_path`` with guarded retries.
 
         The implementation serializes Edge TTS calls within the current
-        process, validates input/output, retries transient failures with
-        exponential backoff plus jitter, and falls back to another Vietnamese
-        voice when the primary Vietnamese voice repeatedly fails.
+        process, validates input/output, and retries transient failures with
+        exponential backoff plus jitter. Retries intentionally keep the same
+        requested voice so a single dubbed video does not switch speakers
+        mid-scene after a transient Edge failure.
         """
         if not isinstance(text, str):
             raise ValueError("text must be a string")
@@ -247,10 +248,6 @@ class EdgeTTS:
 
         primary_voice = voice or self.config.voice
         voices = [primary_voice]
-        if primary_voice == "vi-VN-HoaiMyNeural":
-            voices.append("vi-VN-NamMinhNeural")
-        elif primary_voice == "vi-VN-NamMinhNeural":
-            voices.append("vi-VN-HoaiMyNeural")
 
         self.logger.info(
             "EdgeTTS request: chars=%d voice=%s output=%s text=%r",

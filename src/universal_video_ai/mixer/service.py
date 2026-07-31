@@ -95,7 +95,8 @@ class MixerConfig:
     # lines drag slowly and long lines rush. By default we never slow TTS down
     # and only allow mild speed-up for overcrowded slots.
     min_tts_tempo: float = 1.0
-    max_tts_tempo: float = 1.30
+    max_tts_tempo: float = 1.35
+    min_tts_gap_seconds: float = 0.03
 
 
 class MixerService:
@@ -436,8 +437,14 @@ class MixerService:
         filter_parts: List[str] = []
         mixed_labels: List[str] = []
 
-        for idx, clip in enumerate(clips):
-            slot_duration = max(0.0, clip.end - clip.start)
+        ordered_clips = sorted(clips, key=lambda item: item.start)
+        for idx, clip in enumerate(ordered_clips):
+            slot_end = clip.end
+            if idx + 1 < len(ordered_clips):
+                next_start = ordered_clips[idx + 1].start
+                gap = max(0.0, float(self.config.min_tts_gap_seconds))
+                slot_end = min(slot_end, max(clip.start + 0.05, next_start - gap))
+            slot_duration = max(0.0, slot_end - clip.start)
             actual_duration = self._probe_duration(clip.audio_path)
 
             inputs.extend(["-i", str(clip.audio_path)])
@@ -464,6 +471,13 @@ class MixerService:
                     out_label = f"[t{idx}]"
                     filter_parts.append(f"{stage_label}{chain}{out_label}")
                     stage_label = out_label
+
+            if slot_duration > 0.05:
+                out_label = f"[s{idx}]"
+                filter_parts.append(
+                    f"{stage_label}atrim=duration={slot_duration:.3f},asetpts=PTS-STARTPTS{out_label}"
+                )
+                stage_label = out_label
 
             delay_ms = max(0, int(round(clip.start * 1000)))
             delayed_label = f"[d{idx}]"

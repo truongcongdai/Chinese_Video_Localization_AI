@@ -29,7 +29,7 @@ import tempfile
 import zipfile
 import io
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 try:
     import openai
@@ -50,6 +50,7 @@ from universal_video_ai.orchestrator.factory import create_localization_service
 from universal_video_ai.orchestrator.service import (
     prepared_localization_to_dict, prepared_localization_from_dict,
 )
+from universal_video_ai.trends.service import TrendScanner
 from universal_video_ai.render.renderer import RenderConfig, AnimatedSubtitleConfig, VideoTemplateConfig
 from universal_video_ai.render.animated_subtitles import SubtitleEffect, SubtitleStyle
 from universal_video_ai.postprocess.video_transform import (
@@ -63,6 +64,7 @@ from universal_video_ai.render.prepublish import inspect_for_publish, prepublish
 from universal_video_ai.render.video_review import review_finished_video, video_review_report_to_dict
 from universal_video_ai.render.voice_director import direct_voice_cue
 from universal_video_ai.render.visual_director import direct_visual_scene
+from universal_video_ai.remix import build_remix_plan
 from universal_video_ai.tts.tts import DEFAULT_VOICES_BY_LANGUAGE
 from universal_video_ai.tts.tts import voice_for_language
 from universal_video_ai.tts.voices import voices_for_language
@@ -276,6 +278,11 @@ class NewJobBody(BaseModel):
     translation_tone: str = "natural"
     translation_audience: Optional[str] = None
     translation_glossary: Optional[str] = None
+    remix_enabled: bool = False
+    remix_platforms: List[str] = Field(default_factory=list)
+    remix_goal: str = "viral"
+    remix_strength: str = "balanced"
+    subtitle_offset_seconds: float = 0.0
     # When True, the job stops right after translation (status="review")
     # instead of rendering straight through, so the person can edit the
     # translated text first via PUT .../segments then POST .../render.
@@ -289,6 +296,30 @@ class NewJobBody(BaseModel):
     video_template_config: Optional[Dict[str, Any]] = None
     # Video transformation configuration (flip, border, split-screen, etc.)
     transform_config: Optional[Dict[str, Any]] = None
+
+
+class RemixPlanBody(BaseModel):
+    remix_enabled: bool = True
+    remix_platforms: List[str] = Field(default_factory=list)
+    remix_goal: str = "viral"
+    remix_strength: str = "balanced"
+    free_mode: bool = True
+
+
+class TrendScanBody(BaseModel):
+    topic: str
+    platforms: List[str] = ["youtube"]
+    max_results: int = 20
+    use_agent_reach_fallback: bool = False
+
+
+class TrendScanResponse(BaseModel):
+    scan_id: str
+    topic: str
+    platforms: List[str]
+    items: List[Dict[str, Any]]
+    warnings: List[str] = []
+    error: Optional[str] = None
 
 
 class JobPreflightBody(NewJobBody):
@@ -423,6 +454,31 @@ def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum:
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+
+def _parse_fractional_boxes_env(name: str) -> Tuple[Tuple[float, float, float, float], ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ()
+    boxes = []
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(part.strip()) for part in item.split(","))
+        except ValueError:
+            logger.warning("Ignoring malformed %s entry %r; expected x0,y0,x1,y1", name, item)
+            continue
+        x0 = max(0.0, min(1.0, x0))
+        y0 = max(0.0, min(1.0, y0))
+        x1 = max(0.0, min(1.0, x1))
+        y1 = max(0.0, min(1.0, y1))
+        if x1 <= x0 or y1 <= y0:
+            logger.warning("Ignoring invalid %s box %r; x1/y1 must be greater than x0/y0", name, item)
+            continue
+        boxes.append((x0, y0, x1, y1))
+    return tuple(boxes)
 
 
 def _payment_config(amount_vnd: int = 0, transfer_content: str = "") -> Dict[str, Any]:
@@ -783,9 +839,12 @@ def _build_service_for_job(job):
         and job.animated_subtitle_config.get("enabled")
     )
 
+    watermark_boxes = _parse_fractional_boxes_env("WATERMARK_BOXES_FRACTIONAL")
+
     render_config = RenderConfig(
         preset=WEB_RENDER_PRESET,
         timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
+        watermark_boxes_fractional=watermark_boxes,
     )
 
     # Build animated subtitle config if provided
@@ -869,6 +928,7 @@ def _build_service_for_job(job):
             logo_path=job.logo_path,
             logo_corner=job.logo_corner or "bottom_right",
             logo_size_px=job.logo_size_px or 120,
+            watermark_boxes_fractional=watermark_boxes,
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
@@ -877,6 +937,7 @@ def _build_service_for_job(job):
         render_config = RenderConfig(
             preset=WEB_RENDER_PRESET,
             timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
+            watermark_boxes_fractional=watermark_boxes,
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
@@ -938,6 +999,12 @@ def _build_service_for_job(job):
         os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
         and shutil.which("demucs") is not None
     )
+    job_subtitle_offset = getattr(job, "subtitle_offset_seconds", None)
+    global_subtitle_offset = (
+        float(job_subtitle_offset)
+        if job_subtitle_offset is not None
+        else float(os.getenv("GLOBAL_SUBTITLE_OFFSET", "0.0"))
+    )
 
     return create_localization_service(
         run_demucs=replace_source_audio and run_demucs_for_effects,
@@ -961,11 +1028,12 @@ def _build_service_for_job(job):
         replacement_music_volume=float(os.getenv("REPLACEMENT_MUSIC_VOLUME", "0.16")),
         source_effects_volume=float(os.getenv("SOURCE_EFFECTS_VOLUME", "1.0")),
         tts_min_tempo=float(os.getenv("TTS_MIN_TEMPO", "1.0")),
-        tts_max_tempo=float(os.getenv("TTS_MAX_TEMPO", "1.30")),
+        tts_max_tempo=float(os.getenv("TTS_MAX_TEMPO", "1.35")),
         render_video=True,
         render_config=render_config,
         enable_text_cover=processing_mode in {"quality", "pro"} or animated_subtitle_requested,
         ocr_languages=ocr_languages,
+        global_subtitle_offset=global_subtitle_offset,
         logger=logger,
         progress_callback=lambda percent, message: store.update_job(
             job.id, progress_note=f"[{percent}%] {message}"
@@ -3766,8 +3834,67 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         _running_tasks.pop(job_id, None)
 
 
+@app.post("/api/remix/plan")
+async def remix_plan(body: RemixPlanBody, user_id: int = Depends(get_current_user_id)):
+    plan = build_remix_plan(
+        enabled=body.remix_enabled,
+        platforms=body.remix_platforms,
+        goal=body.remix_goal,
+        strength=body.remix_strength,
+        free_mode=body.free_mode,
+    )
+    return plan.to_dict()
+
+
 @app.post("/api/jobs")
 async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_id)):
+    remix_plan = build_remix_plan(
+        enabled=body.remix_enabled,
+        platforms=body.remix_platforms,
+        goal=body.remix_goal,
+        strength=body.remix_strength,
+        free_mode=True,
+    )
+    if body.remix_enabled:
+        body.processing_mode = body.processing_mode if body.processing_mode in {"quality", "pro"} else remix_plan.processing_mode
+        if body.translation_mode == "faithful":
+            body.translation_mode = remix_plan.translation_mode
+        body.review_before_render = False  # Automatic mode - skip review step
+        body.video_template_config = body.video_template_config or {
+            "enabled": True,
+            "template": remix_plan.template,
+            "transition": "fade",
+            "color_effect": "high_contrast" if body.remix_strength == "strong" else "warm",
+            "audio_filters": {"normalize": True},
+            "video_quality": "high" if remix_plan.primary_format in {"long", "mixed"} else "medium",
+        }
+        body.transform_config = body.transform_config or {
+            "enabled": True,
+            "enable_flip": False,
+            "flip_mode": "none",
+            "enable_border": False,
+            "border_position": "none",
+            "border_px": 0,
+            "border_color": "black",
+            "enable_split_screen": False,
+            "split_mode": "vertical",
+            "enable_randomization": True,
+            "crop_percent": 1.2 if body.remix_strength != "light" else 0.5,
+            "speed_factor": 1.0,
+            "brightness_adjust": 1.0 if body.remix_strength != "light" else 0.5,
+            "contrast_adjust": 2.0 if body.remix_strength == "strong" else 1.0,
+        }
+        if remix_plan.animated_subtitles and not body.animated_subtitle_config:
+            body.animated_subtitle_config = {
+                "enabled": True,
+                "effect": "karaoke",
+                "style": {
+                    "font_size": 24,
+                    "font_color": "white",
+                    "background_color": "black@0.5",
+                },
+                "effect_params": {},
+            }
     report = _job_preflight_report(user_id, body, url_count=1)
     errors = [issue for issue in report["issues"] if issue["severity"] == "error"]
     if errors:
@@ -3817,6 +3944,11 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         translation_tone=body.translation_tone or "natural",
         translation_audience=body.translation_audience,
         translation_glossary=body.translation_glossary,
+        remix_enabled=body.remix_enabled,
+        remix_platforms=remix_plan.platforms if body.remix_enabled else body.remix_platforms,
+        remix_goal=remix_plan.goal,
+        remix_strength=remix_plan.strength,
+        subtitle_offset_seconds=body.subtitle_offset_seconds,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
@@ -3842,6 +3974,29 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
     processing_mode = (body.processing_mode or "fast").strip().lower()
     if processing_mode not in {"fast", "quality", "pro"}:
         issues.append({"severity": "error", "code": "invalid_processing_mode", "message": "Chế độ xử lý không hợp lệ."})
+
+    if body.remix_enabled:
+        plan = build_remix_plan(
+            enabled=True,
+            platforms=body.remix_platforms,
+            goal=body.remix_goal,
+            strength=body.remix_strength,
+            free_mode=True,
+        )
+        issues.append({
+            "severity": "info",
+            "code": "remix_plan",
+            "message": (
+                "AI Remix sẽ chạy qua review trước render, contextual rewrite, "
+                f"QA và asset publish cho: {', '.join(plan.platforms)}."
+            ),
+        })
+        if plan.primary_format in {"long", "mixed"} and processing_mode == "fast":
+            issues.append({
+                "severity": "warning",
+                "code": "long_form_quality",
+                "message": "Video dài nên dùng quality/pro để timestamp, subtitle và QA ổn định hơn.",
+            })
 
     tts_provider = (body.tts_provider or "edge").strip().lower()
     if tts_provider not in {"edge", "openai", "elevenlabs", "playht", "cartesia", "xtts"}:
@@ -5913,7 +6068,65 @@ def admin_reject_top_up_request(
     return {"ok": True, "status": row["status"]}
 
 
-# ---------------------------------------------------------------- feedback --
+# ---------------------------------------------------------------- Trend Scanner --
+
+_trend_scanner = TrendScanner(logger=logger)
+
+
+@app.post("/api/trends/scan", response_model=TrendScanResponse)
+def scan_trends(body: TrendScanBody, user_id: int = Depends(get_current_user_id)):
+    """Scan for trending content across platforms."""
+    if not body.topic.strip():
+        raise HTTPException(400, "Thiếu chủ đề cần quét")
+
+    try:
+        result = _trend_scanner.scan(
+            topic=body.topic,
+            platforms=body.platforms,
+            max_results=body.max_results,
+            use_agent_reach_fallback=body.use_agent_reach_fallback,
+        )
+
+        # Convert TrendItemCandidate objects to dicts for JSON response
+        items_dict = [
+            {
+                "platform": item.platform,
+                "source_url": item.source_url,
+                "title": item.title,
+                "author": item.author,
+                "thumbnail_url": item.thumbnail_url,
+                "duration_seconds": item.duration_seconds,
+                "view_count": item.view_count,
+                "like_count": item.like_count,
+                "comment_count": item.comment_count,
+                "share_count": item.share_count,
+                "published_at": item.published_at,
+                "trend_score": item.trend_score,
+            }
+            for item in result.items
+        ]
+
+        return TrendScanResponse(
+            scan_id=result.scan_id,
+            topic=result.topic,
+            platforms=result.platforms,
+            items=items_dict,
+            warnings=result.warnings,
+            error=result.error,
+        )
+    except Exception as exc:
+        logger.error("Trend scan failed: %s", exc, exc_info=True)
+        raise HTTPException(500, f"Lỗi quét trend: {exc}")
+
+
+@app.get("/api/trends/providers")
+def list_trend_providers(user_id: int = Depends(get_current_user_id)):
+    """List available trend providers."""
+    return {
+        "providers": _trend_scanner.get_available_providers(),
+        "agent_reach_available": _trend_scanner.is_provider_available("agent_reach"),
+    }
+
 
 @app.post("/api/feedback")
 def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_id)):

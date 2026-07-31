@@ -192,8 +192,8 @@
 
 ### Pricing Strategy (Gợi ý)
 
-- **Free**: 10 credits/tháng, watermark branding
-- **Pro ($10/tháng)**: 100 credits, không watermark, priority support
+- **Free**: 10 credits/tháng, không đóng watermark hệ thống; cho phép chèn logo/watermark riêng nếu người dùng bật
+- **Pro ($10/tháng)**: 100 credits, render dài/batch/priority support
 - **Enterprise ($50/tháng)**: Unlimited credits, API access, custom deployment
 
 ---

@@ -293,6 +293,8 @@ class OnScreenTextDetector:
         ),
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
         use_text_ocr_fallback: bool = False,
+        min_offset: float = 0.05,
+        presence_search_radius: float = 1.0,
     ) -> Optional[SubtitleOffsetEstimate]:
         """Estimate hard-sub visual offset from ASR timestamps.
 
@@ -306,7 +308,8 @@ class OnScreenTextDetector:
         visual_estimate = self._estimate_subtitle_time_offset_by_presence(
             video_path,
             source_segments,
-            search_radius=search_radius,
+            search_radius=min(search_radius, presence_search_radius),
+            min_offset=min_offset,
         )
         if visual_estimate is not None:
             return visual_estimate
@@ -407,11 +410,12 @@ class OnScreenTextDetector:
         source_segments: Sequence[Tuple[float, float, str]],
         search_radius: float = 12.0,
         step: float = 0.5,
-        refine_step: float = 0.1,
+        refine_step: float = 0.05,
         max_segments: int = 8,
         min_visual_score: float = 0.003,
         min_best_to_zero_delta: float = 0.004,
         min_visible_matches: int = 2,
+        min_offset: float = 0.05,
     ) -> Optional[SubtitleOffsetEstimate]:
         """Fast visual hard-sub offset estimate without OCR text recognition."""
         anchors = self._select_presence_offset_anchors(source_segments, max_segments=max_segments)
@@ -467,7 +471,7 @@ class OnScreenTextDetector:
             scores_by_offset.items(),
             key=lambda item: item[1][0],
         )
-        if abs(best_offset) < 0.12:
+        if abs(best_offset) < min_offset:
             return None
         if best_visible < min_visible_matches or best_score < min_visual_score:
             return None
@@ -479,7 +483,7 @@ class OnScreenTextDetector:
             offset=round(best_offset, 3),
             confidence=round(confidence, 3),
             matches=best_visible,
-            apply_after=anchors[0][0],
+            apply_after=None,
         )
         self.logger.info(
             "OnScreenTextDetector: estimated hard-sub visual offset %.2fs "
@@ -864,6 +868,105 @@ class OnScreenTextDetector:
             len(undetected_windows),
             "filled via fallback" if (fill_undetected_windows and detected_x0s) else "skipped",
         )
+        return regions
+
+    def detect_persistent_text_regions(
+        self,
+        video_path: Path,
+        duration: float,
+        sample_count: int = 6,
+        min_seen_ratio: float = 0.45,
+        ignore_region_fractional: Tuple[float, float, float, float] = (0.08, 0.55, 0.92, 0.96),
+        padding_fractional: float = 0.012,
+    ) -> List[Tuple[float, float, float, float]]:
+        """Detect static non-subtitle text/watermarks that persist across a video.
+
+        This targets channel titles/logos and faint creator watermarks. It
+        samples frames across the whole video, clusters OCR boxes by position,
+        and returns only clusters seen in several sampled frames. The normal
+        subtitle band is ignored so dialogue captions are not mistaken for a
+        persistent watermark.
+        """
+        video_path = Path(video_path).resolve()
+        dims = self._get_video_dimensions(video_path)
+        if dims is None or duration <= 0:
+            return []
+        frame_w, frame_h = dims
+        sample_count = max(3, sample_count)
+        min_seen = max(2, int(round(sample_count * min_seen_ratio)))
+        times = [duration * (idx + 1) / (sample_count + 1) for idx in range(sample_count)]
+
+        def outside_ignored_region(box: Tuple[int, int, int, int]) -> bool:
+            fx0, fy0, fx1, fy1 = ignore_region_fractional
+            cx = (box[0] + box[2]) / 2.0 / frame_w
+            cy = (box[1] + box[3]) / 2.0 / frame_h
+            return not (fx0 <= cx <= fx1 and fy0 <= cy <= fy1)
+
+        clusters: List[Dict[str, object]] = []
+
+        def matches_cluster(box: Tuple[int, int, int, int], cluster: Dict[str, object]) -> bool:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            ccx, ccy = cluster["center"]  # type: ignore[misc]
+            return abs(cx - ccx) <= frame_w * 0.08 and abs(cy - ccy) <= frame_h * 0.08
+
+        with tempfile.TemporaryDirectory(prefix="persistent_text_") as tmp:
+            tmp_dir = Path(tmp)
+            for sample_index, t in enumerate(times):
+                frame_path = tmp_dir / f"persistent_{sample_index}.png"
+                if not self._extract_frame(video_path, t, frame_path):
+                    continue
+                boxes = self._detect_boxes_in_frame(frame_path)
+                boxes = self._drop_implausible_boxes(
+                    boxes,
+                    frame_w,
+                    frame_h,
+                    max_single_box_width_ratio=0.55,
+                    max_single_box_height_ratio=0.18,
+                )
+                boxes = [box for box in boxes if outside_ignored_region(box)]
+                for box in boxes:
+                    matched = None
+                    for cluster in clusters:
+                        if matches_cluster(box, cluster):
+                            matched = cluster
+                            break
+                    if matched is None:
+                        cx = (box[0] + box[2]) / 2.0
+                        cy = (box[1] + box[3]) / 2.0
+                        clusters.append({
+                            "box": box,
+                            "center": (cx, cy),
+                            "seen": {sample_index},
+                        })
+                        continue
+                    x0, y0, x1, y1 = matched["box"]  # type: ignore[misc]
+                    merged = (
+                        min(x0, box[0]),
+                        min(y0, box[1]),
+                        max(x1, box[2]),
+                        max(y1, box[3]),
+                    )
+                    matched["box"] = merged
+                    matched["center"] = ((merged[0] + merged[2]) / 2.0, (merged[1] + merged[3]) / 2.0)
+                    matched["seen"].add(sample_index)  # type: ignore[union-attr]
+
+        pad_x = frame_w * padding_fractional
+        pad_y = frame_h * padding_fractional
+        regions: List[Tuple[float, float, float, float]] = []
+        for cluster in clusters:
+            seen = cluster["seen"]  # type: ignore[assignment]
+            if len(seen) < min_seen:
+                continue
+            x0, y0, x1, y1 = cluster["box"]  # type: ignore[misc]
+            regions.append((
+                max(0.0, (x0 - pad_x) / frame_w),
+                max(0.0, (y0 - pad_y) / frame_h),
+                min(1.0, (x1 + pad_x) / frame_w),
+                min(1.0, (y1 + pad_y) / frame_h),
+            ))
+
+        self.logger.info("OnScreenTextDetector: detected %d persistent text/watermark region(s)", len(regions))
         return regions
 
     def _drop_implausible_boxes(

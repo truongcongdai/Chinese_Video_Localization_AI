@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from universal_video_ai.mixer.service import (
-    MixerService, MixerConfig, AudioMix, DubbedBackgroundMix,
+    MixerService, MixerConfig, AudioMix, DubbedBackgroundMix, TimedAudioClip,
 )
 
 
@@ -112,3 +112,37 @@ def test_build_source_effects_bed_mixes_non_vocal_stems(tmp_path: Path, monkeypa
     assert captured["op_name"] == "build_source_effects_bed"
     assert "amix=inputs=3" in filter_graph
     assert "volume=0.7000" in filter_graph
+
+
+def test_build_dubbed_track_trims_clip_before_next_start(tmp_path: Path, monkeypatch) -> None:
+    first = tmp_path / "first.wav"
+    second = tmp_path / "second.wav"
+    output = tmp_path / "dub.wav"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    service = MixerService(MixerConfig(min_tts_gap_seconds=0.03))
+    monkeypatch.setattr(service, "_ffmpeg_available", True)
+    monkeypatch.setattr(service, "_probe_duration", lambda path: 1.2 if path == first else 0.4)
+    captured = {}
+
+    def fake_run(cmd, op_name):
+        captured["cmd"] = cmd
+        output.write_bytes(b"dub")
+
+    monkeypatch.setattr(service, "_run_ffmpeg", fake_run)
+
+    result = service.build_dubbed_track(
+        [
+            TimedAudioClip(start=1.0, end=2.0, audio_path=first),
+            TimedAudioClip(start=2.0, end=2.6, audio_path=second),
+        ],
+        total_duration=3.0,
+        output_path=output,
+    )
+
+    filter_graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+    assert result == output.resolve()
+    assert "atempo=1.2371" in filter_graph
+    assert "atrim=duration=0.970" in filter_graph
+    assert "adelay=1000|1000" in filter_graph

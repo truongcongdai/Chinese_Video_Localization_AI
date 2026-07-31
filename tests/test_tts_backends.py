@@ -128,3 +128,26 @@ def test_tts_config_with_api_key():
     assert config.provider == "azure"
     assert config.api_key == "test_key"
     assert config.region == "westus"
+
+
+def test_edge_backend_uses_slightly_faster_vietnamese_default(tmp_path: Path, monkeypatch):
+    from universal_video_ai.tts.backend import EdgeTTSBackend
+
+    captured = {}
+
+    def fake_synthesize(self, text, output_path, voice=None, rate=None, pitch=None):
+        captured.update({"voice": voice, "rate": rate, "pitch": pitch})
+        output_path.write_bytes(b"audio")
+        return output_path
+
+    monkeypatch.setattr(EdgeTTS, "synthesize", fake_synthesize)
+
+    backend = EdgeTTSBackend()
+    result = backend.synthesize("Xin chào", tmp_path / "out.wav", language="vi")
+
+    assert result.exists()
+    assert captured == {
+        "voice": "vi-VN-HoaiMyNeural",
+        "rate": "-3%",
+        "pitch": "+2Hz",
+    }

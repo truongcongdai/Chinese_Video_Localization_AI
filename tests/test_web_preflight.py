@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 
 from universal_video_ai.web import app as web_app
 
@@ -56,6 +57,78 @@ def test_preflight_warns_when_contextual_translation_ollama_is_down(monkeypatch)
     assert "ollama_unavailable" in {issue["code"] for issue in report["issues"]}
     issue = next(issue for issue in report["issues"] if issue["code"] == "ollama_unavailable")
     assert issue["severity"] == "warning"
+
+
+def test_preflight_surfaces_remix_plan_for_long_form(monkeypatch):
+    monkeypatch.setattr(web_app.store, "get_provider_settings", lambda user_id, provider: None)
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
+    monkeypatch.setattr(
+        web_app.requests,
+        "get",
+        lambda url, timeout: (_ for _ in ()).throw(web_app.requests.exceptions.ConnectionError("refused")),
+    )
+
+    report = web_app._job_preflight_report(
+        1,
+        web_app.NewJobBody(
+            url="https://example.com/video.mp4",
+            remix_enabled=True,
+            remix_platforms=["youtube_long", "facebook_long", "youtube_shorts"],
+            remix_goal="education",
+            remix_strength="strong",
+            processing_mode="fast",
+            translation_mode="contextual",
+            tts_provider="edge",
+        ),
+        url_count=1,
+    )
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert report["ok"] is True
+    assert "remix_plan" in codes
+    assert "long_form_quality" in codes
+
+
+def test_create_job_remix_applies_visible_transform_defaults(monkeypatch):
+    captured = {}
+
+    def fake_create_job(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id="job123", to_dict=lambda: {"id": "job123"})
+
+    def fake_create_task(coro):
+        coro.close()
+        return SimpleNamespace(cancel=lambda: None)
+
+    monkeypatch.setattr(web_app.store, "get_provider_settings", lambda user_id, provider: None)
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
+    monkeypatch.setattr(web_app.store, "create_job", fake_create_job)
+    monkeypatch.setattr(web_app.store, "adjust_credits", lambda user_id, delta: 998)
+    monkeypatch.setattr(web_app.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        web_app.requests,
+        "get",
+        lambda url, timeout: (_ for _ in ()).throw(web_app.requests.exceptions.ConnectionError("refused")),
+    )
+
+    result = asyncio.run(web_app.create_job(
+        web_app.NewJobBody(
+            url="https://example.com/video.mp4",
+            remix_enabled=True,
+            remix_platforms=["tiktok"],
+            remix_strength="strong",
+            tts_provider="edge",
+        ),
+        user_id=1,
+    ))
+
+    assert result == {"id": "job123"}
+    assert captured["remix_enabled"] is True
+    assert captured["translation_mode"] == "contextual"
+    assert captured["video_template_config"]["color_effect"] == "high_contrast"
+    assert captured["transform_config"]["enable_randomization"] is True
+    assert captured["transform_config"]["crop_percent"] == 1.2
+    assert captured["transform_config"]["speed_factor"] == 1.0
 
 
 def test_preflight_blocks_gemini_mode_without_saved_key(monkeypatch):
@@ -165,6 +238,7 @@ def test_build_service_uses_strict_gemini_adapter(monkeypatch):
         translation_tone="natural",
         translation_audience=None,
         translation_glossary=None,
+        subtitle_offset_seconds=0.0,
     )
 
     service = web_app._build_service_for_job(job)
@@ -172,3 +246,4 @@ def test_build_service_uses_strict_gemini_adapter(monkeypatch):
     assert service.segment_adapter.config.provider == "gemini"
     assert service.segment_adapter.config.model == "gemini-3.1-flash-lite"
     assert service.segment_adapter.config.fallback_on_error is False
+    assert service.config.global_subtitle_offset == 0.0

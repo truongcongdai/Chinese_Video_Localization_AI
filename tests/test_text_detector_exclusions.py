@@ -64,6 +64,82 @@ class TextDetectorExclusionTests(unittest.TestCase):
 
         self.assertEqual(kept, boxes)
 
+    def test_presence_offset_estimator_accepts_point_one_second_offset(self) -> None:
+        detector = OnScreenTextDetector()
+        detector._select_presence_offset_anchors = (
+            lambda source_segments, max_segments: [(0.0, 1.0, "柳夫人"), (2.0, 3.0, "你糊弄我")]
+        )
+        detector._offset_candidates = lambda search_radius, step: [0.0, 0.1]
+        detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_bytes(b"x") or True
+        detector._subtitle_presence_score = (
+            lambda frame_path: 0.010
+            if frame_path.name in {"presence_2.jpg", "presence_3.jpg"} else 0.003
+        )
+
+        estimate = detector._estimate_subtitle_time_offset_by_presence(
+            __file__,
+            [(0.0, 1.0, "柳夫人"), (2.0, 3.0, "你糊弄我")],
+            search_radius=0.2,
+            step=0.1,
+            refine_step=0.1,
+            min_offset=0.05,
+            min_best_to_zero_delta=0.001,
+        )
+
+        self.assertIsNotNone(estimate)
+        self.assertEqual(estimate.offset, 0.1)
+        self.assertIsNone(estimate.apply_after)
+
+    def test_presence_offset_estimator_accepts_point_zero_five_second_offset(self) -> None:
+        detector = OnScreenTextDetector()
+        detector._select_presence_offset_anchors = (
+            lambda source_segments, max_segments: [(0.0, 1.0, "柳夫人")]
+        )
+        detector._offset_candidates = lambda search_radius, step: [0.0]
+        detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_text(
+            f"{at_seconds:.2f}", encoding="utf-8"
+        ) or True
+
+        def score(frame_path):
+            timestamp = float(frame_path.read_text(encoding="utf-8"))
+            return 0.010 if abs(timestamp - 0.55) < 0.001 else 0.003
+
+        detector._subtitle_presence_score = score
+
+        estimate = detector._estimate_subtitle_time_offset_by_presence(
+            __file__,
+            [(0.0, 1.0, "柳夫人")],
+            search_radius=0.1,
+            step=0.1,
+            refine_step=0.05,
+            min_offset=0.03,
+            min_best_to_zero_delta=0.001,
+            min_visible_matches=1,
+        )
+
+        self.assertIsNotNone(estimate)
+        self.assertEqual(estimate.offset, 0.05)
+
+    def test_presence_offset_estimator_is_limited_to_small_offsets(self) -> None:
+        detector = OnScreenTextDetector()
+        captured = {}
+
+        detector._estimate_subtitle_time_offset_by_presence = (
+            lambda video_path, source_segments, **kwargs: captured.update(kwargs) or None
+        )
+
+        estimate = detector.estimate_subtitle_time_offset(
+            __file__,
+            [(0.0, 1.0, "柳夫人"), (8.0, 9.0, "你糊弄我")],
+            search_radius=12.0,
+            use_text_ocr_fallback=False,
+            min_offset=0.05,
+        )
+
+        self.assertIsNone(estimate)
+        self.assertEqual(captured["search_radius"], 1.0)
+        self.assertEqual(captured["min_offset"], 0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

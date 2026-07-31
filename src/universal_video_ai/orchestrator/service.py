@@ -1,7 +1,7 @@
 # src/universal_video_ai/orchestrator/service.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import asyncio
 import logging
 import os
@@ -136,10 +136,25 @@ class LocalizationConfig:
     max_subtitle_alignment_offset: float = 12.0
     # Offsets below this are usually decoder/ASR boundary noise rather than a
     # separate hard-subtitle layer delay.
-    min_subtitle_alignment_offset: float = 0.05
+    min_subtitle_alignment_offset: float = 0.03
+    # Minimum confidence required for subtitle offset detection to be applied.
+    # Prevents applying unreliable offsets that would misalign subtitles.
+    min_subtitle_alignment_confidence: float = 0.50
     # Small offsets are shifted on the TTS clock too. Larger offsets stay
     # visual-only to avoid moving dubbed speech away from the real audio.
     max_audio_sync_offset: float = 1.0
+    # Optional visual-only padding for burned-subtitle cover/subtitle windows.
+    # Defaults to 0 so generated subtitle timestamps stay exactly on the
+    # detected source-subtitle timeline. Non-zero values are only for users
+    # who explicitly prefer wider cover boxes over exact subtitle timing.
+    visual_subtitle_timing_padding: float = 0.0
+    # Global offset to apply to all subtitle timestamps when OCR alignment
+    # is disabled or not working. Positive values shift subtitles later,
+    # negative values shift them earlier. Use this when Whisper timestamps
+    # are consistently off from the actual audio/subtitle timing.
+    global_subtitle_offset: float = 0.0
+    auto_blur_static_text: bool = True
+    static_text_blur_samples: int = 6
     # Duration-aware subtitle/dub guardrail. This runs after base translation
     # and optional LLM adaptation so every segment is checked against its
     # original timestamp before subtitles and TTS are generated.
@@ -466,6 +481,7 @@ class LocalizationService:
         audio_source_segments: List[TranscriptSegment] = [
             s for s in (audio_result.segments or []) if s.has_timing
         ]
+        
         self._last_subtitle_alignment_estimate = None
         visual_source_segments = self._align_source_segments_to_burned_subtitles(
             video_path=download_result.video_path,
@@ -521,14 +537,14 @@ class LocalizationService:
                             translated_segments,
                             self.config.speech_fit,
                         )
-                        tts_segments = self._maybe_apply_audio_sync_offset(
-                            translated_segments,
-                            audio_duration=audio_result.audio_result.duration,
-                        )
+                        # First align to visual timeline (burned-in subtitles)
                         translated_segments = self._retime_segments(
                             translated_segments,
                             visual_source_segments,
                         )
+                        # TTS segments use the same visual timeline (no separate audio sync offset)
+                        # The visual timeline already accounts for burned-in subtitle offset
+                        tts_segments = translated_segments
                         translated_text = " ".join(s.text for s in translated_segments if s.text)
                     else:
                         # Fallback: no real per-sentence timing available (e.g. a
@@ -577,6 +593,42 @@ class LocalizationService:
             for text, timing in zip(text_segments, timing_segments)
         ]
 
+    @staticmethod
+    def _pad_visual_segments(
+        segments: List[TranscriptSegment],
+        audio_duration: float,
+        padding: float,
+    ) -> List[TranscriptSegment]:
+        if not segments or padding <= 0:
+            return segments
+
+        padded = [
+            TranscriptSegment(
+                start=max(0.0, s.start - padding),
+                end=min(audio_duration, s.end + padding),
+                text=s.text,
+            )
+            for s in sorted(segments, key=lambda item: item.start)
+        ]
+
+        for idx in range(1, len(padded)):
+            previous = padded[idx - 1]
+            current = padded[idx]
+            if previous.end <= current.start:
+                continue
+            boundary = (previous.end + current.start) / 2.0
+            padded[idx - 1] = TranscriptSegment(
+                start=previous.start,
+                end=max(previous.start, boundary),
+                text=previous.text,
+            )
+            padded[idx] = TranscriptSegment(
+                start=min(current.end, boundary),
+                end=current.end,
+                text=current.text,
+            )
+        return padded
+
     def _maybe_apply_audio_sync_offset(
         self,
         segments: Optional[List[TranscriptSegment]],
@@ -623,11 +675,29 @@ class LocalizationService:
         apply it to every segment; if OCR cannot prove a reliable offset, the
         original ASR timing is kept.
         """
+        if not source_segments:
+            return source_segments
+        
+        # Apply global offset if configured (when OCR alignment is disabled)
+        if self.config.global_subtitle_offset != 0.0:
+            offset = self.config.global_subtitle_offset
+            self.logger.info(
+                "LocalizationService: applying global subtitle offset %.2fs",
+                offset,
+            )
+            return [
+                TranscriptSegment(
+                    start=max(0.0, min(audio_duration, s.start + offset)),
+                    end=max(0.0, min(audio_duration, s.end + offset)),
+                    text=s.text,
+                )
+                for s in source_segments
+            ]
+        
         if (
             not self.config.align_to_burned_subtitles
             or not self.config.enable_text_cover
             or not video_path
-            or not source_segments
         ):
             return source_segments
 
@@ -645,12 +715,19 @@ class LocalizationService:
                 [(s.start, s.end, s.text) for s in source_segments],
                 search_radius=self.config.max_subtitle_alignment_offset,
                 exclude_regions_fractional=self.config.watermark_exclude_regions_fractional,
+                min_offset=self.config.min_subtitle_alignment_offset,
             )
         except Exception as exc:
             self.logger.warning("Burned-subtitle timing alignment failed; keeping ASR timing: %s", exc)
             return source_segments
 
         if estimate is None or abs(estimate.offset) < self.config.min_subtitle_alignment_offset:
+            return source_segments
+        if estimate.confidence < self.config.min_subtitle_alignment_confidence:
+            self.logger.info(
+                "LocalizationService: skipping subtitle offset %.2fs due to low confidence %.2f (threshold=%.2f)",
+                estimate.offset, estimate.confidence, self.config.min_subtitle_alignment_confidence,
+            )
             return source_segments
         self._last_subtitle_alignment_estimate = estimate
 
@@ -702,6 +779,18 @@ class LocalizationService:
             translated_text = prepared.translated_text
             tts_segments = prepared.tts_segments or translated_segments
 
+        visual_timing_padding = self._visual_timing_padding_for_current_video()
+        visual_translated_segments = self._pad_visual_segments(
+            translated_segments or [],
+            audio_duration=audio_result.audio_result.duration,
+            padding=visual_timing_padding,
+        ) if translated_segments else None
+        visual_source_segments = self._pad_visual_segments(
+            source_segments,
+            audio_duration=audio_result.audio_result.duration,
+            padding=visual_timing_padding,
+        )
+
         tts_audio_path: Optional[Path] = None
 
         # Step 4: Synthesize TTS from translated text, anchored to the
@@ -745,9 +834,9 @@ class LocalizationService:
         if self.config.generate_subtitles and (translated_segments or translated_text or audio_result.transcript):
             self._progress(75, "Đang tạo phụ đề...")
             self.logger.info("LocalizationService: generating subtitles")
-            if translated_segments:
+            if visual_translated_segments:
                 subtitle_segments = self.timeline.from_segments(
-                    translated_segments, audio_duration=audio_result.audio_result.duration
+                    visual_translated_segments, audio_duration=audio_result.audio_result.duration
                 )
             else:
                 # Fallback: even-split heuristic over whichever text we have
@@ -776,14 +865,14 @@ class LocalizationService:
         text_overlays: Optional[List[TextOverlay]] = None
         if (
             self.config.enable_text_cover
-            and translated_segments
-            and source_segments
+            and visual_translated_segments
+            and visual_source_segments
             and download_result.video_path
         ):
             text_overlays = self._build_text_overlays(
                 video_path=download_result.video_path,
-                source_segments=source_segments,
-                translated_segments=translated_segments,
+                source_segments=visual_source_segments,
+                translated_segments=visual_translated_segments,
                 detected_language=audio_result.detected_language,
             )
             if text_overlays and subtitles_path and subtitle_segments:
@@ -904,6 +993,17 @@ class LocalizationService:
                 try:
                     # Use mixed audio if available, otherwise use TTS audio, otherwise use original audio
                     audio_for_render = mixed_audio_path or tts_audio_path or audio_result.audio_result.audio_path
+                    static_text_boxes = self._detect_static_text_watermark_boxes(
+                        video_path=download_result.video_path,
+                        detected_language=audio_result.detected_language,
+                        duration=audio_result.audio_result.duration,
+                    )
+                    if static_text_boxes:
+                        existing_boxes = tuple(self.renderer.config.watermark_boxes_fractional or ())
+                        self.renderer.config = replace(
+                            self.renderer.config,
+                            watermark_boxes_fractional=existing_boxes + tuple(static_text_boxes),
+                        )
 
                     # Avoid double-showing the translation: where an
                     # OCR-based text_overlay successfully covers the
@@ -1106,6 +1206,46 @@ class LocalizationService:
             if not covered:
                 uncovered.append(seg)
         return uncovered
+
+    def _visual_timing_padding_for_current_video(self) -> float:
+        estimate = self._last_subtitle_alignment_estimate
+        if estimate is None:
+            return 0.0
+        offset = abs(float(getattr(estimate, "offset", 0.0) or 0.0))
+        if offset < self.config.min_subtitle_alignment_offset:
+            return 0.0
+        return max(0.0, self.config.visual_subtitle_timing_padding)
+
+    def _detect_static_text_watermark_boxes(
+        self,
+        video_path: Optional[Path],
+        detected_language: Optional[str],
+        duration: float,
+    ) -> Tuple[Tuple[float, float, float, float], ...]:
+        if (
+            not self.config.auto_blur_static_text
+            or not self.config.enable_text_cover
+            or not video_path
+            or duration <= 0
+        ):
+            return ()
+        if self.text_detector is not None:
+            detector = self.text_detector
+        else:
+            resolved_ocr_languages = ocr_language_map.resolve_ocr_languages(
+                self.config.ocr_languages, detected_language
+            )
+            detector = OnScreenTextDetector(languages=resolved_ocr_languages)
+        try:
+            boxes = detector.detect_persistent_text_regions(
+                video_path,
+                duration=duration,
+                sample_count=self.config.static_text_blur_samples,
+            )
+        except Exception as exc:
+            self.logger.warning("Persistent text/watermark detection failed; skipping static blur: %s", exc)
+            return ()
+        return tuple(boxes)
 
     def _build_text_overlays(
         self,
