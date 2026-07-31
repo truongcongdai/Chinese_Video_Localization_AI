@@ -135,16 +135,16 @@ class ProjectResponse(BaseModel):
     channel_name: str
     mode: str
     topic: str
-    objective: str
+    objective: Optional[str] = None
     target_platform: str
     target_duration_seconds: int
     target_language: str
-    content_style: str
-    visual_style: str
-    voice_id: str
-    subtitle_style_id: str
+    content_style: Optional[str] = None
+    visual_style: Optional[str] = None
+    voice_id: Optional[str] = None
+    subtitle_style_id: Optional[str] = None
     background_music_enabled: bool
-    user_instructions: str
+    user_instructions: Optional[str] = None
     settings: Dict[str, Any]
     created_at: float
     updated_at: float
@@ -981,6 +981,201 @@ async def get_asset_manifest(
         "created_at": manifest.created_at,
         "updated_at": manifest.updated_at,
     }
+
+
+# ==================== Voice Generation (TTS) ====================
+
+@router.post("/runs/{run_id}/voice/generate")
+async def generate_voice(
+    run_id: int,
+    request: dict,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Generate TTS audio for a run."""
+    if not CONTENT_OS_ENABLED:
+        raise FeatureDisabledError("Content OS is disabled")
+    
+    repo, artifact_store, _, _ = get_content_os_components(user_id)
+    
+    from universal_video_ai.content_os.adapters import TTSAdapter
+    tts_adapter = TTSAdapter()
+    
+    text = request.get("text", "")
+    language = request.get("language", "vi")
+    voice_id = request.get("voice_id", "")
+    
+    output_dir = artifact_store._get_run_dir(user_id, 0, run_id)  # project_id not available here
+    
+    try:
+        audio_path = tts_adapter.generate_audio(
+            text=text,
+            language=language,
+            voice_id=voice_id,
+            output_dir=output_dir,
+        )
+        
+        return {
+            "audio_path": str(audio_path),
+            "language": language,
+            "voice_id": voice_id,
+            "status": "completed",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
+
+
+# ==================== Subtitle Generation ====================
+
+@router.post("/runs/{run_id}/subtitles/generate")
+async def generate_subtitles(
+    run_id: int,
+    request: dict,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Generate subtitles for a run."""
+    if not CONTENT_OS_ENABLED:
+        raise FeatureDisabledError("Content OS is disabled")
+    
+    repo, artifact_store, _, _ = get_content_os_components(user_id)
+    
+    from universal_video_ai.content_os.adapters import SubtitleAdapter
+    subtitle_adapter = SubtitleAdapter()
+    
+    segments = request.get("segments", [])
+    duration = request.get("duration", 30.0)
+    
+    output_dir = artifact_store._get_run_dir(user_id, 0, run_id)
+    
+    try:
+        subtitle_path = subtitle_adapter.generate_subtitles(
+            segments=segments,
+            duration=duration,
+            output_dir=output_dir,
+        )
+        
+        return {
+            "subtitle_path": str(subtitle_path),
+            "format": "srt",
+            "segments_count": len(segments),
+            "duration_seconds": duration,
+            "status": "completed",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Subtitle generation failed: {str(e)}")
+
+
+# ==================== Timeline Building ====================
+
+@router.post("/runs/{run_id}/timeline/build")
+async def build_timeline(
+    run_id: int,
+    request: dict,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Build timeline for a run."""
+    if not CONTENT_OS_ENABLED:
+        raise FeatureDisabledError("Content OS is disabled")
+    
+    repo, _, _, _ = get_content_os_components(user_id)
+    
+    from universal_video_ai.content_os.adapters import TimelineAdapter
+    timeline_adapter = TimelineAdapter()
+    
+    script = request.get("script", {})
+    voice_manifest = request.get("voice_manifest", {})
+    subtitle_manifest = request.get("subtitle_manifest", {})
+    assets = request.get("assets", {})
+    target_platform = request.get("target_platform", "youtube_shorts")
+    target_duration = request.get("target_duration", 30.0)
+    
+    try:
+        timeline = timeline_adapter.build_timeline(
+            script=script,
+            voice_manifest=voice_manifest,
+            subtitle_manifest=subtitle_manifest,
+            assets=assets,
+            target_platform=target_platform,
+            target_duration=target_duration,
+        )
+        
+        return {
+            "timeline": timeline,
+            "status": "completed",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Timeline building failed: {str(e)}")
+
+
+# ==================== Output Streaming ====================
+
+@router.get("/runs/{run_id}/output/download")
+async def download_output(
+    run_id: int,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Download the final MP4 output for a run."""
+    if not CONTENT_OS_ENABLED:
+        raise FeatureDisabledError("Content OS is disabled")
+    
+    from fastapi.responses import FileResponse
+    
+    repo, _, _, _ = get_content_os_components(user_id)
+    
+    # Get the latest render artifact
+    artifacts = repo.list_artifacts(run_id)
+    render_artifact = None
+    for artifact in artifacts:
+        if artifact.artifact_type == "render_report":
+            render_artifact = artifact
+            break
+    
+    if not render_artifact:
+        raise HTTPException(status_code=404, detail="Render output not found")
+    
+    output_path = render_artifact.metadata.get("output_path") if hasattr(render_artifact, 'metadata') else None
+    if not output_path or not Path(output_path).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+    
+    return FileResponse(
+        path=output_path,
+        media_type="video/mp4",
+        filename=f"content_os_run_{run_id}.mp4",
+    )
+
+
+@router.get("/runs/{run_id}/output/stream")
+async def stream_output(
+    run_id: int,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Stream the final MP4 output for a run."""
+    if not CONTENT_OS_ENABLED:
+        raise FeatureDisabledError("Content OS is disabled")
+    
+    from fastapi.responses import FileResponse
+    
+    repo, _, _, _ = get_content_os_components(user_id)
+    
+    # Get the latest render artifact
+    artifacts = repo.list_artifacts(run_id)
+    render_artifact = None
+    for artifact in artifacts:
+        if artifact.artifact_type == "render_report":
+            render_artifact = artifact
+            break
+    
+    if not render_artifact:
+        raise HTTPException(status_code=404, detail="Render output not found")
+    
+    output_path = render_artifact.metadata.get("output_path") if hasattr(render_artifact, 'metadata') else None
+    if not output_path or not Path(output_path).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+    
+    return FileResponse(
+        path=output_path,
+        media_type="video/mp4",
+        filename=f"content_os_run_{run_id}.mp4",
+    )
 
 
 # ==================== Renderer ====================

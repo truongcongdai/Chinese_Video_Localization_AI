@@ -482,6 +482,21 @@ _MIGRATIONS = [
     ("jobs", "translation_tone", "ALTER TABLE jobs ADD COLUMN translation_tone TEXT DEFAULT 'natural'"),
     ("jobs", "translation_audience", "ALTER TABLE jobs ADD COLUMN translation_audience TEXT"),
     ("jobs", "translation_glossary", "ALTER TABLE jobs ADD COLUMN translation_glossary TEXT"),
+    # Content OS migrations - add missing columns
+    ("content_os_projects", "channel_id", "ALTER TABLE content_os_projects ADD COLUMN channel_id INTEGER"),
+    ("content_os_projects", "mode", "ALTER TABLE content_os_projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'ai_video'"),
+    ("content_os_projects", "objective", "ALTER TABLE content_os_projects ADD COLUMN objective TEXT"),
+    ("content_os_projects", "target_platform", "ALTER TABLE content_os_projects ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'youtube_shorts'"),
+    ("content_os_projects", "target_duration_seconds", "ALTER TABLE content_os_projects ADD COLUMN target_duration_seconds INTEGER NOT NULL DEFAULT 45"),
+    ("content_os_projects", "target_language", "ALTER TABLE content_os_projects ADD COLUMN target_language TEXT NOT NULL DEFAULT 'vi'"),
+    ("content_os_projects", "content_style", "ALTER TABLE content_os_projects ADD COLUMN content_style TEXT"),
+    ("content_os_projects", "visual_style", "ALTER TABLE content_os_projects ADD COLUMN visual_style TEXT"),
+    ("content_os_projects", "voice_id", "ALTER TABLE content_os_projects ADD COLUMN voice_id TEXT"),
+    ("content_os_projects", "subtitle_style_id", "ALTER TABLE content_os_projects ADD COLUMN subtitle_style_id TEXT"),
+    ("content_os_projects", "background_music_enabled", "ALTER TABLE content_os_projects ADD COLUMN background_music_enabled INTEGER NOT NULL DEFAULT 0"),
+    ("content_os_projects", "user_instructions", "ALTER TABLE content_os_projects ADD COLUMN user_instructions TEXT"),
+    ("content_os_projects", "settings_json", "ALTER TABLE content_os_projects ADD COLUMN settings_json TEXT"),
+    ("content_os_projects", "status", "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
     # Trend Scanner tables (new feature, no migration needed for fresh installs)
 ]
 
@@ -617,7 +632,7 @@ class Store:
             conn.executescript(SCHEMA)
             existing_cols = {
                 table: {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-                for table in ("users", "jobs")
+                for table in ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps", "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals", "content_os_memories")
             }
             ran_is_admin_migration = False
             for table, column, ddl in _MIGRATIONS:

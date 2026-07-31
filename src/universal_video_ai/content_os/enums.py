@@ -89,6 +89,7 @@ class AuditDecision(str, Enum):
 class ApprovalType(str, Enum):
     """Approval checkpoint types."""
     SCRIPT = "script"
+    STORYBOARD = "storyboard"
     RENDER = "render"
     PUBLISH = "publish"
 
@@ -121,6 +122,7 @@ class ArtifactType(str, Enum):
     REVISION_REPORT = "revision_report"
     STORYBOARD = "storyboard"
     ASSET_MANIFEST = "asset_manifest"
+    RESOLVED_ASSETS = "resolved_assets"
     VOICE_MANIFEST = "voice_manifest"
     SUBTITLE_MANIFEST = "subtitle_manifest"
     TIMELINE = "timeline"

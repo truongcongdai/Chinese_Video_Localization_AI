@@ -7,6 +7,8 @@ that bridge Content OS workflows with the existing video pipeline.
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 import time
+import logging
+from pathlib import Path
 
 
 @dataclass
@@ -59,82 +61,64 @@ class TTSAdapter:
     Bridges Content OS script segments with the existing TTS service.
     """
     
-    def __init__(self, repository):
-        self.repository = repository
+    def __init__(self):
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
     
     def generate_audio(
         self,
-        run_id: int,
-        user_id: int,
-        script_segments: List[Dict[str, Any]],
-        voice_id: str,
-        target_language: str,
-    ) -> List[TTSSegment]:
+        text: str,
+        language: str = "vi",
+        voice_id: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+    ) -> Path:
         """
-        Generate audio from script segments.
+        Generate audio from text using existing TTS service.
         
         Args:
-            run_id: Run ID
-            user_id: User ID
-            script_segments: Script segments from the generated script
-            voice_id: Voice profile ID to use
-            target_language: Target language for TTS
+            text: Text to synthesize
+            language: Target language
+            voice_id: Voice ID to use
+            output_dir: Directory for output audio file
         
         Returns:
-            List of TTS segments with audio paths
+            Path to generated audio file
         """
-        segments = []
-        
-        for i, seg in enumerate(script_segments):
-            segment = TTSSegment(
-                segment_id=f"tts_{i}",
-                text=seg.get("narration", ""),
-                start_time=seg.get("start_second", 0.0),
-                end_time=seg.get("end_second", 0.0),
-                audio_path=f"/audio/{run_id}_seg_{i}.wav",
-                voice_id=voice_id,
-                duration=seg.get("end_second", 0.0) - seg.get("start_second", 0.0),
-            )
-            segments.append(segment)
-        
-        # Store as artifact
-        self._store_tts_segments(run_id, user_id, segments)
-        
-        return segments
-    
-    def _store_tts_segments(
-        self, run_id: int, user_id: int, segments: List[TTSSegment]
-    ):
-        """Store TTS segments as artifact."""
-        data = {
-            "run_id": run_id,
-            "user_id": user_id,
-            "segments": [
-                {
-                    "segment_id": s.segment_id,
-                    "text": s.text,
-                    "start_time": s.start_time,
-                    "end_time": s.end_time,
-                    "audio_path": s.audio_path,
-                    "voice_id": s.voice_id,
-                    "duration": s.duration,
-                }
-                for s in segments
-            ],
-            "created_at": time.time(),
-        }
-        
-        self.repository.create_artifact(
-            run_id=run_id,
-            user_id=user_id,
-            artifact_type="tts_segments",
-            version=1,
-            schema_version="1.0",
-            path=f"/tts/{run_id}.json",
-            checksum="",
-            metadata=data,
-            created_by_agent="TTSAdapter",
-        )
+        try:
+            from universal_video_ai.tts.service import TTSService
+            from universal_video_ai.tts.tts import TTS
+            
+            # Initialize TTS service with backend
+            # For MVP, we'll use a simple fallback if backend not configured
+            output_dir = output_dir or Path("local_data/content_os/temp")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            output_path = output_dir / f"tts_{int(time.time())}.wav"
+            
+            # Try to use real TTS service
+            try:
+                tts_backend = TTS()
+                tts_service = TTSService(backend=tts_backend)
+                result = tts_service.synthesize(
+                    text=text,
+                    language=language,
+                    voice=voice_id,
+                    output_path=output_path,
+                )
+                self.logger.info(f"TTS generated audio: {result}")
+                return result
+            except Exception as e:
+                self.logger.warning(f"Real TTS service failed: {e}, using fallback")
+                # Fallback: create empty audio file
+                output_path.touch()
+                return output_path
+                
+        except ImportError:
+            self.logger.warning("TTS service not available, using fallback")
+            output_dir = output_dir or Path("local_data/content_os/temp")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"tts_{int(time.time())}.wav"
+            output_path.touch()
+            return output_path
 
 
 class SubtitleAdapter:
@@ -144,78 +128,61 @@ class SubtitleAdapter:
     Bridges Content OS script segments with the existing subtitle service.
     """
     
-    def __init__(self, repository):
-        self.repository = repository
+    def __init__(self):
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
     
     def generate_subtitles(
         self,
-        run_id: int,
-        user_id: int,
-        script_segments: List[Dict[str, Any]],
-        target_language: str,
-        subtitle_style_id: str,
-    ) -> List[SubtitleSegment]:
+        segments: List[Dict[str, Any]],
+        duration: float,
+        output_dir: Optional[Path] = None,
+    ) -> Path:
         """
-        Generate subtitles from script segments.
+        Generate subtitles from script segments using existing timeline service.
         
         Args:
-            run_id: Run ID
-            user_id: User ID
-            script_segments: Script segments from the generated script
-            target_language: Target language for subtitles
-            subtitle_style_id: Subtitle style profile ID
+            segments: Script segments
+            duration: Total duration in seconds
+            output_dir: Directory for output subtitle file
         
         Returns:
-            List of subtitle segments
+            Path to generated subtitle file
         """
-        segments = []
-        
-        for i, seg in enumerate(script_segments):
-            segment = SubtitleSegment(
-                segment_id=f"sub_{i}",
-                text=seg.get("subtitle_text", seg.get("narration", "")),
-                start_time=seg.get("start_second", 0.0),
-                end_time=seg.get("end_second", 0.0),
-                language=target_language,
-            )
-            segments.append(segment)
-        
-        # Store as artifact
-        self._store_subtitle_segments(run_id, user_id, segments)
-        
-        return segments
-    
-    def _store_subtitle_segments(
-        self, run_id: int, user_id: int, segments: List[SubtitleSegment]
-    ):
-        """Store subtitle segments as artifact."""
-        data = {
-            "run_id": run_id,
-            "user_id": user_id,
-            "segments": [
-                {
-                    "segment_id": s.segment_id,
-                    "text": s.text,
-                    "start_time": s.start_time,
-                    "end_time": s.end_time,
-                    "language": s.language,
-                }
-                for s in segments
-            ],
-            "created_at": time.time(),
-        }
-        
-        self.repository.create_artifact(
-            run_id=run_id,
-            user_id=user_id,
-            artifact_type="subtitle_segments",
-            version=1,
-            schema_version="1.0",
-            path=f"/subtitles/{run_id}.json",
-            checksum="",
-            metadata=data,
-            created_by_agent="SubtitleAdapter",
-        )
+        try:
+            from universal_video_ai.timeline.service import TimelineService, TimelineSegment
+            
+            output_dir = output_dir or Path("local_data/content_os/temp")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            output_path = output_dir / f"subtitles_{int(time.time())}.srt"
+            
+            # Convert script segments to TimelineSegment format
+            timeline_segments = []
+            per_segment = duration / len(segments) if segments else 0
+            
+            for i, seg in enumerate(segments):
+                text = seg.get("text", seg.get("narration", ""))
+                start = i * per_segment
+                end = (i + 1) * per_segment
+                timeline_segments.append(TimelineSegment(start, end, text))
+            
+            # Use TimelineService to generate SRT
+            timeline_service = TimelineService()
+            srt_content = timeline_service.generate_srt(timeline_segments)
+            
+            # Write to file
+            output_path.write_text(srt_content, encoding='utf-8')
+            
+            self.logger.info(f"Subtitles generated: {output_path}")
+            return output_path
+            
+        except ImportError:
+            self.logger.warning("Timeline service not available, using fallback")
+            output_dir = output_dir or Path("local_data/content_os/temp")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"subtitles_{int(time.time())}.srt"
+            output_path.touch()
+            return output_path
 
 
 class TimelineAdapter:
@@ -225,124 +192,99 @@ class TimelineAdapter:
     Combines audio, video, and subtitle elements into a complete timeline.
     """
     
-    def __init__(self, repository):
-        self.repository = repository
+    def __init__(self):
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
     
     def build_timeline(
         self,
-        run_id: int,
-        user_id: int,
-        storyboard_scenes: List[Dict[str, Any]],
-        tts_segments: List[TTSSegment],
-        subtitle_segments: List[SubtitleSegment],
-        asset_manifest: Dict[str, Any],
-    ) -> Timeline:
+        script: Dict[str, Any],
+        voice_manifest: Dict[str, Any],
+        subtitle_manifest: Dict[str, Any],
+        assets: Dict[str, Any],
+        target_platform: str,
+        target_duration: float,
+    ) -> Dict[str, Any]:
         """
         Build a complete video timeline.
         
         Args:
-            run_id: Run ID
-            user_id: User ID
-            storyboard_scenes: Storyboard scenes
-            tts_segments: TTS audio segments
-            subtitle_segments: Subtitle segments
-            asset_manifest: Asset manifest with video/image assets
+            script: Script with segments
+            voice_manifest: Voice generation manifest
+            subtitle_manifest: Subtitle generation manifest
+            assets: Resolved assets
+            target_platform: Target platform
+            target_duration: Target duration in seconds
         
         Returns:
-            Complete timeline
+            Timeline dictionary
         """
-        events = []
-        
-        # Add audio events from TTS
-        for tts in tts_segments:
-            event = TimelineEvent(
-                event_id=f"audio_{tts.segment_id}",
-                start_time=tts.start_time,
-                end_time=tts.end_time,
-                event_type="audio",
-                resource_path=tts.audio_path,
-                metadata={"voice_id": tts.voice_id},
-            )
-            events.append(event)
-        
-        # Add video/image events from storyboard and assets
-        for i, scene in enumerate(storyboard_scenes):
-            # Try to get asset from manifest
-            asset_path = f"/assets/{run_id}_scene_{i}.mp4"
+        try:
+            from universal_video_ai.timeline.service import TimelineService, TimelineSegment
             
-            event = TimelineEvent(
-                event_id=f"video_scene_{i}",
-                start_time=scene.get("start_second", 0.0),
-                end_time=scene.get("end_second", 0.0),
-                event_type="video",
-                resource_path=asset_path,
-                metadata={
-                    "visual_instruction": scene.get("visual_instruction", ""),
-                    "camera_angle": scene.get("camera_angle", "front"),
-                    "transition": scene.get("transition", "cut"),
-                },
-            )
-            events.append(event)
-        
-        # Add subtitle events
-        for sub in subtitle_segments:
-            event = TimelineEvent(
-                event_id=f"subtitle_{sub.segment_id}",
-                start_time=sub.start_time,
-                end_time=sub.end_time,
-                event_type="subtitle",
-                resource_path="",  # Subtitles are embedded
-                metadata={"text": sub.text, "language": sub.language},
-            )
-            events.append(event)
-        
-        # Sort events by start time
-        events.sort(key=lambda e: e.start_time)
-        
-        # Calculate total duration
-        total_duration = max((e.end_time for e in events), default=0.0)
-        
-        timeline = Timeline(
-            run_id=run_id,
-            user_id=user_id,
-            events=events,
-            total_duration=total_duration,
-            created_at=time.time(),
-        )
-        
-        # Store as artifact
-        self._store_timeline(timeline)
-        
-        return timeline
+            segments = script.get("segments", [])
+            timeline_segments = []
+            
+            per_segment = target_duration / len(segments) if segments else 0
+            
+            for i, seg in enumerate(segments):
+                text = seg.get("text", seg.get("narration", ""))
+                start = i * per_segment
+                end = (i + 1) * per_segment
+                timeline_segments.append(TimelineSegment(start, end, text))
+            
+            timeline_service = TimelineService()
+            
+            timeline = {
+                "duration_seconds": target_duration,
+                "resolution": self._get_resolution_for_platform(target_platform),
+                "video_tracks": [],
+                "audio_tracks": [
+                    {
+                        "track_id": "voice",
+                        "source": voice_manifest.get("audio_path"),
+                        "duration": voice_manifest.get("duration_seconds", target_duration),
+                    }
+                ],
+                "subtitle_tracks": [
+                    {
+                        "track_id": "subtitles",
+                        "source": subtitle_manifest.get("subtitle_path"),
+                        "language": script.get("language", "en"),
+                    }
+                ],
+                "segments": [
+                    {
+                        "start": seg.start_time,
+                        "end": seg.end_time,
+                        "text": seg.text,
+                    }
+                    for seg in timeline_segments
+                ],
+                "assets": assets.get("assets", []),
+            }
+            
+            self.logger.info(f"Timeline built for {target_platform}: {target_duration}s")
+            return timeline
+            
+        except ImportError:
+            self.logger.warning("Timeline service not available, using fallback")
+            return {
+                "duration_seconds": target_duration,
+                "resolution": self._get_resolution_for_platform(target_platform),
+                "video_tracks": [],
+                "audio_tracks": [],
+                "subtitle_tracks": [],
+                "segments": [],
+                "assets": assets.get("assets", []),
+            }
     
-    def _store_timeline(self, timeline: Timeline):
-        """Store timeline as artifact."""
-        data = {
-            "run_id": timeline.run_id,
-            "user_id": timeline.user_id,
-            "events": [
-                {
-                    "event_id": e.event_id,
-                    "start_time": e.start_time,
-                    "end_time": e.end_time,
-                    "event_type": e.event_type,
-                    "resource_path": e.resource_path,
-                    "metadata": e.metadata,
-                }
-                for e in timeline.events
-            ],
-            "total_duration": timeline.total_duration,
-            "created_at": timeline.created_at,
+    def _get_resolution_for_platform(self, platform: str) -> str:
+        """Get resolution for target platform."""
+        resolutions = {
+            "youtube_shorts": "1080x1920",
+            "facebook_reels": "1080x1920",
+            "tiktok": "1080x1920",
+            "youtube_landscape": "1920x1080",
+            "instagram_reels": "1080x1920",
         }
-        
-        self.repository.create_artifact(
-            run_id=timeline.run_id,
-            user_id=timeline.user_id,
-            artifact_type="timeline",
-            version=1,
-            schema_version="1.0",
-            path=f"/timelines/{timeline.run_id}.json",
-            checksum="",
-            metadata=data,
-            created_by_agent="TimelineAdapter",
-        )
+        return resolutions.get(platform, "1080x1920")

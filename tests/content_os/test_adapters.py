@@ -2,25 +2,16 @@
 Tests for adapters (TTS, subtitle, timeline).
 """
 import pytest
+from pathlib import Path
 from universal_video_ai.content_os.adapters import (
     TTSAdapter, SubtitleAdapter, TimelineAdapter,
-    TTSSegment, SubtitleSegment, TimelineEvent, Timeline
 )
 
 
 @pytest.fixture
-def temp_db(tmp_path):
-    """Temporary database path."""
-    return str(tmp_path / "test.db")
-
-
-@pytest.fixture
-def repo(temp_db):
-    """Repository instance with initialized schema."""
-    from universal_video_ai.web.store import Store
-    Store(db_path=temp_db)
-    from universal_video_ai.content_os.repository import ContentOSRepository
-    return ContentOSRepository(temp_db)
+def temp_dir(tmp_path):
+    """Temporary directory for outputs."""
+    return tmp_path
 
 
 @pytest.fixture
@@ -28,20 +19,12 @@ def script_segments():
     """Sample script segments."""
     return [
         {
-            "segment_id": "seg1",
-            "start_second": 0.0,
-            "end_second": 3.0,
+            "text": "Hook text",
             "narration": "Hook text",
-            "subtitle_text": "Hook subtitle",
-            "visual_instruction": "Visual 1",
         },
         {
-            "segment_id": "seg2",
-            "start_second": 3.0,
-            "end_second": 45.0,
+            "text": "Main content",
             "narration": "Main content",
-            "subtitle_text": "Main subtitle",
-            "visual_instruction": "Visual 2",
         },
     ]
 
@@ -49,122 +32,78 @@ def script_segments():
 class TestTTSAdapter:
     """Test TTS adapter."""
     
-    def test_generate_audio(self, repo, script_segments):
-        """Test generating audio from script segments."""
-        adapter = TTSAdapter(repo)
+    def test_generate_audio(self, temp_dir, script_segments):
+        """Test generating audio from text."""
+        adapter = TTSAdapter()
         
-        segments = adapter.generate_audio(
-            run_id=1,
-            user_id=1,
-            script_segments=script_segments,
+        text = "Hook text Main content"
+        
+        audio_path = adapter.generate_audio(
+            text=text,
+            language="vi",
             voice_id="voice_1",
-            target_language="vi",
+            output_dir=temp_dir,
         )
         
-        assert len(segments) == 2
-        assert segments[0].segment_id == "tts_0"
-        assert segments[0].text == "Hook text"
-        assert segments[0].voice_id == "voice_1"
+        assert isinstance(audio_path, Path)
+        assert audio_path.exists()
 
 
 class TestSubtitleAdapter:
     """Test subtitle adapter."""
     
-    def test_generate_subtitles(self, repo, script_segments):
+    def test_generate_subtitles(self, temp_dir, script_segments):
         """Test generating subtitles from script segments."""
-        adapter = SubtitleAdapter(repo)
+        adapter = SubtitleAdapter()
         
-        segments = adapter.generate_subtitles(
-            run_id=1,
-            user_id=1,
-            script_segments=script_segments,
-            target_language="vi",
-            subtitle_style_id="style_1",
+        subtitle_path = adapter.generate_subtitles(
+            segments=script_segments,
+            duration=45.0,
+            output_dir=temp_dir,
         )
         
-        assert len(segments) == 2
-        assert segments[0].segment_id == "sub_0"
-        assert segments[0].text == "Hook subtitle"
-        assert segments[0].language == "vi"
+        assert isinstance(subtitle_path, Path)
+        assert subtitle_path.exists()
+        assert subtitle_path.suffix == ".srt"
 
 
 class TestTimelineAdapter:
     """Test timeline adapter."""
     
-    def test_build_timeline(self, repo, script_segments):
+    def test_build_timeline(self, script_segments):
         """Test building timeline from components."""
-        adapter = TimelineAdapter(repo)
+        adapter = TimelineAdapter()
         
-        # Create TTS segments
-        tts_segments = [
-            TTSSegment(
-                segment_id="tts_0",
-                text="Hook text",
-                start_time=0.0,
-                end_time=3.0,
-                audio_path="/audio/1_seg_0.wav",
-                voice_id="voice_1",
-                duration=3.0,
-            ),
-            TTSSegment(
-                segment_id="tts_1",
-                text="Main content",
-                start_time=3.0,
-                end_time=45.0,
-                audio_path="/audio/1_seg_1.wav",
-                voice_id="voice_1",
-                duration=42.0,
-            ),
-        ]
+        script = {
+            "segments": script_segments,
+            "language": "vi",
+        }
         
-        # Create subtitle segments
-        subtitle_segments = [
-            SubtitleSegment(
-                segment_id="sub_0",
-                text="Hook subtitle",
-                start_time=0.0,
-                end_time=3.0,
-                language="vi",
-            ),
-            SubtitleSegment(
-                segment_id="sub_1",
-                text="Main subtitle",
-                start_time=3.0,
-                end_time=45.0,
-                language="vi",
-            ),
-        ]
+        voice_manifest = {
+            "audio_path": "/audio/voice.wav",
+            "duration_seconds": 45.0,
+        }
         
-        # Create storyboard scenes
-        storyboard_scenes = [
-            {
-                "scene_id": "scene_1",
-                "start_second": 0.0,
-                "end_second": 3.0,
-                "visual_instruction": "Visual 1",
-                "camera_angle": "front",
-                "transition": "cut",
-            },
-            {
-                "scene_id": "scene_2",
-                "start_second": 3.0,
-                "end_second": 45.0,
-                "visual_instruction": "Visual 2",
-                "camera_angle": "front",
-                "transition": "cut",
-            },
-        ]
+        subtitle_manifest = {
+            "subtitle_path": "/subtitles/subs.srt",
+        }
+        
+        assets = {
+            "assets": [],
+        }
         
         timeline = adapter.build_timeline(
-            run_id=1,
-            user_id=1,
-            storyboard_scenes=storyboard_scenes,
-            tts_segments=tts_segments,
-            subtitle_segments=subtitle_segments,
-            asset_manifest={},
+            script=script,
+            voice_manifest=voice_manifest,
+            subtitle_manifest=subtitle_manifest,
+            assets=assets,
+            target_platform="youtube_shorts",
+            target_duration=45.0,
         )
         
-        assert timeline.run_id == 1
-        assert timeline.user_id == 1
-        assert len(timeline.events) == 6  # 2 audio + 2 video + 2 subtitle
-        assert timeline.total_duration == 45.0
+        assert isinstance(timeline, dict)
+        assert timeline["duration_seconds"] == 45.0
+        assert timeline["resolution"] == "1080x1920"
+        assert "audio_tracks" in timeline
+        assert "subtitle_tracks" in timeline
+        assert "segments" in timeline

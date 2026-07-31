@@ -7,6 +7,9 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
 import time
+import subprocess
+import logging
+from pathlib import Path
 
 
 class RenderStatus(str, Enum):
@@ -66,6 +69,7 @@ class Renderer:
     
     def __init__(self, repository):
         self.repository = repository
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
     
     def submit_render_job(
         self,
@@ -121,15 +125,60 @@ class Renderer:
         job.progress = 0.0
         job.started_at = time.time()
         
-        # In a real implementation, this would trigger the actual renderer
-        # For now, simulate completion
-        job.status = RenderStatus.COMPLETED
-        job.progress = 100.0
-        job.completed_at = time.time()
+        self.logger.info(f"Starting render job {job.job_id} to {job.output_path}")
+        
+        try:
+            # For MVP, create a simple text-based video using FFmpeg
+            # In production, this would use the full timeline with existing renderer
+            self._create_simple_video(job.output_path, job.metadata.get("resolution", "1080x1920"))
+            
+            job.status = RenderStatus.COMPLETED
+            job.progress = 100.0
+            job.completed_at = time.time()
+            self.logger.info(f"Render job {job.job_id} completed successfully")
+        except Exception as e:
+            self.logger.error(f"Render job {job.job_id} failed: {e}")
+            job.status = RenderStatus.FAILED
+            job.error_message = str(e)
+            job.completed_at = time.time()
         
         self._store_render_job(job)
         
         return job
+    
+    def _create_simple_video(self, output_path: str, resolution: str) -> None:
+        """
+        Create a simple video with text overlay using FFmpeg.
+        
+        This is a minimal implementation for MVP. In production, this would
+        use the full timeline integration with existing render/renderer.py.
+        """
+        width, height = resolution.split("x")
+        
+        # Create a simple video with colored background and text
+        cmd = [
+            "ffmpeg",
+            "-f", "lavfi",
+            "-i", f"color=c=blue:s={resolution}:d=5:r=30",
+            "-vf", f"drawtext=text='Content OS Demo':fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2",
+            "-c:v", "libx264",
+            "-t", "5",
+            "-pix_fmt", "yuv420p",
+            "-y",
+            str(output_path),
+        ]
+        
+        self.logger.debug(f"Running FFmpeg command: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed: {result.stderr}")
     
     def _store_render_job(self, job: RenderJob):
         """Store render job as artifact."""
@@ -236,7 +285,7 @@ class MP4Validator:
     """
     
     def __init__(self):
-        pass
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
     
     def validate(
         self,
@@ -246,7 +295,7 @@ class MP4Validator:
         max_bitrate: int = 5000,
     ) -> ValidationResult:
         """
-        Validate an MP4 file.
+        Validate an MP4 file using FFprobe.
         
         Args:
             file_path: Path to MP4 file
@@ -260,28 +309,74 @@ class MP4Validator:
         issues = []
         warnings = []
         
-        # Simulate validation (real implementation would use ffprobe)
-        status = ValidationStatus.VALID
-        file_size = 1024000
-        duration = expected_duration
-        resolution = expected_resolution
-        video_codec = "h264"
-        audio_codec = "aac"
-        bitrate = 2500
+        # Check if file exists
+        if not Path(file_path).exists():
+            return ValidationResult(
+                status=ValidationStatus.CORRUPTED,
+                file_path=file_path,
+                file_size_bytes=0,
+                duration_seconds=0.0,
+                resolution="unknown",
+                video_codec="unknown",
+                audio_codec="unknown",
+                bitrate=0,
+                issues=["File does not exist"],
+                warnings=warnings,
+            )
         
-        # Check duration
-        if abs(duration - expected_duration) > 1.0:
-            issues.append(f"Duration mismatch: expected {expected_duration}s, got {duration}s")
-            status = ValidationStatus.INVALID
-        
-        # Check bitrate
-        if bitrate > max_bitrate:
-            warnings.append(f"Bitrate {bitrate} kbps exceeds recommended {max_bitrate} kbps")
-        
-        # Check resolution
-        if resolution != expected_resolution:
-            issues.append(f"Resolution mismatch: expected {expected_resolution}, got {resolution}")
-            status = ValidationStatus.INVALID
+        try:
+            # Use FFprobe to get actual file information
+            probe_result = self._probe_file(file_path)
+            
+            file_size = probe_result.get("file_size_bytes", 0)
+            duration = probe_result.get("duration_seconds", 0.0)
+            resolution = probe_result.get("resolution", "unknown")
+            video_codec = probe_result.get("video_codec", "unknown")
+            audio_codec = probe_result.get("audio_codec", "unknown")
+            bitrate = probe_result.get("bitrate_kbps", 0)
+            
+            status = ValidationStatus.VALID
+            
+            # Check duration
+            if expected_duration > 0 and abs(duration - expected_duration) > 2.0:
+                issues.append(f"Duration mismatch: expected {expected_duration}s, got {duration}s")
+                status = ValidationStatus.INVALID
+            
+            # Check resolution
+            if resolution != expected_resolution:
+                issues.append(f"Resolution mismatch: expected {expected_resolution}, got {resolution}")
+                status = ValidationStatus.INVALID
+            
+            # Check bitrate
+            if bitrate > max_bitrate:
+                warnings.append(f"Bitrate {bitrate} kbps exceeds recommended {max_bitrate} kbps")
+            
+            # Check codec compatibility
+            if video_codec not in ["h264", "h265", "hevc"]:
+                warnings.append(f"Video codec {video_codec} may not be widely supported")
+            
+            if audio_codec not in ["aac", "mp3"]:
+                warnings.append(f"Audio codec {audio_codec} may not be widely supported")
+            
+            # Check if file is too small (likely corrupted)
+            if file_size < 1024:
+                issues.append("File size too small, likely corrupted")
+                status = ValidationStatus.CORRUPTED
+            
+        except Exception as e:
+            self.logger.error(f"FFprobe validation failed: {e}")
+            return ValidationResult(
+                status=ValidationStatus.CORRUPTED,
+                file_path=file_path,
+                file_size_bytes=0,
+                duration_seconds=0.0,
+                resolution="unknown",
+                video_codec="unknown",
+                audio_codec="unknown",
+                bitrate=0,
+                issues=[f"Validation error: {str(e)}"],
+                warnings=warnings,
+            )
         
         result = ValidationResult(
             status=status,
@@ -297,6 +392,66 @@ class MP4Validator:
         )
         
         return result
+    
+    def _probe_file(self, file_path: str) -> Dict[str, Any]:
+        """
+        Use FFprobe to extract file information.
+        
+        Args:
+            file_path: Path to MP4 file
+        
+        Returns:
+            Dictionary with file information
+        """
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration,size,bit_rate",
+            "-show_entries", "stream=codec_name,width,height,codec_type",
+            "-of", "json",
+            str(file_path),
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"FFprobe failed: {result.stderr}")
+        
+        import json
+        probe_data = json.loads(result.stdout)
+        
+        # Extract information
+        format_info = probe_data.get("format", {})
+        streams = probe_data.get("streams", [])
+        
+        file_size = int(format_info.get("size", 0))
+        duration = float(format_info.get("duration", 0))
+        bitrate = int(format_info.get("bit_rate", 0)) // 1000 if format_info.get("bit_rate") else 0
+        
+        video_codec = "unknown"
+        audio_codec = "unknown"
+        width = 0
+        height = 0
+        
+        for stream in streams:
+            codec_type = stream.get("codec_type")
+            if codec_type == "video":
+                video_codec = stream.get("codec_name", "unknown")
+                width = stream.get("width", 0)
+                height = stream.get("height", 0)
+            elif codec_type == "audio":
+                audio_codec = stream.get("codec_name", "unknown")
+        
+        resolution = f"{width}x{height}" if width and height else "unknown"
+        
+        return {
+            "file_size_bytes": file_size,
+            "duration_seconds": duration,
+            "resolution": resolution,
+            "video_codec": video_codec,
+            "audio_codec": audio_codec,
+            "bitrate_kbps": bitrate,
+        }
     
     def is_valid_for_platform(
         self, validation: ValidationResult, platform: str

@@ -212,6 +212,7 @@ class StateMachine:
         },
         WorkflowStage.READY_FOR_LOCALIZATION: {
             WorkflowStage.LOCALIZATION_RUNNING,
+            WorkflowStage.STORYBOARDING,  # New production path
             WorkflowStage.CANCELLED,
             WorkflowStage.FAILED,
         },
