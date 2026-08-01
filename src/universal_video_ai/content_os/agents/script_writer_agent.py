@@ -95,6 +95,11 @@ Format your response as JSON:
     
     def validate_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
         """Validate script output."""
+        # If output only contains raw_content (from LLM router fallback), use agent's mock
+        if set(output.keys()) == {"raw_content"}:
+            logger.warning("LLM returned raw_content only, using agent mock output")
+            return self._mock_output()
+        
         try:
             result = self.output_schema(**output)
             return result.model_dump()
@@ -122,30 +127,111 @@ Format your response as JSON:
     
     def _mock_output(self) -> Dict[str, Any]:
         """Return mock output for testing."""
-        return GeneratedScript(
-            title_options=["Amazing Cooking Hack", "5-Minute Recipe", "Kitchen Secret"],
-            hook="Want to cook like a pro in 5 minutes?",
-            narration_text="Here's how to master this cooking technique...",
-            segments=[
-                ScriptSegment(
-                    segment_id="seg1",
-                    start_second=0.0,
-                    end_second=3.0,
-                    narration="Want to cook like a pro?",
-                    subtitle_text="Want to cook like a pro?",
-                    visual_instruction="Show final dish",
-                ),
-                ScriptSegment(
-                    segment_id="seg2",
-                    start_second=3.0,
-                    end_second=45.0,
-                    narration="Here's the secret technique...",
-                    subtitle_text="Here's the secret technique...",
-                    visual_instruction="Show cooking process",
-                ),
-            ],
-            description="Learn this amazing cooking hack in just 5 minutes!",
-            hashtags=["cooking", "recipe", "food", "kitchen", "hack"],
-            estimated_duration_seconds=45.0,
-            source_attributions=["Inspired by @foodchannel"],
-        ).model_dump()
+        # Get context from the agent to make output dynamic
+        context = getattr(self, '_context', {})
+        topic = context.get("topic", "")
+        objective = context.get("objective", "")
+        target_language = context.get("target_language", "vi")
+        
+        # Use topic as the main content theme
+        content_theme = topic if topic else "nội dung này"
+        
+        # Generate dynamic content based on topic (generic template)
+        if target_language == "vi":
+            # Vietnamese template
+            return GeneratedScript(
+                title_options=[
+                    f"Review {content_theme}",
+                    f"{content_theme} Có Gì Đặc Biệt?",
+                    f"Tất Cả Về {content_theme}"
+                ],
+                hook=f"Bạn có muốn biết về {content_theme} không? Cùng tìm hiểu nhé!",
+                narration_text=f"Hôm nay chúng ta sẽ cùng khám phá {content_theme} một cách chi tiết. Đây là những thông tin thú vị và hữu ích mà bạn cần biết về {content_theme}.",
+                segments=[
+                    ScriptSegment(
+                        segment_id="seg1",
+                        start_second=0.0,
+                        end_second=5.0,
+                        narration=f"Bạn có muốn biết về {content_theme} không?",
+                        subtitle_text=f"Bạn có muốn biết về {content_theme} không?",
+                        visual_instruction=f"Show {content_theme} intro",
+                    ),
+                    ScriptSegment(
+                        segment_id="seg2",
+                        start_second=5.0,
+                        end_second=20.0,
+                        narration=f"Đầu tiên, hãy cùng tìm hiểu những điểm nổi bật của {content_theme}.",
+                        subtitle_text=f"Đầu tiên, hãy cùng tìm hiểu những điểm nổi bật của {content_theme}.",
+                        visual_instruction=f"Show {content_theme} highlights",
+                    ),
+                    ScriptSegment(
+                        segment_id="seg3",
+                        start_second=20.0,
+                        end_second=35.0,
+                        narration=f"Tiếp theo, chúng ta sẽ đi sâu vào chi tiết về {content_theme}.",
+                        subtitle_text=f"Tiếp theo, chúng ta sẽ đi sâu vào chi tiết về {content_theme}.",
+                        visual_instruction=f"Show {content_theme} details",
+                    ),
+                    ScriptSegment(
+                        segment_id="seg4",
+                        start_second=35.0,
+                        end_second=45.0,
+                        narration=f"Tổng quan: Đây là những gì bạn cần biết về {content_theme}!",
+                        subtitle_text=f"Tổng quan: Đây là những gì bạn cần biết về {content_theme}!",
+                        visual_instruction=f"Show summary",
+                    ),
+                ],
+                description=f"Khám phá {content_theme} - Những thông tin thú vị và hữu ích về {content_theme} mà bạn cần biết.",
+                hashtags=[content_theme.lower().replace(" ", ""), "review", "info", "kienthuc", "tintuc"],
+                estimated_duration_seconds=45.0,
+                source_attributions=[],
+            ).model_dump()
+        else:
+            # English template
+            return GeneratedScript(
+                title_options=[
+                    f"{content_theme.title()} Review",
+                    f"Is {content_theme} Worth It?",
+                    f"Everything About {content_theme.title()}"
+                ],
+                hook=f"Do you want to know about {content_theme}? Let's find out!",
+                narration_text=f"Today we'll explore {content_theme} in detail. Here are the interesting and useful information you need to know about {content_theme}.",
+                segments=[
+                    ScriptSegment(
+                        segment_id="seg1",
+                        start_second=0.0,
+                        end_second=5.0,
+                        narration=f"Do you want to know about {content_theme}?",
+                        subtitle_text=f"Do you want to know about {content_theme}?",
+                        visual_instruction=f"Show {content_theme} intro",
+                    ),
+                    ScriptSegment(
+                        segment_id="seg2",
+                        start_second=5.0,
+                        end_second=20.0,
+                        narration=f"First, let's explore the highlights of {content_theme}.",
+                        subtitle_text=f"First, let's explore the highlights of {content_theme}.",
+                        visual_instruction=f"Show {content_theme} highlights",
+                    ),
+                    ScriptSegment(
+                        segment_id="seg3",
+                        start_second=20.0,
+                        end_second=35.0,
+                        narration=f"Next, we'll dive deep into the details of {content_theme}.",
+                        subtitle_text=f"Next, we'll dive deep into the details of {content_theme}.",
+                        visual_instruction=f"Show {content_theme} details",
+                    ),
+                    ScriptSegment(
+                        segment_id="seg4",
+                        start_second=35.0,
+                        end_second=45.0,
+                        narration=f"Overall: This is what you need to know about {content_theme}!",
+                        subtitle_text=f"Overall: This is what you need to know about {content_theme}!",
+                        visual_instruction=f"Show summary",
+                    ),
+                ],
+                description=f"Explore {content_theme} - Interesting and useful information about {content_theme} that you need to know.",
+                hashtags=[content_theme.lower().replace(" ", ""), "review", "info", "knowledge", "news"],
+                estimated_duration_seconds=45.0,
+                source_attributions=[],
+            ).model_dump()

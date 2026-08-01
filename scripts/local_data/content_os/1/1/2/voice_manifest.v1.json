@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "voice_manifest",
+  "version": 1,
+  "created_by_agent": "TTSAdapter",
+  "created_at": "2026-08-01T03:09:01.614475",
+  "metadata": {},
+  "data": {
+    "audio_path": "local_data/content_os/1/1/2/tts_1785553741.wav",
+    "duration_seconds": 0.0,
+    "language": "vi",
+    "voice_id": "",
+    "segments_count": 2
+  }
+}

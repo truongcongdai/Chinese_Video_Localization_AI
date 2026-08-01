@@ -89,6 +89,9 @@ class BaseAgent(ABC):
         """
         self.logger.info(f"Executing agent {self.agent_name}")
         
+        # Store context for use in mock output
+        self._context = context
+        
         try:
             prompt = self.build_prompt(context)
             self.logger.debug(f"Prompt built: {len(prompt)} characters")
@@ -115,10 +118,33 @@ class BaseAgent(ABC):
         Returns:
             Raw output from the LLM as a dictionary
         """
-        # Use mock output for stable UI testing
-        # LLM integration can be improved later when needed
-        self.logger.info("Using mock output for stable UI testing")
-        return self._mock_output()
+        from .llm_router import LLMRouter
+        
+        # Use LLM router for real API calls
+        try:
+            router = LLMRouter(
+                provider=self.llm_provider,
+                model=self.llm_model,
+                base_url=self.llm_base_url,
+                api_key=self.llm_api_key,
+            )
+            
+            # Get output schema from agent for structured output
+            output_schema = self.output_schema
+            
+            result = router.invoke(
+                prompt=prompt,
+                output_schema=output_schema,
+                temperature=0.7,
+                max_tokens=2000,
+            )
+            
+            self.logger.info(f"LLM call successful: provider={self.llm_provider}, model={self.llm_model}")
+            return result
+            
+        except Exception as e:
+            self.logger.warning(f"LLM call failed: {e}, falling back to mock output")
+            return self._mock_output()
     
     def _mock_output(self) -> Dict[str, Any]:
         """

@@ -1,0 +1,75 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "timeline",
+  "version": 1,
+  "created_by_agent": "TimelineAdapter",
+  "created_at": "2026-08-01T03:59:06.558852",
+  "metadata": {},
+  "data": {
+    "duration_seconds": 45,
+    "resolution": "1080x1920",
+    "video_tracks": [],
+    "audio_tracks": [
+      {
+        "track_id": "voice",
+        "source": "local_data/content_os/1/2/9/tts_1785556727.wav",
+        "duration": 25.752
+      }
+    ],
+    "subtitle_tracks": [
+      {
+        "track_id": "subtitles",
+        "source": "local_data/content_os/1/2/9/subtitles_1785556746.srt",
+        "language": "en"
+      }
+    ],
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 11.25,
+        "text": "Bạn có muốn biết về 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn không?"
+      },
+      {
+        "start": 11.25,
+        "end": 22.5,
+        "text": "Đầu tiên, hãy cùng tìm hiểu những điểm nổi bật của 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn."
+      },
+      {
+        "start": 22.5,
+        "end": 33.75,
+        "text": "Tiếp theo, chúng ta sẽ đi sâu vào chi tiết về 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn."
+      },
+      {
+        "start": 33.75,
+        "end": 45.0,
+        "text": "Tổng quan: Đây là những gì bạn cần biết về 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn!"
+      }
+    ],
+    "assets": [
+      {
+        "scene_id": "scene_1",
+        "strategy": "fallback_text_card",
+        "local_path": null,
+        "description": "Show 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn intro"
+      },
+      {
+        "scene_id": "scene_2",
+        "strategy": "fallback_text_card",
+        "local_path": null,
+        "description": "Show 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn highlights"
+      },
+      {
+        "scene_id": "scene_3",
+        "strategy": "fallback_text_card",
+        "local_path": null,
+        "description": "Show 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn details"
+      },
+      {
+        "scene_id": "scene_4",
+        "strategy": "fallback_text_card",
+        "local_path": null,
+        "description": "Show summary"
+      }
+    ]
+  }
+}

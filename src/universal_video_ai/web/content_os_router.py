@@ -23,7 +23,7 @@ from universal_video_ai.content_os.repository import ContentOSRepository
 from universal_video_ai.content_os.artifact_store import ArtifactStore
 from universal_video_ai.content_os.workflow import ContentOSWorkflow, WorkflowConfig
 from universal_video_ai.content_os.pipeline_adapter import PipelineAdapter
-from universal_video_ai.content_os.enums import ApprovalType
+from universal_video_ai.content_os.enums import ApprovalType, ArtifactType
 from universal_video_ai.content_os.exceptions import FeatureDisabledError
 from universal_video_ai.content_os.storyboard import StoryboardManager
 from universal_video_ai.content_os.asset_resolver import AssetResolver
@@ -691,7 +691,7 @@ async def create_localization_job(
     user_id: int = Depends(get_current_user_id),
 ):
     """Create a localization job from an approved run."""
-    _, _, _, adapter = get_content_os_components(user_id)
+    _, _, workflow, adapter = get_content_os_components(user_id)
     
     try:
         job_id = adapter.create_job_from_run(
@@ -699,7 +699,64 @@ async def create_localization_job(
             user_id=user_id,
             source_url=request.source_url,
         )
-        return {"job_id": job_id, "run_id": run_id}
+        
+        # Trigger production pipeline to generate actual video
+        # Get the script and content plan artifacts
+        script_artifact = workflow.artifact_store.read(
+            user_id=user_id,
+            project_id=workflow.repository.get_run(run_id, user_id).project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.SCRIPT,
+        )
+        plan_artifact = workflow.artifact_store.read(
+            user_id=user_id,
+            project_id=workflow.repository.get_run(run_id, user_id).project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CONTENT_PLAN,
+        )
+        
+        if script_artifact:
+            context = {
+                "script": script_artifact.get("data", script_artifact),
+                "content_plan": plan_artifact.get("data", plan_artifact) if plan_artifact else {},
+            }
+            
+            # Execute production stages in background
+            import threading
+            def run_production():
+                try:
+                    result = workflow._execute_production_stages(run_id, user_id, context)
+                    # Update job with final video path
+                    if result.get("output_path"):
+                        import sqlite3
+                        import time
+                        web_store_db_path = Path(os.environ.get("WEB_DB_PATH", "local_data/database.sqlite3"))
+                        with sqlite3.connect(str(web_store_db_path)) as conn:
+                            conn.execute(
+                                "UPDATE jobs SET final_video_path = ?, status = ?, updated_at = ? WHERE id = ?",
+                                (result["output_path"], "done", time.time(), job_id)
+                            )
+                            conn.commit()
+                            logger.info(f"Updated job {job_id} with video path: {result['output_path']}")
+                except Exception as e:
+                    logger.error(f"Production pipeline failed for run {run_id}: {e}")
+                    # Mark job as error
+                    import sqlite3
+                    import time
+                    web_store_db_path = Path(os.environ.get("WEB_DB_PATH", "local_data/database.sqlite3"))
+                    with sqlite3.connect(str(web_store_db_path)) as conn:
+                        conn.execute(
+                            "UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                            ("error", str(e), time.time(), job_id)
+                        )
+                        conn.commit()
+            
+            # Start production in background thread
+            thread = threading.Thread(target=run_production, daemon=True)
+            thread.start()
+            logger.info(f"Started production pipeline for run {run_id} in background")
+        
+        return {"job_id": job_id, "run_id": run_id, "status": "production_started"}
     except Exception as e:
         logger.error(f"Failed to create job from run {run_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

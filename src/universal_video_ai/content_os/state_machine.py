@@ -251,7 +251,9 @@ class StateMachine:
             WorkflowStage.SCRIPT_REVISION,
             WorkflowStage.LOCALIZATION_RUNNING,
         },
-        WorkflowStage.CANCELLED: set(),  # Terminal state
+        WorkflowStage.CANCELLED: {
+            WorkflowStage.CREATED,  # Allow restarting cancelled runs
+        },
         WorkflowStage.FAILED: set(),      # Terminal state
         WorkflowStage.BLOCKED: {
             WorkflowStage.PAUSED,

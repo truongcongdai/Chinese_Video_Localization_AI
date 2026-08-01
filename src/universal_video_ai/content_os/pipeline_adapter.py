@@ -246,18 +246,9 @@ class PipelineAdapter:
         except Exception as e:
             self.logger.error(f"Verification failed: {e}")
         
-        # Mark job as done immediately since Content OS jobs don't need localization pipeline
-        # They already have the script generated, no video source to process
-        try:
-            with sqlite3.connect(str(self.web_store_db_path)) as conn:
-                conn.execute(
-                    "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
-                    ("done", time.time(), created_job.id)
-                )
-                conn.commit()
-                self.logger.info(f"Marked job {created_job.id} as done (Content OS job)")
-        except Exception as e:
-            self.logger.error(f"Failed to mark job as done: {e}")
+        # NOTE: Do NOT mark job as done immediately. Content OS jobs need to go through
+        # the production pipeline (storyboard → assets → voice → subtitles → timeline → render)
+        # to generate an actual video file. The job will be marked as done after rendering completes.
         
         # Update the job_id to match the one created by Store
         actual_job_id = created_job.id

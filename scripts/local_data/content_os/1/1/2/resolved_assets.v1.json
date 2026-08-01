@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "resolved_assets",
+  "version": 1,
+  "created_by_agent": "AssetResolver",
+  "created_at": "2026-08-01T03:09:01.325625",
+  "metadata": {},
+  "data": {
+    "assets": [
+      {
+        "scene_id": "scene_1",
+        "strategy": "fallback_text_card",
+        "local_path": null,
+        "description": "Show final dish"
+      },
+      {
+        "scene_id": "scene_2",
+        "strategy": "fallback_text_card",
+        "local_path": null,
+        "description": "Show cooking process"
+      }
+    ],
+    "total_assets": 2
+  }
+}

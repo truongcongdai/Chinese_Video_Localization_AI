@@ -128,9 +128,21 @@ class Renderer:
         self.logger.info(f"Starting render job {job.job_id} to {job.output_path}")
         
         try:
-            # For MVP, create a simple text-based video using FFmpeg
-            # In production, this would use the full timeline with existing renderer
-            self._create_simple_video(job.output_path, job.metadata.get("resolution", "1080x1920"))
+            # Extract audio, subtitle, and duration from metadata
+            audio_path = job.metadata.get("audio_path")
+            subtitle_path = job.metadata.get("subtitle_path")
+            duration = job.metadata.get("duration", 5.0)
+            resolution = job.metadata.get("resolution", "1080x1920")
+            
+            # Create video with actual audio and subtitles
+            self._create_simple_video(
+                output_path=job.output_path,
+                resolution=resolution,
+                audio_path=audio_path,
+                subtitle_path=subtitle_path,
+                duration=duration,
+                assets=job.metadata.get("assets"),
+            )
             
             job.status = RenderStatus.COMPLETED
             job.progress = 100.0
@@ -146,27 +158,80 @@ class Renderer:
         
         return job
     
-    def _create_simple_video(self, output_path: str, resolution: str) -> None:
+    def _create_simple_video(self, output_path: str, resolution: str, audio_path: Optional[str] = None, subtitle_path: Optional[str] = None, duration: float = 5.0, assets: Optional[Dict[str, Any]] = None) -> None:
         """
-        Create a simple video with text overlay using FFmpeg.
+        Create a video with audio and subtitles using FFmpeg.
         
-        This is a minimal implementation for MVP. In production, this would
-        use the full timeline integration with existing render/renderer.py.
+        This implementation uses the actual audio and subtitle files generated
+        by the production pipeline instead of placeholder content.
         """
         width, height = resolution.split("x")
         
-        # Create a simple video with colored background and text
-        cmd = [
-            "ffmpeg",
-            "-f", "lavfi",
-            "-i", f"color=c=blue:s={resolution}:d=5:r=30",
-            "-vf", f"drawtext=text='Content OS Demo':fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2",
+        # Check if we have generated assets to use
+        asset_images = []
+        if assets and assets.get("assets"):
+            for asset in assets["assets"]:
+                if asset.get("local_path") and Path(asset.get("local_path")).exists():
+                    asset_images.append(asset["local_path"])
+        
+        # Build FFmpeg command
+        if asset_images:
+            # Use first asset image as background, loop it for duration
+            cmd = [
+                "ffmpeg",
+                "-loop", "1",
+                "-i", asset_images[0],
+                "-t", str(duration),
+            ]
+        else:
+            # Fallback to gradient background
+            cmd = [
+                "ffmpeg",
+                "-f", "lavfi",
+                "-i", f"color=c=#1a1a2e:s={resolution}:d={duration}:r=30",
+            ]
+        
+        # Add audio if available and valid
+        audio_index = None
+        if audio_path and Path(audio_path).exists() and Path(audio_path).stat().st_size > 0:
+            cmd.extend(["-i", str(audio_path)])
+            audio_index = 1  # Audio will be input index 1
+        else:
+            self.logger.warning(f"Audio file not valid or not found: {audio_path}, creating video without audio")
+        
+        # Add subtitle filter if available
+        vf_filters = []
+        if subtitle_path and Path(subtitle_path).exists() and Path(subtitle_path).stat().st_size > 0:
+            # Use subtitles filter to burn in SRT with smaller font and better positioning
+            vf_filters.append(f"subtitles={subtitle_path}:force_style='Fontsize=18,PrimaryColour=&HFFFFFF&,BackColour=&H80000000&,BorderStyle=4,Alignment=2,MarginV=30'")
+        
+        # Add gradient overlay for better visual
+        vf_filters.insert(0, "geq=r='X/W*255':g='Y/H*255':b='128'")
+        
+        # Add basic text overlay if no subtitles
+        if len(vf_filters) == 1:  # Only gradient, no subtitles
+            vf_filters.append(f"drawtext=text='Content OS Video':fontcolor=white:fontsize=32:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5:boxborderw=5")
+        
+        if vf_filters:
+            cmd.extend(["-vf", ",".join(vf_filters)])
+        
+        # Map video and optionally audio
+        cmd.extend(["-map", "0:v"])
+        if audio_index is not None:
+            cmd.extend(["-map", f"{audio_index}:a"])
+        
+        # Encoding options
+        cmd.extend([
             "-c:v", "libx264",
-            "-t", "5",
+            "-c:a", "aac" if audio_index is not None else None,
+            "-shortest",
             "-pix_fmt", "yuv420p",
             "-y",
             str(output_path),
-        ]
+        ])
+        
+        # Remove None values
+        cmd = [arg for arg in cmd if arg is not None]
         
         self.logger.debug(f"Running FFmpeg command: {' '.join(cmd)}")
         
@@ -174,10 +239,11 @@ class Renderer:
             cmd,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=120
         )
         
         if result.returncode != 0:
+            self.logger.error(f"FFmpeg stderr: {result.stderr}")
             raise RuntimeError(f"FFmpeg failed: {result.stderr}")
     
     def _store_render_job(self, job: RenderJob):

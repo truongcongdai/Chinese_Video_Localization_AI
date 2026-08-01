@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 import time
 import logging
+import subprocess
 from pathlib import Path
 
 
@@ -84,33 +85,46 @@ class TTSAdapter:
             Path to generated audio file
         """
         try:
-            from universal_video_ai.tts.service import TTSService
-            from universal_video_ai.tts.tts import TTS
+            from universal_video_ai.tts.backend import EdgeTTSBackend
             
-            # Initialize TTS service with backend
-            # For MVP, we'll use a simple fallback if backend not configured
             output_dir = output_dir or Path("local_data/content_os/temp")
             output_dir.mkdir(parents=True, exist_ok=True)
             
             output_path = output_dir / f"tts_{int(time.time())}.wav"
             
-            # Try to use real TTS service
+            # Try to use real TTS service with EdgeTTSBackend
             try:
-                tts_backend = TTS()
-                tts_service = TTSService(backend=tts_backend)
-                result = tts_service.synthesize(
+                tts_backend = EdgeTTSBackend()
+                result = tts_backend.synthesize(
                     text=text,
                     language=language,
                     voice=voice_id,
-                    output_path=output_path,
+                    output_path=output_path,  # Pass Path object, not string
                 )
                 self.logger.info(f"TTS generated audio: {result}")
-                return result
-            except Exception as e:
-                self.logger.warning(f"Real TTS service failed: {e}, using fallback")
-                # Fallback: create empty audio file
-                output_path.touch()
                 return output_path
+            except Exception as e:
+                self.logger.warning(f"Real TTS service failed: {e}, creating silent audio fallback")
+                # Fallback: create a silent audio file using FFmpeg
+                try:
+                    silent_cmd = [
+                        "ffmpeg",
+                        "-f", "lavfi",
+                        "-i", "anullsrc=r=44100:cl=mono",
+                        "-t", "5",
+                        "-q:a", "9",
+                        "-acodec", "pcm_s16le",
+                        "-y",
+                        str(output_path),
+                    ]
+                    subprocess.run(silent_cmd, capture_output=True, timeout=30)
+                    self.logger.info(f"Created silent audio fallback: {output_path}")
+                    return output_path
+                except Exception as ffmpeg_error:
+                    self.logger.error(f"Failed to create silent audio: {ffmpeg_error}")
+                    # Last resort: create empty file
+                    output_path.touch()
+                    return output_path
                 
         except ImportError:
             self.logger.warning("TTS service not available, using fallback")
@@ -162,9 +176,26 @@ class SubtitleAdapter:
             
             for i, seg in enumerate(segments):
                 text = seg.get("text", seg.get("narration", ""))
+                # Wrap text to prevent long lines (max 40 chars per line)
+                wrapped_lines = []
+                words = text.split()
+                current_line = ""
+                for word in words:
+                    if len(current_line + " " + word) <= 40:
+                        current_line += " " + word if current_line else word
+                    else:
+                        if current_line:
+                            wrapped_lines.append(current_line)
+                        current_line = word
+                if current_line:
+                    wrapped_lines.append(current_line)
+                
+                # Limit to 2 lines max
+                wrapped_text = "\n".join(wrapped_lines[:2])
+                
                 start = i * per_segment
                 end = (i + 1) * per_segment
-                timeline_segments.append(TimelineSegment(start, end, text))
+                timeline_segments.append(TimelineSegment(start, end, wrapped_text))
             
             # Use TimelineService to generate SRT
             timeline_service = TimelineService()

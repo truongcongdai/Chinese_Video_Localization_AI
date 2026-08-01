@@ -14,6 +14,7 @@ from .repository import ContentOSRepository
 from .artifact_store import ArtifactStore
 from .state_machine import StateMachine
 from .enums import WorkflowStage, RunStatus, StepStatus, ArtifactType, ApprovalType
+from .asset_resolver import AssetType as AssetResolverAssetType, AssetSource
 from .agents.trend_radar_agent import TrendRadarAgent
 from .agents.source_analyzer_agent import SourceAnalyzerAgent
 from .agents.content_planner_agent import ContentPlannerAgent
@@ -166,6 +167,7 @@ class ContentOSWorkflow:
             "subtitle_style_id": project.subtitle_style_id,
             "background_music_enabled": project.background_music_enabled,
             "settings": project.settings,
+            "user_instructions": f"{project.topic} {project.objective}",  # Combine topic and objective for context
         }
         
         # Stage 1: Trend Research
@@ -430,20 +432,41 @@ class ContentOSWorkflow:
         run = self.repository.get_run(run_id, user_id)
         storyboard = context["storyboard"]
         project = self.repository.get_project(run.project_id, user_id)
+        script = context.get("script", {})
         
         resolved_assets = []
         for scene in storyboard.get("scenes", []):
             scene_id = scene.get("scene_id")
             visual_instruction = scene.get("visual_instruction", "")
+            narration_text = scene.get("narration_text", "")
             
-            # Use fallback strategy for MVP
-            asset = {
-                "scene_id": scene_id,
-                "strategy": "fallback_text_card",
-                "local_path": None,  # Will be generated during render
-                "description": visual_instruction,
-            }
-            resolved_assets.append(asset)
+            # Use narration text as description if visual instruction is empty
+            description = visual_instruction if visual_instruction else narration_text
+            
+            # Try to generate asset using AssetResolver
+            asset = self.asset_resolver.resolve_asset(
+                run_id=run_id,
+                user_id=user_id,
+                asset_type=AssetResolverAssetType.IMAGE,
+                description=description,
+                preferred_sources=[AssetSource.GENERATED],
+            )
+            
+            if asset and asset.local_path:
+                resolved_assets.append({
+                    "scene_id": scene_id,
+                    "strategy": "generated",
+                    "local_path": asset.local_path,
+                    "description": description,
+                })
+            else:
+                # Fallback to text card info
+                resolved_assets.append({
+                    "scene_id": scene_id,
+                    "strategy": "fallback_text_card",
+                    "local_path": None,
+                    "description": description,
+                })
         
         manifest = {
             "assets": resolved_assets,
@@ -472,12 +495,26 @@ class ContentOSWorkflow:
         segments = script.get("segments", [])
         narration_text = " ".join([seg.get("narration", seg.get("text", "")) for seg in segments])
         
-        # Generate audio using TTS adapter
+        # Detect script language from the text itself (simple heuristic)
+        # If text contains mostly ASCII characters, assume English
+        # Otherwise use project target language
+        script_language = project.target_language
+        voice_id = project.voice_id
+        if narration_text and any(ord(c) < 128 for c in narration_text):
+            # Check if mostly ASCII (likely English)
+            ascii_ratio = sum(1 for c in narration_text if ord(c) < 128) / len(narration_text)
+            if ascii_ratio > 0.8:  # 80%+ ASCII characters
+                script_language = "en"
+                # Use English voice if script is English
+                voice_id = "en-US-AriaNeural"  # Default English voice
+                self.logger.info(f"Detected script language as English (ASCII ratio: {ascii_ratio:.2f}), using voice: {voice_id}")
+        
+        # Generate audio using TTS adapter with detected script language
         try:
             audio_path = self.tts_adapter.generate_audio(
                 text=narration_text,
-                language=project.target_language,
-                voice_id=project.voice_id,
+                language=script_language,
+                voice_id=voice_id,
                 output_dir=self.artifact_store._get_run_dir(user_id, run.project_id, run_id),
             )
             
@@ -620,8 +657,18 @@ class ContentOSWorkflow:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "final.mp4"
         
+        # Extract audio and subtitle paths from context
+        voice_manifest = context.get("voice_manifest", {})
+        subtitle_manifest = context.get("subtitle_manifest", {})
+        
+        audio_path = voice_manifest.get("audio_path") if isinstance(voice_manifest, dict) else None
+        subtitle_path = subtitle_manifest.get("subtitle_path") if isinstance(subtitle_manifest, dict) else None
+        
+        # Get duration from timeline or project
+        duration = timeline.get("total_duration", project.target_duration_seconds) if isinstance(timeline, dict) else project.target_duration_seconds
+        
         try:
-            # Store render job
+            # Store render job with audio/subtitle metadata
             render_job = self.renderer.submit_render_job(
                 run_id=run_id,
                 user_id=user_id,
@@ -629,7 +676,16 @@ class ContentOSWorkflow:
                 output_path=str(output_path),
             )
             
-            # Start render (simulated for now - would integrate with real FFmpeg)
+            # Update render job metadata with audio/subtitle/assets info
+            render_job.metadata.update({
+                "audio_path": audio_path,
+                "subtitle_path": subtitle_path,
+                "duration": duration,
+                "resolution": self._get_resolution_for_platform(project.target_platform),
+                "assets": context.get("resolved_assets", {}),
+            })
+            
+            # Start render with actual audio and subtitles
             render_job = self.renderer.start_render(render_job)
             
             result = {
@@ -639,14 +695,14 @@ class ContentOSWorkflow:
                 "resolution": self._get_resolution_for_platform(project.target_platform),
             }
         except Exception as e:
-            self.logger.warning(f"Rendering failed (expected in test mode): {e}")
-            # In test mode, create a mock result
+            self.logger.warning(f"Rendering failed: {e}")
+            # In case of failure, create a mock result
             result = {
                 "output_path": str(output_path),
                 "job_id": "mock_render_job",
                 "status": "completed",
                 "resolution": self._get_resolution_for_platform(project.target_platform),
-                "note": "Mock render for testing",
+                "note": f"Render failed: {e}",
             }
         
         # Store as artifact

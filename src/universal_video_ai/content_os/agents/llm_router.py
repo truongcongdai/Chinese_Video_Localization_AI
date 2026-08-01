@@ -106,7 +106,7 @@ class LLMRouter:
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                timeout=60,  # Increased timeout
+                timeout=300,  # Increased timeout
             )
             
             # Extract content
@@ -155,7 +155,7 @@ class LLMRouter:
                 },
             }
             
-            response = requests.post(url, json=payload, timeout=60)
+            response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
             
             data = response.json()

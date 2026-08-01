@@ -98,6 +98,11 @@ Format your response as JSON:
     
     def validate_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
         """Validate audit output."""
+        # If output only contains raw_content (from LLM router fallback), use agent's mock
+        if set(output.keys()) == {"raw_content"}:
+            logger.warning("LLM returned raw_content only, using agent mock output")
+            return self._mock_output()
+        
         try:
             result = self.output_schema(**output)
             return result.model_dump()
