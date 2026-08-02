@@ -2,6 +2,7 @@
 Tests for renderer and MP4 validator.
 """
 import pytest
+import subprocess
 from pathlib import Path
 from universal_video_ai.content_os.renderer import (
     Renderer, MP4Validator, RenderJob, RenderStatus,
@@ -83,6 +84,71 @@ class TestRenderer:
         assert retrieved is not None
         assert retrieved.job_id == job.job_id
         assert retrieved.status == RenderStatus.PENDING
+
+    def test_subtitle_filter_uses_filename_with_cwd_on_windows_paths(
+        self, renderer, tmp_path, monkeypatch
+    ):
+        """FFmpeg subtitle filters must not receive raw Windows paths."""
+        subtitle_dir = tmp_path / "content_os" / "1" / "6" / "12"
+        subtitle_dir.mkdir(parents=True)
+        subtitle_path = subtitle_dir / "subtitles_123.srt"
+        subtitle_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+        audio_path = subtitle_dir / "tts_123.wav"
+        audio_path.write_bytes(b"not-empty")
+        output_path = tmp_path / "renders" / "final.mp4"
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        renderer._create_simple_video(
+            output_path=str(output_path),
+            resolution="1080x1920",
+            audio_path=str(audio_path),
+            subtitle_path=str(subtitle_path),
+            duration=1.0,
+        )
+
+        vf_arg = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+        assert captured["cwd"] == str(subtitle_dir.resolve())
+        assert f"filename={subtitle_path.name}" in vf_arg
+        assert str(subtitle_path.resolve()) not in vf_arg
+        assert "geq=" not in vf_arg
+        assert "-shortest" not in captured["cmd"]
+        assert "-t" in captured["cmd"]
+
+    def test_renderer_uses_all_asset_scenes(self, renderer, tmp_path, monkeypatch):
+        image1 = tmp_path / "scene1.png"
+        image2 = tmp_path / "scene2.png"
+        image1.write_bytes(b"fake")
+        image2.write_bytes(b"fake")
+        output_path = tmp_path / "renders" / "final.mp4"
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        renderer._create_simple_video(
+            output_path=str(output_path),
+            resolution="1080x1920",
+            duration=10.0,
+            assets={
+                "assets": [
+                    {"scene_id": "scene_intro", "local_path": str(image1), "duration_seconds": 2.0},
+                    {"scene_id": "scene_1", "local_path": str(image2), "duration_seconds": 8.0},
+                ]
+            },
+        )
+
+        assert captured["cmd"].count("-loop") == 2
+        assert "concat=n=2:v=1:a=0[basev]" in captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
 
 
 class TestMP4Validator:

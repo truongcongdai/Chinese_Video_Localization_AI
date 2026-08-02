@@ -9,6 +9,8 @@ from enum import Enum
 import json
 import time
 
+from .visual_prompts import clean_text, infer_topic, is_generic_visual_instruction, scene_visual_prompt
+
 
 class StoryboardStatus(str, Enum):
     """Storyboard workflow status."""
@@ -86,16 +88,27 @@ class StoryboardManager:
         """
         scenes = []
         segments = script.get("segments", [])
+        topic = infer_topic(
+            {"topic": script.get("topic", ""), "user_instructions": script.get("user_instructions", "")},
+            " ".join(script.get("title_options", []) if isinstance(script.get("title_options"), list) else []),
+            script.get("hook", ""),
+            script.get("narration_text", ""),
+        )
         
         for i, segment in enumerate(segments):
+            narration_text = clean_text(segment.get("narration", ""))
+            subtitle_text = clean_text(segment.get("subtitle_text", ""))
+            visual_instruction = clean_text(segment.get("visual_instruction", ""))
+            if is_generic_visual_instruction(visual_instruction):
+                visual_instruction = scene_visual_prompt(topic, narration_text or subtitle_text, i + 1)
             scene = StoryboardScene(
                 scene_id=f"scene_{i+1}",
                 order=i + 1,
                 start_second=segment.get("start_second", 0.0),
                 end_second=segment.get("end_second", 0.0),
-                visual_instruction=segment.get("visual_instruction", ""),
-                subtitle_text=segment.get("subtitle_text", ""),
-                narration_text=segment.get("narration", ""),
+                visual_instruction=visual_instruction,
+                subtitle_text=subtitle_text,
+                narration_text=narration_text,
                 camera_angle="front",
                 transition="cut",
                 notes="",

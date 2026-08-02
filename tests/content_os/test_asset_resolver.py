@@ -2,6 +2,7 @@
 Tests for asset resolver.
 """
 import pytest
+import base64
 from universal_video_ai.content_os.asset_resolver import AssetResolver, Asset, AssetManifest, AssetType, AssetSource
 
 
@@ -29,8 +30,8 @@ def resolver(repo):
 class TestAssetResolver:
     """Test asset resolver."""
     
-    def test_resolve_asset_with_fallback(self, resolver):
-        """Test resolving asset falls back to placeholder."""
+    def test_resolve_asset_generates_local_visual(self, resolver):
+        """Test resolving an image produces a usable local visual."""
         asset = resolver.resolve_asset(
             run_id=1,
             user_id=1,
@@ -41,7 +42,10 @@ class TestAssetResolver:
         assert asset is not None
         assert asset.asset_type == AssetType.IMAGE
         assert asset.source == AssetSource.GENERATED
-        assert asset.metadata.get("fallback") is True
+        assert asset.local_path is not None
+        assert asset.metadata.get("generated") is True
+        assert asset.metadata.get("generator") in {"local_procedural_visual", "ai_image"}
+        assert asset.metadata.get("generator") != "local_pil_card"
     
     def test_resolve_video_asset(self, resolver):
         """Test resolving video asset."""
@@ -56,6 +60,115 @@ class TestAssetResolver:
         assert asset.asset_type == AssetType.VIDEO
         assert asset.duration_seconds is not None
         assert asset.resolution is not None
+
+    def test_generate_gemini_image_from_inline_data(self, resolver, tmp_path, monkeypatch):
+        """Gemini image provider should save inlineData bytes when configured."""
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n"
+            + b"0" * 2048
+        )
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+            ok = True
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": base64.b64encode(png_bytes).decode("ascii"),
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs.get("json")
+            return FakeResponse()
+
+        import requests
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        output_path = tmp_path / "gemini.png"
+        assert resolver._generate_gemini_image(output_path, "Vertical 9:16 test prompt") is True
+        assert output_path.read_bytes() == png_bytes
+        assert captured["url"].endswith("/v1beta/interactions")
+        assert captured["json"]["response_format"]["mime_type"] == "image/jpeg"
+        assert captured["json"]["response_format"]["aspect_ratio"] == "9:16"
+
+    def test_generate_gemini_image_generate_content_uses_enum_aspect_ratio(self, resolver, tmp_path, monkeypatch):
+        """generateContent fallback must use enum aspect ratio, not raw 9:16."""
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"1" * 2048
+
+        class FakeResponse:
+            def __init__(self, status_code, payload=None, text=""):
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.text = text
+                self.ok = 200 <= status_code < 300
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs.get("json")))
+            if url.endswith("/v1beta/interactions"):
+                return FakeResponse(404, text="not found")
+            return FakeResponse(
+                200,
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": base64.b64encode(png_bytes).decode("ascii"),
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+
+        import requests
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        output_path = tmp_path / "gemini_enum.png"
+        assert resolver._generate_gemini_image(output_path, "Vertical 9:16 test prompt") is True
+        generate_payload = calls[-1][1]
+        image_format = generate_payload["generationConfig"]["responseFormat"]["image"]
+        assert image_format["mimeType"] == "IMAGE_JPEG"
+        assert image_format["delivery"] == "INLINE"
+        assert image_format["aspectRatio"] == "ASPECT_RATIO_NINE_BY_SIXTEEN"
+        assert "imageSize" not in image_format
     
     def test_create_manifest(self, resolver, repo):
         """Test creating asset manifest."""

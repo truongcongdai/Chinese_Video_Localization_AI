@@ -12,7 +12,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from universal_video_ai.config import CONTENT_OS_ENABLED
+from universal_video_ai.config import CONTENT_OS_ARTIFACT_DIR, CONTENT_OS_ENABLED, TEMP_DIR
 from universal_video_ai.content_os.config import (
     CONTENT_OS_LLM_PROVIDER,
     CONTENT_OS_LLM_MODEL,
@@ -23,7 +23,7 @@ from universal_video_ai.content_os.repository import ContentOSRepository
 from universal_video_ai.content_os.artifact_store import ArtifactStore
 from universal_video_ai.content_os.workflow import ContentOSWorkflow, WorkflowConfig
 from universal_video_ai.content_os.pipeline_adapter import PipelineAdapter
-from universal_video_ai.content_os.enums import ApprovalType, ArtifactType
+from universal_video_ai.content_os.enums import ApprovalType, ArtifactType, WorkflowStage
 from universal_video_ai.content_os.exceptions import FeatureDisabledError
 from universal_video_ai.content_os.storyboard import StoryboardManager
 from universal_video_ai.content_os.asset_resolver import AssetResolver
@@ -35,10 +35,6 @@ from .auth import get_current_user_id
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/content-os", tags=["content-os"])
-
-# Use same TEMP_DIR logic as app.py to avoid circular import
-TEMP_DIR = Path(os.environ.get("TEMP_DIR", Path(__file__).resolve().parents[2] / "temp"))
-
 
 # Pydantic models for request/response
 class CreateChannelRequest(BaseModel):
@@ -179,7 +175,7 @@ def get_content_os_components(user_id: int):
     db_path = Path(os.environ.get("WEB_DB_PATH", TEMP_DIR / "database.sqlite3"))
     store = Store(db_path=db_path)
     repo = ContentOSRepository(db_path)
-    artifact_store = ArtifactStore(base_dir=Path("local_data/content_os"))
+    artifact_store = ArtifactStore(base_dir=CONTENT_OS_ARTIFACT_DIR)
     
     workflow = ContentOSWorkflow(
         repository=repo,
@@ -724,32 +720,41 @@ async def create_localization_job(
             # Execute production stages in background
             import threading
             def run_production():
+                job_store = Store(adapter.web_store_db_path)
                 try:
+                    job_store.update_job(
+                        job_id,
+                        status="running",
+                        progress_note="Content OS đang dựng video...",
+                    )
+                    workflow.repository.update_run(
+                        run_id=run_id,
+                        user_id=user_id,
+                        status="running",
+                        current_stage="ready_for_localization",
+                        progress_percent=workflow._calculate_progress(WorkflowStage.READY_FOR_LOCALIZATION),
+                        error_json=None,
+                        completed_at=None,
+                    )
                     result = workflow._execute_production_stages(run_id, user_id, context)
-                    # Update job with final video path
-                    if result.get("output_path"):
-                        import sqlite3
-                        import time
-                        web_store_db_path = Path(os.environ.get("WEB_DB_PATH", "local_data/database.sqlite3"))
-                        with sqlite3.connect(str(web_store_db_path)) as conn:
-                            conn.execute(
-                                "UPDATE jobs SET final_video_path = ?, status = ?, updated_at = ? WHERE id = ?",
-                                (result["output_path"], "done", time.time(), job_id)
-                            )
-                            conn.commit()
-                            logger.info(f"Updated job {job_id} with video path: {result['output_path']}")
+                    output_path = result.get("output_path")
+                    if not output_path or not Path(output_path).exists():
+                        raise RuntimeError(f"Render finished without output file: {output_path}")
+                    job_store.update_job(
+                        job_id,
+                        final_video_path=output_path,
+                        status="done",
+                        progress_note="Hoàn tất",
+                    )
+                    logger.info(f"Updated job {job_id} with video path: {output_path}")
                 except Exception as e:
                     logger.error(f"Production pipeline failed for run {run_id}: {e}")
-                    # Mark job as error
-                    import sqlite3
-                    import time
-                    web_store_db_path = Path(os.environ.get("WEB_DB_PATH", "local_data/database.sqlite3"))
-                    with sqlite3.connect(str(web_store_db_path)) as conn:
-                        conn.execute(
-                            "UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-                            ("error", str(e), time.time(), job_id)
-                        )
-                        conn.commit()
+                    job_store.update_job(
+                        job_id,
+                        status="error",
+                        error=str(e),
+                        progress_note="Content OS render lỗi",
+                    )
             
             # Start production in background thread
             thread = threading.Thread(target=run_production, daemon=True)

@@ -1049,6 +1049,16 @@ def _is_job_cancelled(job_id: str) -> bool:
     return bool(job and job.status == "cancelled")
 
 
+def _is_content_os_job(job) -> bool:
+    return bool(
+        job
+        and (
+            str(job.source_url or "").startswith("content_os://")
+            or str(job.source_language or "").startswith("content_os")
+        )
+    )
+
+
 def _is_non_retryable_job_error(exc: Exception) -> bool:
     message = str(exc)
     return any(
@@ -1070,6 +1080,19 @@ RETRY_DELAY_SECONDS = 30
 async def _run_job(job_id: str) -> None:
     job = store.get_job(job_id)
     if job is None:
+        return
+
+    if _is_content_os_job(job):
+        store.update_job(
+            job_id,
+            status="error",
+            progress_note="Job Content OS khong chay qua hang doi dich video thong thuong",
+            error=(
+                "Job nay duoc tao boi Content OS va khong co URL video nguon de tai bang yt-dlp. "
+                "Hay tao/chay lai tu man Content OS thay vi nut Thu lai cua lich su job."
+            ),
+        )
+        _running_tasks.pop(job_id, None)
         return
 
     retry_count = 0
@@ -5494,6 +5517,13 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     old_job = _get_owned_job(job_id, user_id)
     if old_job.status != "error":
         raise HTTPException(400, "Chỉ có thể thử lại job bị lỗi")
+
+    if _is_content_os_job(old_job):
+        raise HTTPException(
+            400,
+            "Job nay duoc tao boi Content OS. Hay vao Content OS va tao job/chay production lai; "
+            "khong the retry bang pipeline tai video thong thuong.",
+        )
 
     user = store.get_user_by_id(user_id)
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:

@@ -8,43 +8,47 @@ Responsibilities:
 - Ensure timing matches beats
 - Add source attributions
 """
+
 import logging
-from typing import Dict, Any
+from typing import Any, Dict
+
 from pydantic import BaseModel
 
 from .base import BaseAgent
+from .llm_router import _parse_json_content
 from ..schemas import GeneratedScript, ScriptSegment
+from ..visual_prompts import clean_text, infer_topic, normalize_generated_script, scene_visual_prompt
 
 logger = logging.getLogger(__name__)
 
 
 class ScriptWriterAgent(BaseAgent):
     """Agent for script generation."""
-    
+
     @property
     def agent_name(self) -> str:
         return "ScriptWriterAgent"
-    
+
     @property
     def output_schema(self) -> type[BaseModel]:
         return GeneratedScript
-    
+
     def build_prompt(self, context: Dict[str, Any]) -> str:
         """Build prompt for script writing."""
         content_plan = context.get("content_plan", {})
         target_language = context.get("target_language", "vi")
         target_duration = context.get("target_duration_seconds", 45)
         user_instructions = context.get("user_instructions", "")
-        
-        beats_text = "\n".join([
-            f"- Beat {b.get('order', 0)}: {b.get('start_second', 0)}-{b.get('end_second', 0)}s - "
-            f"{b.get('purpose', '')}: {b.get('narration_goal', '')}"
-            for b in content_plan.get("beats", [])
-        ])
-        
-        prompt = f"""You are a script writer for short-form video content.
 
-Your task is to generate a script based on the content plan.
+        beats_text = "\n".join(
+            [
+                f"- Beat {b.get('order', 0)}: {b.get('start_second', 0)}-{b.get('end_second', 0)}s - "
+                f"{b.get('purpose', '')}: {b.get('narration_goal', '')}"
+                for b in content_plan.get("beats", [])
+            ]
+        )
+
+        return f"""You are a script writer for short-form vertical video content.
 
 Target language: {target_language}
 Target duration: {target_duration} seconds
@@ -60,16 +64,17 @@ Beats:
 
 User instructions: {user_instructions}
 
-Generate:
-- 3-5 title options (catchy, relevant)
-- Hook text (first 3 seconds)
-- Full narration text
-- Script segments with timing matching the beats
-- Description for the video
-- Relevant hashtags
-- Source attributions (if using sources)
+Generate a complete short-video script. Requirements:
+- Write natural narration in the target language.
+- subtitle_text must be a readable caption for the segment, not a short headline.
+- For subtitle_text use 8-18 words, preserve the main meaning of narration, and avoid cutting the sentence too aggressively.
+- Each segment must include a concrete visual_instruction for image/video generation.
+- visual_instruction must be detailed enough for image generation: subject, setting, action, camera angle, visual objects, mood, and continuity.
+- Do not use generic visual instructions like "show intro", "show highlights", or "show summary".
+- Avoid brand logos and avoid readable text inside generated visuals.
+- Leave the lower 28 percent of the frame clean for subtitles.
 
-Format your response as JSON:
+Format your response as one valid JSON object:
 {{
     "title_options": ["Title 1", "Title 2", "Title 3"],
     "hook": "Hook text",
@@ -78,160 +83,142 @@ Format your response as JSON:
         {{
             "segment_id": "seg1",
             "start_second": 0.0,
-            "end_second": 3.0,
+            "end_second": 6.0,
             "narration": "narration for this segment",
-            "subtitle_text": "subtitle text",
-            "visual_instruction": "what to show",
-            "source_refs": ["source1"]
+            "subtitle_text": "short subtitle text",
+            "visual_instruction": "Vertical 9:16 realistic scene ...",
+            "source_refs": []
         }}
     ],
     "description": "Video description",
     "hashtags": ["tag1", "tag2"],
     "estimated_duration_seconds": 45.0,
-    "source_attributions": ["Source: @creator"]
+    "source_attributions": []
 }}
 """
-        return prompt
-    
+
     def validate_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate script output."""
-        # If output only contains raw_content (from LLM router fallback), use agent's mock
+        """Validate script output and repair weak visual instructions."""
         if set(output.keys()) == {"raw_content"}:
-            logger.warning("LLM returned raw_content only, using agent mock output")
-            return self._mock_output()
-        
+            try:
+                output = _parse_json_content(output.get("raw_content", ""))
+            except Exception:
+                logger.warning("LLM returned raw_content only, using agent fallback output")
+                return self._mock_output()
+
         try:
-            result = self.output_schema(**output)
+            topic = infer_topic(getattr(self, "_context", {}), output.get("hook", ""), output.get("narration_text", ""))
+            result = self.output_schema(**normalize_generated_script(output, topic))
             return result.model_dump()
-        except Exception as e:
-            logger.warning(f"Output validation failed, returning default: {e}")
-            return GeneratedScript(
-                title_options=["Title 1", "Title 2", "Title 3"],
-                hook="Hook text",
-                narration_text="Full narration text",
-                segments=[
-                    ScriptSegment(
-                        segment_id="seg1",
-                        start_second=0.0,
-                        end_second=3.0,
-                        narration="Narration",
-                        subtitle_text="Subtitle",
-                        visual_instruction="Visual",
-                    ),
-                ],
-                description="Description",
-                hashtags=["tag1", "tag2"],
-                estimated_duration_seconds=45.0,
-                source_attributions=[],
-            ).model_dump()
-    
+        except Exception as exc:
+            logger.warning("Output validation failed, returning fallback script: %s", exc)
+            return self._mock_output()
+
     def _mock_output(self) -> Dict[str, Any]:
-        """Return mock output for testing."""
-        # Get context from the agent to make output dynamic
-        context = getattr(self, '_context', {})
+        """Return deterministic fallback output when the LLM cannot produce valid JSON."""
+        context = getattr(self, "_context", {})
         topic = context.get("topic", "")
         objective = context.get("objective", "")
         target_language = context.get("target_language", "vi")
-        
-        # Use topic as the main content theme
-        content_theme = topic if topic else "nội dung này"
-        
-        # Generate dynamic content based on topic (generic template)
+
+        content_theme = clean_text(topic or objective or "nội dung này")
+        visual_topic = infer_topic(context, content_theme)
+
         if target_language == "vi":
-            # Vietnamese template
+            segments = [
+                ScriptSegment(
+                    segment_id="seg1",
+                    start_second=0.0,
+                    end_second=6.0,
+                    narration="Bạn đang học tiếng Anh bằng điện thoại? Đây là 3 tính năng AI nên thử ngay.",
+                    subtitle_text="3 tính năng AI nên thử khi học tiếng Anh bằng điện thoại.",
+                    visual_instruction=scene_visual_prompt(visual_topic, "hook smartphone English learning AI", 1),
+                ),
+                ScriptSegment(
+                    segment_id="seg2",
+                    start_second=6.0,
+                    end_second=17.0,
+                    narration="Đầu tiên là luyện nói với AI: bạn nói một câu, ứng dụng phản hồi và sửa phát âm ngay lập tức.",
+                    subtitle_text="Luyện nói với AI: phản hồi và sửa phát âm ngay.",
+                    visual_instruction=scene_visual_prompt(visual_topic, "AI speaking practice pronunciation feedback", 2),
+                ),
+                ScriptSegment(
+                    segment_id="seg3",
+                    start_second=17.0,
+                    end_second=30.0,
+                    narration="Thứ hai là camera dịch và giải thích từ trong ngữ cảnh, rất hữu ích khi đọc sách hoặc xem phụ đề.",
+                    subtitle_text="Camera dịch và giải thích từ trong ngữ cảnh.",
+                    visual_instruction=scene_visual_prompt(visual_topic, "camera translation OCR English book subtitles", 3),
+                ),
+                ScriptSegment(
+                    segment_id="seg4",
+                    start_second=30.0,
+                    end_second=45.0,
+                    narration="Cuối cùng là flashcard thông minh: AI chọn đúng từ bạn hay quên để ôn lại vào thời điểm phù hợp.",
+                    subtitle_text="Flashcard AI nhắc lại đúng từ bạn hay quên.",
+                    visual_instruction=scene_visual_prompt(visual_topic, "AI flashcard spaced repetition vocabulary review", 4),
+                ),
+            ]
             return GeneratedScript(
                 title_options=[
                     f"Review {content_theme}",
-                    f"{content_theme} Có Gì Đặc Biệt?",
-                    f"Tất Cả Về {content_theme}"
+                    "3 tính năng AI giúp học tiếng Anh hiệu quả hơn",
+                    f"Cách dùng {content_theme} trên điện thoại",
                 ],
-                hook=f"Bạn có muốn biết về {content_theme} không? Cùng tìm hiểu nhé!",
-                narration_text=f"Hôm nay chúng ta sẽ cùng khám phá {content_theme} một cách chi tiết. Đây là những thông tin thú vị và hữu ích mà bạn cần biết về {content_theme}.",
-                segments=[
-                    ScriptSegment(
-                        segment_id="seg1",
-                        start_second=0.0,
-                        end_second=5.0,
-                        narration=f"Bạn có muốn biết về {content_theme} không?",
-                        subtitle_text=f"Bạn có muốn biết về {content_theme} không?",
-                        visual_instruction=f"Show {content_theme} intro",
-                    ),
-                    ScriptSegment(
-                        segment_id="seg2",
-                        start_second=5.0,
-                        end_second=20.0,
-                        narration=f"Đầu tiên, hãy cùng tìm hiểu những điểm nổi bật của {content_theme}.",
-                        subtitle_text=f"Đầu tiên, hãy cùng tìm hiểu những điểm nổi bật của {content_theme}.",
-                        visual_instruction=f"Show {content_theme} highlights",
-                    ),
-                    ScriptSegment(
-                        segment_id="seg3",
-                        start_second=20.0,
-                        end_second=35.0,
-                        narration=f"Tiếp theo, chúng ta sẽ đi sâu vào chi tiết về {content_theme}.",
-                        subtitle_text=f"Tiếp theo, chúng ta sẽ đi sâu vào chi tiết về {content_theme}.",
-                        visual_instruction=f"Show {content_theme} details",
-                    ),
-                    ScriptSegment(
-                        segment_id="seg4",
-                        start_second=35.0,
-                        end_second=45.0,
-                        narration=f"Tổng quan: Đây là những gì bạn cần biết về {content_theme}!",
-                        subtitle_text=f"Tổng quan: Đây là những gì bạn cần biết về {content_theme}!",
-                        visual_instruction=f"Show summary",
-                    ),
-                ],
-                description=f"Khám phá {content_theme} - Những thông tin thú vị và hữu ích về {content_theme} mà bạn cần biết.",
-                hashtags=[content_theme.lower().replace(" ", ""), "review", "info", "kienthuc", "tintuc"],
+                hook=segments[0].narration,
+                narration_text=" ".join(segment.narration for segment in segments),
+                segments=segments,
+                description=f"Khám phá {content_theme}: luyện nói với AI, camera dịch ngữ cảnh và flashcard thông minh.",
+                hashtags=[content_theme.lower().replace(" ", ""), "review", "ai", "hoctienganh", "congnghe"],
                 estimated_duration_seconds=45.0,
                 source_attributions=[],
             ).model_dump()
-        else:
-            # English template
-            return GeneratedScript(
-                title_options=[
-                    f"{content_theme.title()} Review",
-                    f"Is {content_theme} Worth It?",
-                    f"Everything About {content_theme.title()}"
-                ],
-                hook=f"Do you want to know about {content_theme}? Let's find out!",
-                narration_text=f"Today we'll explore {content_theme} in detail. Here are the interesting and useful information you need to know about {content_theme}.",
-                segments=[
-                    ScriptSegment(
-                        segment_id="seg1",
-                        start_second=0.0,
-                        end_second=5.0,
-                        narration=f"Do you want to know about {content_theme}?",
-                        subtitle_text=f"Do you want to know about {content_theme}?",
-                        visual_instruction=f"Show {content_theme} intro",
-                    ),
-                    ScriptSegment(
-                        segment_id="seg2",
-                        start_second=5.0,
-                        end_second=20.0,
-                        narration=f"First, let's explore the highlights of {content_theme}.",
-                        subtitle_text=f"First, let's explore the highlights of {content_theme}.",
-                        visual_instruction=f"Show {content_theme} highlights",
-                    ),
-                    ScriptSegment(
-                        segment_id="seg3",
-                        start_second=20.0,
-                        end_second=35.0,
-                        narration=f"Next, we'll dive deep into the details of {content_theme}.",
-                        subtitle_text=f"Next, we'll dive deep into the details of {content_theme}.",
-                        visual_instruction=f"Show {content_theme} details",
-                    ),
-                    ScriptSegment(
-                        segment_id="seg4",
-                        start_second=35.0,
-                        end_second=45.0,
-                        narration=f"Overall: This is what you need to know about {content_theme}!",
-                        subtitle_text=f"Overall: This is what you need to know about {content_theme}!",
-                        visual_instruction=f"Show summary",
-                    ),
-                ],
-                description=f"Explore {content_theme} - Interesting and useful information about {content_theme} that you need to know.",
-                hashtags=[content_theme.lower().replace(" ", ""), "review", "info", "knowledge", "news"],
-                estimated_duration_seconds=45.0,
-                source_attributions=[],
-            ).model_dump()
+
+        segments = [
+            ScriptSegment(
+                segment_id="seg1",
+                start_second=0.0,
+                end_second=6.0,
+                narration=f"Here is a practical look at {content_theme}.",
+                subtitle_text=f"A practical look at {content_theme}.",
+                visual_instruction=scene_visual_prompt(visual_topic, "intro", 1),
+            ),
+            ScriptSegment(
+                segment_id="seg2",
+                start_second=6.0,
+                end_second=18.0,
+                narration="First, focus on the feature that saves the most time in everyday use.",
+                subtitle_text="Start with the feature that saves the most time.",
+                visual_instruction=scene_visual_prompt(visual_topic, "main benefit", 2),
+            ),
+            ScriptSegment(
+                segment_id="seg3",
+                start_second=18.0,
+                end_second=32.0,
+                narration="Next, compare how it works before and after AI assistance.",
+                subtitle_text="Compare the before-and-after workflow.",
+                visual_instruction=scene_visual_prompt(visual_topic, "before after comparison", 3),
+            ),
+            ScriptSegment(
+                segment_id="seg4",
+                start_second=32.0,
+                end_second=45.0,
+                narration="Use it when the task is repetitive, measurable, and easy to verify.",
+                subtitle_text="Use it for repetitive tasks you can verify.",
+                visual_instruction=scene_visual_prompt(visual_topic, "summary", 4),
+            ),
+        ]
+        return GeneratedScript(
+            title_options=[
+                f"{content_theme.title()} Review",
+                f"Is {content_theme} Worth It?",
+                f"Everything About {content_theme.title()}",
+            ],
+            hook=segments[0].narration,
+            narration_text=" ".join(segment.narration for segment in segments),
+            segments=segments,
+            description=f"Explore {content_theme} with practical examples and clear takeaways.",
+            hashtags=[content_theme.lower().replace(" ", ""), "review", "info", "knowledge", "news"],
+            estimated_duration_seconds=45.0,
+            source_attributions=[],
+        ).model_dump()

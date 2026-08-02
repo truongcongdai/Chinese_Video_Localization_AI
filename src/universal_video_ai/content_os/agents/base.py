@@ -139,7 +139,8 @@ class BaseAgent(ABC):
                 max_tokens=2000,
             )
             
-            self.logger.info(f"LLM call successful: provider={self.llm_provider}, model={self.llm_model}")
+            effective_provider = router._effective_provider() if hasattr(router, "_effective_provider") else self.llm_provider
+            self.logger.info(f"LLM call successful: provider={effective_provider}, model={self.llm_model}")
             return result
             
         except Exception as e:

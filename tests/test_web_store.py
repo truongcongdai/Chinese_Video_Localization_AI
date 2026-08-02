@@ -44,3 +44,19 @@ def test_create_job_accepts_and_persists_remix_settings(tmp_path: Path) -> None:
     assert retry.remix_enabled == 1
     assert retry.subtitle_offset_seconds == -0.2
     assert retry.to_dict()["remix_platforms"] == ["youtube_long", "facebook_long"]
+
+
+def test_content_os_job_is_flagged_for_frontend(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    user_id = store.create_user("user", "hash")
+
+    job = store.create_job(
+        user_id,
+        "content_os://generated_script",
+        "vi",
+        source_language="content_os:12",
+    )
+
+    loaded = store.get_job(job.id)
+    assert loaded is not None
+    assert loaded.to_dict()["is_content_os"] is True

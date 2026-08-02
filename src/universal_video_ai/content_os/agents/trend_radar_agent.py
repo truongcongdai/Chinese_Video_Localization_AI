@@ -77,13 +77,15 @@ Format your response as JSON with this structure:
             return self._mock_output()
         
         try:
+            output = dict(output or {})
+            output["topic"] = output.get("topic") or getattr(self, "_context", {}).get("topic", "")
             result = self.output_schema(**output)
             return result.model_dump()
         except Exception as e:
             logger.warning(f"Output validation failed, returning default: {e}")
             # Return a valid default structure
             return TrendRadarResult(
-                topic=output.get("topic", ""),
+                topic=output.get("topic") or getattr(self, "_context", {}).get("topic", ""),
                 expanded_keywords=output.get("expanded_keywords", []),
                 detected_trends=[],
                 warnings=output.get("warnings", []),

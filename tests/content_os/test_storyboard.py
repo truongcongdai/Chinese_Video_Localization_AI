@@ -88,6 +88,8 @@ class TestStoryboardManager:
         assert storyboard.status == StoryboardStatus.DRAFT
         assert len(storyboard.scenes) == 2
         assert storyboard.total_duration == 45.0
+        assert storyboard.scenes[0].visual_instruction != "Visual 1"
+        assert "Vertical 9:16" in storyboard.scenes[0].visual_instruction
     
     def test_update_scene(self, manager, repo, sample_script):
         """Test updating a scene."""

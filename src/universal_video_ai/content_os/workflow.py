@@ -98,6 +98,34 @@ class ContentOSWorkflow:
         run = self.repository.get_run(run_id, user_id)
         if not run:
             raise WorkflowError(f"Run {run_id} not found")
+
+        if run.status == "running":
+            raise WorkflowError(f"Run {run_id} is already running")
+        if run.status == "completed":
+            raise WorkflowError(f"Run {run_id} is already completed")
+        if run.status in {"paused", "awaiting_approval"}:
+            raise WorkflowError(
+                f"Run {run_id} is {run.status}; use the resume or approval action instead"
+            )
+
+        # _execute_workflow currently performs a full run from TREND_RESEARCH.
+        # A failed attempt retains its last stage for diagnostics, so retrying it
+        # without resetting would try to transition backwards (for example,
+        # SOURCE_ANALYSIS -> TREND_RESEARCH) and fail before doing useful work.
+        # Reset only retryable terminal attempts; new runs are already CREATED.
+        if run.status in {"failed", "cancelled"} or run.current_stage != WorkflowStage.CREATED.value:
+            self.repository.update_run(
+                run_id=run_id,
+                user_id=user_id,
+                status="created",
+                current_stage=WorkflowStage.CREATED.value,
+                progress_percent=0,
+                revision_count=0,
+                warning_json=None,
+                error_json=None,
+                started_at=None,
+                completed_at=None,
+            )
         
         # Update status to running
         self.repository.update_run(
@@ -435,7 +463,43 @@ class ContentOSWorkflow:
         script = context.get("script", {})
         
         resolved_assets = []
-        for scene in storyboard.get("scenes", []):
+        scenes = storyboard.get("scenes", [])
+        if scenes:
+            script_title = ""
+            titles = script.get("title_options") or []
+            if titles:
+                script_title = titles[0]
+            intro_prompt = (
+                "Vertical 9:16 realistic opening shot for a Vietnamese mobile learning video. "
+                f"Topic/title: {script_title or project.topic}. "
+                "A modern smartphone on a study desk, soft cinematic light, AI learning symbols subtly around it, "
+                "clear visual hook, no logos, no readable text, leave lower 28 percent clean for subtitles."
+            )
+            intro_asset = self.asset_resolver.resolve_asset(
+                run_id=run_id,
+                user_id=user_id,
+                asset_type=AssetResolverAssetType.IMAGE,
+                description=intro_prompt,
+                preferred_sources=[AssetSource.STOCK_API, AssetSource.GENERATED],
+            )
+            first_scene_duration = max(
+                1.0,
+                float(scenes[0].get("end_second", 2.0) or 2.0) - float(scenes[0].get("start_second", 0.0) or 0.0),
+            )
+            intro_duration = min(2.0, first_scene_duration * 0.4)
+            if intro_asset and intro_asset.local_path:
+                resolved_assets.append({
+                    "scene_id": "scene_intro",
+                    "strategy": "generated_intro",
+                    "local_path": intro_asset.local_path,
+                    "description": intro_prompt,
+                    "start_second": 0.0,
+                    "end_second": intro_duration,
+                    "duration_seconds": intro_duration,
+                    "generator": intro_asset.metadata.get("generator") if intro_asset.metadata else None,
+                })
+
+        for scene_index, scene in enumerate(scenes):
             scene_id = scene.get("scene_id")
             visual_instruction = scene.get("visual_instruction", "")
             narration_text = scene.get("narration_text", "")
@@ -449,15 +513,28 @@ class ContentOSWorkflow:
                 user_id=user_id,
                 asset_type=AssetResolverAssetType.IMAGE,
                 description=description,
-                preferred_sources=[AssetSource.GENERATED],
+                preferred_sources=[AssetSource.STOCK_API, AssetSource.GENERATED],
             )
             
             if asset and asset.local_path:
+                start_second = float(scene.get("start_second", 0.0) or 0.0)
+                end_second = float(scene.get("end_second", start_second + 5.0) or start_second + 5.0)
+                if end_second <= start_second:
+                    end_second = start_second + 5.0
+                if scene_index == 0 and resolved_assets and resolved_assets[0].get("scene_id") == "scene_intro":
+                    intro_duration = float(resolved_assets[0].get("duration_seconds") or 0.0)
+                    start_second += intro_duration
+                    if end_second <= start_second:
+                        end_second = start_second + 0.5
                 resolved_assets.append({
                     "scene_id": scene_id,
                     "strategy": "generated",
                     "local_path": asset.local_path,
                     "description": description,
+                    "start_second": start_second,
+                    "end_second": end_second,
+                    "duration_seconds": end_second - start_second,
+                    "generator": asset.metadata.get("generator") if asset.metadata else None,
                 })
             else:
                 # Fallback to text card info
@@ -495,19 +572,11 @@ class ContentOSWorkflow:
         segments = script.get("segments", [])
         narration_text = " ".join([seg.get("narration", seg.get("text", "")) for seg in segments])
         
-        # Detect script language from the text itself (simple heuristic)
-        # If text contains mostly ASCII characters, assume English
-        # Otherwise use project target language
-        script_language = project.target_language
-        voice_id = project.voice_id
-        if narration_text and any(ord(c) < 128 for c in narration_text):
-            # Check if mostly ASCII (likely English)
-            ascii_ratio = sum(1 for c in narration_text if ord(c) < 128) / len(narration_text)
-            if ascii_ratio > 0.8:  # 80%+ ASCII characters
-                script_language = "en"
-                # Use English voice if script is English
-                voice_id = "en-US-AriaNeural"  # Default English voice
-                self.logger.info(f"Detected script language as English (ASCII ratio: {ascii_ratio:.2f}), using voice: {voice_id}")
+        # Content OS scripts are generated for the project's target_language.
+        # Do not infer English from ASCII ratio: Vietnamese text is mostly ASCII too
+        # and that caused Vietnamese scripts to be spoken by en-US voices.
+        script_language = (project.target_language or "vi").strip() or "vi"
+        voice_id = (project.voice_id or "").strip() or None
         
         # Generate audio using TTS adapter with detected script language
         try:
@@ -530,9 +599,10 @@ class ContentOSWorkflow:
             manifest = {
                 "audio_path": str(audio_path),
                 "duration_seconds": duration,
-                "language": project.target_language,
-                "voice_id": project.voice_id,
+                "language": script_language,
+                "voice_id": voice_id or "",
                 "segments_count": len(segments),
+                "text_source": "segments.narration",
             }
         except Exception as e:
             self.logger.warning(f"TTS generation failed: {e}, using fallback")
@@ -578,7 +648,7 @@ class ContentOSWorkflow:
             
             manifest = {
                 "subtitle_path": str(subtitle_path),
-                "format": "srt",
+                "format": subtitle_path.suffix.lstrip(".") or "ass",
                 "segments_count": len(segments),
                 "duration_seconds": duration,
             }
@@ -653,7 +723,7 @@ class ContentOSWorkflow:
         project = self.repository.get_project(run.project_id, user_id)
         
         # Prepare output path
-        output_dir = Path("local_data/content_os") / str(user_id) / str(project.channel_id or "default") / str(run.project_id) / str(run_id) / "renders"
+        output_dir = self.artifact_store._get_run_dir(user_id, run.project_id, run_id) / "renders"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "final.mp4"
         
@@ -687,6 +757,8 @@ class ContentOSWorkflow:
             
             # Start render with actual audio and subtitles
             render_job = self.renderer.start_render(render_job)
+            if render_job.status.value != "completed":
+                raise RuntimeError(render_job.error_message or "Render failed")
             
             result = {
                 "output_path": str(output_path),
@@ -695,17 +767,24 @@ class ContentOSWorkflow:
                 "resolution": self._get_resolution_for_platform(project.target_platform),
             }
         except Exception as e:
-            self.logger.warning(f"Rendering failed: {e}")
-            # In case of failure, create a mock result
+            self.logger.error(f"Rendering failed: {e}")
             result = {
                 "output_path": str(output_path),
-                "job_id": "mock_render_job",
-                "status": "completed",
+                "job_id": "failed_render_job",
+                "status": "failed",
                 "resolution": self._get_resolution_for_platform(project.target_platform),
-                "note": f"Render failed: {e}",
+                "error": str(e),
             }
-        
-        # Store as artifact
+            self.artifact_store.write(
+                user_id=user_id,
+                project_id=run.project_id,
+                run_id=run_id,
+                artifact_type=ArtifactType.RENDER_REPORT,
+                data=result,
+                created_by_agent="Renderer",
+            )
+            raise
+
         self.artifact_store.write(
             user_id=user_id,
             project_id=run.project_id,
@@ -726,7 +805,12 @@ class ContentOSWorkflow:
         )
         
         output_path = render_result.get("output_path")
-        expected_duration = project.target_duration_seconds
+        timeline = context.get("timeline", {}) if isinstance(context, dict) else {}
+        expected_duration = (
+            float(timeline.get("total_duration") or timeline.get("duration_seconds"))
+            if isinstance(timeline, dict) and (timeline.get("total_duration") or timeline.get("duration_seconds"))
+            else project.target_duration_seconds
+        )
         expected_resolution = self._get_resolution_for_platform(project.target_platform)
         
         if output_path and Path(output_path).exists():
@@ -784,7 +868,7 @@ class ContentOSWorkflow:
             "youtube_landscape": "1920x1080",
             "instagram_reels": "1080x1920",
         }
-        return resolutions.get(platform, "youtube_shorts")
+        return resolutions.get(platform, "1080x1920")
     
     def _advance_stage(self, run_id: int, user_id: int, new_stage: WorkflowStage, has_approval: bool = False) -> None:
         """Advance workflow stage with state machine validation."""

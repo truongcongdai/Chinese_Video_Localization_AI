@@ -2389,7 +2389,7 @@ async function refreshJobs() {
           ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>SRT dịch</a>` : ""}
           ${hasSourceSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/source-subtitles.srt" download>SRT gốc</a>` : ""}
           ${hasSubtitles || hasSourceSubtitles ? `<button class="btn secondary small" data-subtitle-view="${job.id}">Xem phụ đề</button>` : ""}
-          ${job.status === "error" ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
+          ${job.status === "error" && !job.is_content_os ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
         </div>
       </div>
       <button class="btn danger small job-delete" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
@@ -3042,7 +3042,7 @@ function renderContentOSRuns() {
             ${r.status === 'created' ? `<button class="btn secondary small" onclick="event.stopPropagation(); startContentOSRun(${r.id})">▶️</button>` : ''}
             ${r.status === 'running' ? `<button class="btn secondary small" onclick="event.stopPropagation(); cancelContentOSRun(${r.id})">⏸️</button>` : ''}
             ${r.current_stage === 'awaiting_approval' ? `<button class="btn gradient small" onclick="event.stopPropagation(); approveContentOSRun(${r.id})">✅</button>` : ''}
-            ${r.current_stage === 'ready_for_localization' ? `<button class="btn gradient small" onclick="event.stopPropagation(); createContentOSJob(${r.id})">🎬</button>` : ''}
+            ${canCreateContentOSJob(r) ? `<button class="btn gradient small" onclick="event.stopPropagation(); createContentOSJob(${r.id})">🎬</button>` : ''}
           </div>
         </div>
       </div>
@@ -3060,6 +3060,25 @@ function getRunStatusColor(status) {
     "cancelled": "var(--text-dim)",
   };
   return colors[status] || "var(--text-dim)";
+}
+
+function canCreateContentOSJob(run) {
+  return [
+    "approved",
+    "ready_for_localization",
+    "storyboarding",
+    "awaiting_storyboard_approval",
+    "asset_planning",
+    "asset_resolving",
+    "assets_ready",
+    "voice_generation",
+    "subtitle_generation",
+    "timeline_building",
+    "rendering",
+    "output_validation",
+    "completed",
+    "failed",
+  ].includes(run.current_stage);
 }
 
 function selectContentOSRun(runId) {
@@ -3080,7 +3099,7 @@ function selectContentOSRun(runId) {
     if (existingBtn) existingBtn.remove();
     
     // Add view script button if script is available
-    if (run.current_stage === "awaiting_approval" || run.current_stage === "ready_for_localization" || run.current_stage === "completed") {
+    if (run.current_stage === "awaiting_approval" || canCreateContentOSJob(run)) {
       const scriptBtn = document.createElement("button");
       scriptBtn.id = "content-os-view-script-btn";
       scriptBtn.className = "btn secondary";
@@ -3093,7 +3112,7 @@ function selectContentOSRun(runId) {
     $("#content-os-start-run-btn").disabled = run.status === "running" || run.status === "completed";
     $("#content-os-cancel-run-btn").disabled = run.status === "completed" || run.status === "cancelled";
     $("#content-os-approve-run-btn").disabled = run.current_stage !== "awaiting_approval" && run.current_stage !== "script_audit";
-    $("#content-os-create-job-btn").disabled = run.current_stage !== "ready_for_localization" && run.current_stage !== "approved";
+    $("#content-os-create-job-btn").disabled = !canCreateContentOSJob(run);
   }
 }
 

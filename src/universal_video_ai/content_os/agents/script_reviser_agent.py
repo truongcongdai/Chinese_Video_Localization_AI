@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from .base import BaseAgent
 from ..schemas import RevisionResult, GeneratedScript, AuditIssue
+from ..visual_prompts import infer_topic, normalize_generated_script
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,12 @@ Format your response as JSON:
     "change_summary": "Summary of changes made",
     "remaining_issues": [...]
 }}
+
+Important schema rules:
+- Every revised_script.segments item must use exactly these keys:
+  segment_id, start_second, end_second, narration, subtitle_text, visual_instruction, source_refs.
+- Do not use time_start/time_end/start/end. Use start_second/end_second.
+- Preserve segment timing and visual_instruction unless a change is required by the audit.
 """
         return prompt
     
@@ -96,25 +103,42 @@ Format your response as JSON:
             return self._mock_output()
         
         try:
+            output = self._normalize_revision_output(output)
             result = self.output_schema(**output)
             return result.model_dump()
         except Exception as e:
             logger.warning(f"Output validation failed, returning default: {e}")
-            # Return a valid default structure
+            original_script = getattr(self, "_context", {}).get("script") or {}
+            topic = infer_topic(getattr(self, "_context", {}), original_script.get("hook", ""), original_script.get("narration_text", ""))
             return RevisionResult(
-                revised_script=GeneratedScript(
-                    title_options=["Title 1"],
-                    hook="Hook",
-                    narration_text="Narration",
-                    segments=[],
-                    description="Description",
-                    hashtags=["tag1"],
-                    estimated_duration_seconds=45.0,
-                    source_attributions=[],
-                ),
-                change_summary="Revision failed, returning default script",
+                revised_script=GeneratedScript(**normalize_generated_script(original_script, topic)),
+                change_summary="Revision validation failed; preserved the current valid script instead of returning an empty script",
                 remaining_issues=[],
             ).model_dump()
+
+    def _normalize_revision_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize Gemini/OpenAI alias fields before validating RevisionResult."""
+        data = dict(output or {})
+        revised_script = data.get("revised_script") or data.get("script") or data.get("revised") or {}
+        topic = infer_topic(getattr(self, "_context", {}), revised_script.get("hook", ""), revised_script.get("narration_text", ""))
+        data["revised_script"] = normalize_generated_script(revised_script, topic)
+
+        remaining = data.get("remaining_issues") or []
+        normalized_issues = []
+        for index, issue in enumerate(remaining, start=1):
+            if not isinstance(issue, dict):
+                issue = {"description": str(issue)}
+            normalized_issues.append({
+                "issue_id": issue.get("issue_id") or f"remaining_{index}",
+                "severity": issue.get("severity") if issue.get("severity") in {"info", "warning", "critical"} else "info",
+                "category": issue.get("category") or "revision",
+                "segment_id": issue.get("segment_id"),
+                "description": issue.get("description") or "",
+                "required_fix": issue.get("required_fix") or "",
+            })
+        data["remaining_issues"] = normalized_issues
+        data["change_summary"] = data.get("change_summary") or data.get("summary") or ""
+        return data
     
     def _mock_output(self) -> Dict[str, Any]:
         """Return mock output for testing."""

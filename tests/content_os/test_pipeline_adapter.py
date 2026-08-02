@@ -156,6 +156,23 @@ class TestPipelineAdapter:
         job_status = adapter.get_job_status(job_id)
         assert job_status is not None
         assert job_status["source_url"] == "https://youtube.com/watch?v=test123"
+
+    def test_create_job_allows_completed_run_for_rerender(
+        self, adapter, run, script_artifact, content_plan_artifact, repo
+    ):
+        """Runs incorrectly completed by older builds can be sent through production again."""
+        repo.update_run(
+            run_id=run.id,
+            user_id=1,
+            current_stage="completed",
+            status="completed",
+        )
+
+        job_id = adapter.create_job_from_run(run.id, user_id=1)
+
+        assert job_id is not None
+        job_status = adapter.get_job_status(job_id)
+        assert job_status["source_language"] == f"content_os:{run.id}"
     
     def test_create_job_with_selected_source(self, adapter, run, script_artifact, content_plan_artifact, repo):
         """Test creating a job using selected source."""
@@ -193,6 +210,8 @@ class TestPipelineAdapter:
         
         assert status is not None
         assert status["id"] == job_id
+        assert status["source_url"] == "content_os://generated_script"
+        assert status["source_language"] == f"content_os:{run.id}"
         # Content OS jobs are marked as "done" immediately since they don't run the full pipeline
         assert status["status"] in ["queued", "done"]
     

@@ -7,9 +7,11 @@ the migration is idempotent (safe to run multiple times).
 import pytest
 import sqlite3
 import tempfile
+import json
 from pathlib import Path
 
 from universal_video_ai.web.store import Store
+from universal_video_ai.content_os.repository import ContentOSRepository
 
 
 class TestContentOSDatabaseMigration:
@@ -174,3 +176,69 @@ class TestContentOSDatabaseMigration:
             cursor.execute("PRAGMA foreign_key_list(content_os_artifacts)")
             fk_artifacts = cursor.fetchall()
             assert len(fk_artifacts) > 0, "No foreign keys found in content_os_artifacts"
+
+    def test_legacy_project_schema_remains_writable(self, temp_db_path):
+        """Upgraded databases with legacy NOT NULL columns accept new projects."""
+        with sqlite3.connect(str(temp_db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE content_os_projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    channel_name TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    target_platforms_json TEXT NOT NULL,
+                    source_platforms_json TEXT NOT NULL,
+                    target_market TEXT NOT NULL,
+                    target_language TEXT NOT NULL,
+                    target_duration_seconds INTEGER NOT NULL,
+                    content_format TEXT NOT NULL,
+                    settings_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO content_os_projects
+                (user_id, channel_name, topic, target_platforms_json,
+                 source_platforms_json, target_market, target_language,
+                 target_duration_seconds, content_format, created_at, updated_at)
+                VALUES (1, 'Legacy', 'Existing', '["tiktok"]', '[]',
+                        'Vietnam', 'vi', 45, 'trend_decode', 1, 1)
+                """
+            )
+
+        Store(db_path=temp_db_path)
+        repo = ContentOSRepository(temp_db_path)
+
+        migrated = repo.get_project(1, user_id=1)
+        assert migrated.target_platform == "tiktok"
+
+        created = repo.create_project(
+            user_id=1,
+            channel_id=None,
+            channel_name="New",
+            mode="ai_video",
+            topic="New topic",
+            objective="",
+            target_platform="instagram_reels",
+            target_duration_seconds=30,
+            target_language="vi",
+            content_style="trend_decode",
+            visual_style="modern_documentary",
+            voice_id="",
+            subtitle_style_id="",
+            background_music_enabled=True,
+            user_instructions="",
+        )
+        assert created.target_platform == "instagram_reels"
+
+        with sqlite3.connect(str(temp_db_path)) as conn:
+            legacy_platforms = conn.execute(
+                "SELECT target_platforms_json FROM content_os_projects WHERE id = ?",
+                (created.id,),
+            ).fetchone()[0]
+        assert json.loads(legacy_platforms) == ["instagram_reels"]

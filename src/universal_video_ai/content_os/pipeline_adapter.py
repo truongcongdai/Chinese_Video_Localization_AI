@@ -62,8 +62,23 @@ class PipelineAdapter:
         if not project:
             raise WorkflowError(f"Project {run.project_id} not found")
         
-        # Verify run is in ready state
-        if run.current_stage not in ["ready_for_localization", "approved"]:
+        production_ready_stages = {
+            "approved",
+            "ready_for_localization",
+            "storyboarding",
+            "awaiting_storyboard_approval",
+            "asset_planning",
+            "asset_resolving",
+            "assets_ready",
+            "voice_generation",
+            "subtitle_generation",
+            "timeline_building",
+            "rendering",
+            "output_validation",
+            "completed",
+            "failed",
+        }
+        if run.current_stage not in production_ready_stages:
             raise WorkflowError(
                 f"Run {run_id} is not ready for localization. "
                 f"Current stage: {run.current_stage}"
@@ -104,6 +119,7 @@ class PipelineAdapter:
         
         # Create job in web store (Store.create_job will generate the job_id)
         actual_job_id = self._create_web_store_job(
+            run_id=run_id,
             user_id=user_id,
             project=project,
             script=script_data,
@@ -152,6 +168,7 @@ class PipelineAdapter:
     
     def _create_web_store_job(
         self,
+        run_id: int,
         user_id: int,
         project,
         script: Dict[str, Any],
@@ -180,11 +197,14 @@ class PipelineAdapter:
         # Build segments_json for the job
         segments_data = []
         for i, seg in enumerate(segments):
+            segment_text = seg.get("text") or seg.get("subtitle_text") or seg.get("narration") or ""
             segments_data.append({
                 "index": i,
                 "start": seg.get("start_second", 0),
                 "end": seg.get("end_second", 0),
-                "text": seg.get("text", ""),
+                "text": segment_text,
+                "narration": seg.get("narration", segment_text),
+                "visual_instruction": seg.get("visual_instruction", ""),
             })
         
         # Use source URL from selected sources if available
@@ -204,7 +224,7 @@ class PipelineAdapter:
                 user_id=user_id,
                 source_url=source_url,
                 target_language=project.target_language,
-                source_language="auto",
+                source_language=f"content_os:{run_id}",
                 tts_provider="edge",
                 tts_voice="",
             )
@@ -271,7 +291,7 @@ class PipelineAdapter:
         with sqlite3.connect(str(self.web_store_db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(
-                "SELECT id, status, progress_note, error, source_url, created_at, updated_at FROM jobs WHERE id = ?",
+                "SELECT id, status, progress_note, error, source_url, source_language, created_at, updated_at FROM jobs WHERE id = ?",
                 (job_id,),
             )
             row = cur.fetchone()

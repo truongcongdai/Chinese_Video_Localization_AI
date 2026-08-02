@@ -202,21 +202,42 @@ class ContentOSRepository:
         }
         
         with self._connect() as conn:
+            actual_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(content_os_projects)")
+            }
+            values_by_column = {
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "mode": mode,
+                "topic": topic,
+                "objective": objective,
+                "target_platform": target_platform,
+                "target_duration_seconds": target_duration_seconds,
+                "target_language": target_language,
+                "content_style": content_style,
+                "visual_style": visual_style,
+                "voice_id": voice_id,
+                "subtitle_style_id": subtitle_style_id,
+                "background_music_enabled": int(background_music_enabled),
+                "user_instructions": user_instructions,
+                "settings_json": json.dumps(settings),
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+                # Compatibility with the original Content OS project schema.
+                # These columns remain NOT NULL in upgraded SQLite databases,
+                # even after the canonical singular fields are added.
+                "target_platforms_json": json.dumps([target_platform]),
+                "source_platforms_json": json.dumps([]),
+                "target_market": "",
+                "content_format": content_style or mode,
+            }
+            columns = [name for name in values_by_column if name in actual_columns]
+            placeholders = ", ".join("?" for _ in columns)
             cur = conn.execute(
-                """
-                INSERT INTO content_os_projects 
-                (user_id, channel_id, channel_name, mode, topic, objective, target_platform,
-                 target_duration_seconds, target_language, content_style, visual_style,
-                 voice_id, subtitle_style_id, background_music_enabled, user_instructions,
-                 settings_json, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id, channel_id, channel_name, mode, topic, objective, target_platform,
-                    target_duration_seconds, target_language, content_style, visual_style,
-                    voice_id, subtitle_style_id, int(background_music_enabled), user_instructions,
-                    json.dumps(settings), "active", now, now,
-                ),
+                f"INSERT INTO content_os_projects ({', '.join(columns)}) VALUES ({placeholders})",
+                [values_by_column[name] for name in columns],
             )
             project_id = cur.lastrowid
             conn.commit()
@@ -336,10 +357,18 @@ class ContentOSRepository:
         if "background_music_enabled" in updates:
             updates["background_music_enabled"] = int(updates["background_music_enabled"])
         
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        values = list(updates.values()) + [time.time(), project_id, user_id]
-        
         with self._connect() as conn:
+            actual_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(content_os_projects)")
+            }
+            updates = {key: value for key, value in updates.items() if key in actual_columns}
+            if "target_platform" in updates and "target_platforms_json" in actual_columns:
+                updates["target_platforms_json"] = json.dumps([updates["target_platform"]])
+            if "content_style" in updates and "content_format" in actual_columns:
+                updates["content_format"] = updates["content_style"]
+
+            set_clause = ", ".join(f"{key} = ?" for key in updates)
+            values = list(updates.values()) + [time.time(), project_id, user_id]
             conn.execute(
                 f"UPDATE content_os_projects SET {set_clause}, updated_at = ? WHERE id = ? AND user_id = ?",
                 values,

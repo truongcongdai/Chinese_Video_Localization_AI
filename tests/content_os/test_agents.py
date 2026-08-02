@@ -25,11 +25,22 @@ class TestLLMRouter:
     def test_router_initialization(self):
         """Should initialize with default or provided config."""
         router = LLMRouter()
-        assert router.provider == "ollama"  # Default from config
+        assert router.provider in {"auto", "gemini", "ollama"}  # Env-dependent default
         
         router2 = LLMRouter(provider="openai", model="gpt-4")
         assert router2.provider == "openai"
         assert router2.model == "gpt-4"
+
+    def test_auto_provider_prefers_gemini_when_key_exists(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        router = LLMRouter(provider="auto")
+        assert router._effective_provider() == "gemini"
+
+    def test_auto_provider_falls_back_to_ollama_without_gemini_key(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_AI_API_KEY", raising=False)
+        router = LLMRouter(provider="auto", api_key="")
+        assert router._effective_provider() == "ollama"
     
     def test_mock_output(self):
         """Should return mock output when LLM not available."""
@@ -44,6 +55,47 @@ class TestLLMRouter:
         router = LLMRouter(provider="unsupported")
         with pytest.raises(Exception):  # ProviderUnavailableError
             router.invoke("test prompt")
+
+    def test_gemini_structured_output(self, monkeypatch):
+        """Gemini provider should request JSON output and parse it."""
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"text": '{"ok": true, "items": [1]}'},
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs.get("json")
+            return FakeResponse()
+
+        import requests
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        router = LLMRouter(provider="gemini", model="gemini-test")
+        result = router.invoke("Return JSON", output_schema=object)
+
+        assert result["ok"] is True
+        assert "gemini-test:generateContent" in captured["url"]
+        assert captured["json"]["generationConfig"]["responseMimeType"] == "application/json"
 
 
 class TestContextBuilder:
@@ -167,6 +219,15 @@ class TestTrendRadarAgent:
         assert "warnings" in result
         assert len(result["expanded_keywords"]) > 0
 
+    def test_validate_adds_missing_topic(self, agent):
+        agent._context = {"topic": "AI học tiếng Anh"}
+        result = agent.validate_output({
+            "expanded_keywords": ["AI speaking"],
+            "detected_trends": [],
+            "warnings": [],
+        })
+        assert result["topic"] == "AI học tiếng Anh"
+
 
 class TestSourceAnalyzerAgent:
     """Test SourceAnalyzerAgent."""
@@ -283,6 +344,11 @@ class TestScriptWriterAgent:
         assert "narration_text" in result
         assert "segments" in result
         assert len(result["title_options"]) > 0
+        assert all(
+            not segment["visual_instruction"].lower().startswith("show ")
+            for segment in result["segments"]
+        )
+        assert any("Vertical 9:16" in segment["visual_instruction"] for segment in result["segments"])
 
 
 class TestContentAuditAgent:
@@ -377,3 +443,54 @@ class TestScriptReviserAgent:
         assert "revised_script" in result
         assert "change_summary" in result
         assert "remaining_issues" in result
+
+    def test_validate_normalizes_segment_time_aliases(self, agent):
+        agent._context = {
+            "script": {
+                "title_options": ["Old"],
+                "hook": "Old hook",
+                "narration_text": "Old narration",
+                "segments": [
+                    {
+                        "segment_id": "seg1",
+                        "start_second": 0,
+                        "end_second": 5,
+                        "narration": "Old",
+                        "subtitle_text": "Old",
+                        "visual_instruction": "Vertical 9:16 realistic scene",
+                    }
+                ],
+                "description": "",
+                "hashtags": [],
+                "estimated_duration_seconds": 45,
+                "source_attributions": [],
+            }
+        }
+        result = agent.validate_output({
+            "revised_script": {
+                "title_options": ["New"],
+                "hook": "New hook",
+                "narration_text": "New narration",
+                "segments": [
+                    {
+                        "time_start": 0.0,
+                        "time_end": 5.0,
+                        "narration": "New narration",
+                        "subtitle": "New subtitle",
+                        "visual_prompt": "phone AI learning English scene",
+                    }
+                ],
+                "description": "desc",
+                "hashtags": ["ai"],
+                "estimated_duration_seconds": 45,
+                "source_attributions": [],
+            },
+            "change_summary": "Changed",
+            "remaining_issues": [],
+        })
+        segment = result["revised_script"]["segments"][0]
+        assert segment["segment_id"] == "seg1"
+        assert segment["start_second"] == 0.0
+        assert segment["end_second"] == 5.0
+        assert "phone AI learning English scene" in segment["visual_instruction"]
+        assert "Script context: New narration" in segment["visual_instruction"]

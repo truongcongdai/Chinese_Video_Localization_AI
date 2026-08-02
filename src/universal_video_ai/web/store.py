@@ -598,6 +598,10 @@ class Job:
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
+        d["is_content_os"] = (
+            str(self.source_url or "").startswith("content_os://")
+            or str(self.source_language or "").startswith("content_os")
+        )
         d["has_video"] = bool(self.final_video_path and Path(self.final_video_path).exists())
         # review_state_json is an internal implementation detail (a
         # serialized PreparedLocalization, can be sizeable) — not useful to
@@ -634,12 +638,35 @@ class Store:
                 table: {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                 for table in ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps", "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals", "content_os_memories")
             }
+            migrated_legacy_projects = (
+                "target_platforms_json" in existing_cols.get("content_os_projects", set())
+                and "target_platform" not in existing_cols.get("content_os_projects", set())
+            )
             ran_is_admin_migration = False
             for table, column, ddl in _MIGRATIONS:
                 if column not in existing_cols.get(table, set()):
                     conn.execute(ddl)
                     if column == "is_admin":
                         ran_is_admin_migration = True
+
+            if migrated_legacy_projects:
+                # The first Content OS schema stored platforms as a JSON list.
+                # Preserve that value when adding the canonical singular column;
+                # otherwise SQLite's ADD COLUMN default silently changes every
+                # existing project to youtube_shorts.
+                rows = conn.execute(
+                    "SELECT id, target_platforms_json FROM content_os_projects"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        platforms = json.loads(row["target_platforms_json"] or "[]")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        platforms = []
+                    if isinstance(platforms, list) and platforms and isinstance(platforms[0], str):
+                        conn.execute(
+                            "UPDATE content_os_projects SET target_platform = ? WHERE id = ?",
+                            (platforms[0], row["id"]),
+                        )
 
             if ran_is_admin_migration:
                 # Upgrading a database created before admin/credits existed:

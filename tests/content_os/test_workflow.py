@@ -5,13 +5,16 @@ Tests workflow lifecycle, state transitions, agent execution, and approval gates
 """
 import pytest
 import tempfile
+import wave
 from pathlib import Path
 
 from universal_video_ai.web.store import Store
 from universal_video_ai.content_os.repository import ContentOSRepository
 from universal_video_ai.content_os.artifact_store import ArtifactStore
 from universal_video_ai.content_os.workflow import ContentOSWorkflow, WorkflowConfig
-from universal_video_ai.content_os.enums import WorkflowStage, ApprovalType
+from universal_video_ai.content_os.enums import WorkflowStage, ApprovalType, ArtifactType
+from universal_video_ai.content_os.exceptions import WorkflowError
+from universal_video_ai.content_os.renderer import RenderJob, RenderStatus
 
 
 class TestContentOSWorkflow:
@@ -237,6 +240,126 @@ class TestContentOSWorkflow:
         result = workflow.start_run(run.id, user_id=1)
         
         assert result["status"] in ["ready_for_localization", "completed"]
+
+    def test_generate_voice_respects_project_target_language_for_vietnamese(
+        self, workflow, run
+    ):
+        """Vietnamese scripts are mostly ASCII; do not auto-switch them to English TTS."""
+        captured = {}
+
+        def fake_generate_audio(text, language="vi", voice_id=None, output_dir=None):
+            captured["text"] = text
+            captured["language"] = language
+            captured["voice_id"] = voice_id
+            output_path = Path(output_dir) / "voice.wav"
+            with wave.open(str(output_path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(24000)
+                wav.writeframes(b"\x00\x00" * 24000)
+            return output_path
+
+        workflow.tts_adapter.generate_audio = fake_generate_audio
+        manifest = workflow._generate_voice(
+            run.id,
+            user_id=1,
+            context={
+                "script": {
+                    "segments": [
+                        {
+                            "narration": "Dừng ngay việc học tiếng Anh kiểu cũ! Đây là 3 tính năng AI trên điện thoại.",
+                            "text": "Caption ngắn",
+                        }
+                    ]
+                }
+            },
+        )
+
+        assert captured["language"] == "vi"
+        assert captured["voice_id"] is None
+        assert "Dừng ngay" in captured["text"]
+        assert manifest["language"] == "vi"
+        assert manifest["voice_id"] == ""
+
+    def test_retry_failed_run_resets_stage_before_full_execution(
+        self, workflow, run, repo, monkeypatch
+    ):
+        """A failed partial run can restart without an invalid backward transition."""
+        repo.update_run(
+            run_id=run.id,
+            user_id=1,
+            status="failed",
+            current_stage="source_analysis",
+            progress_percent=13,
+            revision_count=2,
+            error_json='{"error":"previous failure"}',
+        )
+        state_at_execution = {}
+
+        def fake_execute(run_id, user_id):
+            current = repo.get_run(run_id, user_id)
+            state_at_execution.update(
+                status=current.status,
+                stage=current.current_stage,
+                progress=current.progress_percent,
+                revision_count=current.revision_count,
+                error_json=current.error_json,
+            )
+            return {"status": "completed", "run_id": run_id}
+
+        monkeypatch.setattr(workflow, "_execute_workflow", fake_execute)
+
+        workflow.start_run(run.id, user_id=1)
+
+        assert state_at_execution == {
+            "status": "running",
+            "stage": "created",
+            "progress": 0,
+            "revision_count": 0,
+            "error_json": None,
+        }
+
+    def test_start_rejects_duplicate_running_run(self, workflow, run, repo):
+        repo.update_run(run_id=run.id, user_id=1, status="running")
+
+        with pytest.raises(WorkflowError, match="already running"):
+            workflow.start_run(run.id, user_id=1)
+
+    def test_render_failure_is_not_reported_as_completed(
+        self, workflow, run, repo
+    ):
+        context = {
+            "timeline": {"total_duration": 1.0},
+            "voice_manifest": {},
+            "subtitle_manifest": {},
+            "resolved_assets": {"assets": []},
+        }
+        failed_job = RenderJob(
+            job_id="render_test",
+            run_id=run.id,
+            user_id=1,
+            status=RenderStatus.FAILED,
+            timeline_path="timeline.json",
+            output_path="final.mp4",
+            progress=0.0,
+            error_message="ffmpeg failed",
+            started_at=0.0,
+            completed_at=1.0,
+            metadata={},
+        )
+        workflow.renderer.submit_render_job = lambda **_: failed_job
+        workflow.renderer.start_render = lambda job: failed_job
+
+        with pytest.raises(RuntimeError, match="ffmpeg failed"):
+            workflow._render_video(run.id, 1, context)
+
+        artifact = workflow.artifact_store.read(
+            user_id=1,
+            project_id=run.project_id,
+            run_id=run.id,
+            artifact_type=ArtifactType.RENDER_REPORT,
+        )
+        assert artifact["data"]["status"] == "failed"
     
     def test_calculate_progress(self, workflow):
         """Test progress calculation for stages."""

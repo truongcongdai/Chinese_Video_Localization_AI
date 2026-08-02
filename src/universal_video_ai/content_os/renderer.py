@@ -166,25 +166,39 @@ class Renderer:
         by the production pipeline instead of placeholder content.
         """
         width, height = resolution.split("x")
+        output_path_obj = Path(output_path).resolve()
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
         
         # Check if we have generated assets to use
         asset_images = []
         if assets and assets.get("assets"):
             for asset in assets["assets"]:
                 if asset.get("local_path") and Path(asset.get("local_path")).exists():
-                    asset_images.append(asset["local_path"])
+                    asset_duration = float(asset.get("duration_seconds") or 0.0)
+                    asset_images.append({
+                        "path": str(Path(asset["local_path"]).resolve()),
+                        "duration": asset_duration,
+                        "scene_id": asset.get("scene_id"),
+                    })
         
         # Build FFmpeg command
         if asset_images:
-            # Use first asset image as background, loop it for duration
-            cmd = [
-                "ffmpeg",
-                "-loop", "1",
-                "-i", asset_images[0],
-                "-t", str(duration),
-            ]
+            cmd = ["ffmpeg"]
+            default_scene_duration = max(0.1, duration / len(asset_images))
+            total_asset_duration = sum(asset["duration"] or default_scene_duration for asset in asset_images)
+            duration_scale = (duration / total_asset_duration) if total_asset_duration > 0 and duration > 0 else 1.0
+            self.logger.info(
+                "Rendering %d visual scenes over %.2fs (asset planned %.2fs, scale %.3f): %s",
+                len(asset_images),
+                duration,
+                total_asset_duration,
+                duration_scale,
+                ", ".join(str(asset.get("scene_id") or index) for index, asset in enumerate(asset_images, start=1)),
+            )
+            for asset in asset_images:
+                scene_duration = max(0.1, (asset["duration"] or default_scene_duration) * duration_scale)
+                cmd.extend(["-loop", "1", "-t", f"{scene_duration:.3f}", "-i", asset["path"]])
         else:
-            # Fallback to gradient background
             cmd = [
                 "ffmpeg",
                 "-f", "lavfi",
@@ -194,44 +208,69 @@ class Renderer:
         # Add audio if available and valid
         audio_index = None
         if audio_path and Path(audio_path).exists() and Path(audio_path).stat().st_size > 0:
-            cmd.extend(["-i", str(audio_path)])
-            audio_index = 1  # Audio will be input index 1
+            cmd.extend(["-i", str(Path(audio_path).resolve())])
+            audio_index = len(asset_images) if asset_images else 1
         else:
             self.logger.warning(f"Audio file not valid or not found: {audio_path}, creating video without audio")
         
-        # Add subtitle filter if available
-        vf_filters = []
+        subtitle_filter = None
+        ffmpeg_cwd = None
         if subtitle_path and Path(subtitle_path).exists() and Path(subtitle_path).stat().st_size > 0:
-            # Use subtitles filter to burn in SRT with smaller font and better positioning
-            vf_filters.append(f"subtitles={subtitle_path}:force_style='Fontsize=18,PrimaryColour=&HFFFFFF&,BackColour=&H80000000&,BorderStyle=4,Alignment=2,MarginV=30'")
-        
-        # Add gradient overlay for better visual
-        vf_filters.insert(0, "geq=r='X/W*255':g='Y/H*255':b='128'")
-        
-        # Add basic text overlay if no subtitles
-        if len(vf_filters) == 1:  # Only gradient, no subtitles
-            vf_filters.append(f"drawtext=text='Content OS Video':fontcolor=white:fontsize=32:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5:boxborderw=5")
-        
-        if vf_filters:
-            cmd.extend(["-vf", ",".join(vf_filters)])
-        
-        # Map video and optionally audio
-        cmd.extend(["-map", "0:v"])
+            # libass treats backslashes in Windows paths as escapes. Run from
+            # the subtitle directory and pass only the file name to the filter.
+            subtitle_path_obj = Path(subtitle_path).resolve()
+            ffmpeg_cwd = str(subtitle_path_obj.parent)
+            if subtitle_path_obj.suffix.lower() == ".ass":
+                subtitle_filter = f"subtitles=filename={subtitle_path_obj.name}"
+            else:
+                subtitle_filter = (
+                    "subtitles="
+                    f"filename={subtitle_path_obj.name}:"
+                    "force_style='Fontsize=18,PrimaryColour=&HFFFFFF&,BackColour=&H80000000&,BorderStyle=4,Alignment=2,MarginV=30'"
+                )
+
+        video_filters = []
+        if asset_images:
+            for index in range(len(asset_images)):
+                video_filters.append(
+                    f"[{index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},setsar=1,format=yuv420p[v{index}]"
+                )
+            video_filters.append(
+                "".join(f"[v{index}]" for index in range(len(asset_images)))
+                + f"concat=n={len(asset_images)}:v=1:a=0[basev]"
+            )
+        else:
+            video_filters.append("[0:v]format=yuv420p[basev]")
+
+        if subtitle_filter:
+            video_filters.append(f"[basev]{subtitle_filter}[vout]")
+            video_map = "[vout]"
+        else:
+            video_map = "[basev]"
+
+        if video_filters:
+            cmd.extend(["-filter_complex", ";".join(video_filters)])
+
+        cmd.extend(["-map", video_map])
         if audio_index is not None:
             cmd.extend(["-map", f"{audio_index}:a"])
         
         # Encoding options
         cmd.extend([
             "-c:v", "libx264",
-            "-c:a", "aac" if audio_index is not None else None,
-            "-shortest",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-r", "30",
             "-pix_fmt", "yuv420p",
-            "-y",
-            str(output_path),
         ])
-        
-        # Remove None values
-        cmd = [arg for arg in cmd if arg is not None]
+        if audio_index is not None:
+            cmd.extend(["-c:a", "aac", "-af", "apad"])
+        cmd.extend(["-t", f"{duration:.3f}"])
+        cmd.extend([
+            "-y",
+            str(output_path_obj),
+        ])
         
         self.logger.debug(f"Running FFmpeg command: {' '.join(cmd)}")
         
@@ -239,7 +278,8 @@ class Renderer:
             cmd,
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=120,
+            cwd=ffmpeg_cwd,
         )
         
         if result.returncode != 0:
