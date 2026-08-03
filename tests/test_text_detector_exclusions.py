@@ -4,7 +4,7 @@ import unittest
 
 from universal_video_ai.orchestrator.service import LocalizationConfig
 from universal_video_ai.orchestrator.factory import create_localization_service
-from universal_video_ai.render.text_detector import OnScreenTextDetector
+from universal_video_ai.render.text_detector import OnScreenTextDetector, SubtitleTimingWindow
 
 
 class TextDetectorExclusionTests(unittest.TestCase):
@@ -139,6 +139,121 @@ class TextDetectorExclusionTests(unittest.TestCase):
         self.assertIsNone(estimate)
         self.assertEqual(captured["search_radius"], 1.0)
         self.assertEqual(captured["min_offset"], 0.05)
+
+    def test_detect_subtitle_windows_for_segments_finds_first_cue_at_point_four(self) -> None:
+        detector = OnScreenTextDetector()
+        detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_text(
+            f"{at_seconds:.2f}", encoding="utf-8"
+        ) or True
+
+        def score(frame_path):
+            timestamp = float(frame_path.read_text(encoding="utf-8"))
+            return 0.010 if 0.4 <= timestamp <= 1.2 else 0.0
+
+        detector._subtitle_presence_score = score
+
+        windows = detector.detect_subtitle_windows_for_segments(
+            __file__,
+            [(0.0, 1.0, "æŸ³å¤«äºº")],
+            audio_duration=5.0,
+            search_radius=0.6,
+            step=0.1,
+            min_visible_samples=2,
+        )
+
+        self.assertIsNotNone(windows[0])
+        self.assertAlmostEqual(windows[0].start, 0.35)
+        self.assertAlmostEqual(windows[0].end, 1.25)
+
+    def test_ocr_boundary_refine_keeps_first_cue_out_of_zero_false_positive(self) -> None:
+        detector = OnScreenTextDetector()
+        detector._get_video_dimensions = lambda video_path: (1280, 720)
+        detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_text(
+            f"{at_seconds:.2f}", encoding="utf-8"
+        ) or True
+        detector._subtitle_presence_score = lambda frame_path: 0.010
+
+        def detect_boxes(frame_path):
+            timestamp = float(frame_path.read_text(encoding="utf-8"))
+            return [(640, 390, 730, 420)] if timestamp >= 0.3 else []
+
+        detector._detect_boxes_in_frame = detect_boxes
+
+        windows = detector.detect_subtitle_windows_for_segments(
+            __file__,
+            [(0.0, 1.0, "æŸ³å¤«äºº")],
+            audio_duration=5.0,
+            search_radius=0.6,
+            step=0.1,
+            min_visible_samples=2,
+        )
+
+        self.assertIsNotNone(windows[0])
+        self.assertAlmostEqual(windows[0].start, 0.25)
+        self.assertGreater(windows[0].end, windows[0].start)
+
+    def test_detected_subtitle_windows_are_trimmed_to_avoid_overlap(self) -> None:
+        windows = OnScreenTextDetector._trim_overlapping_subtitle_windows([
+            SubtitleTimingWindow(start=0.25, end=2.85, confidence=0.8),
+            SubtitleTimingWindow(start=1.15, end=4.85, confidence=0.8),
+        ])
+
+        self.assertEqual(windows[0], SubtitleTimingWindow(start=0.25, end=1.12, confidence=0.8))
+        self.assertEqual(windows[1], SubtitleTimingWindow(start=1.15, end=4.85, confidence=0.8))
+
+    def test_learn_subtitle_band_prefers_horizontal_dialogue_over_vertical_watermark(self) -> None:
+        detector = OnScreenTextDetector()
+        boxes = [
+            # Persistent vertical/side text: many narrow boxes.
+            (12, 210, 36, 236),
+            (12, 230, 36, 256),
+            (12, 250, 36, 276),
+            (12, 270, 36, 296),
+            # Actual dialogue subtitle: fewer but horizontal/wide boxes.
+            (632, 386, 782, 416),
+            (640, 392, 736, 418),
+        ]
+
+        band_center, line_height = detector._learn_subtitle_band(boxes)
+
+        self.assertGreater(band_center, 370)
+        self.assertLess(band_center, 430)
+        self.assertGreaterEqual(line_height, 26)
+
+    def test_detect_regions_prefers_window_local_subtitle_box_over_global_band(self) -> None:
+        detector = OnScreenTextDetector()
+        detector._get_video_dimensions = lambda video_path: (1280, 720)
+        detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_text(
+            f"{at_seconds:.2f}", encoding="utf-8"
+        ) or True
+
+        def detect_boxes(frame_path):
+            timestamp = float(frame_path.read_text(encoding="utf-8"))
+            if timestamp < 1.0:
+                return [
+                    (12, 16, 36, 40),       # corner/side noise
+                    (632, 384, 780, 416),   # first cue, lower on screen
+                ]
+            return [
+                (12, 210, 36, 236),       # vertical noise
+                (12, 230, 36, 256),
+                (426, 268, 576, 300),     # later cue, different y
+            ]
+
+        detector._detect_boxes_in_frame = detect_boxes
+
+        regions = detector.detect_regions_for_windows(
+            __file__,
+            [(0.25, 0.95), (3.5, 4.5)],
+            samples_per_window=1,
+            fill_undetected_windows=False,
+        )
+
+        self.assertEqual(len(regions), 2)
+        self.assertEqual(regions[0].y, 374)
+        self.assertEqual(regions[0].height, 52)
+        self.assertEqual(regions[1].y, 258)
+        self.assertEqual(regions[1].height, 52)
 
 
 if __name__ == "__main__":

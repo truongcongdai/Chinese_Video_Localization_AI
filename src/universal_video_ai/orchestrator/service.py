@@ -139,10 +139,18 @@ class LocalizationConfig:
     min_subtitle_alignment_offset: float = 0.03
     # Minimum confidence required for subtitle offset detection to be applied.
     # Prevents applying unreliable offsets that would misalign subtitles.
-    min_subtitle_alignment_confidence: float = 0.50
+    min_subtitle_alignment_confidence: float = 0.40
     # Small offsets are shifted on the TTS clock too. Larger offsets stay
     # visual-only to avoid moving dubbed speech away from the real audio.
     max_audio_sync_offset: float = 1.0
+    # Prefer detecting each burned-in subtitle cue's own visible start/end
+    # time over applying a single whole-video offset. This is the batch-safe
+    # path for videos whose first source subtitle starts at e.g. 0.4s and
+    # whose later cues have natural gaps that should be preserved exactly.
+    use_source_subtitle_timing: bool = True
+    source_subtitle_timing_search_radius: float = 0.8
+    source_subtitle_timing_step: float = 0.1
+    source_subtitle_timing_min_coverage: float = 0.60
     # Optional visual-only padding for burned-subtitle cover/subtitle windows.
     # Defaults to 0 so generated subtitle timestamps stay exactly on the
     # detected source-subtitle timeline. Non-zero values are only for users
@@ -344,6 +352,7 @@ class LocalizationService:
         self.cancellation_checker = cancellation_checker
         self.user_id = user_id
         self._last_subtitle_alignment_estimate = None
+        self._used_source_subtitle_timing = False
 
         self.logger.debug(
             "LocalizationService initialized run_transcription=%s run_translation=%s run_tts=%s run_render=%s "
@@ -483,6 +492,7 @@ class LocalizationService:
         ]
         
         self._last_subtitle_alignment_estimate = None
+        self._used_source_subtitle_timing = False
         visual_source_segments = self._align_source_segments_to_burned_subtitles(
             video_path=download_result.video_path,
             source_segments=audio_source_segments,
@@ -537,14 +547,24 @@ class LocalizationService:
                             translated_segments,
                             self.config.speech_fit,
                         )
+                        audio_clock_translated_segments = translated_segments
                         # First align to visual timeline (burned-in subtitles)
                         translated_segments = self._retime_segments(
                             translated_segments,
                             visual_source_segments,
                         )
-                        # TTS segments use the same visual timeline (no separate audio sync offset)
-                        # The visual timeline already accounts for burned-in subtitle offset
-                        tts_segments = translated_segments
+                        # Keep TTS anchored to the spoken-audio clock. Only
+                        # small, whole-video subtitle offsets are safe to
+                        # apply to voice; large hard-subtitle delays are
+                        # visual-only and should not move dubbed speech away
+                        # from the original dialogue.
+                        if self._used_source_subtitle_timing:
+                            tts_segments = translated_segments
+                        else:
+                            tts_segments = self._maybe_apply_audio_sync_offset(
+                                audio_clock_translated_segments,
+                                audio_result.audio_result.duration,
+                            )
                         translated_text = " ".join(s.text for s in translated_segments if s.text)
                     else:
                         # Fallback: no real per-sentence timing available (e.g. a
@@ -708,6 +728,56 @@ class LocalizationService:
                 self.config.ocr_languages, detected_language
             )
             detector = OnScreenTextDetector(languages=resolved_ocr_languages)
+
+        if self.config.use_source_subtitle_timing:
+            detect_windows = getattr(type(detector), "detect_subtitle_windows_for_segments", None)
+            if callable(detect_windows):
+                try:
+                    windows = detector.detect_subtitle_windows_for_segments(
+                        video_path,
+                        [(s.start, s.end, s.text) for s in source_segments],
+                        audio_duration=audio_duration,
+                        search_radius=self.config.source_subtitle_timing_search_radius,
+                        step=self.config.source_subtitle_timing_step,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Per-cue burned-subtitle timing detection failed; falling back to global offset: %s",
+                        exc,
+                    )
+                else:
+                    if len(windows) != len(source_segments):
+                        self.logger.warning(
+                            "Per-cue burned-subtitle timing returned %d window(s) for %d segment(s); "
+                            "falling back to global offset",
+                            len(windows),
+                            len(source_segments),
+                        )
+                        windows = []
+                    detected = [window for window in windows if window is not None]
+                    coverage = len(detected) / len(source_segments) if source_segments else 0.0
+                    if detected and coverage >= self.config.source_subtitle_timing_min_coverage:
+                        self._used_source_subtitle_timing = True
+                        self.logger.info(
+                            "LocalizationService: using per-cue source subtitle timing for %d/%d segment(s)",
+                            len(detected),
+                            len(source_segments),
+                        )
+                        self._progress(42, "Đã bắt timing phụ đề gốc theo từng câu")
+                        return [
+                            TranscriptSegment(
+                                start=window.start if window is not None else s.start,
+                                end=window.end if window is not None else s.end,
+                                text=s.text,
+                            )
+                            for s, window in zip(source_segments, windows)
+                        ]
+                    self.logger.info(
+                        "LocalizationService: per-cue subtitle timing coverage %.0f%% below threshold %.0f%%; "
+                        "falling back to global offset",
+                        coverage * 100.0,
+                        self.config.source_subtitle_timing_min_coverage * 100.0,
+                    )
 
         try:
             estimate = detector.estimate_subtitle_time_offset(
@@ -1391,7 +1461,7 @@ class LocalizationService:
         translated caption too instead of letting it spill outside. Never
         shrinks the box below what OCR actually detected.
         """
-        needed_width = self._measure_text_width_px(translated_text, font_size, font_path) + 16  # small side padding
+        needed_width = self._measure_text_width_px(translated_text, font_size, font_path) + 32  # side padding
         if needed_width <= region_width:
             return region_x, region_width
 

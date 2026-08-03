@@ -90,3 +90,58 @@ def test_cached_model_inference_is_serialized(monkeypatch, tmp_path: Path):
         thread.join()
 
     assert max_active == 1
+
+
+def test_whisper_passes_fp16_false_when_device_is_auto(monkeypatch, tmp_path: Path):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"fake audio")
+    captured = {}
+
+    class FakeModel:
+        device = SimpleNamespace(type="cuda")
+
+        def transcribe(self, _audio_path, **kwargs):
+            captured["kwargs"] = kwargs
+            return {"text": "ok", "segments": [], "language": "en"}
+
+    fake_whisper = SimpleNamespace(load_model=lambda *_args, **_kwargs: FakeModel())
+    monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    whisper_module._MODEL_CACHE.clear()
+    whisper_module._MODEL_INFERENCE_LOCKS.clear()
+
+    WhisperTranscriber(WhisperConfig(model="tiny", device=None)).transcribe(audio_file)
+
+    assert captured["kwargs"]["fp16"] is False
+
+
+def test_whisper_retries_cpu_fp32_after_cuda_invalid_values(monkeypatch, tmp_path: Path):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"fake audio")
+    loaded_devices = []
+
+    class FailingCudaModel:
+        device = SimpleNamespace(type="cuda")
+
+        def transcribe(self, _audio_path, **_kwargs):
+            raise ValueError("invalid values: tensor([[nan]], device='cuda:0')")
+
+    class CpuModel:
+        device = SimpleNamespace(type="cpu")
+
+        def transcribe(self, _audio_path, **kwargs):
+            assert kwargs["fp16"] is False
+            return {"text": "cpu ok", "segments": [], "language": "en"}
+
+    def load_model(_model_name, device=None):
+        loaded_devices.append(device)
+        return CpuModel() if device == "cpu" else FailingCudaModel()
+
+    fake_whisper = SimpleNamespace(load_model=load_model)
+    monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    whisper_module._MODEL_CACHE.clear()
+    whisper_module._MODEL_INFERENCE_LOCKS.clear()
+
+    text = WhisperTranscriber(WhisperConfig(model="tiny", device=None)).transcribe(audio_file)
+
+    assert text == "cpu ok"
+    assert loaded_devices == [None, "cpu"]

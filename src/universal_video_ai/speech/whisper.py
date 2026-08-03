@@ -184,22 +184,44 @@ class WhisperTranscriber:
                 whisper_kwargs["language"] = language
             if self.config.task:
                 whisper_kwargs["task"] = self.config.task
-            # Use fp16 for GPU if enabled (much faster)
-            if use_fp16:
-                whisper_kwargs["fp16"] = True
+            # Pass fp16 explicitly. openai-whisper defaults to fp16 on CUDA;
+            # with device=None it may auto-pick CUDA even though our local
+            # config resolved use_fp16=False, which can produce NaN logits on
+            # some Windows/GPU/driver combinations.
+            whisper_kwargs["fp16"] = bool(use_fp16)
 
             inference_lock = _whisper_inference_lock(
                 self.config.model, self.config.device, bool(use_fp16)
             )
+            def retry_cpu_fp32() -> dict:
+                self.logger.warning(
+                    "Whisper CUDA decoding produced invalid values on %s; "
+                    "retrying once on CPU/fp32",
+                    audio_path,
+                )
+                cpu_model = _cached_whisper_model(whisper, self.config.model, "cpu", False)
+                cpu_lock = _whisper_inference_lock(self.config.model, "cpu", False)
+                retry_kwargs = dict(whisper_kwargs)
+                retry_kwargs["fp16"] = False
+                with cpu_lock:
+                    return cpu_model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
+
             with inference_lock:
                 try:
                     result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
                 except (ValueError, RuntimeError) as decode_exc:
-                    # Retry with fp16=False if fp16 failed (dtype mismatch or NaN).
-                    # Keep the same lock for the retry because it uses the same
-                    # cached model and mutable decoder hooks.
+                    # Retry with safer precision/device if CUDA decoding
+                    # produces dtype/NaN failures. Keep same-model retries
+                    # under the same lock because openai-whisper mutates
+                    # decoder hooks during inference.
                     message = str(decode_exc)
-                    if use_fp16 and ("dtype" in message.lower() or "invalid values" in message.lower()):
+                    lower_message = message.lower()
+                    is_numeric_cuda_failure = (
+                        "dtype" in lower_message
+                        or "invalid values" in lower_message
+                        or "nan" in lower_message
+                    )
+                    if use_fp16 and is_numeric_cuda_failure:
                         self.logger.warning(
                             "Whisper fp16 decoding failed on %s with %s; "
                             "retrying once with fp16=False",
@@ -208,7 +230,20 @@ class WhisperTranscriber:
                         )
                         retry_kwargs = dict(whisper_kwargs)
                         retry_kwargs["fp16"] = False
-                        result = model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
+                        try:
+                            result = model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
+                        except (ValueError, RuntimeError) as retry_exc:
+                            retry_message = str(retry_exc).lower()
+                            if (
+                                "dtype" in retry_message
+                                or "invalid values" in retry_message
+                                or "nan" in retry_message
+                            ):
+                                result = retry_cpu_fp32()
+                            else:
+                                raise
+                    elif is_numeric_cuda_failure:
+                        result = retry_cpu_fp32()
                     else:
                         raise
             if not isinstance(result, dict):

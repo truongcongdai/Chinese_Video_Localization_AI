@@ -202,6 +202,8 @@ class DemucsProcessor:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=3600,  # 1 hour timeout
             )

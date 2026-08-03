@@ -16,7 +16,7 @@ from universal_video_ai.timeline.service import TimelineService, TimelineSegment
 from universal_video_ai.mixer.service import MixerService
 from universal_video_ai.render.animated_subtitles import SubtitleEffect
 from universal_video_ai.render.renderer import Renderer, RenderConfig, AnimatedSubtitleConfig, TextOverlay
-from universal_video_ai.render.text_detector import SubtitleOffsetEstimate
+from universal_video_ai.render.text_detector import OnScreenTextDetector, SubtitleOffsetEstimate, SubtitleTimingWindow
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.segment import TranscriptSegment
 
@@ -812,6 +812,80 @@ def test_global_subtitle_offset_is_applied_once(tmp_path: Path):
 
     assert result.source_segments == [TranscriptSegment(start=0.2, end=1.2, text="hello")]
     assert result.translated_segments == [TranscriptSegment(start=0.2, end=1.2, text="Xin chào.")]
+
+
+def test_per_cue_source_subtitle_timing_drives_subtitle_and_tts_clock(tmp_path: Path):
+    downloader = MagicMock(spec=DownloadService)
+    download_result = MagicMock(spec=DownloadResult)
+    download_result.success = True
+    download_result.video_path = tmp_path / "video.mp4"
+    downloader.download.return_value = download_result
+
+    translate_service = MagicMock(spec=TranslateService)
+    translate_service.translate_segments.return_value = [
+        TranscriptSegment(start=0.0, end=1.0, text="Translated cue.")
+    ]
+
+    tts_service = MagicMock(spec=TTSService)
+    tts_service.synthesize.side_effect = (
+        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+    )
+
+    mixer = MagicMock(spec=MixerService)
+    mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
+
+    detector = OnScreenTextDetector()
+    detector.detect_subtitle_windows_for_segments = MagicMock(return_value=[
+        SubtitleTimingWindow(start=0.4, end=1.35, confidence=0.85)
+    ])
+    detector.estimate_subtitle_time_offset = MagicMock(return_value=SubtitleOffsetEstimate(
+        offset=0.9,
+        confidence=0.9,
+        matches=2,
+    ))
+
+    service = LocalizationService(
+        downloader=downloader,
+        translate_service=translate_service,
+        tts_service=tts_service,
+        mixer=mixer,
+        text_detector=detector,
+        config=LocalizationConfig(
+            run_transcription=True,
+            run_translation=True,
+            target_language="vi",
+            run_tts=True,
+            generate_subtitles=True,
+            enable_text_cover=True,
+        ),
+    )
+
+    with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
+        audio_result_obj = MagicMock()
+        audio_result_obj.audio_path = tmp_path / "audio.wav"
+        audio_result_obj.duration = 10.0
+
+        audio_result = MagicMock(spec=AudioPipelineResult)
+        audio_result.transcript = "source cue"
+        audio_result.detected_language = "zh"
+        audio_result.audio_result = audio_result_obj
+        audio_result.segments = [TranscriptSegment(start=0.0, end=1.0, text="source cue")]
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.process.return_value = audio_result
+        mock_pipeline_factory.return_value = mock_pipeline
+
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
+
+    detector.detect_subtitle_windows_for_segments.assert_called_once()
+    detector.estimate_subtitle_time_offset.assert_not_called()
+    tts_clips = mixer.build_dubbed_track.call_args.args[0]
+    assert tts_clips[0].start == pytest.approx(0.4)
+    assert tts_clips[0].end == pytest.approx(1.35)
+    assert result.source_segments == [TranscriptSegment(start=0.4, end=1.35, text="source cue")]
+    assert result.translated_segments == [TranscriptSegment(start=0.4, end=1.35, text="Translated cue.")]
+    assert result.tts_segments == [TranscriptSegment(start=0.4, end=1.35, text="Translated cue.")]
+    assert result.subtitle_segments[0].start_time == pytest.approx(0.4)
 
 
 def test_small_detected_offset_moves_first_subtitle_and_tts_segment(tmp_path: Path):

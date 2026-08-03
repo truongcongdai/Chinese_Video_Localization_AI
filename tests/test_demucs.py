@@ -92,6 +92,7 @@ def test_wav_command_uses_demucs_default_format_and_segment_flag(tmp_path: Path,
     def mock_run(*args, **kwargs):
         cmd = kwargs.get("args", args[0])
         captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
         result = MagicMock()
         result.returncode = 0
         result.stderr = ""
@@ -113,6 +114,8 @@ def test_wav_command_uses_demucs_default_format_and_segment_flag(tmp_path: Path,
     assert "--format" not in cmd
     assert "--segment-length" not in cmd
     assert cmd[cmd.index("--segment") + 1] == "12"
+    assert captured["kwargs"]["encoding"] == "utf-8"
+    assert captured["kwargs"]["errors"] == "replace"
 
 
 def test_mp3_command_uses_demucs_mp3_flag(tmp_path: Path, monkeypatch):

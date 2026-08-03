@@ -42,7 +42,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 warnings.filterwarnings("ignore", message=".*pin_memory.*no accelerator.*")
 warnings.filterwarnings("ignore", message=".*quantize_per_tensor.*deprecated.*")
 
-__all__ = ["TextRegion", "SubtitleOffsetEstimate", "OnScreenTextDetector", "OCR_AVAILABLE"]
+__all__ = [
+    "TextRegion",
+    "SubtitleTimingWindow",
+    "SubtitleOffsetEstimate",
+    "OnScreenTextDetector",
+    "OCR_AVAILABLE",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -71,6 +77,15 @@ class TextRegion:
     y: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class SubtitleTimingWindow:
+    """Detected time window where one burned-in subtitle cue is visible."""
+
+    start: float
+    end: float
+    confidence: float
 
 
 @dataclass(frozen=True)
@@ -404,6 +419,175 @@ class OnScreenTextDetector:
         )
         return estimate
 
+    def detect_subtitle_windows_for_segments(
+        self,
+        video_path: Path,
+        source_segments: Sequence[Tuple[float, float, str]],
+        audio_duration: float,
+        search_radius: float = 0.8,
+        step: float = 0.1,
+        min_visual_score: float = 0.003,
+        min_visible_samples: int = 2,
+        use_ocr_boundary_refine: bool = True,
+        max_ocr_boundary_samples: int = 8,
+        ocr_boundary_score_delta: float = 0.012,
+        max_subtitle_early_start: float = 0.15,
+        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
+            0.08, 0.25, 0.92, 0.95,
+        ),
+    ) -> List[Optional[SubtitleTimingWindow]]:
+        """Detect per-cue hard-sub timing windows near ASR segments.
+
+        This is stronger than a single whole-video offset. For every ASR
+        sentence, sample frames around its expected timestamp, score whether a
+        subtitle line is visually present, and return the visible run nearest
+        that sentence. Callers can then anchor translated subtitles/TTS to the
+        source video's actual burned-in subtitle windows.
+        """
+        video_path = Path(video_path).resolve()
+        results: List[Optional[SubtitleTimingWindow]] = []
+        frame_cache: Dict[float, float] = {}
+        step = max(0.03, float(step))
+        search_radius = max(0.0, float(search_radius))
+        dims = self._get_video_dimensions(video_path)
+        frame_w, frame_h = dims if dims else (None, None)
+        candidate_filter_active = bool(subtitle_candidate_region_fractional and frame_w and frame_h)
+
+        def score_at(t: float, tmp_dir: Path) -> float:
+            key = round(max(0.0, min(audio_duration, t)), 2)
+            if key in frame_cache:
+                return frame_cache[key]
+            frame_path = tmp_dir / f"subtitle_window_{len(frame_cache)}.jpg"
+            if not self._extract_frame(video_path, key, frame_path):
+                frame_cache[key] = 0.0
+                return 0.0
+            frame_cache[key] = self._subtitle_presence_score(frame_path)
+            return frame_cache[key]
+
+        def has_ocr_subtitle_at(t: float, tmp_dir: Path) -> bool:
+            frame_path = tmp_dir / f"subtitle_boundary_{len(frame_cache)}_{int(t * 1000)}.jpg"
+            if not self._extract_frame(video_path, t, frame_path):
+                return False
+            boxes = self._detect_boxes_in_frame(frame_path)
+            boxes = self._drop_implausible_boxes(boxes, frame_w, frame_h, 0.92, 0.3)
+            if (
+                boxes
+                and candidate_filter_active
+                and subtitle_candidate_region_fractional
+                and frame_w
+                and frame_h
+            ):
+                boxes = self._keep_candidate_subtitle_boxes(
+                    boxes, frame_w, frame_h, subtitle_candidate_region_fractional
+                )
+            return bool(boxes)
+
+        with tempfile.TemporaryDirectory(prefix="subtitle_windows_") as tmp:
+            tmp_dir = Path(tmp)
+            for start, end, _text in source_segments:
+                if end <= start or audio_duration <= 0:
+                    results.append(None)
+                    continue
+                scan_start = max(0.0, start - search_radius)
+                scan_end = min(audio_duration, end + search_radius)
+                sample_count = max(1, int(round((scan_end - scan_start) / step)) + 1)
+                samples = [
+                    round(min(scan_end, scan_start + idx * step), 3)
+                    for idx in range(sample_count)
+                ]
+                scored = [(t, score_at(t, tmp_dir)) for t in samples]
+                visible_times = [t for t, score in scored if score >= min_visual_score]
+                if len(visible_times) < min_visible_samples:
+                    results.append(None)
+                    continue
+
+                runs: List[List[float]] = []
+                current: List[float] = []
+                for t in visible_times:
+                    if current and (t - current[-1]) > (step * 1.6):
+                        runs.append(current)
+                        current = []
+                    current.append(t)
+                if current:
+                    runs.append(current)
+
+                midpoint = (start + end) / 2.0
+                best_run = min(
+                    runs,
+                    key=lambda run: (
+                        0 if run[0] <= midpoint <= run[-1] else min(abs(midpoint - run[0]), abs(midpoint - run[-1])),
+                        -len(run),
+                    ),
+                )
+                if len(best_run) < min_visible_samples:
+                    results.append(None)
+                    continue
+
+                window_start = max(0.0, best_run[0] - step / 2.0)
+                window_end = min(audio_duration, best_run[-1] + step / 2.0)
+                if window_end <= window_start:
+                    results.append(None)
+                    continue
+
+                if use_ocr_boundary_refine and (best_run[0] - scan_start) <= (step * 1.5):
+                    ocr_hit_time = None
+                    for t in best_run[:max(1, max_ocr_boundary_samples)]:
+                        if has_ocr_subtitle_at(t, tmp_dir):
+                            ocr_hit_time = t
+                            break
+                    if ocr_hit_time is not None:
+                        prefix = [(t, score) for t, score in scored if scan_start <= t <= ocr_hit_time]
+                        min_index = min(range(len(prefix)), key=lambda idx: prefix[idx][1]) if prefix else 0
+                        baseline = prefix[min_index][1] if prefix else 0.0
+                        boundary_time = ocr_hit_time
+                        for t, score in prefix[min_index:]:
+                            if score >= baseline + ocr_boundary_score_delta:
+                                boundary_time = t
+                                break
+                        window_start = max(0.0, boundary_time - step / 2.0)
+                window_start = max(window_start, max(0.0, start - max_subtitle_early_start))
+
+                run_scores = [score for t, score in scored if best_run[0] <= t <= best_run[-1]]
+                confidence = min(1.0, max(0.0, (sum(run_scores) / len(run_scores)) / 0.02))
+                results.append(
+                    SubtitleTimingWindow(
+                        start=round(window_start, 3),
+                        end=round(window_end, 3),
+                        confidence=round(confidence, 3),
+                    )
+                )
+
+        results = self._trim_overlapping_subtitle_windows(results)
+        detected = sum(1 for item in results if item is not None)
+        self.logger.info(
+            "OnScreenTextDetector: detected %d/%d per-cue subtitle timing window(s)",
+            detected,
+            len(results),
+        )
+        return results
+
+    @staticmethod
+    def _trim_overlapping_subtitle_windows(
+        windows: List[Optional[SubtitleTimingWindow]],
+        min_gap: float = 0.03,
+    ) -> List[Optional[SubtitleTimingWindow]]:
+        result = list(windows)
+        for idx in range(len(result) - 1):
+            current = result[idx]
+            next_window = result[idx + 1]
+            if current is None or next_window is None:
+                continue
+            if current.end <= next_window.start:
+                continue
+            trimmed_end = max(current.start + 0.05, next_window.start - min_gap)
+            if trimmed_end < current.end:
+                result[idx] = SubtitleTimingWindow(
+                    start=current.start,
+                    end=round(trimmed_end, 3),
+                    confidence=current.confidence,
+                )
+        return result
+
     def _estimate_subtitle_time_offset_by_presence(
         self,
         video_path: Path,
@@ -604,7 +788,7 @@ class OnScreenTextDetector:
         video_path: Path,
         windows: Sequence[Tuple[float, float]],
         samples_per_window: int = 2,
-        padding_px: int = 6,
+        padding_px: int = 10,
         band_tolerance: float = 1.6,
         max_single_box_width_ratio: float = 0.92,
         max_single_box_height_ratio: float = 0.3,
@@ -785,7 +969,11 @@ class OnScreenTextDetector:
         band_half = band_tolerance * typical_line_height
         max_region_height = int(round(max_lines_per_region * typical_line_height))
 
-        # ---- Pass 2: keep only in-band boxes per window, union, cap height ----
+        # ---- Pass 2: prefer each window's own horizontal subtitle boxes,
+        # then fall back to the learned band only when that window has no
+        # direct subtitle-shaped OCR hit. Some short-drama sources move
+        # captions around the frame; forcing every cue into one global band
+        # makes the cover box miss the original text.
         undetected_windows: List[Tuple[float, float]] = []
         # Track the x-extent actually seen in windows that DID have a hit,
         # so any undetected window can fall back to "the typical horizontal
@@ -795,7 +983,8 @@ class OnScreenTextDetector:
         detected_heights: List[int] = []
 
         for (start, end, boxes) in per_window_boxes:
-            in_band = [
+            local_boxes = self._keep_horizontal_subtitle_line_boxes(boxes)
+            in_band = local_boxes or [
                 b for b in boxes
                 if abs(((b[1] + b[3]) / 2.0) - band_center) <= band_half
             ]
@@ -1032,6 +1221,23 @@ class OnScreenTextDetector:
                 kept.append(b)
         return kept
 
+    def _keep_horizontal_subtitle_line_boxes(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        min_aspect_ratio: float = 1.35,
+        min_width_px: int = 28,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Keep OCR boxes that look like horizontal subtitle/dialogue lines."""
+        kept = []
+        for b in boxes:
+            width = b[2] - b[0]
+            height = b[3] - b[1]
+            if width < min_width_px or height <= 0:
+                continue
+            if (width / max(1, height)) >= min_aspect_ratio:
+                kept.append(b)
+        return kept
+
     def _learn_subtitle_band(
         self,
         boxes: List[Tuple[int, int, int, int]],
@@ -1063,20 +1269,42 @@ class OnScreenTextDetector:
         median_h = sorted(heights)[len(heights) // 2]
         bin_size = max(10.0, median_h * 0.8)
 
+        widths = [b[2] - b[0] for b in boxes]
+
         bins: dict = {}
-        for c, h in zip(centers, heights):
+        for c, h, w in zip(centers, heights, widths):
             key = int(c // bin_size)
-            bucket = bins.setdefault(key, {"count": 0, "centers": [], "heights": []})
+            bucket = bins.setdefault(key, {"count": 0, "centers": [], "heights": [], "widths": []})
             bucket["count"] += 1
             bucket["centers"].append(c)
             bucket["heights"].append(h)
+            bucket["widths"].append(w)
 
         # Merge each bin with its immediate neighbors when scoring, so a
         # cluster that straddles a bin boundary isn't undercounted.
-        def neighborhood_count(key: int) -> int:
-            return sum(bins.get(k, {"count": 0})["count"] for k in (key - 1, key, key + 1))
+        def neighborhood_score(key: int) -> float:
+            count = 0
+            widths_for_key: List[int] = []
+            heights_for_key: List[int] = []
+            for k in (key - 1, key, key + 1):
+                if k not in bins:
+                    continue
+                count += bins[k]["count"]
+                widths_for_key.extend(bins[k]["widths"])
+                heights_for_key.extend(bins[k]["heights"])
+            if not count or not widths_for_key or not heights_for_key:
+                return 0.0
+            median_width = sorted(widths_for_key)[len(widths_for_key) // 2]
+            median_height = sorted(heights_for_key)[len(heights_for_key) // 2]
+            horizontal_ratio = median_width / max(1, median_height)
+            # Dialogue subtitles are horizontal text lines. Vertical
+            # watermarks/side labels can appear in many frames and otherwise
+            # win on raw count, causing the white cover box to be drawn in
+            # the wrong place.
+            horizontal_weight = 0.25 if horizontal_ratio < 1.4 else min(4.0, horizontal_ratio)
+            return count * horizontal_weight
 
-        best_key = max(bins.keys(), key=neighborhood_count)
+        best_key = max(bins.keys(), key=neighborhood_score)
 
         combined_centers: List[float] = []
         combined_heights: List[int] = []
