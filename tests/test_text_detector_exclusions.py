@@ -293,3 +293,19 @@ class TextDetectorExclusionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_region_detector_never_falls_back_to_upper_title_boxes(tmp_path: Path) -> None:
+    detector = OnScreenTextDetector()
+    detector._get_video_dimensions = lambda _video: (1280, 720)
+    detector._extract_frame = lambda _video, _time, out_path: out_path.write_bytes(b"frame") or True
+    detector._subtitle_presence_score = lambda _frame: 0.02
+    detector._detect_boxes_in_frame = lambda _frame: [(200, 90, 900, 150)]
+
+    regions = detector.detect_regions_for_windows(
+        tmp_path / "video.mp4",
+        [(0.0, 1.0)],
+        samples_per_window=1,
+    )
+
+    assert regions == []

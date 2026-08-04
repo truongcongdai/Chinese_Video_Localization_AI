@@ -1040,3 +1040,23 @@ def test_static_text_watermark_boxes_are_added_to_render_config(tmp_path: Path):
         (0.14, 0.18, 0.34, 0.31),
     )
     detector.detect_persistent_text_regions.assert_called_once()
+
+
+def test_missing_visual_windows_are_interpolated_into_one_canonical_clock():
+    source = [
+        TranscriptSegment(start=0.0, end=1.0, text="a"),
+        TranscriptSegment(start=1.2, end=2.0, text="b"),
+        TranscriptSegment(start=2.2, end=3.0, text="c"),
+    ]
+    windows = [
+        None,
+        SubtitleTimingWindow(start=1.6, end=2.4, confidence=0.9),
+        SubtitleTimingWindow(start=2.6, end=3.4, confidence=0.9),
+    ]
+
+    resolved = LocalizationService._fill_missing_subtitle_windows(source, windows, audio_duration=5.0)
+
+    assert all(window is not None for window in resolved)
+    assert resolved[0].start == pytest.approx(0.4)
+    assert resolved[0].end <= resolved[1].start
+    assert resolved[1].end <= resolved[2].start

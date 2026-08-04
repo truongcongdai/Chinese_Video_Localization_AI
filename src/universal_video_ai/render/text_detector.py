@@ -508,45 +508,23 @@ class OnScreenTextDetector:
                     continue
 
                 source_norm = _normalize_ocr_match_text(source_text)
-                matched_times: List[float] = []
-                if use_ocr_text_match_refine and len(source_norm) >= 4:
-                    text_cache: Dict[float, str] = {}
+                text_cache: Dict[float, str] = {}
 
-                    def text_at(t: float) -> str:
-                        key = round(max(0.0, min(audio_duration, t)), 2)
-                        if key in text_cache:
-                            return text_cache[key]
-                        frame_path = tmp_dir / f"subtitle_text_{len(frame_cache)}_{int(key * 1000)}.jpg"
-                        if not self._extract_frame(video_path, key, frame_path):
-                            text_cache[key] = ""
-                        else:
-                            text_cache[key] = self._read_text_in_frame(
-                                frame_path,
-                                frame_w,
-                                frame_h,
-                                subtitle_candidate_region_fractional,
-                            )
+                def text_at(t: float) -> str:
+                    key = round(max(0.0, min(audio_duration, t)), 2)
+                    if key in text_cache:
                         return text_cache[key]
-
-                    scored_text_times: List[Tuple[float, float]] = []
-                    text_candidates = [
-                        (t, visual_score)
-                        for t, visual_score in scored
-                        if visual_score >= (min_visual_score * 0.6)
-                    ]
-                    text_candidates.sort(key=lambda item: item[1], reverse=True)
-                    text_candidates = text_candidates[:max(1, max_ocr_text_match_samples)]
-                    text_candidates.sort(key=lambda item: item[0])
-                    for t, _visual_score in text_candidates:
-                        match_score = _subtitle_text_match_score(source_norm, text_at(t))
-                        if match_score >= min_ocr_match_score:
-                            scored_text_times.append((t, match_score))
-                    if scored_text_times:
-                        best_score = max(score for _t, score in scored_text_times)
-                        matched_times = [
-                            t for t, score in scored_text_times
-                            if score >= max(min_ocr_match_score, best_score - 0.08)
-                        ]
+                    frame_path = tmp_dir / f"subtitle_text_{len(frame_cache)}_{int(key * 1000)}.jpg"
+                    if not self._extract_frame(video_path, key, frame_path):
+                        text_cache[key] = ""
+                    else:
+                        text_cache[key] = self._read_text_in_frame(
+                            frame_path,
+                            frame_w,
+                            frame_h,
+                            subtitle_candidate_region_fractional,
+                        )
+                    return text_cache[key]
 
                 runs: List[List[float]] = []
                 current: List[float] = []
@@ -559,13 +537,30 @@ class OnScreenTextDetector:
                     runs.append(current)
 
                 midpoint = (start + end) / 2.0
-                if matched_times:
-                    matched_midpoint = sum(matched_times) / len(matched_times)
+                best_run: List[float]
+                run_match_scores: List[Tuple[float, List[float]]] = []
+                if use_ocr_text_match_refine and len(source_norm) >= 4:
+                    remaining_samples = max(1, max_ocr_text_match_samples)
+                    for run in sorted(runs, key=lambda item: min(abs(midpoint - item[0]), abs(midpoint - item[-1]))):
+                        if remaining_samples <= 0:
+                            break
+                        representative = sorted({run[0], run[len(run) // 2], run[-1]})
+                        representative = representative[:remaining_samples]
+                        remaining_samples -= len(representative)
+                        match_score = max(
+                            (_subtitle_text_match_score(source_norm, text_at(t)) for t in representative),
+                            default=0.0,
+                        )
+                        run_match_scores.append((match_score, run))
+
+                matched_runs = [item for item in run_match_scores if item[0] >= min_ocr_match_score]
+                if matched_runs:
+                    best_score = max(item[0] for item in matched_runs)
                     best_run = min(
-                        runs,
+                        (run for score, run in matched_runs if score >= best_score - 0.05),
                         key=lambda run: (
-                            0 if run[0] <= matched_midpoint <= run[-1]
-                            else min(abs(matched_midpoint - run[0]), abs(matched_midpoint - run[-1])),
+                            0 if run[0] <= midpoint <= run[-1]
+                            else min(abs(midpoint - run[0]), abs(midpoint - run[-1])),
                             -len(run),
                         ),
                     )
@@ -573,7 +568,8 @@ class OnScreenTextDetector:
                     best_run = min(
                         runs,
                         key=lambda run: (
-                            0 if run[0] <= midpoint <= run[-1] else min(abs(midpoint - run[0]), abs(midpoint - run[-1])),
+                            0 if run[0] <= midpoint <= run[-1]
+                            else min(abs(midpoint - run[0]), abs(midpoint - run[-1])),
                             -len(run),
                         ),
                     )
@@ -1111,14 +1107,10 @@ class OnScreenTextDetector:
         all_boxes = [b for (_s, _e, boxes, _score) in per_window_boxes for b in boxes]
         if not all_boxes and candidate_filter_active:
             self.logger.info(
-                "OnScreenTextDetector: subtitle candidate region removed every OCR box; "
-                "falling back to unfiltered OCR boxes for this video"
+                "OnScreenTextDetector: no OCR boxes remained inside the configured subtitle band; "
+                "refusing to fall back to upper-screen/title boxes"
             )
-            per_window_boxes = [
-                (start, end, boxes, 0.0)
-                for start, end, boxes in fallback_per_window_boxes
-            ]
-            all_boxes = [b for (_s, _e, boxes, _score) in per_window_boxes for b in boxes]
+            return []
         band_center, typical_line_height = self._learn_subtitle_band(all_boxes)
         self.last_typical_line_height = typical_line_height
 

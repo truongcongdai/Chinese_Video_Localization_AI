@@ -437,7 +437,7 @@ class LocalizationService:
     ) -> "PreparedLocalization":
         """Steps 1-3: download the source video, extract/transcribe its
         audio, and translate the transcript. See `localize()`.
-        
+
         Optimized with parallel processing where possible:
         - Download runs immediately with rate limiting
         - Audio processing starts as soon as download completes
@@ -506,7 +506,7 @@ class LocalizationService:
 
             self.logger.info("LocalizationService: download successful: %s", download_result.video_path)
             self._progress(15, "Đã tải video ✓")
-        
+
         # Step 2: Process audio (extract → demucs → transcribe)
         self._progress(20, "Đang tách âm thanh...")
         self.logger.info("LocalizationService: processing audio")
@@ -518,7 +518,7 @@ class LocalizationService:
             demucs_output_dir=self.config.demucs_output_dir,
             logger=self.logger,
         )
-        
+
         # Run audio processing (this is the CPU-heavy bottleneck)
         async with _TRANSCRIPTION_SLOTS:
             audio_result = await asyncio.to_thread(
@@ -530,7 +530,7 @@ class LocalizationService:
         audio_source_segments: List[TranscriptSegment] = [
             s for s in (audio_result.segments or []) if s.has_timing
         ]
-        
+
         self._last_subtitle_alignment_estimate = None
         self._used_source_subtitle_timing = False
         visual_source_segments = self._align_source_segments_to_burned_subtitles(
@@ -642,6 +642,82 @@ class LocalizationService:
         )
 
     @staticmethod
+    def _fill_missing_subtitle_windows(
+        source_segments: List[TranscriptSegment],
+        windows: List[Optional[Any]],
+        audio_duration: float,
+        min_gap: float = 0.03,
+        min_duration: float = 0.12,
+    ) -> List[Optional[Any]]:
+        """Fill OCR-missed cue windows from neighbouring visual timing anchors.
+
+        Mixing OCR-adjusted cues with untouched ASR cues creates two clocks in
+        the same output: detected captions/voice follow the burned subtitles,
+        while missed cues appear too early.  Once visual timing has sufficient
+        coverage, interpolate the visual offset for missed cues so subtitles,
+        overlays and TTS all use one monotonic clock.
+        """
+        if not source_segments or len(source_segments) != len(windows):
+            return windows
+        anchors = [idx for idx, window in enumerate(windows) if window is not None]
+        if not anchors:
+            return windows
+
+        def offset_at(index: int) -> float:
+            previous = max((i for i in anchors if i < index), default=None)
+            following = min((i for i in anchors if i > index), default=None)
+            if previous is None:
+                anchor = following if following is not None else anchors[0]
+                return float(windows[anchor].start - source_segments[anchor].start)
+            if following is None:
+                return float(windows[previous].start - source_segments[previous].start)
+            left_offset = float(windows[previous].start - source_segments[previous].start)
+            right_offset = float(windows[following].start - source_segments[following].start)
+            span = max(1, following - previous)
+            weight = (index - previous) / span
+            return left_offset + ((right_offset - left_offset) * weight)
+
+        resolved: List[Optional[Any]] = list(windows)
+        window_type = type(next(w for w in windows if w is not None))
+        for idx, (segment, window) in enumerate(zip(source_segments, resolved)):
+            if window is not None:
+                continue
+            offset = offset_at(idx)
+            start = max(0.0, min(audio_duration, segment.start + offset))
+            end = max(start + min_duration, min(audio_duration, segment.end + offset))
+            if end <= start:
+                continue
+            resolved[idx] = window_type(
+                start=round(start, 3),
+                end=round(end, 3),
+                confidence=0.25,
+            )
+
+        # Enforce a single monotonic non-overlapping clock.  Boundaries are
+        # split between neighbouring cues instead of allowing duplicate text.
+        for idx in range(len(resolved) - 1):
+            current = resolved[idx]
+            following = resolved[idx + 1]
+            if current is None or following is None or current.end <= following.start - min_gap:
+                continue
+            boundary = max(current.start + min_duration, (current.end + following.start) / 2.0)
+            boundary = min(boundary, following.end - min_duration)
+            if boundary <= current.start or boundary >= following.end:
+                resolved[idx] = None
+                continue
+            resolved[idx] = window_type(
+                start=current.start,
+                end=round(boundary - (min_gap / 2.0), 3),
+                confidence=current.confidence,
+            )
+            resolved[idx + 1] = window_type(
+                start=round(boundary + (min_gap / 2.0), 3),
+                end=following.end,
+                confidence=following.confidence,
+            )
+        return resolved
+
+    @staticmethod
     def _retime_segments(
         text_segments: Optional[List[TranscriptSegment]],
         timing_segments: Optional[List[TranscriptSegment]],
@@ -737,7 +813,7 @@ class LocalizationService:
         """
         if not source_segments:
             return source_segments
-        
+
         # Apply global offset if configured (when OCR alignment is disabled)
         if self.config.global_subtitle_offset != 0.0:
             offset = self.config.global_subtitle_offset
@@ -753,7 +829,7 @@ class LocalizationService:
                 )
                 for s in source_segments
             ]
-        
+
         if (
             not self.config.align_to_burned_subtitles
             or not self.config.enable_text_cover
@@ -796,7 +872,7 @@ class LocalizationService:
                         windows = []
                     detected = [window for window in windows if window is not None]
                     coverage = len(detected) / len(source_segments) if source_segments else 0.0
-                    
+
                     # Validate that source timing roughly matches visual timing
                     if self.config.validate_source_timing_match and detected:
                         validation_count = min(self.config.source_timing_validation_segments, len(source_segments))
@@ -814,13 +890,21 @@ class LocalizationService:
                             )
                             windows = []
                             detected = []
-                    
+
                     if detected and coverage >= self.config.source_subtitle_timing_min_coverage:
+                        windows = self._fill_missing_subtitle_windows(
+                            source_segments,
+                            windows,
+                            audio_duration,
+                        )
+                        resolved_count = sum(1 for window in windows if window is not None)
                         self._used_source_subtitle_timing = True
                         self.logger.info(
-                            "LocalizationService: using per-cue source subtitle timing for %d/%d segment(s)",
-                            len(detected),
+                            "LocalizationService: using one canonical visual subtitle clock for %d/%d "
+                            "segment(s) (%d direct OCR anchor(s))",
+                            resolved_count,
                             len(source_segments),
+                            len(detected),
                         )
                         self._progress(42, "Đã bắt timing phụ đề gốc theo từng câu")
                         return [
@@ -971,7 +1055,7 @@ class LocalizationService:
         if self.config.generate_subtitles and (translated_segments or translated_text or audio_result.transcript):
             self._progress(75, "Đang tạo phụ đề...")
             self.logger.info("LocalizationService: generating subtitles")
-            
+
             # Check if visual_source_segments have detected subtitle timing (from OCR/burned-in subtitles)
             source_min_start = min((s.start for s in visual_source_segments), default=0.0) if visual_source_segments else 0.0
             has_detected_source_timing = source_min_start > 0.01  # Reduced from 0.05 to catch subtitles starting near 0s
@@ -983,7 +1067,7 @@ class LocalizationService:
                 source_min_start,
                 has_detected_source_timing
             )
-            
+
             if visual_translated_segments:
                 # Translated segments already have offset applied via _retime_segments() in _prepare()
                 subtitle_segments = self.timeline.from_segments(
@@ -1003,7 +1087,7 @@ class LocalizationService:
                 subtitle_segments = self.timeline.align_transcript(
                     text_for_subs, audio_result.audio_result.duration
                 )
-            
+
             if subtitle_segments:
                 first_start = min((s.start_time for s in subtitle_segments), default=0.0)
                 self.logger.info(
@@ -1241,7 +1325,7 @@ class LocalizationService:
                             subtitles_for_render = None
 
                     final_video_path = output_dir / "output_final.mp4"
-                    
+
                     # Prepare subtitle segments for drawtext-based animated
                     # effects. Karaoke is special: the ASS subtitle file we
                     # generated above already contains real \kf karaoke timing,
@@ -1266,7 +1350,7 @@ class LocalizationService:
                             "LocalizationService: karaoke subtitles enabled; using ASS karaoke "
                             "burn-in and text-cover boxes, not static drawtext subtitles"
                         )
-                    
+
                     async with _RENDER_SLOTS:
                         await asyncio.to_thread(
                             self.renderer.render,
