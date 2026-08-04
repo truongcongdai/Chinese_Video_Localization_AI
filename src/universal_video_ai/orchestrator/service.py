@@ -904,9 +904,32 @@ class LocalizationService:
         if self.config.generate_subtitles and (translated_segments or translated_text or audio_result.transcript):
             self._progress(75, "Đang tạo phụ đề...")
             self.logger.info("LocalizationService: generating subtitles")
+            
+            # Check if visual_source_segments have detected subtitle timing (from OCR/burned-in subtitles)
+            source_min_start = min((s.start for s in visual_source_segments), default=0.0) if visual_source_segments else 0.0
+            has_detected_source_timing = source_min_start > 0.05
+            
             if visual_translated_segments:
                 subtitle_segments = self.timeline.from_segments(
                     visual_translated_segments, audio_duration=audio_result.audio_result.duration
+                )
+                if has_detected_source_timing:
+                    self.logger.info(
+                        "LocalizationService: subtitle timing preserved from detected source offset (starts at %.2fs)",
+                        source_min_start
+                    )
+            elif has_detected_source_timing:
+                # CRITICAL FIX: If source subtitles have detected timing (from OCR detection of burned-in subtitles),
+                # but visual_translated_segments is missing, still apply the source timing to subtitles.
+                # This ensures that videos with original subtitles starting at 0.2s (or 0.1s, 0.3s, etc.)
+                # get properly timed generated subtitles, not ones starting at 0.0s.
+                # This handles batch processing with variable subtitle offsets automatically.
+                self.logger.info(
+                    "LocalizationService: applying detected source subtitle offset to subtitle generation "
+                    "(detected offset: first segment starts at %.2fs)", source_min_start
+                )
+                subtitle_segments = self.timeline.from_segments(
+                    visual_source_segments, audio_duration=audio_result.audio_result.duration
                 )
             else:
                 # Fallback: even-split heuristic over whichever text we have
@@ -916,7 +939,15 @@ class LocalizationService:
                 subtitle_segments = self.timeline.align_transcript(
                     text_for_subs, audio_result.audio_result.duration
                 )
-            self.logger.info("LocalizationService: generated %d subtitle segments", len(subtitle_segments))
+            
+            if subtitle_segments:
+                first_start = min((s.start_time for s in subtitle_segments), default=0.0)
+                self.logger.info(
+                    "LocalizationService: generated %d subtitle segments (first segment starts at %.3fs)",
+                    len(subtitle_segments), first_start
+                )
+            else:
+                self.logger.info("LocalizationService: generated 0 subtitle segments")
 
             subtitles_path = output_dir / "subtitles.ass"
             dimensions = (
