@@ -910,24 +910,13 @@ class LocalizationService:
             has_detected_source_timing = source_min_start > 0.05
             
             if visual_translated_segments:
+                # Translated segments already have offset applied via _retime_segments() in _prepare()
                 subtitle_segments = self.timeline.from_segments(
                     visual_translated_segments, audio_duration=audio_result.audio_result.duration
                 )
-                if has_detected_source_timing:
-                    self.logger.info(
-                        "LocalizationService: subtitle timing preserved from detected source offset (starts at %.2fs)",
-                        source_min_start
-                    )
             elif has_detected_source_timing:
-                # CRITICAL FIX: If source subtitles have detected timing (from OCR detection of burned-in subtitles),
-                # but visual_translated_segments is missing, still apply the source timing to subtitles.
-                # This ensures that videos with original subtitles starting at 0.2s (or 0.1s, 0.3s, etc.)
-                # get properly timed generated subtitles, not ones starting at 0.0s.
-                # This handles batch processing with variable subtitle offsets automatically.
-                self.logger.info(
-                    "LocalizationService: applying detected source subtitle offset to subtitle generation "
-                    "(detected offset: first segment starts at %.2fs)", source_min_start
-                )
+                # Use source segments if translated segments are missing
+                # Source segments have offset from OCR detection
                 subtitle_segments = self.timeline.from_segments(
                     visual_source_segments, audio_duration=audio_result.audio_result.duration
                 )
