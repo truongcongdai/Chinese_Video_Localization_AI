@@ -218,8 +218,8 @@ function showApp(me) {
   refreshJobQueueStatus();
   requestNotificationPermission();
   refreshJobs();
-  pollTimer = setInterval(refreshJobs, 4000);
-  pollTimer2 = setInterval(refreshMe, 10000);
+  pollTimer = setInterval(refreshJobs, 8000);  // Increased from 4000ms to reduce server load
+  pollTimer2 = setInterval(refreshMe, 15000);  // Increased from 10000ms
 }
 
 $("#referral-copy-btn").onclick = async () => {

@@ -482,6 +482,9 @@ _MIGRATIONS = [
     ("jobs", "translation_tone", "ALTER TABLE jobs ADD COLUMN translation_tone TEXT DEFAULT 'natural'"),
     ("jobs", "translation_audience", "ALTER TABLE jobs ADD COLUMN translation_audience TEXT"),
     ("jobs", "translation_glossary", "ALTER TABLE jobs ADD COLUMN translation_glossary TEXT"),
+    # Upload video audio configuration
+    ("jobs", "keep_original_audio", "ALTER TABLE jobs ADD COLUMN keep_original_audio INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "background_music_strategy", "ALTER TABLE jobs ADD COLUMN background_music_strategy TEXT NOT NULL DEFAULT 'deterministic'"),
     # Content OS migrations - add missing columns
     ("content_os_projects", "channel_id", "ALTER TABLE content_os_projects ADD COLUMN channel_id INTEGER"),
     ("content_os_projects", "mode", "ALTER TABLE content_os_projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'ai_video'"),
@@ -595,6 +598,8 @@ class Job:
     remix_goal: str = "viral"
     remix_strength: str = "balanced"
     subtitle_offset_seconds: float = 0.0
+    keep_original_audio: int = 0
+    background_music_strategy: str = "deterministic"
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -829,6 +834,8 @@ class Store:
         remix_goal: str = "viral",
         remix_strength: str = "balanced",
         subtitle_offset_seconds: float = 0.0,
+        keep_original_audio: int = 0,
+        background_music_strategy: str = "deterministic",
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -857,30 +864,41 @@ class Store:
             remix_goal=remix_goal,
             remix_strength=remix_strength,
             subtitle_offset_seconds=float(subtitle_offset_seconds or 0.0),
+            keep_original_audio=keep_original_audio,
+            background_music_strategy=background_music_strategy,
         )
+        columns = (
+            "id", "user_id", "source_url", "target_language", "source_language", "status",
+            "progress_note", "error", "title", "final_video_path", "logo_path", "logo_corner",
+            "logo_size_px", "tts_voice", "review_mode", "review_state_json", "segments_json",
+            "qc_warnings_json", "created_at", "updated_at", "animated_subtitle_config",
+            "video_template_config", "transform_config", "source_video_path", "source_segments_json",
+            "processing_mode", "tts_provider", "tts_style", "translation_mode", "translation_tone",
+            "translation_audience", "translation_glossary", "tts_model", "translation_model",
+            "remix_enabled", "remix_platforms_json", "remix_goal", "remix_strength",
+            "subtitle_offset_seconds", "keep_original_audio", "background_music_strategy",
+        )
+        values = (
+            job.id, job.user_id, job.source_url, job.target_language, job.source_language,
+            job.status, job.progress_note, job.error, job.title, job.final_video_path,
+            job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
+            job.review_state_json, job.segments_json, job.qc_warnings_json,
+            job.created_at, job.updated_at,
+            json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
+            json.dumps(job.video_template_config) if job.video_template_config else None,
+            json.dumps(job.transform_config) if job.transform_config else None,
+            job.source_video_path, job.source_segments_json,
+            job.processing_mode, job.tts_provider, job.tts_style,
+            job.translation_mode, job.translation_tone, job.translation_audience,
+            job.translation_glossary, job.tts_model, job.translation_model,
+            job.remix_enabled, job.remix_platforms_json, job.remix_goal, job.remix_strength,
+            job.subtitle_offset_seconds, job.keep_original_audio, job.background_music_strategy,
+        )
+        placeholders = ",".join("?" for _ in values)
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO jobs (id, user_id, source_url, target_language, source_language, status, "
-                "progress_note, error, title, final_video_path, source_video_path, logo_path, logo_corner, logo_size_px, "
-                "tts_voice, review_mode, review_state_json, segments_json, source_segments_json, qc_warnings_json, "
-                "animated_subtitle_config, video_template_config, remix_enabled, remix_platforms_json, remix_goal, "
-                "remix_strength, subtitle_offset_seconds, transform_config, processing_mode, tts_provider, "
-                "tts_style, tts_model, translation_mode, translation_model, translation_tone, "
-                "translation_audience, translation_glossary, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (job.id, job.user_id, job.source_url, job.target_language, job.source_language,
-                 job.status, job.progress_note, job.error, job.title, job.final_video_path, job.source_video_path,
-                 job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
-                 None, None, None, None,
-                 json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
-                 json.dumps(job.video_template_config) if job.video_template_config else None,
-                 job.remix_enabled, job.remix_platforms_json, job.remix_goal, job.remix_strength,
-                 job.subtitle_offset_seconds,
-                 json.dumps(job.transform_config) if job.transform_config else None,
-                 job.processing_mode, job.tts_provider, job.tts_style, job.tts_model,
-                 job.translation_mode, job.translation_model, job.translation_tone,
-                 job.translation_audience, job.translation_glossary,
-                 job.created_at, job.updated_at),
+                f"INSERT INTO jobs ({','.join(columns)}) VALUES ({placeholders})",
+                values,
             )
         return job
 
@@ -915,6 +933,8 @@ class Store:
             remix_goal=old.remix_goal,
             remix_strength=old.remix_strength,
             subtitle_offset_seconds=old.subtitle_offset_seconds,
+            keep_original_audio=old.keep_original_audio,
+            background_music_strategy=old.background_music_strategy,
         )
 
     # ---- provider settings ----

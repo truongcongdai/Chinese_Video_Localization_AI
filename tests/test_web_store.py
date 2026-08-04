@@ -46,6 +46,29 @@ def test_create_job_accepts_and_persists_remix_settings(tmp_path: Path) -> None:
     assert retry.to_dict()["remix_platforms"] == ["youtube_long", "facebook_long"]
 
 
+def test_create_job_persists_audio_settings(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    user_id = store.create_user("user", "hash")
+
+    job = store.create_job(
+        user_id,
+        "https://example.com/audio",
+        "vi",
+        keep_original_audio=1,
+        background_music_strategy="none",
+    )
+
+    loaded = store.get_job(job.id)
+    assert loaded is not None
+    assert loaded.keep_original_audio == 1
+    assert loaded.background_music_strategy == "none"
+
+    retry = store.retry_job(job.id, user_id)
+    assert retry is not None
+    assert retry.keep_original_audio == 1
+    assert retry.background_music_strategy == "none"
+
+
 def test_content_os_job_is_flagged_for_frontend(tmp_path: Path) -> None:
     store = Store(tmp_path / "web.sqlite3")
     user_id = store.create_user("user", "hash")

@@ -237,7 +237,7 @@ class OnScreenTextDetector:
         entries: List[Tuple[int, int, str]] = []
         for detection in results:
             points, text, confidence = detection
-            if confidence < 0.25 or not str(text).strip():
+            if confidence < 0.15 or not str(text).strip():  # Reduced from 0.25 for better detection
                 continue
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
@@ -265,7 +265,7 @@ class OnScreenTextDetector:
         video_path: Path,
         at_seconds: float,
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.08, 0.25, 0.92, 0.95,
+            0.06, 0.55, 0.94, 0.96,
         ),
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
     ) -> str:
@@ -304,7 +304,7 @@ class OnScreenTextDetector:
         min_score: float = 0.72,
         min_matches: int = 2,
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.08, 0.25, 0.92, 0.95,
+            0.06, 0.55, 0.94, 0.96,
         ),
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
         use_text_ocr_fallback: bool = False,
@@ -426,14 +426,17 @@ class OnScreenTextDetector:
         audio_duration: float,
         search_radius: float = 0.8,
         step: float = 0.1,
-        min_visual_score: float = 0.003,
+        min_visual_score: float = 0.012,
         min_visible_samples: int = 2,
         use_ocr_boundary_refine: bool = True,
+        use_ocr_text_match_refine: bool = True,
         max_ocr_boundary_samples: int = 8,
+        max_ocr_text_match_samples: int = 8,
         ocr_boundary_score_delta: float = 0.012,
+        min_ocr_match_score: float = 0.68,
         max_subtitle_early_start: float = 0.15,
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.08, 0.25, 0.92, 0.95,
+            0.06, 0.55, 0.94, 0.96,
         ),
     ) -> List[Optional[SubtitleTimingWindow]]:
         """Detect per-cue hard-sub timing windows near ASR segments.
@@ -461,7 +464,10 @@ class OnScreenTextDetector:
             if not self._extract_frame(video_path, key, frame_path):
                 frame_cache[key] = 0.0
                 return 0.0
-            frame_cache[key] = self._subtitle_presence_score(frame_path)
+            frame_cache[key] = self._subtitle_presence_score_for_region(
+                frame_path,
+                region_fractional=subtitle_candidate_region_fractional or (0.06, 0.55, 0.94, 0.96),
+            )
             return frame_cache[key]
 
         def has_ocr_subtitle_at(t: float, tmp_dir: Path) -> bool:
@@ -484,7 +490,7 @@ class OnScreenTextDetector:
 
         with tempfile.TemporaryDirectory(prefix="subtitle_windows_") as tmp:
             tmp_dir = Path(tmp)
-            for start, end, _text in source_segments:
+            for start, end, source_text in source_segments:
                 if end <= start or audio_duration <= 0:
                     results.append(None)
                     continue
@@ -501,6 +507,47 @@ class OnScreenTextDetector:
                     results.append(None)
                     continue
 
+                source_norm = _normalize_ocr_match_text(source_text)
+                matched_times: List[float] = []
+                if use_ocr_text_match_refine and len(source_norm) >= 4:
+                    text_cache: Dict[float, str] = {}
+
+                    def text_at(t: float) -> str:
+                        key = round(max(0.0, min(audio_duration, t)), 2)
+                        if key in text_cache:
+                            return text_cache[key]
+                        frame_path = tmp_dir / f"subtitle_text_{len(frame_cache)}_{int(key * 1000)}.jpg"
+                        if not self._extract_frame(video_path, key, frame_path):
+                            text_cache[key] = ""
+                        else:
+                            text_cache[key] = self._read_text_in_frame(
+                                frame_path,
+                                frame_w,
+                                frame_h,
+                                subtitle_candidate_region_fractional,
+                            )
+                        return text_cache[key]
+
+                    scored_text_times: List[Tuple[float, float]] = []
+                    text_candidates = [
+                        (t, visual_score)
+                        for t, visual_score in scored
+                        if visual_score >= (min_visual_score * 0.6)
+                    ]
+                    text_candidates.sort(key=lambda item: item[1], reverse=True)
+                    text_candidates = text_candidates[:max(1, max_ocr_text_match_samples)]
+                    text_candidates.sort(key=lambda item: item[0])
+                    for t, _visual_score in text_candidates:
+                        match_score = _subtitle_text_match_score(source_norm, text_at(t))
+                        if match_score >= min_ocr_match_score:
+                            scored_text_times.append((t, match_score))
+                    if scored_text_times:
+                        best_score = max(score for _t, score in scored_text_times)
+                        matched_times = [
+                            t for t, score in scored_text_times
+                            if score >= max(min_ocr_match_score, best_score - 0.08)
+                        ]
+
                 runs: List[List[float]] = []
                 current: List[float] = []
                 for t in visible_times:
@@ -512,13 +559,24 @@ class OnScreenTextDetector:
                     runs.append(current)
 
                 midpoint = (start + end) / 2.0
-                best_run = min(
-                    runs,
-                    key=lambda run: (
-                        0 if run[0] <= midpoint <= run[-1] else min(abs(midpoint - run[0]), abs(midpoint - run[-1])),
-                        -len(run),
-                    ),
-                )
+                if matched_times:
+                    matched_midpoint = sum(matched_times) / len(matched_times)
+                    best_run = min(
+                        runs,
+                        key=lambda run: (
+                            0 if run[0] <= matched_midpoint <= run[-1]
+                            else min(abs(matched_midpoint - run[0]), abs(matched_midpoint - run[-1])),
+                            -len(run),
+                        ),
+                    )
+                else:
+                    best_run = min(
+                        runs,
+                        key=lambda run: (
+                            0 if run[0] <= midpoint <= run[-1] else min(abs(midpoint - run[0]), abs(midpoint - run[-1])),
+                            -len(run),
+                        ),
+                    )
                 if len(best_run) < min_visible_samples:
                     results.append(None)
                     continue
@@ -570,6 +628,7 @@ class OnScreenTextDetector:
     def _trim_overlapping_subtitle_windows(
         windows: List[Optional[SubtitleTimingWindow]],
         min_gap: float = 0.03,
+        min_duration: float = 0.12,
     ) -> List[Optional[SubtitleTimingWindow]]:
         result = list(windows)
         for idx in range(len(result) - 1):
@@ -579,6 +638,9 @@ class OnScreenTextDetector:
                 continue
             if current.end <= next_window.start:
                 continue
+            if current.start >= next_window.start - min_gap:
+                result[idx] = None
+                continue
             trimmed_end = max(current.start + 0.05, next_window.start - min_gap)
             if trimmed_end < current.end:
                 result[idx] = SubtitleTimingWindow(
@@ -586,6 +648,12 @@ class OnScreenTextDetector:
                     end=round(trimmed_end, 3),
                     confidence=current.confidence,
                 )
+        result = [
+            window
+            if window is None or (window.end - window.start) >= min_duration
+            else None
+            for window in result
+        ]
         return result
 
     def _estimate_subtitle_time_offset_by_presence(
@@ -596,7 +664,7 @@ class OnScreenTextDetector:
         step: float = 0.5,
         refine_step: float = 0.05,
         max_segments: int = 8,
-        min_visual_score: float = 0.003,
+        min_visual_score: float = 0.012,
         min_best_to_zero_delta: float = 0.004,
         min_visible_matches: int = 2,
         min_offset: float = 0.05,
@@ -724,34 +792,119 @@ class OnScreenTextDetector:
     def _subtitle_presence_score(
         self,
         frame_path: Path,
-        region_fractional: Tuple[float, float, float, float] = (0.10, 0.55, 0.90, 0.92),
+        region_fractional: Tuple[float, float, float, float] = (0.08, 0.55, 0.92, 0.96),
     ) -> float:
-        """Measure likely white hard-sub text density in the subtitle band."""
+        """Measure likely white hard-sub text in the subtitle band.
+
+        A plain bright-pixel ratio is not enough: jewelry, table edges, lamps,
+        and pale clothing can occupy the lower half of short-drama frames and
+        make subtitles appear "present" before any burned-in subtitle is
+        actually visible. This score looks for small, high-contrast, white-ish
+        connected components that line up horizontally like subtitle glyphs.
+        """
         try:
             from PIL import Image
+            import cv2  # type: ignore
+            import numpy as np
 
             with Image.open(frame_path) as image:
-                rgb = image.convert("RGB")
-                w, h = rgb.size
+                rgb_image = image.convert("RGB")
+                rgb = np.array(rgb_image)
+                h, w = rgb.shape[:2]
                 fx0, fy0, fx1, fy1 = region_fractional
-                crop = rgb.crop((
-                    int(fx0 * w), int(fy0 * h),
-                    int(fx1 * w), int(fy1 * h),
-                ))
-                data = (
-                    crop.get_flattened_data()
-                    if hasattr(crop, "get_flattened_data")
-                    else crop.getdata()
-                )
-                bright = 0
-                total = 0
-                for r, g, b in data:
-                    total += 1
-                    if r > 185 and g > 185 and b > 185 and (max(r, g, b) - min(r, g, b)) < 80:
-                        bright += 1
-                return bright / total if total else 0.0
+                x0, y0 = int(fx0 * w), int(fy0 * h)
+                x1, y1 = int(fx1 * w), int(fy1 * h)
+                if x1 <= x0 or y1 <= y0:
+                    return 0.0
+                crop = rgb[y0:y1, x0:x1]
+
+                bright = (
+                    (crop[:, :, 0] > 180)
+                    & (crop[:, :, 1] > 180)
+                    & (crop[:, :, 2] > 180)
+                    & ((crop.max(axis=2) - crop.min(axis=2)) < 90)
+                ).astype("uint8") * 255
+                if not int(bright.any()):
+                    return 0.0
+
+                gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(bright, 8)
+                components: List[Tuple[int, int, int, int, int, float, float]] = []
+                for idx in range(1, component_count):
+                    cx, cy = centroids[idx]
+                    x, y, box_w, box_h, area = stats[idx]
+                    if area < 10 or area > 1600:
+                        continue
+                    if box_w < 2 or box_w > 100 or box_h < 8 or box_h > 70:
+                        continue
+                    if (box_w / max(1, box_h)) > 6.0:
+                        continue
+                    ex0 = max(0, x - 2)
+                    ey0 = max(0, y - 2)
+                    ex1 = min(gray.shape[1], x + box_w + 2)
+                    ey1 = min(gray.shape[0], y + box_h + 2)
+                    neighborhood = gray[ey0:ey1, ex0:ex1]
+                    if neighborhood.size and (int(neighborhood.max()) - int(neighborhood.min())) < 55:
+                        continue
+                    components.append((x, y, box_w, box_h, area, float(cx), float(cy)))
+
+                if not components:
+                    return 0.0
+
+                heights = sorted(c[3] for c in components)
+                median_height = heights[len(heights) // 2]
+                bin_size = max(12.0, median_height * 0.9)
+                bins: Dict[int, List[Tuple[int, int, int, int, int, float, float]]] = {}
+                for component in components:
+                    bins.setdefault(int(component[6] // bin_size), []).append(component)
+
+                def subtitle_line_score(line: List[Tuple[int, int, int, int, int, float, float]]) -> float:
+                    if len(line) < 3:
+                        return 0.0
+                    xs = [item[5] for item in line]
+                    span = max(xs) - min(xs)
+                    if span < max(60.0, w * 0.12):
+                        return 0.0
+                    area = sum(item[4] for item in line)
+                    return (area / max(1, w * h)) * (span / max(1, w)) * len(line)
+
+                return max((subtitle_line_score(line) for line in bins.values()), default=0.0)
         except Exception:
-            return 0.0
+            try:
+                from PIL import Image
+
+                with Image.open(frame_path) as image:
+                    rgb = image.convert("RGB")
+                    w, h = rgb.size
+                    fx0, fy0, fx1, fy1 = region_fractional
+                    crop = rgb.crop((
+                        int(fx0 * w), int(fy0 * h),
+                        int(fx1 * w), int(fy1 * h),
+                    ))
+                    data = (
+                        crop.get_flattened_data()
+                        if hasattr(crop, "get_flattened_data")
+                        else crop.getdata()
+                    )
+                    bright = 0
+                    total = 0
+                    for r, g, b in data:
+                        total += 1
+                        if r > 185 and g > 185 and b > 185 and (max(r, g, b) - min(r, g, b)) < 80:
+                            bright += 1
+                    return bright / total if total else 0.0
+            except Exception:
+                return 0.0
+
+    def _subtitle_presence_score_for_region(
+        self,
+        frame_path: Path,
+        region_fractional: Tuple[float, float, float, float],
+    ) -> float:
+        try:
+            return self._subtitle_presence_score(frame_path, region_fractional)
+        except TypeError:
+            return self._subtitle_presence_score(frame_path)  # type: ignore[misc]
 
     def _select_offset_anchors(
         self,
@@ -789,13 +942,13 @@ class OnScreenTextDetector:
         windows: Sequence[Tuple[float, float]],
         samples_per_window: int = 2,
         padding_px: int = 10,
-        band_tolerance: float = 1.6,
+        band_tolerance: float = 2.5,  # Increased from 1.6 for better multi-line subtitle detection
         max_single_box_width_ratio: float = 0.92,
         max_single_box_height_ratio: float = 0.3,
         max_lines_per_region: float = 2.4,
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.08, 0.25, 0.92, 0.95,
+            0.06, 0.55, 0.94, 0.96,
         ),
         fill_undetected_windows: bool = True,
     ) -> List[TextRegion]:
@@ -912,7 +1065,7 @@ class OnScreenTextDetector:
                 ))
 
         # ---- Pass 1: sample every window's frames once, keep raw per-window boxes ----
-        per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]]]] = []
+        per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]], float]] = []
         fallback_per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]]]] = []
         candidate_filter_active = bool(subtitle_candidate_region_fractional and frame_w and frame_h)
 
@@ -926,10 +1079,18 @@ class OnScreenTextDetector:
                 sample_times = [start + step * (i + 1) for i in range(sample_count)]
 
                 raw_boxes: List[Tuple[int, int, int, int]] = []
+                max_presence_score = 0.0
                 for s_idx, t in enumerate(sample_times):
                     frame_path = tmp_dir / f"frame_{w_idx}_{s_idx}.png"
                     if not self._extract_frame(video_path, t, frame_path):
                         continue
+                    max_presence_score = max(
+                        max_presence_score,
+                        self._subtitle_presence_score_for_region(
+                            frame_path,
+                            subtitle_candidate_region_fractional or (0.06, 0.55, 0.94, 0.96),
+                        ),
+                    )
                     raw_boxes.extend(self._detect_boxes_in_frame(frame_path))
 
                 raw_boxes = self._drop_implausible_boxes(
@@ -944,17 +1105,20 @@ class OnScreenTextDetector:
                         raw_boxes, frame_w, frame_h, subtitle_candidate_region_fractional
                     )
                     raw_boxes = candidate_boxes
-                per_window_boxes.append((start, end, raw_boxes))
+                per_window_boxes.append((start, end, raw_boxes, max_presence_score))
 
         # ---- Learn where this video's subtitle line actually sits ----
-        all_boxes = [b for (_s, _e, boxes) in per_window_boxes for b in boxes]
+        all_boxes = [b for (_s, _e, boxes, _score) in per_window_boxes for b in boxes]
         if not all_boxes and candidate_filter_active:
             self.logger.info(
                 "OnScreenTextDetector: subtitle candidate region removed every OCR box; "
                 "falling back to unfiltered OCR boxes for this video"
             )
-            per_window_boxes = fallback_per_window_boxes
-            all_boxes = [b for (_s, _e, boxes) in per_window_boxes for b in boxes]
+            per_window_boxes = [
+                (start, end, boxes, 0.0)
+                for start, end, boxes in fallback_per_window_boxes
+            ]
+            all_boxes = [b for (_s, _e, boxes, _score) in per_window_boxes for b in boxes]
         band_center, typical_line_height = self._learn_subtitle_band(all_boxes)
         self.last_typical_line_height = typical_line_height
 
@@ -974,7 +1138,7 @@ class OnScreenTextDetector:
         # direct subtitle-shaped OCR hit. Some short-drama sources move
         # captions around the frame; forcing every cue into one global band
         # makes the cover box miss the original text.
-        undetected_windows: List[Tuple[float, float]] = []
+        undetected_windows: List[Tuple[float, float, float]] = []
         # Track the x-extent actually seen in windows that DID have a hit,
         # so any undetected window can fall back to "the typical horizontal
         # extent of this video's subtitle line" rather than being skipped.
@@ -982,14 +1146,15 @@ class OnScreenTextDetector:
         detected_x1s: List[int] = []
         detected_heights: List[int] = []
 
-        for (start, end, boxes) in per_window_boxes:
-            local_boxes = self._keep_horizontal_subtitle_line_boxes(boxes)
-            in_band = local_boxes or [
+        for (start, end, boxes, presence_score) in per_window_boxes:
+            band_boxes = [
                 b for b in boxes
                 if abs(((b[1] + b[3]) / 2.0) - band_center) <= band_half
             ]
+            local_boxes = self._keep_horizontal_subtitle_line_boxes(band_boxes)
+            in_band = local_boxes or band_boxes
             if not in_band:
-                undetected_windows.append((start, end))
+                undetected_windows.append((start, end, presence_score))
                 continue
 
             x0 = max(0, min(b[0] for b in in_band) - padding_px)
@@ -1039,7 +1204,9 @@ class OnScreenTextDetector:
                 fb_y0 = max(0, min(fb_y0, frame_h - fb_height))
                 fb_y1 = fb_y0 + fb_height
 
-            for (start, end) in undetected_windows:
+            for (start, end, presence_score) in undetected_windows:
+                if presence_score < 0.012:
+                    continue
                 regions.append(
                     TextRegion(
                         start=start, end=end,

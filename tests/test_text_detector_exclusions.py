@@ -1,6 +1,10 @@
 """Regression tests for OCR subtitle/ad region separation."""
 
+import tempfile
 import unittest
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
 
 from universal_video_ai.orchestrator.service import LocalizationConfig
 from universal_video_ai.orchestrator.factory import create_localization_service
@@ -72,7 +76,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
         detector._offset_candidates = lambda search_radius, step: [0.0, 0.1]
         detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_bytes(b"x") or True
         detector._subtitle_presence_score = (
-            lambda frame_path: 0.010
+            lambda frame_path: 0.020
             if frame_path.name in {"presence_2.jpg", "presence_3.jpg"} else 0.003
         )
 
@@ -90,6 +94,38 @@ class TextDetectorExclusionTests(unittest.TestCase):
         self.assertEqual(estimate.offset, 0.1)
         self.assertIsNone(estimate.apply_after)
 
+    def test_presence_score_rejects_bright_object_but_accepts_subtitle_text(self) -> None:
+        detector = OnScreenTextDetector()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            bright_object = tmp_dir / "bright_object.png"
+            subtitle_text = tmp_dir / "subtitle_text.png"
+
+            image = Image.new("RGB", (1280, 720), (25, 25, 30))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((360, 610, 920, 660), fill=(235, 235, 235))
+            image.save(bright_object)
+
+            image = Image.new("RGB", (1280, 720), (25, 25, 30))
+            draw = ImageDraw.Draw(image)
+            try:
+                font = ImageFont.truetype("DejaVuSans-Bold.ttf", 56)
+            except Exception:
+                font = ImageFont.load_default()
+            draw.text(
+                (300, 600),
+                "Subtitle text here now",
+                fill=(255, 255, 255),
+                font=font,
+                stroke_width=4,
+                stroke_fill=(0, 0, 0),
+            )
+            image.save(subtitle_text)
+
+            self.assertLess(detector._subtitle_presence_score(bright_object), 0.012)
+            self.assertGreater(detector._subtitle_presence_score(subtitle_text), 0.012)
+
     def test_presence_offset_estimator_accepts_point_zero_five_second_offset(self) -> None:
         detector = OnScreenTextDetector()
         detector._select_presence_offset_anchors = (
@@ -102,7 +138,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
 
         def score(frame_path):
             timestamp = float(frame_path.read_text(encoding="utf-8"))
-            return 0.010 if abs(timestamp - 0.55) < 0.001 else 0.003
+            return 0.020 if abs(timestamp - 0.55) < 0.001 else 0.003
 
         detector._subtitle_presence_score = score
 
@@ -148,7 +184,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
 
         def score(frame_path):
             timestamp = float(frame_path.read_text(encoding="utf-8"))
-            return 0.010 if 0.4 <= timestamp <= 1.2 else 0.0
+            return 0.020 if 0.4 <= timestamp <= 1.2 else 0.0
 
         detector._subtitle_presence_score = score
 
@@ -171,7 +207,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
         detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_text(
             f"{at_seconds:.2f}", encoding="utf-8"
         ) or True
-        detector._subtitle_presence_score = lambda frame_path: 0.010
+        detector._subtitle_presence_score = lambda frame_path: 0.020
 
         def detect_boxes(frame_path):
             timestamp = float(frame_path.read_text(encoding="utf-8"))
@@ -220,7 +256,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
         self.assertLess(band_center, 430)
         self.assertGreaterEqual(line_height, 26)
 
-    def test_detect_regions_prefers_window_local_subtitle_box_over_global_band(self) -> None:
+    def test_detect_regions_ignores_upper_noise_and_keeps_subtitle_band(self) -> None:
         detector = OnScreenTextDetector()
         detector._get_video_dimensions = lambda video_path: (1280, 720)
         detector._extract_frame = lambda video_path, at_seconds, out_path: out_path.write_text(
@@ -231,13 +267,12 @@ class TextDetectorExclusionTests(unittest.TestCase):
             timestamp = float(frame_path.read_text(encoding="utf-8"))
             if timestamp < 1.0:
                 return [
-                    (12, 16, 36, 40),       # corner/side noise
-                    (632, 384, 780, 416),   # first cue, lower on screen
+                    (20, 60, 300, 104),     # title/watermark noise
+                    (632, 620, 780, 652),   # first cue, subtitle band
                 ]
             return [
-                (12, 210, 36, 236),       # vertical noise
-                (12, 230, 36, 256),
-                (426, 268, 576, 300),     # later cue, different y
+                (80, 80, 520, 124),       # upper horizontal noise
+                (426, 618, 576, 650),     # later cue, subtitle band
             ]
 
         detector._detect_boxes_in_frame = detect_boxes
@@ -250,9 +285,9 @@ class TextDetectorExclusionTests(unittest.TestCase):
         )
 
         self.assertEqual(len(regions), 2)
-        self.assertEqual(regions[0].y, 374)
+        self.assertEqual(regions[0].y, 610)
         self.assertEqual(regions[0].height, 52)
-        self.assertEqual(regions[1].y, 258)
+        self.assertEqual(regions[1].y, 608)
         self.assertEqual(regions[1].height, 52)
 
 

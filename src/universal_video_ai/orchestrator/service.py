@@ -44,6 +44,7 @@ _logger = logging.getLogger(__name__)
 _DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "10"))))
 _TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "5"))))
 _RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
+_TTS_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TTS_CONCURRENCY", "8"))))
 
 
 @dataclass(frozen=True)
@@ -127,7 +128,7 @@ class LocalizationConfig:
         # Common Douyin/TikTok watermark/account area.
         (0.80, 0.72, 1.0, 1.0),
     )
-    text_cover_samples_per_segment: int = 2
+    text_cover_samples_per_segment: int = 4  # Increased from 2 for better OCR detection
     # If the source video has burned-in subtitles whose visual timing differs
     # from ASR/audio timing, estimate a single OCR-based offset and shift the
     # per-segment timeline before translation/TTS/render. This keeps dubbed
@@ -148,9 +149,14 @@ class LocalizationConfig:
     # path for videos whose first source subtitle starts at e.g. 0.4s and
     # whose later cues have natural gaps that should be preserved exactly.
     use_source_subtitle_timing: bool = True
-    source_subtitle_timing_search_radius: float = 0.8
-    source_subtitle_timing_step: float = 0.1
+    source_subtitle_timing_search_radius: float = 2.5
+    source_subtitle_timing_step: float = 0.2
     source_subtitle_timing_min_coverage: float = 0.60
+    # Validate that source timing roughly matches visual timing before using it.
+    # If the first N source segments can't find any visual presence within
+    # search_radius, disable source timing and use visual-only detection.
+    validate_source_timing_match: bool = True
+    source_timing_validation_segments: int = 3
     # Optional visual-only padding for burned-subtitle cover/subtitle windows.
     # Defaults to 0 so generated subtitle timestamps stay exactly on the
     # detected source-subtitle timeline. Non-zero values are only for users
@@ -447,25 +453,59 @@ class LocalizationService:
             url, output_dir, effective_target_language,
         )
 
-        # Step 1: Download video
-        self._progress(5, "Đang tải video nguồn...")
-        self.logger.info("LocalizationService: downloading video")
-        
-        # Apply rate limiting before download
-        rate_limiter = get_rate_limiter()
-        await rate_limiter.acquire(self.user_id)
-        
-        try:
-            async with _DOWNLOAD_SLOTS:
-                download_result = await asyncio.to_thread(self.downloader.download, url, output_dir)
-        finally:
-            rate_limiter.release()
+        # Step 1: Download video (or use uploaded file directly)
+        if url.startswith("file://"):
+            # Handle uploaded video file - skip download
+            self._progress(5, "Đang chuẩn bị file video...")
+            self.logger.info("LocalizationService: using uploaded file (file:// protocol)")
+            from universal_video_ai.downloader.download_result import DownloadResult
+            from universal_video_ai.downloader.platform import Platform
 
-        if not download_result.success:
-            raise ValueError(f"Download failed for {url}")
+            # Extract file path from file:// URL
+            file_path_str = url[7:]  # Remove "file://" prefix
+            video_path = Path(file_path_str)
 
-        self.logger.info("LocalizationService: download successful: %s", download_result.video_path)
-        self._progress(15, "Đã tải video ✓")
+            if not video_path.exists():
+                raise ValueError(f"Uploaded file not found: {video_path}")
+
+            # Create DownloadResult directly from file
+            file_size = video_path.stat().st_size
+            file_ext = video_path.suffix.lower()
+            file_stem = video_path.stem
+
+            download_result = DownloadResult(
+                success=True,
+                platform=Platform.GENERIC,
+                original_url=url,
+                final_url=url,
+                video_path=video_path,
+                title=file_stem,
+                filesize=file_size,
+                extension=file_ext[1:] if file_ext else "mp4",  # Remove dot
+            )
+
+            self.logger.info("LocalizationService: uploaded file ready: %s (size=%d bytes)", video_path, file_size)
+            self._progress(15, "Đã chuẩn bị file video ✓")
+        else:
+            # Regular download from URL
+            self._progress(5, "Đang tải video nguồn...")
+            self.logger.info("LocalizationService: downloading video")
+
+            # Apply rate limiting before download
+            rate_limiter = get_rate_limiter()
+            await rate_limiter.acquire(self.user_id)
+
+            try:
+                async with _DOWNLOAD_SLOTS:
+                    download_result = await asyncio.to_thread(self.downloader.download, url, output_dir)
+            finally:
+                rate_limiter.release()
+
+            if not download_result.success:
+                raise ValueError(f"Download failed for {url}")
+
+            self.logger.info("LocalizationService: download successful: %s", download_result.video_path)
+            self._progress(15, "Đã tải video ✓")
         
         # Step 2: Process audio (extract → demucs → transcribe)
         self._progress(20, "Đang tách âm thanh...")
@@ -756,6 +796,25 @@ class LocalizationService:
                         windows = []
                     detected = [window for window in windows if window is not None]
                     coverage = len(detected) / len(source_segments) if source_segments else 0.0
+                    
+                    # Validate that source timing roughly matches visual timing
+                    if self.config.validate_source_timing_match and detected:
+                        validation_count = min(self.config.source_timing_validation_segments, len(source_segments))
+                        valid_matches = 0
+                        for i in range(validation_count):
+                            if windows[i] is not None:
+                                valid_matches += 1
+                        validation_ratio = valid_matches / validation_count if validation_count > 0 else 0.0
+                        if validation_ratio < 0.5:
+                            self.logger.warning(
+                                "Source timing validation failed: only %d/%d of first segments found visual matches; "
+                                "falling back to visual-only detection",
+                                valid_matches,
+                                validation_count,
+                            )
+                            windows = []
+                            detected = []
+                    
                     if detected and coverage >= self.config.source_subtitle_timing_min_coverage:
                         self._used_source_subtitle_timing = True
                         self.logger.info(
@@ -850,6 +909,10 @@ class LocalizationService:
             tts_segments = prepared.tts_segments or translated_segments
 
         visual_timing_padding = self._visual_timing_padding_for_current_video()
+        self.logger.debug(
+            "LocalizationService._finalize: source_segments=%s",
+            [(s.start, s.end) for s in (source_segments or [])[:3]]  # First 3 segments
+        )
         visual_translated_segments = self._pad_visual_segments(
             translated_segments or [],
             audio_duration=audio_result.audio_result.duration,
@@ -859,6 +922,11 @@ class LocalizationService:
             source_segments,
             audio_duration=audio_result.audio_result.duration,
             padding=visual_timing_padding,
+        )
+        self.logger.debug(
+            "LocalizationService._finalize: visual_source_segments=%s visual_translated_segments=%s",
+            [(s.start, s.end) for s in (visual_source_segments or [])[:3]] if visual_source_segments else None,
+            [(s.start, s.end) for s in (visual_translated_segments or [])[:3]] if visual_translated_segments else None
         )
 
         tts_audio_path: Optional[Path] = None
@@ -872,8 +940,7 @@ class LocalizationService:
             else:
                 try:
                     if tts_segments:
-                        tts_audio_path = await asyncio.to_thread(
-                            self._synthesize_timed_track,
+                        tts_audio_path = await self._synthesize_timed_track_async(
                             tts_segments,
                             total_duration=audio_result.audio_result.duration,
                             output_dir=output_dir,
@@ -907,7 +974,15 @@ class LocalizationService:
             
             # Check if visual_source_segments have detected subtitle timing (from OCR/burned-in subtitles)
             source_min_start = min((s.start for s in visual_source_segments), default=0.0) if visual_source_segments else 0.0
-            has_detected_source_timing = source_min_start > 0.05
+            has_detected_source_timing = source_min_start > 0.01  # Reduced from 0.05 to catch subtitles starting near 0s
+
+            self.logger.debug(
+                "LocalizationService: subtitle generation - visual_translated_segments=%s, "
+                "source_min_start=%.3f, has_detected_source_timing=%s",
+                "None" if visual_translated_segments is None else f"len={len(visual_translated_segments)}",
+                source_min_start,
+                has_detected_source_timing
+            )
             
             if visual_translated_segments:
                 # Translated segments already have offset applied via _retime_segments() in _prepare()
@@ -1238,6 +1313,8 @@ class LocalizationService:
         translation of whatever was said at second 0-3 in the source video
         — rather than reading the whole translated transcript back-to-back
         starting from second 0.
+
+        Legacy synchronous implementation - kept for backward compatibility.
         """
         segments_dir = output_dir / "tts_segments"
         segments_dir.mkdir(parents=True, exist_ok=True)
@@ -1269,6 +1346,76 @@ class LocalizationService:
                 # the previous clip rather than dropping it.
                 prev_end = clips[-1].end if clips else 0.0
                 clips.append(TimedAudioClip(start=prev_end, end=prev_end + 2.0, audio_path=clip_path))
+
+        tts_audio_path = output_dir / "tts_audio.wav"
+        self.mixer.build_dubbed_track(clips, total_duration=total_duration, output_path=tts_audio_path)
+        return tts_audio_path
+
+    async def _synthesize_timed_track_async(
+        self,
+        translated_segments: List[TranscriptSegment],
+        total_duration: float,
+        output_dir: Path,
+        target_language: str,
+        voice: Optional[str] = None,
+    ) -> Path:
+        """
+        Async version of _synthesize_timed_track with parallel TTS synthesis.
+
+        Optimized with parallel TTS synthesis using asyncio and concurrency control.
+        This can significantly reduce TTS processing time for videos with many segments.
+        """
+        segments_dir = output_dir / "tts_segments"
+        segments_dir.mkdir(parents=True, exist_ok=True)
+
+        async def synthesize_segment(idx: int, seg: TranscriptSegment) -> Optional[TimedAudioClip]:
+            """Synthesize a single segment with concurrency control."""
+            self._raise_if_cancelled()
+            if not seg.text.strip():
+                return None
+            clip_path = segments_dir / f"segment_{idx:04d}.wav"
+            try:
+                async with _TTS_SLOTS:
+                    await asyncio.to_thread(
+                        self.tts_service.synthesize,
+                        seg.text,
+                        output_path=clip_path,
+                        language=target_language,
+                        voice=voice,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Skipping TTS for segment %d after synthesis failed; subtitles remain: %s",
+                    idx,
+                    exc,
+                )
+                return None
+
+            if seg.has_timing:
+                return TimedAudioClip(start=seg.start, end=seg.end, audio_path=clip_path)
+            else:
+                # No real timing for this one sentence: place it right after
+                # the previous clip rather than dropping it.
+                return TimedAudioClip(start=0.0, end=2.0, audio_path=clip_path)
+
+        # Run TTS synthesis in parallel with concurrency control
+        tasks = [
+            synthesize_segment(idx, seg)
+            for idx, seg in enumerate(translated_segments)
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Filter out failed syntheses and fix timing for segments without timing
+        clips: List[TimedAudioClip] = []
+        for idx, clip in enumerate(results):
+            if clip is None:
+                continue
+            if clip.start == 0.0 and clip.end == 2.0:
+                # This was a segment without timing - place it after previous clip
+                prev_end = clips[-1].end if clips else 0.0
+                clips.append(TimedAudioClip(start=prev_end, end=prev_end + 2.0, audio_path=clip.audio_path))
+            else:
+                clips.append(clip)
 
         tts_audio_path = output_dir / "tts_audio.wav"
         self.mixer.build_dubbed_track(clips, total_duration=total_duration, output_path=tts_audio_path)

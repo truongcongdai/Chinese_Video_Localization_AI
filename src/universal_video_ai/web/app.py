@@ -216,6 +216,8 @@ _LOGO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "logos"
 _LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _PRODUCT_MEDIA_UPLOAD_DIR = _REPO_ROOT / "local_data" / "web_uploads" / "product_media"
 _PRODUCT_MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_VIDEO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "videos"
+_VIDEO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Human-readable Vietnamese labels for language codes, shown in the
 # frontend's dropdowns. Target-language options come straight from
@@ -297,6 +299,9 @@ class NewJobBody(BaseModel):
     video_template_config: Optional[Dict[str, Any]] = None
     # Video transformation configuration (flip, border, split-screen, etc.)
     transform_config: Optional[Dict[str, Any]] = None
+    # Audio configuration for uploaded videos
+    keep_original_audio: int = 0
+    background_music_strategy: str = "deterministic"
 
 
 class RemixPlanBody(BaseModel):
@@ -684,6 +689,8 @@ def logout():
 @app.get("/api/me")
 def me(user_id: int = Depends(get_current_user_id)):
     user = store.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
     referral_code = user["referral_code"] or store.ensure_referral_code(user_id)
     return {
         "id": user["id"], "username": user["username"],
@@ -995,7 +1002,17 @@ def _build_service_for_job(job):
         ollama_num_predict=_env_int("OLLAMA_TRANSLATION_NUM_PREDICT", 0, minimum=0, maximum=32768),
     )
 
-    replace_source_audio = os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"}
+    # Audio configuration: use job-specific settings if available, otherwise fall back to env vars
+    keep_original_audio = getattr(job, "keep_original_audio", 0) or 0
+    background_music_strategy = getattr(job, "background_music_strategy", "deterministic") or "deterministic"
+    
+    # replace_source_audio = keep_original_audio == 0 AND background_music_strategy != "none"
+    job_replace_audio = (keep_original_audio == 0) and (background_music_strategy != "none")
+    env_replace_audio = os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"}
+    
+    # Use job-specific config if the job has these fields (uploaded video), otherwise use env default
+    replace_source_audio = job_replace_audio if hasattr(job, "keep_original_audio") else env_replace_audio
+    
     run_demucs_for_effects = (
         os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
         and shutil.which("demucs") is not None
@@ -3973,12 +3990,97 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         remix_goal=remix_plan.goal,
         remix_strength=remix_plan.strength,
         subtitle_offset_seconds=body.subtitle_offset_seconds,
+        keep_original_audio=body.keep_original_audio,
+        background_music_strategy=body.background_music_strategy,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
     return job.to_dict()
+
+
+@app.post("/api/upload-video")
+async def upload_video(
+    file: UploadFile = File(...),
+    target_language: str = Form("vi"),
+    source_language: str = Form("auto"),
+    logo_path: Optional[str] = Form(None),
+    logo_corner: str = Form("bottom_right"),
+    logo_size_px: int = Form(120),
+    tts_voice: Optional[str] = Form(None),
+    review_before_render: bool = Form(False),
+    animated_subtitle_config: Optional[str] = Form(None),
+    video_template_config: Optional[str] = Form(None),
+    keep_original_audio: int = Form(0),
+    background_music_strategy: str = Form("deterministic"),
+    user_id: int = Depends(get_current_user_id),
+):
+    """Upload a video file directly instead of providing a URL."""
+    # Validate file type
+    allowed_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    file_ext = Path(file.filename or "").suffix.lower()
+    if file_ext not in allowed_extensions:
+        raise HTTPException(400, f"Định dạng file không được hỗ trợ. Chỉ chấp nhận: {', '.join(allowed_extensions)}")
+    
+    # Validate file size (max 500MB)
+    MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+    file_size = 0
+    for chunk in file.file:
+        file_size += len(chunk)
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(400, "File quá lớn. Kích thước tối đa: 500MB")
+    
+    # Reset file pointer
+    await file.seek(0)
+    
+    # Generate unique filename
+    video_id = uuid.uuid4().hex[:12]
+    safe_filename = f"{user_id}_{video_id}{file_ext}"
+    video_path = _VIDEO_UPLOAD_DIR / safe_filename
+    
+    # Save uploaded file
+    try:
+        with open(video_path, "wb") as f:
+            while chunk := await file.read(8192):
+                f.write(chunk)
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi khi lưu file: {str(e)}")
+    
+    # Parse JSON configs
+    try:
+        animated_config = json.loads(animated_subtitle_config) if animated_subtitle_config else None
+        template_config = json.loads(video_template_config) if video_template_config else None
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
+    
+    # Create job with file:// URL
+    file_url = f"file://{video_path}"
+    job = store.create_job(
+        user_id=user_id,
+        source_url=file_url,
+        target_language=target_language,
+        source_language=source_language,
+        logo_path=logo_path,
+        logo_corner=logo_corner,
+        logo_size_px=logo_size_px,
+        tts_voice=tts_voice,
+        review_mode=review_before_render,
+        animated_subtitle_config=animated_config,
+        video_template_config=template_config,
+        keep_original_audio=keep_original_audio,
+        background_music_strategy=background_music_strategy,
+    )
+    
+    # Deduct credits if needed
+    if JOB_COST_CREDITS > 0:
+        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    
+    # Start job processing
+    task = asyncio.create_task(_run_job(job.id))
+    _running_tasks[job.id] = task
+    
+    return {"job_id": job.id, "job": job.to_dict()}
 
 
 def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> Dict[str, Any]:
