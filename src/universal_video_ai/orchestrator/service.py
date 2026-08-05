@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, replace
 import asyncio
 import logging
 import os
+import subprocess
+import wave
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -28,7 +30,7 @@ from universal_video_ai.mixer.service import (
 )
 from universal_video_ai.render.animated_subtitles import SubtitleEffect
 from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverlay
-from universal_video_ai.render.text_detector import OnScreenTextDetector
+from universal_video_ai.render.text_detector import OnScreenTextDetector, TextRegion
 from universal_video_ai.render import ocr_language_map
 
 __all__ = [
@@ -68,6 +70,13 @@ class LocalizationConfig:
     # tts.voice_for_language()'s default for target_language, unchanged
     # from before this option existed.
     tts_voice: Optional[str] = None
+    # Fit each generated WAV to its real timeline slot instead of letting the
+    # mixer truncate words at the nominal subtitle end.  The clip duration is
+    # measured after synthesis; modest atempo compression is preferred, then
+    # the clip is allowed to extend rather than being cut.
+    tts_fit_real_duration: bool = True
+    tts_max_speed_ratio: float = 1.70
+    tts_neighbor_gap_seconds: float = 0.025
 
     # Subtitles & mixing
     generate_subtitles: bool = False
@@ -1014,6 +1023,7 @@ class LocalizationService:
         )
 
         tts_audio_path: Optional[Path] = None
+        self._last_tts_playback_segments = None
 
         # Step 4: Synthesize TTS from translated text, anchored to the
         # original sentence timestamps whenever we have them.
@@ -1068,7 +1078,17 @@ class LocalizationService:
                 has_detected_source_timing
             )
 
-            if visual_translated_segments:
+            playback_segments = getattr(self, "_last_tts_playback_segments", None)
+            if playback_segments:
+                # Karaoke and voice must share one measured playback clock.
+                subtitle_segments = self.timeline.from_segments(
+                    playback_segments,
+                    audio_duration=max(
+                        audio_result.audio_result.duration,
+                        max((s.end for s in playback_segments), default=audio_result.audio_result.duration),
+                    ),
+                )
+            elif visual_translated_segments:
                 # Translated segments already have offset applied via _retime_segments() in _prepare()
                 subtitle_segments = self.timeline.from_segments(
                     visual_translated_segments, audio_duration=audio_result.audio_result.duration
@@ -1289,7 +1309,6 @@ class LocalizationService:
                         and self.config.skip_srt_when_text_overlays_present
                         and subtitles_path is not None
                         and text_overlays
-                        and any(overlay.text for overlay in text_overlays)
                         and subtitle_segments
                     ):
                         uncovered = self._filter_uncovered_subtitle_segments(
@@ -1381,6 +1400,184 @@ class LocalizationService:
             final_video_path=final_video_path,
         )
 
+
+    @staticmethod
+    def _wav_duration(path: Path) -> float:
+        """Return real media duration even when a provider writes MP3/AAC bytes
+        to a file named ``.wav``.
+
+        Several TTS backends do exactly that.  ``wave.open`` then returns 0,
+        causing the mixer to trust the nominal subtitle window and trim the
+        final syllables.  Probe with ffprobe first and keep the stdlib WAV
+        reader as a dependency-free fallback.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            duration = float((result.stdout or "").strip())
+            if duration > 0.0:
+                return duration
+        except Exception:
+            pass
+        try:
+            with wave.open(str(path), "rb") as wav_file:
+                rate = wav_file.getframerate()
+                frames = wav_file.getnframes()
+                return (frames / rate) if rate else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _atempo_chain(speed: float) -> str:
+        speed = max(0.01, float(speed))
+        parts: List[float] = []
+        while speed > 2.0:
+            parts.append(2.0)
+            speed /= 2.0
+        while speed < 0.5:
+            parts.append(0.5)
+            speed /= 0.5
+        parts.append(speed)
+        return ",".join(f"atempo={value:.6f}" for value in parts)
+
+    def _fit_tts_clip_to_window(
+        self,
+        clip_path: Path,
+        *,
+        start: float,
+        nominal_end: float,
+        next_start: Optional[float],
+        total_duration: float,
+    ) -> TimedAudioClip:
+        actual_duration = self._wav_duration(clip_path)
+        if actual_duration <= 0.0:
+            return TimedAudioClip(start=start, end=nominal_end, audio_path=clip_path)
+
+        available_end = min(total_duration, next_start - self.config.tts_neighbor_gap_seconds) if next_start is not None else total_duration
+        available_duration = max(0.05, available_end - start)
+        speed = 1.0
+        fitted_path = clip_path
+        if self.config.tts_fit_real_duration and actual_duration > available_duration + 0.02:
+            required_speed = actual_duration / available_duration
+            speed = min(max(1.0, required_speed), max(1.0, self.config.tts_max_speed_ratio))
+            if speed > 1.01:
+                candidate = clip_path.with_name(f"{clip_path.stem}_fit{clip_path.suffix}")
+                command = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(clip_path), "-filter:a", self._atempo_chain(speed), str(candidate),
+                ]
+                try:
+                    subprocess.run(command, check=True, capture_output=True, text=True)
+                    if candidate.exists() and candidate.stat().st_size > 0:
+                        fitted_path = candidate
+                        actual_duration = self._wav_duration(candidate) or (actual_duration / speed)
+                except Exception as exc:
+                    self.logger.warning("Could not time-fit TTS clip %s: %s", clip_path, exc)
+
+        # Critical invariant: never advertise an end earlier than the actual
+        # audio. Mixer implementations commonly atrim to TimedAudioClip.end;
+        # using the measured duration prevents final syllables being lost.
+        real_end = min(total_duration, start + actual_duration)
+        if real_end > available_end + 0.01:
+            self.logger.warning(
+                "TTS clip %s exceeds its free slot by %.3fs after %.3fx fit; preserving the full clip instead of truncating it",
+                clip_path.name, real_end - available_end, speed,
+            )
+        return TimedAudioClip(start=start, end=max(start + 0.05, real_end), audio_path=fitted_path)
+
+    def _schedule_tts_clips(
+        self,
+        synthesized: List[Tuple[int, TranscriptSegment, Path]],
+        *,
+        total_duration: float,
+    ) -> Tuple[List[TimedAudioClip], List[TranscriptSegment]]:
+        """Create a non-truncating speech schedule and its karaoke timeline.
+
+        The source subtitle windows are anchors, not hard audio cut points.
+        Generated speech is measured from the actual media files, compressed
+        only as much as necessary, and later clips are shifted forward instead
+        of overlapping or losing their last words.  The returned transcript
+        segments are the single timing source for ASS karaoke.
+        """
+        items = []
+        for idx, seg, clip_path in synthesized:
+            duration = self._wav_duration(clip_path)
+            if duration <= 0.0:
+                self.logger.warning("Could not measure TTS segment %s; skipping it", clip_path)
+                continue
+            items.append((idx, seg, clip_path, duration))
+
+        clips: List[TimedAudioClip] = []
+        playback: List[TranscriptSegment] = []
+        previous_end = 0.0
+        gap = max(0.0, float(self.config.tts_neighbor_gap_seconds))
+        max_speed = max(1.0, float(self.config.tts_max_speed_ratio))
+
+        for pos, (idx, seg, clip_path, raw_duration) in enumerate(items):
+            anchor_start = seg.start if seg.has_timing else previous_end
+            start = max(anchor_start, previous_end + (gap if clips else 0.0))
+
+            remaining_raw = sum(item[3] for item in items[pos:])
+            remaining_gaps = gap * max(0, len(items) - pos - 1)
+            remaining_time = max(0.10, total_duration - start - remaining_gaps)
+            global_required_speed = remaining_raw / remaining_time
+
+            next_anchor = None
+            for _later_idx, later_seg, _later_path, _later_duration in items[pos + 1:]:
+                if later_seg.has_timing:
+                    next_anchor = later_seg.start
+                    break
+            if next_anchor is not None:
+                local_available = max(0.10, next_anchor - start - gap)
+                local_required_speed = raw_duration / local_available
+            else:
+                local_required_speed = 1.0
+
+            speed = min(max_speed, max(1.0, global_required_speed, local_required_speed))
+            fitted_path = clip_path
+            fitted_duration = raw_duration
+            if speed > 1.01:
+                candidate = clip_path.with_name(f"{clip_path.stem}_fit{clip_path.suffix}")
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-i", str(clip_path), "-filter:a", self._atempo_chain(speed),
+                            "-c:a", "pcm_s16le", str(candidate),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    measured = self._wav_duration(candidate)
+                    if measured > 0.0:
+                        fitted_path = candidate
+                        fitted_duration = measured
+                except Exception as exc:
+                    self.logger.warning("Could not fit TTS segment %s: %s", clip_path, exc)
+
+            end = start + fitted_duration
+            if end > total_duration:
+                # Never trim the waveform.  Log the overflow so the caller can
+                # choose a shorter translation or a longer visual timeline.
+                self.logger.warning(
+                    "TTS schedule exceeds video duration by %.3fs at segment %d; preserving full speech",
+                    end - total_duration,
+                    idx,
+                )
+            clips.append(TimedAudioClip(start=start, end=end, audio_path=fitted_path))
+            playback.append(TranscriptSegment(start=start, end=end, text=seg.text))
+            previous_end = end
+
+        return clips, playback
+
     def _synthesize_timed_track(
         self,
         translated_segments: List[TranscriptSegment],
@@ -1424,12 +1621,17 @@ class LocalizationService:
                 )
                 continue
             if seg.has_timing:
-                clips.append(TimedAudioClip(start=seg.start, end=seg.end, audio_path=clip_path))
+                next_start = next((item.start for item in translated_segments[idx + 1:] if item.has_timing), None)
+                clips.append(self._fit_tts_clip_to_window(
+                    clip_path, start=seg.start, nominal_end=seg.end,
+                    next_start=next_start, total_duration=total_duration,
+                ))
             else:
-                # No real timing for this one sentence: place it right after
-                # the previous clip rather than dropping it.
                 prev_end = clips[-1].end if clips else 0.0
-                clips.append(TimedAudioClip(start=prev_end, end=prev_end + 2.0, audio_path=clip_path))
+                clips.append(self._fit_tts_clip_to_window(
+                    clip_path, start=prev_end, nominal_end=prev_end + 2.0,
+                    next_start=None, total_duration=total_duration,
+                ))
 
         tts_audio_path = output_dir / "tts_audio.wav"
         self.mixer.build_dubbed_track(clips, total_duration=total_duration, output_path=tts_audio_path)
@@ -1452,7 +1654,7 @@ class LocalizationService:
         segments_dir = output_dir / "tts_segments"
         segments_dir.mkdir(parents=True, exist_ok=True)
 
-        async def synthesize_segment(idx: int, seg: TranscriptSegment) -> Optional[TimedAudioClip]:
+        async def synthesize_segment(idx: int, seg: TranscriptSegment) -> Optional[Tuple[int, TranscriptSegment, Path]]:
             """Synthesize a single segment with concurrency control."""
             self._raise_if_cancelled()
             if not seg.text.strip():
@@ -1475,12 +1677,7 @@ class LocalizationService:
                 )
                 return None
 
-            if seg.has_timing:
-                return TimedAudioClip(start=seg.start, end=seg.end, audio_path=clip_path)
-            else:
-                # No real timing for this one sentence: place it right after
-                # the previous clip rather than dropping it.
-                return TimedAudioClip(start=0.0, end=2.0, audio_path=clip_path)
+            return idx, seg, clip_path
 
         # Run TTS synthesis in parallel with concurrency control
         tasks = [
@@ -1489,20 +1686,16 @@ class LocalizationService:
         ]
         results = await asyncio.gather(*tasks)
 
-        # Filter out failed syntheses and fix timing for segments without timing
-        clips: List[TimedAudioClip] = []
-        for idx, clip in enumerate(results):
-            if clip is None:
-                continue
-            if clip.start == 0.0 and clip.end == 2.0:
-                # This was a segment without timing - place it after previous clip
-                prev_end = clips[-1].end if clips else 0.0
-                clips.append(TimedAudioClip(start=prev_end, end=prev_end + 2.0, audio_path=clip.audio_path))
-            else:
-                clips.append(clip)
+        completed = [item for item in results if item is not None]
+        clips, playback_segments = self._schedule_tts_clips(
+            completed,
+            total_duration=total_duration,
+        )
+        self._last_tts_playback_segments = playback_segments
 
         tts_audio_path = output_dir / "tts_audio.wav"
-        self.mixer.build_dubbed_track(clips, total_duration=total_duration, output_path=tts_audio_path)
+        mix_duration = max(total_duration, clips[-1].end if clips else total_duration)
+        self.mixer.build_dubbed_track(clips, total_duration=mix_duration, output_path=tts_audio_path)
         return tts_audio_path
 
     @staticmethod
@@ -1568,6 +1761,79 @@ class LocalizationService:
             return ()
         return tuple(boxes)
 
+
+    @staticmethod
+    def _fill_missing_text_regions(
+        windows: List[Tuple[float, float]],
+        regions: List[TextRegion],
+        typical_line_height: Optional[float],
+    ) -> List[TextRegion]:
+        """Return one cleanup region for every subtitle window.
+
+        OCR occasionally misses a low-contrast cue even though neighboring
+        cues clearly establish the subtitle layout.  Leaving that cue without
+        a region exposes the burned-in source text.  This method fills only
+        missing windows using time-local detected geometry.  It never assumes
+        a fixed screen position: the nearest preceding/following detections
+        determine the fallback, and interpolation is used only when both sides
+        belong to the same learned vertical band.
+        """
+        if not windows or not regions:
+            return list(regions)
+
+        by_window = {
+            (round(region.start, 3), round(region.end, 3)): region
+            for region in regions
+        }
+        detected = sorted(regions, key=lambda r: ((r.start + r.end) / 2.0))
+        typical_h = max(1.0, float(typical_line_height or 0.0))
+        if typical_h <= 1.0:
+            hs = sorted(r.height for r in detected)
+            typical_h = float(hs[len(hs) // 2]) if hs else 1.0
+
+        output: List[TextRegion] = []
+        for start, end in windows:
+            key = (round(start, 3), round(end, 3))
+            exact = by_window.get(key)
+            if exact is not None:
+                output.append(exact)
+                continue
+
+            midpoint = (start + end) / 2.0
+            before = [r for r in detected if ((r.start + r.end) / 2.0) <= midpoint]
+            after = [r for r in detected if ((r.start + r.end) / 2.0) > midpoint]
+            left = before[-1] if before else None
+            right = after[0] if after else None
+
+            chosen: Optional[TextRegion] = None
+            if left is not None and right is not None:
+                left_mid = (left.start + left.end) / 2.0
+                right_mid = (right.start + right.end) / 2.0
+                left_cy = left.y + left.height / 2.0
+                right_cy = right.y + right.height / 2.0
+                same_band = abs(left_cy - right_cy) <= max(typical_h * 1.5, (left.height + right.height) * 0.55)
+                if same_band and right_mid > left_mid:
+                    ratio = max(0.0, min(1.0, (midpoint - left_mid) / (right_mid - left_mid)))
+                    chosen = TextRegion(
+                        start=start, end=end,
+                        x=round(left.x + (right.x - left.x) * ratio),
+                        y=round(left.y + (right.y - left.y) * ratio),
+                        width=round(left.width + (right.width - left.width) * ratio),
+                        height=round(left.height + (right.height - left.height) * ratio),
+                    )
+                else:
+                    chosen = left if (midpoint - left_mid) <= (right_mid - midpoint) else right
+            else:
+                chosen = left or right
+
+            if chosen is not None:
+                output.append(TextRegion(
+                    start=start, end=end, x=chosen.x, y=chosen.y,
+                    width=chosen.width, height=chosen.height,
+                ))
+
+        return output
+
     def _build_text_overlays(
         self,
         video_path: Path,
@@ -1619,6 +1885,17 @@ class LocalizationService:
             self.logger.info("LocalizationService: no on-screen text detected; skipping text-cover overlays")
             return None
 
+        detected_count = len(regions)
+        regions = self._fill_missing_text_regions(
+            windows, regions, detector.last_typical_line_height
+        )
+        if len(regions) > detected_count:
+            self.logger.info(
+                "LocalizationService: filled %d OCR-missed subtitle window(s) "
+                "from neighboring adaptive regions",
+                len(regions) - detected_count,
+            )
+
         # Match detected regions back to the translated sentence at the same
         # (start, end) window. Both lists were built from the same
         # `source_segments` ordering, so a (start, end) -> translated text
@@ -1654,17 +1931,17 @@ class LocalizationService:
             if not translated_text:
                 continue
 
-            x, width = self._fit_box_to_text(
-                region.x, region.width, translated_text, fixed_font_size, font_path, frame_w,
-            )
-
+            # Cleanup geometry must follow the ORIGINAL source glyphs, not
+            # the translated sentence width.  The ASS renderer is responsible
+            # for translated text layout; widening the cleanup box to fit the
+            # translation caused the large white rectangles seen in output.
             overlays.append(
                 TextOverlay(
                     start=region.start,
                     end=region.end,
-                    x=x,
+                    x=region.x,
                     y=region.y,
-                    width=width,
+                    width=region.width,
                     height=region.height,
                     text=translated_text,
                     font_size=fixed_font_size,

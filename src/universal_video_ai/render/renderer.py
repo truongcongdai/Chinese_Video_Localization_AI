@@ -10,6 +10,11 @@ import time
 from typing import List, Optional, Tuple
 
 from universal_video_ai.config import TEMP_DIR
+from universal_video_ai.render.subtitle_region_tracker import (
+    AdaptiveSubtitleRegionConfig,
+    AdaptiveSubtitleRegionTracker,
+    TrackedRegion,
+)
 from universal_video_ai.render.animated_subtitles import (
     AnimatedSubtitleGenerator,
     SubtitleEffect,
@@ -124,7 +129,7 @@ class TextOverlay:
 class AnimatedSubtitleConfig:
     """
     Configuration for animated subtitle effects.
-    
+
     Attributes:
         enabled: Whether animated subtitles are enabled
         effect: The animation effect to apply (SubtitleEffect enum)
@@ -135,7 +140,7 @@ class AnimatedSubtitleConfig:
     effect: SubtitleEffect = SubtitleEffect.NONE
     style: Optional[SubtitleStyle] = None
     effect_params: dict = None
-    
+
     def __post_init__(self):
         if self.style is None:
             object.__setattr__(self, 'style', SubtitleStyle())
@@ -147,7 +152,7 @@ class AnimatedSubtitleConfig:
 class VideoTemplateConfig:
     """
     Configuration for video template effects.
-    
+
     Attributes:
         enabled: Whether video template is enabled
         template: Template preset name (minimal, cinematic, vibrant, professional, social)
@@ -162,7 +167,7 @@ class VideoTemplateConfig:
     color_effect: str = "none"
     audio_filters: dict = None
     video_quality: str = "medium"
-    
+
     def __post_init__(self):
         if self.audio_filters is None:
             object.__setattr__(self, 'audio_filters', {})
@@ -239,6 +244,44 @@ class RenderConfig:
     # Gap in pixels between the logo and the frame edge.
     logo_margin_px: int = 24
 
+    # Adaptive subtitle cleanup. These settings contain no fixed subtitle
+    # coordinate. Regions are learned from OCR overlays and normalized to the
+    # actual source resolution for each render.
+    adaptive_text_region_enabled: bool = True
+    adaptive_text_cleanup_enabled: bool = True
+    # Keep the cleanup visually natural by default. An opaque rectangle is
+    # only an opt-in emergency fallback; localized delogo cleanup is used
+    # for normal subtitle removal.
+    adaptive_text_drawbox_enabled: bool = False
+    # Two local cleanup passes remove antialiased glyph edges much more
+    # reliably than one pass while remaining limited to the learned region.
+    adaptive_text_cleanup_passes: int = 5
+    # Cleanup time is deliberately wider than translated-text display time.
+    # OCR/ASR boundaries can differ by a few frames, so using the exact cue
+    # window can expose the tail of the source subtitle. Padding is calculated
+    # from each cue duration and clipped against neighbouring cues; it is not a
+    # fixed timestamp or tied to any specific video.
+    adaptive_text_cleanup_time_padding_ratio: float = 0.20
+    adaptive_text_cleanup_max_gap_fill_ratio: float = 0.50
+    # When neighbouring cues belong to the same learned subtitle band, keep
+    # cleanup continuous through their short boundary gap. This prevents a
+    # 1-3 frame flash of the original subtitle between adjacent cues.
+    adaptive_text_cleanup_bridge_same_band: bool = True
+    # Final residual-suppression layer. delogo can leave high-contrast CJK
+    # strokes on difficult backgrounds; a narrow translucent veil over the
+    # learned cleanup region guarantees they do not flash through. Geometry
+    # remains fully adaptive and cue-timed, and this replaces the old opaque
+    # white rectangle.
+    adaptive_text_residual_veil_enabled: bool = True
+    adaptive_text_residual_veil_color: str = "black"
+    adaptive_text_residual_veil_opacity: float = 0.14
+    # Never paint a veil over a weakly tracked or oversized region. The veil
+    # is only a subtle last-resort edge suppressor after delogo, not the main
+    # removal mechanism.
+    adaptive_text_residual_veil_min_confidence: float = 0.72
+    adaptive_text_residual_veil_max_frame_area_ratio: float = 0.055
+    adaptive_text_region_config: Optional[AdaptiveSubtitleRegionConfig] = None
+
 
 class Renderer:
     """
@@ -275,130 +318,207 @@ class Renderer:
         return out_dir / filename
 
     def _build_text_overlay_filters(
-        self, overlays: List[TextOverlay], frame_w: Optional[int] = None
+            self, overlays: List[TextOverlay], frame_w: Optional[int] = None, frame_h: Optional[int] = None
     ) -> List[str]:
-        """
-        Build one `drawbox` (cover the original text) + one `drawtext` (draw
-        the translated text) filter pair per overlay, each gated to only be
-        active during that sentence's `[start, end)` window via ffmpeg's
-        `enable='between(t,start,end)'` expression. This is what makes the
-        cover box and translated caption appear/disappear in sync with the
-        original on-screen text instead of covering the whole video.
+        """Build adaptive cleanup, cover, and translated-text filters.
 
-        The translated sentence is very often wider than the ORIGINAL
-        on-screen text's OCR-detected box (e.g. Vietnamese needs more
-        horizontal space per "word" than Chinese characters do), so sizing
-        the box/font purely from the detected box's height — ignoring how
-        long the translated string actually is — let long sentences spill
-        text outside the white cover box or off the edge of the frame.
-        Below, both the font size and the box width adapt to the text
-        length: first try to fit at a height-based font size by widening
-        the box (kept centered on the original detected box and clamped to
-        the frame); only if that would make the box unreasonably wide do we
-        shrink the font instead.
+        The region tracker learns one or more subtitle bands from the OCR
+        overlays themselves. It never assumes a fixed Y coordinate and all
+        padding is derived from detected line height plus source resolution.
+        This allows subtitles to move between layouts/scenes while rejecting
+        isolated title or watermark detections.
         """
         filters: List[str] = []
-        # Average glyph width as a fraction of font size for a typical bold
-        # sans-serif font (incl. Vietnamese diacritics/wide glyphs) — a
-        # deliberately conservative estimate so text more often fits with
-        # room to spare than overflows.
+        if not overlays:
+            return filters
+
         avg_char_width_ratio = 0.72
-        box_padding_x = 28  # px of breathing room inside the box, each side
-        # Allow long translated OCR overlays to shrink enough to stay
-        # inside the horizontal safe area instead of clipping off-screen.
         min_font_size = 8
         max_font_size = 64
 
-        for overlay in overlays:
-            enable_expr = f"between(t\\,{overlay.start:.3f}\\,{overlay.end:.3f})"
+        if frame_w and frame_h and self.config.adaptive_text_region_enabled:
+            tracker = AdaptiveSubtitleRegionTracker(
+                self.config.adaptive_text_region_config or AdaptiveSubtitleRegionConfig()
+            )
+            tracked = tracker.track(overlays, frame_w, frame_h)
+        else:
+            tracked = []
+            for overlay in overlays:
+                tracked.append((overlay, TrackedRegion(
+                    overlay.x, overlay.y, overlay.width, overlay.height,
+                    overlay.x, overlay.y, overlay.width, overlay.height, -1, 1.0
+                )))
 
+        # Neighbour-based temporal extension requires chronological order.
+        tracked = sorted(tracked, key=lambda item: (item[0].start, item[0].end))
+
+        for index, (overlay, region) in enumerate(tracked):
+            # Keep translated text on its exact canonical cue clock, while the
+            # source-subtitle cleanup gets a slightly wider adaptive window.
+            text_enable_expr = f"between(t\\,{overlay.start:.3f}\\,{overlay.end:.3f})"
+            cue_duration = max(0.001, overlay.end - overlay.start)
+            temporal_pad = cue_duration * max(0.0, self.config.adaptive_text_cleanup_time_padding_ratio)
+            cleanup_start = max(0.0, overlay.start - temporal_pad)
+            cleanup_end = overlay.end + temporal_pad
+
+            previous = tracked[index - 1] if index > 0 else None
+            following = tracked[index + 1] if index + 1 < len(tracked) else None
+
+            if previous is not None:
+                previous_overlay, previous_region = previous
+                gap = overlay.start - previous_overlay.end
+                if gap > 0:
+                    max_fill = gap * max(0.0, min(1.0, self.config.adaptive_text_cleanup_max_gap_fill_ratio))
+                    cleanup_start = max(previous_overlay.end, overlay.start - min(temporal_pad, max_fill))
+                    if (
+                            self.config.adaptive_text_cleanup_bridge_same_band
+                            and previous_region.cluster_id == region.cluster_id
+                            and region.cluster_id >= 0
+                    ):
+                        cleanup_start = previous_overlay.end
+                else:
+                    cleanup_start = max(0.0, min(cleanup_start, overlay.start))
+
+            if following is not None:
+                next_overlay, next_region = following
+                gap = next_overlay.start - overlay.end
+                if gap > 0:
+                    max_fill = gap * max(0.0, min(1.0, self.config.adaptive_text_cleanup_max_gap_fill_ratio))
+                    cleanup_end = min(next_overlay.start, overlay.end + min(temporal_pad, max_fill))
+                    if (
+                            self.config.adaptive_text_cleanup_bridge_same_band
+                            and next_region.cluster_id == region.cluster_id
+                            and region.cluster_id >= 0
+                    ):
+                        cleanup_end = next_overlay.start
+                else:
+                    cleanup_end = max(cleanup_end, overlay.end)
+
+            cleanup_enable_expr = f"between(t\\,{cleanup_start:.3f}\\,{cleanup_end:.3f})"
             font_path = overlay.font_path or self.config.default_overlay_font_path
             font_clause = f"fontfile='{font_path}':" if font_path else ""
 
+            # Clean the original glyphs before the replacement box is painted.
+            # delogo works as a local adaptive blur/inpaint approximation and is
+            # gated to the exact cue time, so the rest of the video stays sharp.
+            if self.config.adaptive_text_cleanup_enabled and frame_w and frame_h:
+                cx, cy, cw, ch = self._clamp_delogo_box(
+                    region.cleanup_x, region.cleanup_y,
+                    region.cleanup_width, region.cleanup_height,
+                    frame_w, frame_h,
+                )
+                passes = max(1, int(self.config.adaptive_text_cleanup_passes))
+                # Alternate expanded and core passes. The expanded passes
+                # remove anti-aliased outline/shadow pixels; the core passes
+                # suppress the bright glyph body. Every amount is proportional
+                # to the learned region, never a fixed screen coordinate.
+                pass_scales = (1.06, 1.00, 0.96, 1.02, 0.98)
+                for pass_index in range(passes):
+                    scale = pass_scales[pass_index] if pass_index < len(pass_scales) else 1.0
+                    pw = max(2, int(round(cw * scale)))
+                    ph = max(2, int(round(ch * scale)))
+                    px = int(round(cx + (cw - pw) / 2.0))
+                    py = int(round(cy + (ch - ph) / 2.0))
+                    px, py, pw, ph = self._clamp_delogo_box(
+                        px, py, pw, ph, frame_w, frame_h,
+                    )
+                    filters.append(
+                        f"delogo=x={px}:y={py}:w={pw}:h={ph}:show=0:enable='{cleanup_enable_expr}'"
+                    )
+
+                if self.config.adaptive_text_residual_veil_enabled:
+                    veil_opacity = max(0.0, min(1.0, self.config.adaptive_text_residual_veil_opacity))
+                    veil_area_ratio = (region.width * region.height) / max(1.0, float(frame_w * frame_h))
+                    # The veil is deliberately applied to the tight tracked
+                    # subtitle box, never the expanded cleanup box. This keeps
+                    # the underlying picture visible and prevents the large
+                    # dark rectangles seen when cleanup padding is substantial.
+                    if (
+                            veil_opacity > 0.0
+                            and region.confidence >= self.config.adaptive_text_residual_veil_min_confidence
+                            and veil_area_ratio <= self.config.adaptive_text_residual_veil_max_frame_area_ratio
+                    ):
+                        filters.append(
+                            f"drawbox=x={region.x}:y={region.y}:w={region.width}:h={region.height}:"
+                            f"color={self.config.adaptive_text_residual_veil_color}@{veil_opacity:.3f}:"
+                            f"t=fill:enable='{cleanup_enable_expr}'"
+                        )
+
             text_len = max(1, len(overlay.text))
-            font_size = (
-                overlay.font_size
-                if overlay.font_size is not None
-                else max(min_font_size, int(overlay.height * 0.6))
+            font_size = overlay.font_size if overlay.font_size is not None else max(
+                min_font_size, int(region.height * 0.46)
             )
-            font_size = min(font_size, max_font_size)
-            font_size = min(font_size, max(min_font_size, int(overlay.height * 0.48)))
+            font_size = min(max_font_size, max(min_font_size, font_size))
 
-            box_cx = overlay.x + overlay.width / 2.0
-            # Don't let the cover box balloon past ~92% of the frame width
-            # even for very long sentences — beyond that we shrink the font
-            # instead so it still reads as a caption, not a banner.
-            max_box_width = int(frame_w * 0.86) if frame_w else overlay.width * 4
-
+            # Internal horizontal breathing room scales with the detected line
+            # height; it is not a resolution-specific pixel constant.
+            box_padding_x = max(2, int(region.height * 0.34))
+            box_cx = region.x + region.width / 2.0
+            max_box_width = int(frame_w * 0.90) if frame_w else region.width * 4
             est_text_width = text_len * font_size * avg_char_width_ratio
-            avail_width = overlay.width - 2 * box_padding_x
+            avail_width = max(1, region.width - 2 * box_padding_x)
 
             if est_text_width > avail_width:
                 needed_box_width = int(est_text_width + 2 * box_padding_x)
                 box_width = min(needed_box_width, max_box_width)
-                avail_at_box = box_width - 2 * box_padding_x
-                est_text_width_at_box = text_len * font_size * avg_char_width_ratio
-                if est_text_width_at_box > avail_at_box > 0:
-                    # Even the widened (capped) box isn't enough — shrink
-                    # the font until the estimated text width fits.
+                avail_at_box = max(1, box_width - 2 * box_padding_x)
+                if est_text_width > avail_at_box:
                     font_size = max(
                         min_font_size,
                         int(avail_at_box / (text_len * avg_char_width_ratio)),
                     )
             else:
-                box_width = overlay.width
+                box_width = region.width
 
             box_x = int(box_cx - box_width / 2.0)
             if frame_w:
+                box_width = min(box_width, frame_w)
                 box_x = max(0, min(box_x, frame_w - box_width))
 
-            filters.append(
-                f"drawbox=x={box_x}:y={overlay.y}:w={box_width}:h={overlay.height}"
-                f":color={overlay.box_color}@1.0:t=fill:enable='{enable_expr}'"
-            )
+            if self.config.adaptive_text_drawbox_enabled:
+                filters.append(
+                    f"drawbox=x={box_x}:y={region.y}:w={box_width}:h={region.height}"
+                    f":color={overlay.box_color}@1.0:t=fill:enable='{cleanup_enable_expr}'"
+                )
 
-            # Center the translated text both horizontally and vertically
-            # inside the (possibly widened) cover box. `text_w`/`text_h` are
-            # ffmpeg drawtext's built-in expressions for the rendered text's
-            # own pixel size, so this stays centered regardless of length.
             if overlay.text:
                 filters.append(
                     "drawtext="
                     f"{font_clause}"
                     f"text='{_escape_drawtext(overlay.text)}':"
                     f"x={box_x}+({box_width}-text_w)/2:"
-                    f"y={overlay.y}+({overlay.height}-ascent+descent)/2:"
+                    f"y={region.y}+({region.height}-ascent+descent)/2:"
                     f"fontsize={font_size}:fontcolor={overlay.font_color}:"
-                    f"enable='{enable_expr}'"
+                    f"enable='{text_enable_expr}'"
                 )
         return filters
 
     def _build_animated_subtitle_filters(
-        self, subtitle_segments: List[dict]
+            self, subtitle_segments: List[dict]
     ) -> List[str]:
         """
         Build animated subtitle filters from subtitle segments.
-        
+
         Args:
             subtitle_segments: List of dicts with keys: text, start, end
-            
+
         Returns:
             List of FFmpeg filter strings for animated subtitles
         """
         if not self.config.animated_subtitle_config or not self.config.animated_subtitle_config.enabled:
             return []
-        
+
         anim_config = self.config.animated_subtitle_config
         filters = []
-        
+
         for segment in subtitle_segments:
             text = segment.get("text", "")
             start = segment.get("start", 0.0)
             end = segment.get("end", 0.0)
-            
+
             if not text or end <= start:
                 continue
-            
+
             filter_str = self.subtitle_generator.generate_filter(
                 text=text,
                 start=start,
@@ -408,22 +528,22 @@ class Renderer:
                 **anim_config.effect_params
             )
             filters.append(filter_str)
-        
+
         return filters
 
     def _build_video_template_filters(self) -> List[str]:
         """
         Build video template filters (color grading, transitions, etc.).
-        
+
         Returns:
             List of FFmpeg filter strings for video template effects
         """
         if not self.config.video_template_config or not self.config.video_template_config.enabled:
             return []
-        
+
         template_config = self.config.video_template_config
         filters = []
-        
+
         # Color grading effects
         color_effect = template_config.color_effect
         if color_effect == "warm":
@@ -435,7 +555,7 @@ class Renderer:
             filters.append("curves=all='0/0 0.2/0.3 0.5/0.5 0.8/0.7 1/1'")
         elif color_effect == "high_contrast":
             filters.append("eq=contrast=1.3:saturation=1.1")
-        
+
         # Video quality adjustments
         quality = template_config.video_quality
         if quality == "low":
@@ -444,22 +564,22 @@ class Renderer:
             filters.append("scale=iw*1.1:ih*1.1:flags=lanczos,crop=iw:ih")
         elif quality == "ultra":
             filters.append("scale=iw*1.2:ih*1.2:flags=lanczos,crop=iw:ih")
-        
+
         return filters
 
     def _build_audio_template_filters(self) -> List[str]:
         """
         Build audio template filters (equalizer, compressor, etc.).
-        
+
         Returns:
             List of FFmpeg filter strings for audio template effects
         """
         if not self.config.video_template_config or not self.config.video_template_config.enabled:
             return []
-        
+
         audio_filters = self.config.video_template_config.audio_filters or {}
         filters = []
-        
+
         # Audio equalizer
         if audio_filters.get("equalizer"):
             eq = audio_filters["equalizer"]
@@ -467,16 +587,17 @@ class Renderer:
                 filters.append(f"equalizer=f=100:width_type=h:width=100:g={eq['bass']}")
             if eq.get("treble"):
                 filters.append(f"equalizer=f=10000:width_type=h:width=1000:g={eq['treble']}")
-        
+
         # Audio compressor
         if audio_filters.get("compressor"):
             comp = audio_filters["compressor"]
-            filters.append(f"acompressor=threshold={comp.get('threshold', -20)}dB:ratio={comp.get('ratio', 4)}:attack={comp.get('attack', 20)}:release={comp.get('release', 250)}")
-        
+            filters.append(
+                f"acompressor=threshold={comp.get('threshold', -20)}dB:ratio={comp.get('ratio', 4)}:attack={comp.get('attack', 20)}:release={comp.get('release', 250)}")
+
         # Volume normalization
         if audio_filters.get("normalize", False):
             filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
-        
+
         return filters
 
     def _get_video_dimensions(self, video_path: Path) -> Optional[Tuple[int, int]]:
@@ -563,20 +684,20 @@ class Renderer:
 
         post_config = replace(transform_config, enable_flip=False)
         if (
-            not post_config.target_width
-            and not post_config.target_height
-            and not post_config.enable_border
-            and not post_config.enable_split_screen
-            and not post_config.enable_randomization
+                not post_config.target_width
+                and not post_config.target_height
+                and not post_config.enable_border
+                and not post_config.enable_split_screen
+                and not post_config.enable_randomization
         ):
             return None
         return post_config
 
     def _transform_text_overlays_for_pre_filters(
-        self,
-        text_overlays: List[TextOverlay],
-        frame_w: Optional[int],
-        frame_h: Optional[int],
+            self,
+            text_overlays: List[TextOverlay],
+            frame_w: Optional[int],
+            frame_h: Optional[int],
     ) -> List[TextOverlay]:
         """
         TextOverlay coordinates are detected on the original source frame.
@@ -612,13 +733,13 @@ class Renderer:
         return transformed
 
     def _build_command(
-        self,
-        input_video: Path,
-        input_audio: Path,
-        output: Path,
-        subtitles: Optional[Path] = None,
-        text_overlays: Optional[List[TextOverlay]] = None,
-        subtitle_segments: Optional[List[dict]] = None,
+            self,
+            input_video: Path,
+            input_audio: Path,
+            output: Path,
+            subtitles: Optional[Path] = None,
+            text_overlays: Optional[List[TextOverlay]] = None,
+            subtitle_segments: Optional[List[dict]] = None,
     ) -> List[str]:
         """
         Build ffmpeg command list based on configuration and presence of subtitles
@@ -657,19 +778,20 @@ class Renderer:
 
         # Determine if we need video filters (subtitles, overlays, or blur)
         needs_reencode = (
-            subtitles is not None
-            or self.config.blur_text
-            or bool(text_overlays)
-            or self.config.watermark_box_fractional is not None
-            or bool(self.config.watermark_boxes_fractional)
-            or logo_configured
-            or bool(self._build_pre_subtitle_transform_filters())
-            or (self.config.animated_subtitle_config and self.config.animated_subtitle_config.enabled and bool(subtitle_segments))
-            or (self.config.video_template_config and self.config.video_template_config.enabled)
+                subtitles is not None
+                or self.config.blur_text
+                or bool(text_overlays)
+                or self.config.watermark_box_fractional is not None
+                or bool(self.config.watermark_boxes_fractional)
+                or logo_configured
+                or bool(self._build_pre_subtitle_transform_filters())
+                or (self.config.animated_subtitle_config and self.config.animated_subtitle_config.enabled and bool(
+            subtitle_segments))
+                or (self.config.video_template_config and self.config.video_template_config.enabled)
         )
 
         if text_overlays and not self.config.default_overlay_font_path and not any(
-            o.font_path for o in text_overlays
+                o.font_path for o in text_overlays
         ):
             self.logger.warning(
                 "Rendering %d text_overlay(s) with no font_path/default_overlay_font_path set. "
@@ -686,9 +808,9 @@ class Renderer:
             frame_w: Optional[int] = None
             frame_h: Optional[int] = None
             if (
-                self.config.watermark_box_fractional is not None
-                or self.config.watermark_boxes_fractional
-                or text_overlays
+                    self.config.watermark_box_fractional is not None
+                    or self.config.watermark_boxes_fractional
+                    or text_overlays
             ):
                 dims = self._get_video_dimensions(input_video)
                 if dims is not None:
@@ -769,7 +891,9 @@ class Renderer:
 
             # Add per-sentence text-cover + translated-text overlays, each
             # only active during its own [start, end) window.
-            filters.extend(self._build_text_overlay_filters(text_overlays_for_render, frame_w=frame_w))
+            filters.extend(self._build_text_overlay_filters(
+                text_overlays_for_render, frame_w=frame_w, frame_h=frame_h
+            ))
 
             # Add animated subtitle filters if enabled
             filters.extend(self._build_animated_subtitle_filters(subtitle_segments))
@@ -884,13 +1008,13 @@ class Renderer:
         return positions.get(corner, positions["bottom_right"])
 
     def render(
-        self,
-        video_path: Path,
-        audio_path: Path,
-        subtitles: Optional[Path] = None,
-        output_path: Optional[Path] = None,
-        text_overlays: Optional[List[TextOverlay]] = None,
-        subtitle_segments: Optional[List[dict]] = None,
+            self,
+            video_path: Path,
+            audio_path: Path,
+            subtitles: Optional[Path] = None,
+            output_path: Optional[Path] = None,
+            text_overlays: Optional[List[TextOverlay]] = None,
+            subtitle_segments: Optional[List[dict]] = None,
     ) -> Path:
         """
         Render the final video.
@@ -949,12 +1073,12 @@ class Renderer:
                 raise RuntimeError(f"FFmpeg did not create output file: {output}")
 
             self.logger.info("Rendering completed successfully: %s", output)
-            
+
             # Apply video transformations if configured
             post_transform_config = self._post_subtitle_transform_config()
             if post_transform_config:
                 output = self._apply_transformations(output, post_transform_config)
-            
+
             return output
 
         except subprocess.TimeoutExpired:
@@ -967,26 +1091,26 @@ class Renderer:
         except Exception as exc:
             self.logger.exception("Unexpected error during rendering: %s", exc)
             raise RuntimeError(f"Rendering failed: {exc}") from exc
-    
+
     def _apply_transformations(self, video_path: Path, transform_config: TransformConfig) -> Path:
         """
         Apply video transformations (flip, border, split-screen, etc.) to the rendered video.
-        
+
         :param video_path: Path to the rendered video
         :return: Path to the transformed video
         """
         # Create output path for transformed video
         transformed_path = video_path.parent / f"{video_path.stem}.transformed{video_path.suffix}"
-        
+
         self.logger.info("Applying video transformations to %s", video_path)
-        
+
         transformer = VideoTransformer(
             config=transform_config,
             logger=self.logger
         )
-        
+
         success = transformer.transform(video_path, transformed_path)
-        
+
         if success and transformed_path.exists():
             # Replace original with transformed version
             video_path.unlink()
@@ -997,7 +1121,8 @@ class Renderer:
             self.logger.warning("Video transformations failed, using original video")
             return video_path
 
-    def _run_ffmpeg_with_progress(self, cmd: List[str], timeout_seconds: int, heartbeat_seconds: float = 15.0) -> "tuple[int, str]":
+    def _run_ffmpeg_with_progress(self, cmd: List[str], timeout_seconds: int,
+                                  heartbeat_seconds: float = 15.0) -> "tuple[int, str]":
         """
         Run an ffmpeg command while streaming its stderr instead of buffering
         it silently until exit. A full re-encode (needed whenever subtitles

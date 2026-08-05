@@ -13,3 +13,8 @@ __all__ = [
     "Renderer", "RenderConfig", "TextOverlay",
     "OnScreenTextDetector", "TextRegion", "OCR_AVAILABLE",
 ]
+from .subtitle_region_tracker import (
+    AdaptiveSubtitleRegionConfig,
+    AdaptiveSubtitleRegionTracker,
+    TrackedRegion,
+)

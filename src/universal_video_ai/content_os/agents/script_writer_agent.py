@@ -68,8 +68,12 @@ Generate a complete short-video script. Requirements:
 - Write natural narration in the target language.
 - subtitle_text must be a readable caption for the segment, not a short headline.
 - For subtitle_text use 8-18 words, preserve the main meaning of narration, and avoid cutting the sentence too aggressively.
-- Each segment must include a concrete visual_instruction for image/video generation.
-- visual_instruction must be detailed enough for image generation: subject, setting, action, camera angle, visual objects, mood, and continuity.
+- Each segment must include a concrete visual_instruction suitable for both image generation and short AI-video generation.
+- Every scene should contain a believable human presence whenever the topic allows it: a named role such as student, customer, creator, parent, employee, or expert.
+- Describe a visible human action, facial emotion, hand movement, eye direction, interaction with a real object, and a beginning-to-end micro-action for the scene.
+- visual_instruction must specify subject continuity, setting, action, camera angle, camera movement, foreground/background depth, lighting, mood, and practical objects.
+- Avoid five static product shots. Vary scene grammar: hook close-up, over-the-shoulder demonstration, top-down detail, medium reaction shot, and confident closing shot.
+- Make the narration sound human: include a relatable pain point, a concrete everyday example, a brief emotional reaction, and a natural conversational CTA.
 - Do not use generic visual instructions like "show intro", "show highlights", or "show summary".
 - Avoid brand logos and avoid readable text inside generated visuals.
 - Leave the lower 28 percent of the frame clean for subtitles.
@@ -86,7 +90,7 @@ Format your response as one valid JSON object:
             "end_second": 6.0,
             "narration": "narration for this segment",
             "subtitle_text": "short subtitle text",
-            "visual_instruction": "Vertical 9:16 realistic scene ...",
+            "visual_instruction": "Vertical 9:16 live-action scene with a human subject, a clear action, emotion, camera motion, and clean subtitle area ...",
             "source_refs": []
         }}
     ],
