@@ -262,10 +262,19 @@ class Renderer:
                         zexpr, xexpr, yexpr = f"min(1.0+0.10*on/{frames},1.10)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
                     else:
                         zexpr, xexpr, yexpr = f"min(1.0+0.07*on/{frames},1.07)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+                    # The image input is already looped at 30 fps.  Using
+                    # zoompan d=<scene frames> here would repeat *every input
+                    # frame that many times, making scene 1 thousands of frames
+                    # long.  The final -t then cuts the concat while scene 1 is
+                    # already faded to black, so all later scenes appear black.
+                    # Produce exactly one output frame per looped input frame and
+                    # trim the result to the planned scene duration.
                     chain = (
                         f"[{index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
                         f"crop={width}:{height},zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':"
-                        f"d={frames}:s={width}x{height}:fps=30,setsar=1,format=yuv420p,"
+                        f"d=1:s={width}x{height}:fps=30,"
+                        f"trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS,"
+                        f"setsar=1,format=yuv420p,"
                         f"fade=t=in:st=0:d={min(0.25, scene_duration/4):.3f},"
                         f"fade=t=out:st={max(0.0, scene_duration-min(0.25, scene_duration/4)):.3f}:d={min(0.25, scene_duration/4):.3f}[v{index}]"
                     )
