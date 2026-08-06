@@ -12,6 +12,10 @@ from .factory import DownloaderFactory
 from .platform import Platform
 from .platform_detector import PlatformDetector
 from .download_result import DownloadResult
+from .channel import (
+    ChannelListingService, ChannelScanResult, ChannelVideoCandidate,
+    URLClassification, URLIntent, VideoURLClassifier,
+)
 from .strategy import DownloadStrategy
 from .validator import UrlValidator, FileValidator, validate_url_or_raise
 
@@ -21,6 +25,12 @@ __all__ = [
     "Platform",
     "PlatformDetector",
     "DownloadResult",
+    "ChannelListingService",
+    "ChannelScanResult",
+    "ChannelVideoCandidate",
+    "URLClassification",
+    "URLIntent",
+    "VideoURLClassifier",
     "DownloadStrategy",
     "UrlValidator",
     "FileValidator",

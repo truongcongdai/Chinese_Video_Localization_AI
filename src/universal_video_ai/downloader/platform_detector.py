@@ -22,6 +22,8 @@ class PlatformDetector:
         "kuaishou.com": Platform.KUAISHOU,
 
         "tiktok.com": Platform.TIKTOK,
+        "vm.tiktok.com": Platform.TIKTOK,
+        "vt.tiktok.com": Platform.TIKTOK,
 
         "facebook.com": Platform.FACEBOOK,
         "fb.watch": Platform.FACEBOOK,

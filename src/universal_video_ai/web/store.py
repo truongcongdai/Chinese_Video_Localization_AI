@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -484,24 +483,31 @@ _MIGRATIONS = [
     ("jobs", "translation_glossary", "ALTER TABLE jobs ADD COLUMN translation_glossary TEXT"),
     # Upload video audio configuration
     ("jobs", "keep_original_audio", "ALTER TABLE jobs ADD COLUMN keep_original_audio INTEGER NOT NULL DEFAULT 0"),
-    ("jobs", "background_music_strategy", "ALTER TABLE jobs ADD COLUMN background_music_strategy TEXT NOT NULL DEFAULT 'deterministic'"),
+    ("jobs", "background_music_strategy",
+     "ALTER TABLE jobs ADD COLUMN background_music_strategy TEXT NOT NULL DEFAULT 'deterministic'"),
     # Content OS migrations - add missing columns
     ("content_os_projects", "channel_id", "ALTER TABLE content_os_projects ADD COLUMN channel_id INTEGER"),
     ("content_os_projects", "mode", "ALTER TABLE content_os_projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'ai_video'"),
     ("content_os_projects", "objective", "ALTER TABLE content_os_projects ADD COLUMN objective TEXT"),
-    ("content_os_projects", "target_platform", "ALTER TABLE content_os_projects ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'youtube_shorts'"),
-    ("content_os_projects", "target_duration_seconds", "ALTER TABLE content_os_projects ADD COLUMN target_duration_seconds INTEGER NOT NULL DEFAULT 45"),
-    ("content_os_projects", "target_language", "ALTER TABLE content_os_projects ADD COLUMN target_language TEXT NOT NULL DEFAULT 'vi'"),
+    ("content_os_projects", "target_platform",
+     "ALTER TABLE content_os_projects ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'youtube_shorts'"),
+    ("content_os_projects", "target_duration_seconds",
+     "ALTER TABLE content_os_projects ADD COLUMN target_duration_seconds INTEGER NOT NULL DEFAULT 45"),
+    ("content_os_projects", "target_language",
+     "ALTER TABLE content_os_projects ADD COLUMN target_language TEXT NOT NULL DEFAULT 'vi'"),
     ("content_os_projects", "content_style", "ALTER TABLE content_os_projects ADD COLUMN content_style TEXT"),
     ("content_os_projects", "visual_style", "ALTER TABLE content_os_projects ADD COLUMN visual_style TEXT"),
     ("content_os_projects", "voice_id", "ALTER TABLE content_os_projects ADD COLUMN voice_id TEXT"),
     ("content_os_projects", "subtitle_style_id", "ALTER TABLE content_os_projects ADD COLUMN subtitle_style_id TEXT"),
-    ("content_os_projects", "background_music_enabled", "ALTER TABLE content_os_projects ADD COLUMN background_music_enabled INTEGER NOT NULL DEFAULT 0"),
+    ("content_os_projects", "background_music_enabled",
+     "ALTER TABLE content_os_projects ADD COLUMN background_music_enabled INTEGER NOT NULL DEFAULT 0"),
     ("content_os_projects", "user_instructions", "ALTER TABLE content_os_projects ADD COLUMN user_instructions TEXT"),
     ("content_os_projects", "settings_json", "ALTER TABLE content_os_projects ADD COLUMN settings_json TEXT"),
-    ("content_os_projects", "status", "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+    ("content_os_projects", "status",
+     "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
     # Trend Scanner tables (new feature, no migration needed for fresh installs)
 ]
+
 
 @dataclass
 class TrendScan:
@@ -604,8 +610,8 @@ class Job:
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
         d["is_content_os"] = (
-            str(self.source_url or "").startswith("content_os://")
-            or str(self.source_language or "").startswith("content_os")
+                str(self.source_url or "").startswith("content_os://")
+                or str(self.source_language or "").startswith("content_os")
         )
         d["has_video"] = bool(self.final_video_path and Path(self.final_video_path).exists())
         # review_state_json is an internal implementation detail (a
@@ -641,11 +647,14 @@ class Store:
             conn.executescript(SCHEMA)
             existing_cols = {
                 table: {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-                for table in ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps", "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals", "content_os_memories")
+                for table in
+                ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
+                 "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
+                 "content_os_memories")
             }
             migrated_legacy_projects = (
-                "target_platforms_json" in existing_cols.get("content_os_projects", set())
-                and "target_platform" not in existing_cols.get("content_os_projects", set())
+                    "target_platforms_json" in existing_cols.get("content_os_projects", set())
+                    and "target_platform" not in existing_cols.get("content_os_projects", set())
             )
             ran_is_admin_migration = False
             for table, column, ddl in _MIGRATIONS:
@@ -690,9 +699,9 @@ class Store:
 
     # ---- users ----
     def create_user(
-        self, username: str, password_hash: str, is_admin: bool = False,
-        credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
-        referred_by_user_id: Optional[int] = None,
+            self, username: str, password_hash: str, is_admin: bool = False,
+            credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
+            referred_by_user_id: Optional[int] = None,
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
@@ -720,8 +729,8 @@ class Store:
             return cur.fetchone()
 
     def create_user_oauth(
-        self, username: str, oauth_provider: str, oauth_id: str,
-        email: Optional[str] = None, is_admin: bool = False, credits: int = 10,
+            self, username: str, oauth_provider: str, oauth_id: str,
+            email: Optional[str] = None, is_admin: bool = False, credits: int = 10,
     ) -> int:
         """
         Create an account for someone who signed up/in via "Sign in with
@@ -813,29 +822,29 @@ class Store:
 
     # ---- jobs ----
     def create_job(
-        self, user_id: int, source_url: str, target_language: str,
-        source_language: str = "auto", logo_path: Optional[str] = None,
-        logo_corner: str = "bottom_right", logo_size_px: int = 120,
-        tts_voice: Optional[str] = None, review_mode: bool = False,
-        animated_subtitle_config: Optional[Dict[str, Any]] = None,
-        video_template_config: Optional[Dict[str, Any]] = None,
-        transform_config: Optional[Dict[str, Any]] = None,
-        processing_mode: str = "fast",
-        tts_provider: str = "edge",
-        tts_style: str = "natural",
-        tts_model: Optional[str] = None,
-        translation_mode: str = "faithful",
-        translation_model: Optional[str] = None,
-        translation_tone: str = "natural",
-        translation_audience: Optional[str] = None,
-        translation_glossary: Optional[str] = None,
-        remix_enabled: bool = False,
-        remix_platforms: Optional[List[str]] = None,
-        remix_goal: str = "viral",
-        remix_strength: str = "balanced",
-        subtitle_offset_seconds: float = 0.0,
-        keep_original_audio: int = 0,
-        background_music_strategy: str = "deterministic",
+            self, user_id: int, source_url: str, target_language: str,
+            source_language: str = "auto", logo_path: Optional[str] = None,
+            logo_corner: str = "bottom_right", logo_size_px: int = 120,
+            tts_voice: Optional[str] = None, review_mode: bool = False,
+            animated_subtitle_config: Optional[Dict[str, Any]] = None,
+            video_template_config: Optional[Dict[str, Any]] = None,
+            transform_config: Optional[Dict[str, Any]] = None,
+            processing_mode: str = "fast",
+            tts_provider: str = "edge",
+            tts_style: str = "natural",
+            tts_model: Optional[str] = None,
+            translation_mode: str = "faithful",
+            translation_model: Optional[str] = None,
+            translation_tone: str = "natural",
+            translation_audience: Optional[str] = None,
+            translation_glossary: Optional[str] = None,
+            remix_enabled: bool = False,
+            remix_platforms: Optional[List[str]] = None,
+            remix_goal: str = "viral",
+            remix_strength: str = "balanced",
+            subtitle_offset_seconds: float = 0.0,
+            keep_original_audio: int = 0,
+            background_music_strategy: str = "deterministic",
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -939,14 +948,14 @@ class Store:
 
     # ---- provider settings ----
     def upsert_provider_settings(
-        self,
-        user_id: int,
-        provider: str,
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
-        default_model: Optional[str] = None,
-        default_voice: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None,
+            self,
+            user_id: int,
+            provider: str,
+            api_key: Optional[str] = None,
+            api_secret: Optional[str] = None,
+            default_model: Optional[str] = None,
+            default_voice: Optional[str] = None,
+            extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         now = time.time()
         provider = provider.strip().lower()
@@ -1097,8 +1106,8 @@ class Store:
 
     # ---- top-up requests ----
     def create_top_up_request(
-        self, user_id: int, credits: int, amount_vnd: int,
-        payment_method: str, note: Optional[str] = None,
+            self, user_id: int, credits: int, amount_vnd: int,
+            payment_method: str, note: Optional[str] = None,
     ) -> int:
         now = time.time()
         with self._connect() as conn:
@@ -1219,6 +1228,29 @@ class Store:
             row = cur.fetchone()
             return self._row_to_job(row) if row else None
 
+    def existing_source_urls_for_user(self, user_id: int, urls: List[str]) -> set[str]:
+        """Return exact source URLs already present in this user's history.
+
+        Used by channel mode to avoid re-downloading/re-processing videos that
+        have already been submitted. Queries are chunked to stay below
+        SQLite's bound-parameter limit.
+        """
+        cleaned = [str(url).strip() for url in urls if str(url).strip()]
+        if not cleaned:
+            return set()
+        found: set[str] = set()
+        with self._connect() as conn:
+            for offset in range(0, len(cleaned), 800):
+                chunk = cleaned[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT source_url FROM jobs WHERE user_id = ? "
+                    f"AND source_url IN ({placeholders})",
+                    [user_id, *chunk],
+                ).fetchall()
+                found.update(str(row["source_url"]) for row in rows)
+        return found
+
     def list_jobs_for_user(self, user_id: int, limit: int = 100) -> List[Job]:
         with self._connect() as conn:
             cur = conn.execute(
@@ -1228,13 +1260,13 @@ class Store:
             return [self._row_to_job(row) for row in cur.fetchall()]
 
     def search_jobs_for_user(
-        self,
-        user_id: int,
-        query: Optional[str] = None,
-        status: Optional[str] = None,
-        date_from: Optional[float] = None,
-        date_to: Optional[float] = None,
-        limit: int = 200,
+            self,
+            user_id: int,
+            query: Optional[str] = None,
+            status: Optional[str] = None,
+            date_from: Optional[float] = None,
+            date_to: Optional[float] = None,
+            limit: int = 200,
     ) -> List[Job]:
         """
         Same as `list_jobs_for_user` but filterable — used by the history
@@ -1343,7 +1375,8 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE scheduled_posts SET status='error', result_json=?, updated_at=? WHERE status='processing'",
-                (json.dumps({"message": "Server khởi động lại khi đang đăng; không tự thử lại để tránh đăng trùng."}, ensure_ascii=False), time.time()),
+                (json.dumps({"message": "Server khởi động lại khi đang đăng; không tự thử lại để tránh đăng trùng."},
+                            ensure_ascii=False), time.time()),
             )
 
     def finish_scheduled_post(self, post_id: int, status: str, result: Any) -> None:
@@ -1364,7 +1397,7 @@ class Store:
 
     # ---- publish log ----
     def log_publish(self, job_id: str, platform: str, success: bool, message: str,
-                     remote_url: Optional[str] = None) -> None:
+                    remote_url: Optional[str] = None) -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO publish_log (job_id, platform, success, message, remote_url, created_at) "
@@ -1374,21 +1407,21 @@ class Store:
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(
-        self, user_id: int, platform: str, access_token: Optional[str],
-        refresh_token: Optional[str] = None, expires_at: Optional[float] = None,
-        account_name: Optional[str] = None, account_ref: Optional[str] = None,
+            self, user_id: int, platform: str, access_token: Optional[str],
+            refresh_token: Optional[str] = None, expires_at: Optional[float] = None,
+            account_name: Optional[str] = None, account_ref: Optional[str] = None,
     ) -> None:
         now = time.time()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO social_accounts
-                    (user_id, platform, access_token, refresh_token, expires_at,
-                     account_name, account_ref, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(user_id, platform) DO UPDATE SET
+                (user_id, platform, access_token, refresh_token, expires_at,
+                 account_name, account_ref, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform) DO
+                UPDATE SET
                     access_token=excluded.access_token,
-                    refresh_token=COALESCE(excluded.refresh_token, social_accounts.refresh_token),
+                    refresh_token= COALESCE (excluded.refresh_token, social_accounts.refresh_token),
                     expires_at=excluded.expires_at,
                     account_name=excluded.account_name,
                     account_ref=excluded.account_ref,
@@ -1459,15 +1492,15 @@ class Store:
 
     # ---- video presets ----
     def create_video_preset(
-        self,
-        user_id: int,
-        name: str,
-        template: str,
-        transition: str,
-        color_effect: str,
-        audio_filters: Optional[Dict[str, Any]] = None,
-        video_quality: Optional[str] = None,
-        is_default: bool = False,
+            self,
+            user_id: int,
+            name: str,
+            template: str,
+            transition: str,
+            color_effect: str,
+            audio_filters: Optional[Dict[str, Any]] = None,
+            video_quality: Optional[str] = None,
+            is_default: bool = False,
     ) -> int:
         now = time.time()
         with self._connect() as conn:
@@ -1475,10 +1508,12 @@ class Store:
             if is_default:
                 conn.execute("UPDATE video_presets SET is_default = 0 WHERE user_id = ?", (user_id,))
             cursor = conn.execute(
-                """INSERT INTO video_presets 
-                   (user_id, name, template, transition, color_effect, audio_filters_json, video_quality, is_default, created_at, updated_at)
+                """INSERT INTO video_presets
+                   (user_id, name, template, transition, color_effect, audio_filters_json, video_quality, is_default,
+                    created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, name, template, transition, color_effect, json.dumps(audio_filters) if audio_filters else None, video_quality, 1 if is_default else 0, now, now),
+                (user_id, name, template, transition, color_effect,
+                 json.dumps(audio_filters) if audio_filters else None, video_quality, 1 if is_default else 0, now, now),
             )
             return cursor.lastrowid
 
@@ -1514,16 +1549,16 @@ class Store:
             return None
 
     def update_video_preset(
-        self,
-        preset_id: int,
-        user_id: int,
-        name: Optional[str] = None,
-        template: Optional[str] = None,
-        transition: Optional[str] = None,
-        color_effect: Optional[str] = None,
-        audio_filters: Optional[Dict[str, Any]] = None,
-        video_quality: Optional[str] = None,
-        is_default: Optional[bool] = None,
+            self,
+            preset_id: int,
+            user_id: int,
+            name: Optional[str] = None,
+            template: Optional[str] = None,
+            transition: Optional[str] = None,
+            color_effect: Optional[str] = None,
+            audio_filters: Optional[Dict[str, Any]] = None,
+            video_quality: Optional[str] = None,
+            is_default: Optional[bool] = None,
     ) -> bool:
         now = time.time()
         with self._connect() as conn:
@@ -1534,7 +1569,7 @@ class Store:
             ).fetchone()
             if not existing:
                 return False
-            
+
             # Build update query
             updates = []
             params = []
@@ -1561,7 +1596,7 @@ class Store:
                     conn.execute("UPDATE video_presets SET is_default = 0 WHERE user_id = ?", (user_id,))
                 updates.append("is_default = ?")
                 params.append(1 if is_default else 0)
-            
+
             if updates:
                 updates.append("updated_at = ?")
                 params.append(now)

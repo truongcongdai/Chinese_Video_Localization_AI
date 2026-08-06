@@ -1355,6 +1355,21 @@ function extractVideoUrlsFromText(text) {
   return matches.map(url => url.replace(/[.,;:!?)[\]}>】》”’"']+$/g, ""));
 }
 
+function channelModeEnabled() {
+  return Boolean($("#channel-mode-checkbox")?.checked);
+}
+
+function updateChannelModeUI() {
+  const enabled = channelModeEnabled();
+  $("#channel-options-panel").classList.toggle("hidden", !enabled);
+  $("#url-input").rows = enabled ? 1 : 2;
+  $("#url-input").placeholder = enabled
+    ? "https://www.youtube.com/@kenh/videos hoặc https://www.tiktok.com/@user hoặc https://www.douyin.com/user/..."
+    : "https://www.youtube.com/watch?v=...\nhttps://v.douyin.com/...\nhttps://www.tiktok.com/@user/video/...";
+  $("#channel-analysis-status").textContent = enabled ? "Chưa quét." : "Chưa quét.";
+  updateLocalizationSummary();
+}
+
 function localizationUrls() {
   const entries = [];
   for (const line of $("#url-input").value.split("\n")) {
@@ -1372,10 +1387,17 @@ function updateLocalizationSummary() {
   const source = $("#source-lang-select")?.selectedOptions[0]?.textContent || "—";
   const target = $("#lang-select")?.selectedOptions[0]?.textContent || "—";
   const voice = $("#voice-select")?.selectedOptions[0]?.textContent || translatedUiText("Mặc định");
-  $("#url-count-help").textContent = urls.length
-    ? `${urls.length} link sẽ được xử lý.`
-    : "Chưa có link nào.";
-  $("#summary-video-count").textContent = `${urls.length} link`;
+  if (channelModeEnabled()) {
+    $("#url-count-help").textContent = urls.length
+      ? `${urls.length} link kênh đã nhập; chế độ này chỉ chấp nhận đúng 1 link kênh.`
+      : "Chưa có link kênh.";
+    $("#summary-video-count").textContent = urls.length ? "1 kênh" : "0 kênh";
+  } else {
+    $("#url-count-help").textContent = urls.length
+      ? `${urls.length} link video sẽ được xử lý.`
+      : "Chưa có link video.";
+    $("#summary-video-count").textContent = `${urls.length} link`;
+  }
   $("#summary-language").textContent = `${source} → ${target}`;
   $("#summary-voice").textContent = voice;
 }
@@ -1384,7 +1406,14 @@ function validateLocalizationStep(step) {
   if (step !== 1) return true;
   const urls = localizationUrls();
   if (!urls.length) {
-    $("#submit-error").textContent = "Nhập ít nhất 1 đường link video.";
+    $("#submit-error").textContent = channelModeEnabled()
+      ? "Nhập đúng 1 đường link kênh YouTube, TikTok hoặc Douyin."
+      : "Nhập ít nhất 1 đường link video.";
+    $("#url-input").focus();
+    return false;
+  }
+  if (channelModeEnabled() && urls.length !== 1) {
+    $("#submit-error").textContent = "Chế độ tải toàn bộ kênh chỉ nhận đúng 1 link kênh mỗi lần.";
     $("#url-input").focus();
     return false;
   }
@@ -1428,6 +1457,39 @@ document.querySelectorAll("[data-localization-step]").forEach(button => {
   });
 });
 $("#url-input").addEventListener("input", updateLocalizationSummary);
+$("#channel-mode-checkbox").addEventListener("change", updateChannelModeUI);
+$("#channel-max-videos").addEventListener("input", updateLocalizationSummary);
+$("#channel-skip-existing").addEventListener("change", updateLocalizationSummary);
+updateChannelModeUI();
+
+$("#channel-analyze-btn").addEventListener("click", async () => {
+  $("#submit-error").textContent = "";
+  const urls = localizationUrls();
+  if (!channelModeEnabled() || urls.length !== 1) {
+    $("#submit-error").textContent = "Bật chế độ tải toàn bộ kênh và dán đúng 1 link kênh trước khi quét.";
+    return;
+  }
+  const button = $("#channel-analyze-btn");
+  button.disabled = true;
+  $("#channel-analysis-status").textContent = "Đang quét danh sách video công khai...";
+  try {
+    const result = await api("/api/channel-downloads/analyze", {
+      method: "POST",
+      body: JSON.stringify({
+        url: urls[0],
+        max_videos: parseInt($("#channel-max-videos").value, 10) || 0,
+      }),
+    });
+    const warning = (result.warnings || []).join(" ");
+    $("#channel-analysis-status").textContent =
+      `Tìm thấy ${result.video_count} video · ${result.platform}${result.channel_title ? ` · ${result.channel_title}` : ""}` +
+      (warning ? ` · ${warning}` : "");
+  } catch (error) {
+    $("#channel-analysis-status").textContent = `Quét thất bại: ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
 for (const selector of ["#source-lang-select", "#lang-select", "#voice-select"]) {
   $(selector).addEventListener("change", updateLocalizationSummary);
 }
@@ -1651,6 +1713,10 @@ $("#submit-btn").onclick = async () => {
     return;
   }
   const reviewMode = $("#review-mode-checkbox").checked;
+  if (channelModeEnabled() && reviewMode) {
+    $("#submit-error").textContent = "Xử lý toàn bộ kênh không hỗ trợ dừng từng video để sửa phụ đề thủ công.";
+    return;
+  }
   if (reviewMode && urls.length > 1) {
     $("#submit-error").textContent = "Chế độ 'xem & sửa phụ đề' chỉ dùng được với 1 link mỗi lần, không dùng chung với xử lý hàng loạt";
     return;
@@ -1688,27 +1754,61 @@ $("#submit-btn").onclick = async () => {
   $("#submit-btn").disabled = true;
   const failures = [];
   try {
-    $("#preflight-status").textContent = "Đang kiểm tra trước khi tạo job...";
-    $("#preflight-list").innerHTML = "";
-    const preflight = await runJobPreflight(urls, commonBody);
-    if (!preflight.ok) {
-      $("#submit-error").textContent = "Preflight check chưa đạt. Sửa các lỗi được liệt kê rồi chạy lại.";
-      return;
-    }
-    for (const url of urls) {
-      try {
-        await api("/api/jobs", { method: "POST", body: JSON.stringify({ url, ...commonBody }) });
-      } catch (e) {
-        failures.push(`${url}: ${e.message}`);
+    if (channelModeEnabled()) {
+      $("#preflight-status").textContent = "Đang quét kênh và tạo job cho từng video...";
+      $("#preflight-list").innerHTML = "";
+      const result = await api("/api/channel-downloads/process", {
+        method: "POST",
+        body: JSON.stringify({
+          url: urls[0],
+          max_videos: parseInt($("#channel-max-videos").value, 10) || 0,
+          skip_existing: $("#channel-skip-existing").checked,
+          ...commonBody,
+        }),
+      });
+      const notes = [
+        `Đã quét ${result.scanned} video`,
+        `tạo ${result.created_count} job`,
+        `bỏ qua ${result.skipped_existing_count} video cũ`,
+        result.failed_count ? `${result.failed_count} lỗi` : "",
+      ].filter(Boolean);
+      $("#preflight-status").textContent = notes.join(" · ");
+      $("#preflight-list").innerHTML = (result.warnings || []).map(
+        warning => `<li class="warning">${escapeHtml(warning)}</li>`
+      ).join("");
+      if (result.failed_count) {
+        $("#submit-error").textContent = result.failed.slice(0, 5)
+          .map(item => `${item.source_url}: ${item.error}`).join(" | ");
+      } else {
+        $("#url-input").value = "";
+        $("#channel-analysis-status").textContent = "Đã tạo batch xử lý kênh.";
+        localStorage.removeItem(localizationDraftKey());
+        $("#draft-status").textContent = "Đã xóa bản nháp sau khi gửi";
+        showLocalizationStep(1);
       }
-    }
-    if (failures.length) {
-      $("#submit-error").textContent = `${failures.length}/${urls.length} link gửi thất bại — ${failures.join(" | ")}`;
     } else {
-      $("#url-input").value = "";
-      localStorage.removeItem(localizationDraftKey());
-      $("#draft-status").textContent = "Đã xóa bản nháp sau khi gửi";
-      showLocalizationStep(1);
+      $("#preflight-status").textContent = "Đang kiểm tra trước khi tạo job...";
+      $("#preflight-list").innerHTML = "";
+      const preflight = await runJobPreflight(urls, commonBody);
+      if (!preflight.ok) {
+        $("#submit-error").textContent = "Preflight check chưa đạt. Sửa các lỗi được liệt kê rồi chạy lại.";
+        return;
+      }
+      for (const url of urls) {
+        try {
+          await api("/api/jobs", { method: "POST", body: JSON.stringify({ url, ...commonBody }) });
+        } catch (e) {
+          failures.push(`${url}: ${e.message}`);
+        }
+      }
+      if (failures.length) {
+        $("#submit-error").textContent = `${failures.length}/${urls.length} link gửi thất bại — ${failures.join(" | ")}`;
+      } else {
+        $("#url-input").value = "";
+        localStorage.removeItem(localizationDraftKey());
+        $("#draft-status").textContent = "Đã xóa bản nháp sau khi gửi";
+        showLocalizationStep(1);
+      }
     }
     refreshJobs();
     refreshMe();
@@ -2148,7 +2248,7 @@ $("#trend-scan-btn").onclick = async () => {
   topic = topic.replace(/VN\s*Bỏ qua điều hướng Tìm kiếm.*$/, '').trim();
   topic = topic.replace(/Tạo\s*Hình ảnh đại diện.*$/, '').trim();
   topic = topic.replace(/Official Audio Video.*$/, '').trim();
-  
+
   if (!topic) {
     $("#trend-error").style.color = "var(--err)";
     $("#trend-error").textContent = "Vui lòng nhập chủ đề cần quét";
@@ -2258,27 +2358,27 @@ function updateStats(jobs) {
   const queued = jobs.filter(j => j.status === "queued").length;
   const error = jobs.filter(j => j.status === "error").length;
   const processing = running + queued;
-  
+
   // Calculate total duration (in minutes)
   const totalDuration = jobs.reduce((sum, job) => {
     const duration = job.duration_seconds || 0;
     return sum + duration;
   }, 0) / 60;
-  
+
   // Update stat boxes
   $("#stat-total").textContent = total;
   $("#stat-completed").textContent = completed;
   $("#stat-processing").textContent = processing;
   $("#stat-error").textContent = error;
   $("#stat-duration").textContent = Math.round(totalDuration);
-  
+
   // Update progress bar
   if (total > 0) {
     const donePercent = (completed / total) * 100;
     const runningPercent = (running / total) * 100;
     const queuedPercent = (queued / total) * 100;
     const errorPercent = (error / total) * 100;
-    
+
     $("#bar-done").style.flex = `${donePercent}`;
     $("#bar-running").style.flex = `${runningPercent}`;
     $("#bar-queued").style.flex = `${queuedPercent}`;
@@ -2289,7 +2389,7 @@ function updateStats(jobs) {
     $("#bar-queued").style.flex = "0";
     $("#bar-error").style.flex = "0";
   }
-  
+
   // Update labels
   $("#label-done").textContent = completed;
   $("#label-running").textContent = running;
@@ -2310,7 +2410,7 @@ async function refreshJobs() {
   const qs = params.toString();
 
   const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
-  
+
   // Update statistics
   updateStats(jobs);
   refreshJobQueueStatus();
@@ -2891,20 +2991,20 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".feature-tab").forEach(tab => {
     tab.onclick = () => {
       const feature = tab.dataset.feature;
-      
+
       console.log("Tab clicked:", feature);
-      
+
       // Update tab active state
       document.querySelectorAll(".feature-tab").forEach(t => t.classList.remove("active"));
       tab.classList.add("active");
-      
+
       // Update panel visibility
       document.querySelectorAll(".feature-panel").forEach(panel => {
         panel.classList.remove("active");
         if (panel.dataset.feature === feature) {
           panel.classList.add("active");
           console.log("Panel shown:", feature);
-          
+
           // Initialize Content OS if switching to that tab
           if (feature === "content-os") {
             initContentOS();
@@ -2923,20 +3023,20 @@ let selectedRunId = null;
 
 async function initContentOS() {
   console.log("Initializing Content OS");
-  
+
   try {
     const health = await api("/api/content-os/health");
     console.log("Content OS health:", health);
-    
+
     if (!health.enabled) {
       $("#content-os-feature-disabled").classList.remove("hidden");
       $("#content-os-enabled").classList.add("hidden");
       return;
     }
-    
+
     $("#content-os-feature-disabled").classList.add("hidden");
     $("#content-os-enabled").classList.remove("hidden");
-    
+
     // Load projects
     await loadContentOSProjects();
   } catch (e) {
@@ -2958,13 +3058,13 @@ async function loadContentOSProjects() {
 function renderContentOSProjects() {
   const list = $("#content-os-projects-list");
   const select = $("#content-os-project-select");
-  
+
   if (contentOSProjects.length === 0) {
     list.innerHTML = `<div style="font-size: 13px; color: var(--text-dim);">Chưa có dự án nào.</div>`;
     select.innerHTML = `<option value="">-- Chọn dự án --</option>`;
     return;
   }
-  
+
   list.innerHTML = contentOSProjects.map(p => `
     <div style="padding: 8px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="selectContentOSProject(${p.id})">
       <div>
@@ -2975,8 +3075,8 @@ function renderContentOSProjects() {
       <button class="btn secondary small" onclick="event.stopPropagation(); deleteContentOSProject(${p.id})" style="margin-left: 8px;">🗑️</button>
     </div>
   `).join("");
-  
-  select.innerHTML = `<option value="">-- Chọn dự án --</option>` + 
+
+  select.innerHTML = `<option value="">-- Chọn dự án --</option>` +
     contentOSProjects.map(p => `<option value="${p.id}">${escapeHtml(p.channel_name)} - ${escapeHtml(p.topic)}</option>`).join("");
 }
 
@@ -2984,18 +3084,18 @@ function selectContentOSProject(projectId) {
   selectedProjectId = projectId;
   $("#content-os-project-select").value = projectId;
   $("#content-os-create-run-btn").disabled = false;
-  
+
   // Load runs for this project
   loadContentOSRuns(projectId);
 }
 
 async function deleteContentOSProject(projectId) {
   if (!confirm("Bạn có chắc muốn xóa dự án này và tất cả runs liên quan?")) return;
-  
+
   try {
     await api(`/api/content-os/projects/${projectId}`, { method: "DELETE" });
     await loadContentOSProjects();
-    
+
     // Clear selection if deleted project was selected
     if (selectedProjectId === projectId) {
       selectedProjectId = null;
@@ -3022,12 +3122,12 @@ async function loadContentOSRuns(projectId) {
 
 function renderContentOSRuns() {
   const list = $("#content-os-runs-list");
-  
+
   if (contentOSRuns.length === 0) {
     list.innerHTML = `<div style="font-size: 13px; color: var(--text-dim);">Chưa có run nào.</div>`;
     return;
   }
-  
+
   list.innerHTML = contentOSRuns.map(r => `
     <div style="padding: 8px; border-bottom: 1px solid var(--border);">
       <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -3084,7 +3184,7 @@ function canCreateContentOSJob(run) {
 function selectContentOSRun(runId) {
   selectedRunId = runId;
   const run = contentOSRuns.find(r => r.id === runId);
-  
+
   if (run) {
     $("#content-os-run-actions").style.display = "block";
     $("#content-os-run-status").innerHTML = `
@@ -3093,11 +3193,11 @@ function selectContentOSRun(runId) {
       <div>Trạng thái: ${escapeHtml(run.status)}</div>
       <div>Tiến độ: ${run.progress_percent}%</div>
     `;
-    
+
     // Remove existing view script button if any
     const existingBtn = document.querySelector("#content-os-view-script-btn");
     if (existingBtn) existingBtn.remove();
-    
+
     // Add view script button if script is available
     if (run.current_stage === "awaiting_approval" || canCreateContentOSJob(run)) {
       const scriptBtn = document.createElement("button");
@@ -3107,7 +3207,7 @@ function selectContentOSRun(runId) {
       scriptBtn.onclick = () => viewContentOSScript(run.id);
       $("#content-os-run-actions").appendChild(scriptBtn);
     }
-    
+
     // Enable/disable buttons based on run state
     $("#content-os-start-run-btn").disabled = run.status === "running" || run.status === "completed";
     $("#content-os-cancel-run-btn").disabled = run.status === "completed" || run.status === "cancelled";
@@ -3121,21 +3221,21 @@ async function viewContentOSScript(runId) {
     console.log("Fetching script for run:", runId);
     const script = await api(`/api/content-os/runs/${runId}/artifacts/script`);
     console.log("Script data received:", script);
-    
+
     if (!script) {
       alert("Không tìm thấy script cho run này");
       return;
     }
-    
+
     // The actual script data is in the 'data' field
     const scriptContent = script.data || script;
     console.log("Script content:", scriptContent);
-    
+
     // Display script in the run detail area instead of modal
     const scriptDiv = document.createElement("div");
     scriptDiv.id = "content-os-script-display";
     scriptDiv.style.cssText = "margin-top: 20px; padding: 15px; background: #f9f9f9; border-radius: 8px; border: 1px solid #ddd; color: #333;";
-    
+
     scriptDiv.innerHTML = `
       <h3 style="margin-top: 0; color: #333;">📄 Script Details</h3>
       <div style="margin-bottom: 15px; color: #333;">
@@ -3164,14 +3264,14 @@ async function viewContentOSScript(runId) {
         <button class="btn secondary" onclick="document.getElementById('content-os-script-display').remove()">Đóng</button>
       </div>
     `;
-    
+
     // Remove existing script display if any
     const existing = document.getElementById("content-os-script-display");
     if (existing) existing.remove();
-    
+
     // Add to run detail area
     $("#content-os-run-actions").appendChild(scriptDiv);
-    
+
   } catch (e) {
     console.error("Failed to load script:", e);
     alert(`Lỗi tải script: ${e.message}`);
@@ -3188,12 +3288,12 @@ $("#content-os-create-project-btn").onclick = async () => {
   const duration = parseInt($("#content-os-duration").value);
   const format = $("#content-os-format").value;
   const instructions = $("#content-os-instructions").value.trim();
-  
+
   if (!channelName || !topic) {
     $("#content-os-project-error").textContent = "Vui lòng nhập tên kênh và chủ đề.";
     return;
   }
-  
+
   try {
     const project = await api("/api/content-os/projects", {
       method: "POST",
@@ -3211,12 +3311,12 @@ $("#content-os-create-project-btn").onclick = async () => {
         auto_download_sources: false,
       }),
     });
-    
+
     $("#content-os-project-error").textContent = "";
     $("#content-os-channel-name").value = "";
     $("#content-os-topic").value = "";
     $("#content-os-instructions").value = "";
-    
+
     await loadContentOSProjects();
   } catch (e) {
     $("#content-os-project-error").textContent = `Lỗi: ${e.message}`;
@@ -3235,13 +3335,13 @@ $("#content-os-project-select").onchange = (e) => {
 
 $("#content-os-create-run-btn").onclick = async () => {
   if (!selectedProjectId) return;
-  
+
   try {
     const run = await api("/api/content-os/runs", {
       method: "POST",
       body: JSON.stringify({ project_id: selectedProjectId }),
     });
-    
+
     await loadContentOSRuns(selectedProjectId);
     selectContentOSRun(run.id);
   } catch (e) {
@@ -3254,12 +3354,12 @@ let contentOSPollingInterval = null;
 
 $("#content-os-start-run-btn").onclick = async () => {
   if (!selectedRunId) return;
-  
+
   try {
     await api(`/api/content-os/runs/${selectedRunId}/start`, { method: "POST" });
     await loadContentOSRuns(selectedProjectId);
     selectContentOSRun(selectedRunId);
-    
+
     // Start polling for updates
     startContentOSPolling();
   } catch (e) {
@@ -3272,13 +3372,13 @@ function startContentOSPolling() {
   if (contentOSPollingInterval) {
     clearInterval(contentOSPollingInterval);
   }
-  
+
   contentOSPollingInterval = setInterval(async () => {
     if (!selectedProjectId) return;
-    
+
     try {
       await loadContentOSRuns(selectedProjectId);
-      
+
       // Check if run is still running
       const run = contentOSRuns.find(r => r.id === selectedRunId);
       if (run && (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled')) {
@@ -3299,9 +3399,9 @@ function stopContentOSPolling() {
 
 $("#content-os-cancel-run-btn").onclick = async () => {
   if (!selectedRunId) return;
-  
+
   if (!confirm("Bạn có chắc muốn hủy run này?")) return;
-  
+
   try {
     await api(`/api/content-os/runs/${selectedRunId}/cancel`, { method: "POST" });
     await loadContentOSRuns(selectedProjectId);
@@ -3314,7 +3414,7 @@ $("#content-os-cancel-run-btn").onclick = async () => {
 
 $("#content-os-approve-run-btn").onclick = async () => {
   if (!selectedRunId) return;
-  
+
   try {
     await api(`/api/content-os/runs/${selectedRunId}/approve`, {
       method: "POST",
@@ -3334,13 +3434,13 @@ $("#content-os-approve-run-btn").onclick = async () => {
 
 $("#content-os-create-job-btn").onclick = async () => {
   if (!selectedRunId) return;
-  
+
   try {
     const result = await api(`/api/content-os/runs/${selectedRunId}/create-job`, {
       method: "POST",
       body: JSON.stringify({ source_url: null }),
     });
-    
+
     alert(`Đã tạo job: ${result.job_id}\nJob sẽ hiển thị trong danh sách Jobs.`);
     // Refresh job list to show the new job
     refreshJobs();

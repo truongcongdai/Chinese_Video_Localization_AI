@@ -298,6 +298,34 @@
         <textarea id="url-input" rows="2" placeholder="https://www.youtube.com/watch?v=...&#10;https://v.douyin.com/...&#10;https://www.tiktok.com/@user/video/..."></textarea>
         <div id="url-count-help" style="font-size:12px;color:var(--text-dim);margin-top:6px">Chưa có link nào.</div>
       </div>
+      <div class="field" style="margin-top:12px">
+        <div class="check-row">
+          <input type="checkbox" id="channel-mode-checkbox">
+          <span>
+            <strong>Tải toàn bộ video của một kênh</strong>
+            <small id="channel-mode-help" class="muted-help">Tắt: mỗi link phải là link của một video cụ thể. Bật: chỉ dán đúng 1 link kênh YouTube, TikTok hoặc Douyin.</small>
+          </span>
+        </div>
+        <div id="channel-options-panel" class="hidden" style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-soft)">
+          <div class="row">
+            <div class="field" style="flex:1">
+              <label>Số video tối đa</label>
+              <input id="channel-max-videos" type="number" min="0" max="10000" value="0">
+              <small class="muted-help">0 = toàn bộ video công khai (theo giới hạn an toàn của server).</small>
+            </div>
+            <div class="field" style="flex:1">
+              <div class="check-row" style="margin-top:26px">
+                <input type="checkbox" id="channel-skip-existing" checked>
+                <span>Bỏ qua video đã từng tạo job</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn secondary small" type="button" id="channel-analyze-btn">🔎 Quét thử kênh</button>
+            <span id="channel-analysis-status" class="muted-help">Chưa quét.</span>
+          </div>
+        </div>
+      </div>
       <div class="localization-step-actions">
         <span></span>
         <button class="btn gradient" type="button" data-localization-next="2">Tiếp theo: Ngôn ngữ &amp; giọng →</button>
@@ -492,7 +520,7 @@
           Ưu tiên xử lý hàng loạt này (high priority) ⚡
         </label>
       </div>
-    
+
       <div class="field">
         <label>Số lượng job chạy đồng thời tối đa</label>
         <select id="max-concurrent-jobs">
@@ -682,7 +710,7 @@
           <option value="ultra">Ultra (tối ưu nhất)</option>
         </select>
       </div>
-      
+
       <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
         <label style="font-weight: 600; margin-bottom: 8px; display: block;">🎵 Audio Filters</label>
         <div class="field">
@@ -1117,7 +1145,7 @@
         <button class="btn secondary small" id="creator-script-generate" type="button">🎬 Gen visual brief từ chủ đề</button>
       </div>
     </div>
-    
+
     <div class="field">
       <label>
         <input type="checkbox" id="advanced-script-options-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
@@ -1260,12 +1288,12 @@
       <h3 class="section-title">🚀 Content OS</h3>
       <span id="content-os-status" class="muted-help">Workflow tạo nội dung AI</span>
     </div>
-    
+
     <div id="content-os-feature-disabled" class="hidden" style="padding: 20px; text-align: center; color: var(--text-dim);">
       <p>Content OS hiện đang bị tắt.</p>
       <p style="font-size: 13px;">Để bật tính năng này, hãy đặt CONTENT_OS_ENABLED=true trong file .env</p>
     </div>
-    
+
     <div id="content-os-enabled">
       <!-- Project Creation -->
       <div class="field">
@@ -1322,7 +1350,7 @@
       </div>
       <button class="btn gradient" id="content-os-create-project-btn" type="button">📝 Tạo dự án</button>
       <div id="content-os-project-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
-      
+
       <!-- Project List -->
       <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);">
         <h4 style="font-size: 14px; margin-bottom: 12px;">Dự án của bạn</h4>
@@ -1330,7 +1358,7 @@
           <div style="font-size: 13px; color: var(--text-dim);">Chưa có dự án nào.</div>
         </div>
       </div>
-      
+
       <!-- Run Management -->
       <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);">
         <h4 style="font-size: 14px; margin-bottom: 12px;">Chạy workflow</h4>
@@ -1341,13 +1369,13 @@
           </select>
         </div>
         <button class="btn gradient" id="content-os-create-run-btn" type="button" disabled>▶️ Tạo run mới</button>
-        
+
         <!-- Run List -->
         <div id="content-os-runs-list" style="margin-top: 16px; max-height: 250px; overflow-y: auto;">
           <div style="font-size: 13px; color: var(--text-dim);">Chưa có run nào.</div>
         </div>
       </div>
-      
+
       <!-- Run Actions -->
       <div id="content-os-run-actions" style="margin-top: 16px; padding: 16px; background: var(--panel-2); border-radius: var(--radius-sm); border: 1px solid var(--border); display: none;">
         <h4 style="font-size: 14px; margin-bottom: 12px;">Thao tác run</h4>
@@ -1633,6 +1661,6 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260801g" defer></script>
+<script src="/assets/app.js?v=20260805-channel" defer></script>
 </body>
 </html>

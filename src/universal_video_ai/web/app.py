@@ -80,6 +80,9 @@ from universal_video_ai.timeline.service import _balanced_caption_chunks
 from universal_video_ai.config import REDIS_URL, TEMP_DIR
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
+from universal_video_ai.downloader.channel import (
+    ChannelListingService, URLIntent, VideoURLClassifier,
+)
 
 from .store import Store
 from .auth import (
@@ -167,6 +170,47 @@ TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 store = Store(_DB_PATH)
 
 
+def _is_expected_windows_client_disconnect(context: Dict[str, Any]) -> bool:
+    """Return True only for the known Proactor reset caused by browser seek/abort.
+
+    HTML5 video players frequently close one HTTP Range connection and open
+    another while seeking. On Windows, Proactor may surface that normal client
+    disconnect as WinError 10054 from its connection-lost callback.
+    """
+    if sys.platform != "win32":
+        return False
+    exc = context.get("exception")
+    if not isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    if winerror not in {64, 995, 10053, 10054}:
+        return False
+    callback_text = " ".join(
+        str(context.get(key, "")) for key in ("message", "handle", "protocol", "transport")
+    ).lower()
+    return "proactor" in callback_text or "connection_lost" in callback_text or "pipe" in callback_text
+
+
+@app.on_event("startup")
+async def install_windows_disconnect_handler() -> None:
+    loop = asyncio.get_running_loop()
+    if getattr(loop, "_uvai_disconnect_handler_installed", False):
+        return
+    previous_handler = loop.get_exception_handler()
+
+    def _handler(current_loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
+        if _is_expected_windows_client_disconnect(context):
+            logger.debug("Ignored normal browser Range disconnect on Windows: %s", context.get("exception"))
+            return
+        if previous_handler:
+            previous_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+    setattr(loop, "_uvai_disconnect_handler_installed", True)
+
+
 @app.on_event("startup")
 def recover_jobs_interrupted_by_restart() -> None:
     """Background jobs cannot survive a process restart; expose that state."""
@@ -198,6 +242,7 @@ def _extract_first_video_url(text: str) -> str:
     if not match:
         return raw
     return match.group(0).rstrip(".,;:!?)]}】》”’\"'")
+
 
 # SaaS/multi-user mode is the safe default: publishing must use the social
 # account connected by the current user.  The legacy shared tokens can only be
@@ -235,6 +280,21 @@ LANGUAGE_LABELS = {
 # actual job state lives in the DB (store) so it survives restarts for
 # already-finished jobs, just not for one that was mid-run at restart time.
 _running_tasks: dict[str, asyncio.Task] = {}
+
+# Channel/profile mode uses the same localization pipeline as single-video
+# jobs. Limit actual concurrent processing server-wide so a large channel
+# does not spawn hundreds of FFmpeg/ASR/TTS workloads at once.
+_WEB_MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("WEB_MAX_CONCURRENT_JOBS", "2")))
+_job_run_semaphore: Optional[asyncio.Semaphore] = None
+_video_url_classifier = VideoURLClassifier()
+_channel_listing_service = ChannelListingService()
+
+
+def _get_job_run_semaphore() -> asyncio.Semaphore:
+    global _job_run_semaphore
+    if _job_run_semaphore is None:
+        _job_run_semaphore = asyncio.Semaphore(_WEB_MAX_CONCURRENT_JOBS)
+    return _job_run_semaphore
 
 
 def require_admin_user_id(user_id: int = Depends(get_current_user_id)) -> int:
@@ -302,6 +362,19 @@ class NewJobBody(BaseModel):
     # Audio configuration for uploaded videos
     keep_original_audio: int = 0
     background_music_strategy: str = "deterministic"
+
+
+class ChannelAnalyzeBody(BaseModel):
+    url: str
+    # 0 means all public videos, capped by CHANNEL_SCAN_HARD_LIMIT.
+    max_videos: int = Field(default=0, ge=0, le=10000)
+
+
+class ChannelProcessBody(NewJobBody):
+    # Keep the existing localization settings from NewJobBody and add only
+    # channel-specific controls. `url` is the channel/profile URL.
+    max_videos: int = Field(default=0, ge=0, le=10000)
+    skip_existing: bool = True
 
 
 class RemixPlanBody(BaseModel):
@@ -960,20 +1033,24 @@ def _build_service_for_job(job):
         translation_provider = "gemini"
         translation_api_key = gemini_settings.get("api_key")
         requested_model = getattr(job, "translation_model", None) or ""
-        available_models = (gemini_settings.get("extra") or {}).get("llm_models") or (gemini_settings.get("extra") or {}).get("models") or []
+        available_models = (gemini_settings.get("extra") or {}).get("llm_models") or (
+                    gemini_settings.get("extra") or {}).get("models") or []
         translation_model = requested_model if requested_model in available_models else (
-            gemini_settings.get("default_model") or (available_models[0] if available_models else "gemini-3.1-flash-lite")
+                gemini_settings.get("default_model") or (
+            available_models[0] if available_models else "gemini-3.1-flash-lite")
         )
         translation_base_url = None
     elif use_contextual_translation and openai_settings and openai_settings.get("api_key"):
         translation_provider = "openai"
         translation_api_key = openai_settings.get("api_key")
-        translation_model = getattr(job, "translation_model", None) or openai_settings.get("default_model") or "gpt-5.6-luna"
+        translation_model = getattr(job, "translation_model", None) or openai_settings.get(
+            "default_model") or "gpt-5.6-luna"
         translation_base_url = None
     elif use_contextual_translation:
         translation_provider = "ollama"
         translation_api_key = None
-        translation_model = getattr(job, "translation_model", None) or _env_first("OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL
+        translation_model = getattr(job, "translation_model", None) or _env_first(
+            "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL
         translation_base_url = _env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434"
     else:
         translation_provider = "none"
@@ -1005,17 +1082,17 @@ def _build_service_for_job(job):
     # Audio configuration: use job-specific settings if available, otherwise fall back to env vars
     keep_original_audio = getattr(job, "keep_original_audio", 0) or 0
     background_music_strategy = getattr(job, "background_music_strategy", "deterministic") or "deterministic"
-    
+
     # replace_source_audio = keep_original_audio == 0 AND background_music_strategy != "none"
     job_replace_audio = (keep_original_audio == 0) and (background_music_strategy != "none")
     env_replace_audio = os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"}
-    
+
     # Use job-specific config if the job has these fields (uploaded video), otherwise use env default
     replace_source_audio = job_replace_audio if hasattr(job, "keep_original_audio") else env_replace_audio
-    
+
     run_demucs_for_effects = (
-        os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
-        and shutil.which("demucs") is not None
+            os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
+            and shutil.which("demucs") is not None
     )
     job_subtitle_offset = getattr(job, "subtitle_offset_seconds", None)
     global_subtitle_offset = (
@@ -1036,7 +1113,7 @@ def _build_service_for_job(job):
         tts_provider=tts_provider,
         tts_provider_api_key=provider_settings.get("api_key") if provider_settings else None,
         tts_provider_model=getattr(job, "tts_model", None)
-        or (provider_settings.get("default_model") if provider_settings else None),
+                           or (provider_settings.get("default_model") if provider_settings else None),
         tts_style=getattr(job, "tts_style", "natural") or "natural",
         translation_adaptation=translation_adaptation,
         generate_subtitles=True,
@@ -1070,8 +1147,8 @@ def _is_content_os_job(job) -> bool:
     return bool(
         job
         and (
-            str(job.source_url or "").startswith("content_os://")
-            or str(job.source_language or "").startswith("content_os")
+                str(job.source_url or "").startswith("content_os://")
+                or str(job.source_language or "").startswith("content_os")
         )
     )
 
@@ -1095,6 +1172,16 @@ RETRY_DELAY_SECONDS = 30
 
 
 async def _run_job(job_id: str) -> None:
+    try:
+        async with _get_job_run_semaphore():
+            await _run_job_unlocked(job_id)
+    finally:
+        # Also covers a task cancelled while still waiting for a semaphore
+        # slot; _run_job_unlocked performs the same pop after normal runs.
+        _running_tasks.pop(job_id, None)
+
+
+async def _run_job_unlocked(job_id: str) -> None:
     job = store.get_job(job_id)
     if job is None:
         return
@@ -1241,9 +1328,9 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
 
 
 def _write_job_srt_artifacts(
-    job_id: str,
-    source_segments: List[Dict[str, Any]],
-    translated_segments: List[Dict[str, Any]],
+        job_id: str,
+        source_segments: List[Dict[str, Any]],
+        translated_segments: List[Dict[str, Any]],
 ) -> None:
     job_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -3889,6 +3976,22 @@ async def remix_plan(body: RemixPlanBody, user_id: int = Depends(get_current_use
 
 @app.post("/api/jobs")
 async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_id)):
+    normalized_url = _extract_first_video_url(body.url)
+    classification = await asyncio.to_thread(_video_url_classifier.classify, normalized_url)
+    if classification.platform.value in {"youtube", "tiktok", "douyin"}:
+        if classification.intent == URLIntent.CHANNEL:
+            raise HTTPException(
+                400,
+                "Đây là link kênh/profile. Hãy bật 'Tải toàn bộ video của kênh' để quét và xử lý cả kênh.",
+            )
+        if classification.intent != URLIntent.VIDEO:
+            raise HTTPException(
+                400,
+                "Link không phải link video cụ thể. Hãy dán đúng link của một video hoặc bật chế độ tải toàn bộ kênh.",
+            )
+        normalized_url = classification.resolved_url
+    body.url = normalized_url
+
     remix_plan = build_remix_plan(
         enabled=body.remix_enabled,
         platforms=body.remix_platforms,
@@ -3897,7 +4000,8 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         free_mode=True,
     )
     if body.remix_enabled:
-        body.processing_mode = body.processing_mode if body.processing_mode in {"quality", "pro"} else remix_plan.processing_mode
+        body.processing_mode = body.processing_mode if body.processing_mode in {"quality",
+                                                                                "pro"} else remix_plan.processing_mode
         if body.translation_mode == "faithful":
             body.translation_mode = remix_plan.translation_mode
         body.review_before_render = False  # Automatic mode - skip review step
@@ -3964,7 +4068,7 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         elif candidate.exists():
             logo_path = str(candidate)
 
-    normalized_url = _extract_first_video_url(body.url)
+    normalized_url = body.url
     job = store.create_job(
         user_id, normalized_url, body.target_language,
         source_language=body.source_language or "auto",
@@ -4000,21 +4104,117 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
     return job.to_dict()
 
 
+@app.post("/api/channel-downloads/analyze")
+async def analyze_channel_download(
+        body: ChannelAnalyzeBody,
+        user_id: int = Depends(get_current_user_id),
+):
+    del user_id  # Authentication/ownership gate; scan itself creates no data.
+    try:
+        result = await asyncio.to_thread(
+            _channel_listing_service.scan,
+            _extract_first_video_url(body.url),
+            body.max_videos,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("Channel analyze failed for %s: %s", body.url, exc, exc_info=True)
+        raise HTTPException(400, str(exc)) from exc
+    payload = result.to_dict(include_videos=False)
+    payload["preview"] = [video.to_dict() for video in result.videos[:50]]
+    payload["preview_truncated"] = len(result.videos) > 50
+    return payload
+
+
+@app.post("/api/channel-downloads/process")
+async def process_channel_download(
+        body: ChannelProcessBody,
+        user_id: int = Depends(get_current_user_id),
+):
+    if body.review_before_render:
+        raise HTTPException(
+            400,
+            "Chế độ xem/sửa phụ đề thủ công không dùng được khi xử lý toàn bộ kênh.",
+        )
+
+    try:
+        scan = await asyncio.to_thread(
+            _channel_listing_service.scan,
+            _extract_first_video_url(body.url),
+            body.max_videos,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("Channel process scan failed for %s: %s", body.url, exc, exc_info=True)
+        raise HTTPException(400, str(exc)) from exc
+
+    candidates = list(scan.videos)
+    skipped_existing: list[str] = []
+    if body.skip_existing:
+        existing = store.existing_source_urls_for_user(
+            user_id, [candidate.source_url for candidate in candidates]
+        )
+        skipped_existing = [candidate.source_url for candidate in candidates if candidate.source_url in existing]
+        candidates = [candidate for candidate in candidates if candidate.source_url not in existing]
+
+    user = store.get_user_by_id(user_id)
+    total_cost = JOB_COST_CREDITS * len(candidates)
+    if JOB_COST_CREDITS > 0 and user["credits"] < total_cost:
+        raise HTTPException(
+            402,
+            f"Kênh có {len(candidates)} video mới, cần {total_cost} credit nhưng tài khoản chỉ còn "
+            f"{user['credits']}. Giảm giới hạn video hoặc nạp thêm credit.",
+        )
+
+    base_payload = body.model_dump()
+    base_payload.pop("max_videos", None)
+    base_payload.pop("skip_existing", None)
+    created: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    for candidate in candidates:
+        try:
+            payload = dict(base_payload)
+            payload["url"] = candidate.source_url
+            single_body = NewJobBody(**payload)
+            job = await create_job(single_body, user_id)
+            created.append({
+                "job_id": job.get("id"),
+                "source_url": candidate.source_url,
+                "title": candidate.title,
+            })
+        except Exception as exc:
+            logger.exception("Could not create channel job for %s", candidate.source_url)
+            failed.append({"source_url": candidate.source_url, "error": str(exc)})
+
+    return {
+        "ok": bool(created) or not candidates,
+        "platform": scan.platform.value,
+        "channel_title": scan.channel_title,
+        "scanned": len(scan.videos),
+        "created_count": len(created),
+        "skipped_existing_count": len(skipped_existing),
+        "failed_count": len(failed),
+        "created": created,
+        "skipped_existing": skipped_existing,
+        "failed": failed,
+        "warnings": scan.warnings,
+        "max_concurrent_processing": _WEB_MAX_CONCURRENT_JOBS,
+    }
+
+
 @app.post("/api/upload-video")
 async def upload_video(
-    file: UploadFile = File(...),
-    target_language: str = Form("vi"),
-    source_language: str = Form("auto"),
-    logo_path: Optional[str] = Form(None),
-    logo_corner: str = Form("bottom_right"),
-    logo_size_px: int = Form(120),
-    tts_voice: Optional[str] = Form(None),
-    review_before_render: bool = Form(False),
-    animated_subtitle_config: Optional[str] = Form(None),
-    video_template_config: Optional[str] = Form(None),
-    keep_original_audio: int = Form(0),
-    background_music_strategy: str = Form("deterministic"),
-    user_id: int = Depends(get_current_user_id),
+        file: UploadFile = File(...),
+        target_language: str = Form("vi"),
+        source_language: str = Form("auto"),
+        logo_path: Optional[str] = Form(None),
+        logo_corner: str = Form("bottom_right"),
+        logo_size_px: int = Form(120),
+        tts_voice: Optional[str] = Form(None),
+        review_before_render: bool = Form(False),
+        animated_subtitle_config: Optional[str] = Form(None),
+        video_template_config: Optional[str] = Form(None),
+        keep_original_audio: int = Form(0),
+        background_music_strategy: str = Form("deterministic"),
+        user_id: int = Depends(get_current_user_id),
 ):
     """Upload a video file directly instead of providing a URL."""
     # Validate file type
@@ -4022,7 +4222,7 @@ async def upload_video(
     file_ext = Path(file.filename or "").suffix.lower()
     if file_ext not in allowed_extensions:
         raise HTTPException(400, f"Định dạng file không được hỗ trợ. Chỉ chấp nhận: {', '.join(allowed_extensions)}")
-    
+
     # Validate file size (max 500MB)
     MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
     file_size = 0
@@ -4030,15 +4230,15 @@ async def upload_video(
         file_size += len(chunk)
         if file_size > MAX_FILE_SIZE:
             raise HTTPException(400, "File quá lớn. Kích thước tối đa: 500MB")
-    
+
     # Reset file pointer
     await file.seek(0)
-    
+
     # Generate unique filename
     video_id = uuid.uuid4().hex[:12]
     safe_filename = f"{user_id}_{video_id}{file_ext}"
     video_path = _VIDEO_UPLOAD_DIR / safe_filename
-    
+
     # Save uploaded file
     try:
         with open(video_path, "wb") as f:
@@ -4046,14 +4246,14 @@ async def upload_video(
                 f.write(chunk)
     except Exception as e:
         raise HTTPException(500, f"Lỗi khi lưu file: {str(e)}")
-    
+
     # Parse JSON configs
     try:
         animated_config = json.loads(animated_subtitle_config) if animated_subtitle_config else None
         template_config = json.loads(video_template_config) if video_template_config else None
     except json.JSONDecodeError:
         raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
-    
+
     # Create job with file:// URL
     file_url = f"file://{video_path}"
     job = store.create_job(
@@ -4071,15 +4271,15 @@ async def upload_video(
         keep_original_audio=keep_original_audio,
         background_music_strategy=background_music_strategy,
     )
-    
+
     # Deduct credits if needed
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
-    
+
     # Start job processing
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
-    
+
     return {"job_id": job.id, "job": job.to_dict()}
 
 
@@ -4093,9 +4293,11 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
         try:
             parsed = urllib.parse.urlparse(url)
             if parsed.scheme not in {"http", "https"}:
-                issues.append({"severity": "error", "code": "invalid_url", "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
+                issues.append({"severity": "error", "code": "invalid_url",
+                               "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
         except Exception:
-            issues.append({"severity": "error", "code": "invalid_url", "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
+            issues.append({"severity": "error", "code": "invalid_url",
+                           "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
 
     processing_mode = (body.processing_mode or "fast").strip().lower()
     if processing_mode not in {"fast", "quality", "pro"}:
@@ -4185,14 +4387,17 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
     if aspect not in {"source", "9:16", "16:9", "1:1"}:
         issues.append({"severity": "warning", "code": "unknown_aspect", "message": f"Tỷ lệ đầu ra lạ: {aspect}."})
     elif aspect == "16:9":
-        issues.append({"severity": "ok", "code": "youtube_16_9", "message": "Preset YouTube 16:9 sẵn sàng cho video ngang."})
+        issues.append(
+            {"severity": "ok", "code": "youtube_16_9", "message": "Preset YouTube 16:9 sẵn sàng cho video ngang."})
     elif aspect == "9:16":
-        issues.append({"severity": "ok", "code": "short_form_9_16", "message": "Preset 9:16 sẵn sàng cho Shorts/TikTok/Reels."})
+        issues.append(
+            {"severity": "ok", "code": "short_form_9_16", "message": "Preset 9:16 sẵn sàng cho Shorts/TikTok/Reels."})
 
     if body.animated_subtitle_config and (body.animated_subtitle_config.get("effect") == "karaoke"):
         issues.append({"severity": "ok", "code": "karaoke_subtitle", "message": "Subtitle Karaoke đang bật."})
     elif not body.animated_subtitle_config:
-        issues.append({"severity": "warning", "code": "subtitle_disabled", "message": "Subtitle động đang tắt; video có thể kém bắt mắt hơn."})
+        issues.append({"severity": "warning", "code": "subtitle_disabled",
+                       "message": "Subtitle động đang tắt; video có thể kém bắt mắt hơn."})
 
     return {"ok": not any(issue["severity"] == "error" for issue in issues), "issues": issues}
 
@@ -5053,7 +5258,8 @@ def _probe_provider(provider: str, api_key: Optional[str], api_secret: Optional[
             if model_id.startswith(("gpt-", "o")) and "tts" not in model_id and "audio" not in model_id
         })
         models = tts_models or PROVIDER_CATALOG["openai"]["models"]
-        voices = [{"id": f"openai:{voice}", "label": voice.title(), "gender": "neutral"} for voice in OPENAI_BUILTIN_VOICES]
+        voices = [{"id": f"openai:{voice}", "label": voice.title(), "gender": "neutral"} for voice in
+                  OPENAI_BUILTIN_VOICES]
         return {"models": models, "llm_models": llm_models or ["gpt-5.6-luna"], "voices": voices}
     if provider == "gemini":
         if not api_key:
@@ -5137,7 +5343,8 @@ def provider_settings(user_id: int = Depends(get_current_user_id)):
             "default_model": saved.get("default_model") if saved else (meta["models"][0] if meta["models"] else None),
             "default_voice": saved.get("default_voice") if saved else None,
             "available_models": (saved.get("extra", {}) if saved else {}).get("models") or meta["models"],
-            "available_llm_models": (saved.get("extra", {}) if saved else {}).get("llm_models") or (meta["models"] if key in {"gemini"} else []),
+            "available_llm_models": (saved.get("extra", {}) if saved else {}).get("llm_models") or (
+                meta["models"] if key in {"gemini"} else []),
             "available_voices": (saved.get("extra", {}) if saved else {}).get("voices") or meta["voices"],
             "connect_url": meta.get("connect_url"),
             "extra": saved.get("extra", {}) if saved else {},
@@ -5158,10 +5365,12 @@ def save_provider_settings(body: ProviderSettingsBody, user_id: int = Depends(ge
     extra = dict((current or {}).get("extra") or {})
     extra.update(body.extra or {})
     if api_key or (provider == "xtts"):
-        discovery = _probe_provider(provider, api_key or (current or {}).get("api_key"), body.api_secret or (current or {}).get("api_secret"))
+        discovery = _probe_provider(provider, api_key or (current or {}).get("api_key"),
+                                    body.api_secret or (current or {}).get("api_secret"))
         extra.update(discovery)
     discovered_models = extra.get("llm_models") or extra.get("models") or []
-    default_model = body.default_model or (discovered_models[0] if discovered_models else (meta["models"][0] if meta["models"] else None))
+    default_model = body.default_model or (
+        discovered_models[0] if discovered_models else (meta["models"][0] if meta["models"] else None))
     store.upsert_provider_settings(
         user_id=user_id,
         provider=provider,
@@ -5184,9 +5393,9 @@ def delete_provider_settings(provider: str, user_id: int = Depends(get_current_u
 
 @app.get("/api/voices")
 def list_voices(
-    language: str = "vi",
-    provider: str = "edge",
-    user_id: int = Depends(get_current_user_id),
+        language: str = "vi",
+        provider: str = "edge",
+        user_id: int = Depends(get_current_user_id),
 ):
     """Curated male/female voice choices for `language`, for the optional
     'chọn giọng đọc' dropdown. Empty list means: no curated options for
@@ -5679,7 +5888,8 @@ def _segment_quality_report(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     if empty:
         warnings.append(f"{empty} segment đang rỗng.")
     if too_long:
-        warnings.append(f"{too_long} segment có chữ quá dài so với timestamp; nên rút gọn để TTS/subtitle tự nhiên hơn.")
+        warnings.append(
+            f"{too_long} segment có chữ quá dài so với timestamp; nên rút gọn để TTS/subtitle tự nhiên hơn.")
     score = 100 - min(55, too_long * 6 + empty * 10)
     return {"score": max(0, score), "warnings": warnings}
 
@@ -6272,6 +6482,7 @@ def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # Include Content OS router
 app.include_router(content_os_router)
