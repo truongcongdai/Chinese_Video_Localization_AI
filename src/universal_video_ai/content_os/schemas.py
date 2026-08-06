@@ -33,6 +33,7 @@ class CreateProjectRequest(BaseModel):
     max_source_items: int = Field(default=10, ge=1, le=100)
     user_instructions: str = Field(default="", max_length=2000)
     auto_download_sources: bool = Field(default=False)
+    branding_config: Optional[Dict[str, Any]] = None
     
     @field_validator('target_platforms')
     @classmethod

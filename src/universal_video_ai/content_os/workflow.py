@@ -825,6 +825,8 @@ class ContentOSWorkflow:
                 "duration": duration,
                 "resolution": self._get_resolution_for_platform(project.target_platform),
                 "assets": context.get("resolved_assets", {}),
+                "branding_config": (project.settings or {}).get("branding_config", {}),
+                "branding_context": [user_id, run_id, project.channel_name, project.topic],
             })
 
             # Start render with actual audio and subtitles

@@ -192,6 +192,7 @@ class ContentOSRepository:
         subtitle_style_id: str,
         background_music_enabled: bool,
         user_instructions: str,
+        branding_config: Optional[Dict[str, Any]] = None,
     ) -> ContentOSProject:
         now = time.time()
         settings = {
@@ -199,6 +200,7 @@ class ContentOSRepository:
             "visual_style": visual_style,
             "voice_id": voice_id,
             "subtitle_style_id": subtitle_style_id,
+            "branding_config": branding_config or {},
         }
         
         with self._connect() as conn:

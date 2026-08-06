@@ -68,6 +68,7 @@ class CreateProjectRequest(BaseModel):
     subtitle_style_id: str = ""
     background_music_enabled: bool = True
     user_instructions: str = ""
+    branding_config: Optional[Dict[str, Any]] = None
 
 
 class CreateRunRequest(BaseModel):
@@ -371,6 +372,7 @@ async def create_project(
         subtitle_style_id=request.subtitle_style_id,
         background_music_enabled=request.background_music_enabled,
         user_instructions=request.user_instructions,
+        branding_config=request.branding_config,
     )
     
     return ProjectResponse(

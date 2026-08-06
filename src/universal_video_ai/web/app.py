@@ -27,16 +27,15 @@ import threading
 import gc
 import tempfile
 import zipfile
-import io
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 try:
-    import openai
-
-    OPENAI_AVAILABLE = True
+    import openai as _openai
 except ImportError:
-    OPENAI_AVAILABLE = False
+    _openai = None
+
+OPENAI_AVAILABLE = _openai is not None
 
 import requests
 
@@ -52,6 +51,10 @@ from universal_video_ai.orchestrator.service import (
 )
 from universal_video_ai.trends.service import TrendScanner
 from universal_video_ai.render.renderer import RenderConfig, AnimatedSubtitleConfig, VideoTemplateConfig
+from universal_video_ai.render.branding import (
+    BrandingConfig, build_branding_filters, fingerprint_comment,
+    stamp_fingerprint_metadata, write_branding_manifest,
+)
 from universal_video_ai.render.animated_subtitles import SubtitleEffect, SubtitleStyle
 from universal_video_ai.postprocess.video_transform import (
     TransformConfig,
@@ -168,6 +171,48 @@ DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
+
+
+def _store_create_job(*args: Any, branding_config: Optional[Dict[str, Any]] = None, **kwargs: Any):
+    """Create a job while remaining compatible with pre-branding Store builds.
+
+    A partially applied deployment can leave app.py newer than store.py. Passing
+    ``branding_config`` directly in that state raises ``unexpected keyword
+    argument`` before the server can start a job. This helper feature-detects
+    Store.create_job and persists branding through the dedicated setter when
+    the older call signature is still loaded.
+    """
+    normalized_branding = None
+    if branding_config:
+        normalized_branding = BrandingConfig.from_dict(branding_config).to_dict()
+
+    create_method = store.create_job
+    try:
+        supports_branding = "branding_config" in inspect.signature(create_method).parameters
+    except (TypeError, ValueError):
+        supports_branding = False
+
+    if supports_branding:
+        kwargs["branding_config"] = normalized_branding
+
+    job = create_method(*args, **kwargs)
+
+    if normalized_branding and not supports_branding:
+        setter = getattr(store, "set_job_branding_config", None)
+        if callable(setter):
+            setter(job.id, normalized_branding)
+        else:
+            logger.warning(
+                "Store.create_job does not support branding_config and no "
+                "set_job_branding_config() fallback is available; apply the bundled store.py."
+            )
+
+    if normalized_branding is not None:
+        try:
+            job.branding_config = normalized_branding
+        except Exception:
+            pass
+    return job
 
 
 def _is_expected_windows_client_disconnect(context: Dict[str, Any]) -> bool:
@@ -329,6 +374,9 @@ class NewJobBody(BaseModel):
     logo_path: Optional[str] = None
     logo_corner: str = "bottom_right"  # top_left | top_right | bottom_left | bottom_right
     logo_size_px: int = 120
+    # Optional global text branding. This same payload is inherited by every
+    # video created from a channel batch.
+    branding_config: Optional[Dict[str, Any]] = None
     # Explicit Edge-TTS voice id from GET /api/voices, e.g.
     # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
     tts_voice: Optional[str] = None
@@ -416,6 +464,7 @@ class CreatorJobBody(BaseModel):
     tts_voice: Optional[str] = None
     image_provider: str = "stock"  # stock | cpu_ai | ai_video
     product_media_paths: List[str] = Field(default_factory=list)
+    branding_config: Optional[Dict[str, Any]] = None
 
 
 class CreatorSuggestionBody(BaseModel):
@@ -921,11 +970,17 @@ def _build_service_for_job(job):
     )
 
     watermark_boxes = _parse_fractional_boxes_env("WATERMARK_BOXES_FRACTIONAL")
+    branding_config = BrandingConfig.from_dict(getattr(job, "branding_config", None))
+    if branding_config.enabled:
+        branding_config = branding_config.with_fingerprint_context(
+            job.user_id, job.id, job.source_url, job.target_language
+        )
 
     render_config = RenderConfig(
         preset=WEB_RENDER_PRESET,
         timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
         watermark_boxes_fractional=watermark_boxes,
+        branding_config=branding_config,
     )
 
     # Build animated subtitle config if provided
@@ -1013,6 +1068,7 @@ def _build_service_for_job(job):
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
+            branding_config=branding_config,
         )
     else:
         render_config = RenderConfig(
@@ -1022,6 +1078,7 @@ def _build_service_for_job(job):
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
+            branding_config=branding_config,
         )
 
     translation_mode = getattr(job, "translation_mode", "faithful") or "faithful"
@@ -2048,7 +2105,7 @@ def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, An
 
 def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     """Generate script suggestions using OpenAI API (GPT-4, GPT-3.5, etc.)."""
-    if not OPENAI_AVAILABLE:
+    if _openai is None:
         raise RuntimeError("OpenAI library chưa được cài đặt. Chạy: pip install openai")
 
     api_key = _env_first("OPENAI_API_KEY")
@@ -2059,7 +2116,7 @@ def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     prompt, scene_count = _creator_ai_prompt(body, require_search=False)
 
     try:
-        client = openai.OpenAI(api_key=api_key)
+        client = _openai.OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model=configured_model,
             messages=[
@@ -2830,7 +2887,7 @@ def _generate_dalle_image(
         prompt: str, output_path: Path, aspect_ratio: str,
 ) -> Path:
     """Generate image using DALL-E API for better quality."""
-    if not OPENAI_AVAILABLE:
+    if _openai is None:
         raise RuntimeError("OpenAI library not available")
 
     openai_api_key = _env_first("OPENAI_API_KEY")
@@ -2847,7 +2904,7 @@ def _generate_dalle_image(
         size = "1024x1792"  # Portrait
 
     try:
-        client = openai.OpenAI(api_key=openai_api_key)
+        client = _openai.OpenAI(api_key=openai_api_key)
         response = client.images.generate(
             model="dall-e-3",
             prompt=image_prompt,
@@ -3599,12 +3656,18 @@ def _synthesize_creator_cues(
 def _add_creator_voice_and_subtitles(
         video_path: Path, voice_path: Path, subtitles_path: Path,
         output_path: Path, duration: float,
+        frame_width: int, frame_height: int,
+        branding_config: Optional[BrandingConfig] = None,
 ) -> None:
     # On Windows, an absolute `D:/...` path inside a filtergraph is parsed as
     # `filename=D` followed by a new `:` option. Run FFmpeg in the subtitle
     # directory and pass only the generated relative filename instead. This
     # also avoids fragile cross-platform escaping of drive letters/spaces.
     subtitle_filter = f"subtitles=filename={subtitles_path.name}"
+    branding_config = (branding_config or BrandingConfig()).normalized()
+    # Branding is below subtitles so the caption remains fully readable.
+    video_filters = build_branding_filters(branding_config, frame_width, frame_height)
+    video_filters.append(subtitle_filter)
     # Never time-compress or stretch narration. The selected duration drives
     # script length; if real TTS happens to run longer, the visual timeline is
     # extended before this function is called. A shorter voice gets silence at
@@ -3612,18 +3675,25 @@ def _add_creator_voice_and_subtitles(
     audio_filters = ["apad"]
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path), "-i", str(voice_path),
-        "-vf", subtitle_filter, "-filter:a", ",".join(audio_filters),
+        "-vf", ",".join(video_filters), "-filter:a", ",".join(audio_filters),
         "-map", "0:v:0", "-map", "1:a:0", "-t", f"{duration:.3f}",
         "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", str(WEB_RENDER_CRF),
         "-r", "30", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", str(output_path),
+        "-movflags", "+faststart",
     ]
+    comment = fingerprint_comment(branding_config)
+    if comment:
+        cmd.extend(["-metadata", f"comment={comment}", "-metadata", f"description={comment}"])
+    cmd.append(str(output_path))
     result = subprocess.run(
         cmd, cwd=str(subtitles_path.parent), capture_output=True, text=True,
         check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "FFmpeg voice/subtitle render failed")[-4000:])
+    if branding_config.enabled:
+        stamp_fingerprint_metadata(output_path, branding_config, logger)
+        write_branding_manifest(output_path, branding_config, source_path=video_path, logger=logger)
 
 
 def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
@@ -3943,8 +4013,14 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
 
         store.update_job(job_id, progress_note="Đang ghép voice và đóng subtitle...")
         output_path = output_dir / "output_generated.mp4"
+        creator_branding = BrandingConfig.from_dict(body.branding_config)
+        if creator_branding.enabled:
+            creator_branding = creator_branding.with_fingerprint_context(
+                job.user_id, job.id, body.topic, body.aspect_ratio
+            )
         _add_creator_voice_and_subtitles(
             visual_path, voice_path, subtitles_path, output_path, final_duration,
+            width, height, creator_branding,
         )
         store.update_job(
             job_id, status="done",
@@ -4069,12 +4145,13 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
             logo_path = str(candidate)
 
     normalized_url = body.url
-    job = store.create_job(
+    job = _store_create_job(
         user_id, normalized_url, body.target_language,
         source_language=body.source_language or "auto",
         logo_path=logo_path,
         logo_corner=body.logo_corner or "bottom_right",
         logo_size_px=body.logo_size_px or 120,
+        branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
         tts_voice=body.tts_voice or None,
         review_mode=body.review_before_render,
         animated_subtitle_config=body.animated_subtitle_config,
@@ -4208,6 +4285,7 @@ async def upload_video(
         logo_path: Optional[str] = Form(None),
         logo_corner: str = Form("bottom_right"),
         logo_size_px: int = Form(120),
+        branding_config: Optional[str] = Form(None),
         tts_voice: Optional[str] = Form(None),
         review_before_render: bool = Form(False),
         animated_subtitle_config: Optional[str] = Form(None),
@@ -4251,12 +4329,13 @@ async def upload_video(
     try:
         animated_config = json.loads(animated_subtitle_config) if animated_subtitle_config else None
         template_config = json.loads(video_template_config) if video_template_config else None
+        branding_data = BrandingConfig.from_dict(json.loads(branding_config)).to_dict() if branding_config else None
     except json.JSONDecodeError:
         raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
 
     # Create job with file:// URL
     file_url = f"file://{video_path}"
-    job = store.create_job(
+    job = _store_create_job(
         user_id=user_id,
         source_url=file_url,
         target_language=target_language,
@@ -4264,6 +4343,7 @@ async def upload_video(
         logo_path=logo_path,
         logo_corner=logo_corner,
         logo_size_px=logo_size_px,
+        branding_config=branding_data,
         tts_voice=tts_voice,
         review_mode=review_before_render,
         animated_subtitle_config=animated_config,
@@ -4374,6 +4454,18 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
             "message": "Xem & sửa phụ đề trước render chỉ dùng cho 1 link mỗi lần.",
         })
 
+    branding = BrandingConfig.from_dict(body.branding_config)
+    if body.branding_config and body.branding_config.get("enabled") and not branding.enabled:
+        issues.append({
+            "severity": "error", "code": "branding_text_missing",
+            "message": "Đã bật bảo vệ thương hiệu nhưng chưa nhập tên kênh/watermark.",
+        })
+    elif branding.enabled:
+        issues.append({
+            "severity": "ok", "code": "global_branding",
+            "message": f"Watermark động và fingerprint sẽ được áp dụng với tên: {branding.text}.",
+        })
+
     user = store.get_user_by_id(user_id)
     required_credits = JOB_COST_CREDITS * max(1, url_count)
     if JOB_COST_CREDITS > 0 and user["credits"] < required_credits:
@@ -4456,11 +4548,12 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
         raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
 
-    job = store.create_job(
+    job = _store_create_job(
         user_id,
         f"creator:{body.topic.strip()}",
         body.target_language,
         source_language=f"creator:{'ai' if body.image_provider == 'cpu_ai' else body.image_provider}",
+        branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)

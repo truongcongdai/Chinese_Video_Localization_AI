@@ -15,6 +15,12 @@ from universal_video_ai.render.subtitle_region_tracker import (
     AdaptiveSubtitleRegionTracker,
     TrackedRegion,
 )
+from universal_video_ai.render.branding import (
+    BrandingConfig,
+    build_branding_filters,
+    stamp_fingerprint_metadata,
+    write_branding_manifest,
+)
 from universal_video_ai.render.animated_subtitles import (
     AnimatedSubtitleGenerator,
     SubtitleEffect,
@@ -25,7 +31,7 @@ from universal_video_ai.postprocess.video_transform import (
     TransformConfig,
 )
 
-__all__ = ["Renderer", "RenderConfig", "TextOverlay", "AnimatedSubtitleConfig", "VideoTemplateConfig"]
+__all__ = ["Renderer", "RenderConfig", "TextOverlay", "AnimatedSubtitleConfig", "VideoTemplateConfig", "BrandingConfig"]
 
 _logger = logging.getLogger(__name__)
 
@@ -243,6 +249,10 @@ class RenderConfig:
     logo_size_px: int = 120
     # Gap in pixels between the logo and the frame edge.
     logo_margin_px: int = 24
+
+    # Global optional text branding shared by localization, reup/batch and
+    # Content OS outputs. Disabled by default, so existing jobs are unchanged.
+    branding_config: Optional[BrandingConfig] = None
 
     # Adaptive subtitle cleanup. These settings contain no fixed subtitle
     # coordinate. Regions are learned from OCR overlays and normalized to the
@@ -784,6 +794,7 @@ class Renderer:
                 or self.config.watermark_box_fractional is not None
                 or bool(self.config.watermark_boxes_fractional)
                 or logo_configured
+                or bool(self.config.branding_config and self.config.branding_config.normalized().enabled)
                 or bool(self._build_pre_subtitle_transform_filters())
                 or (self.config.animated_subtitle_config and self.config.animated_subtitle_config.enabled and bool(
             subtitle_segments))
@@ -811,6 +822,7 @@ class Renderer:
                     self.config.watermark_box_fractional is not None
                     or self.config.watermark_boxes_fractional
                     or text_overlays
+                    or (self.config.branding_config and self.config.branding_config.normalized().enabled)
             ):
                 dims = self._get_video_dimensions(input_video)
                 if dims is not None:
@@ -900,6 +912,23 @@ class Renderer:
 
             # Add video template filters if enabled
             filters.extend(self._build_video_template_filters())
+
+            # Global branding is intentionally placed before the final subtitle
+            # layer. The runner also routes above the lower subtitle-safe area,
+            # and subtitles remain readable on top even for unusual layouts.
+            if self.config.branding_config and self.config.branding_config.normalized().enabled:
+                if frame_w is None or frame_h is None:
+                    dims = self._get_video_dimensions(input_video)
+                    if dims is not None:
+                        frame_w, frame_h = dims
+                if frame_w is not None and frame_h is not None:
+                    filters.extend(build_branding_filters(
+                        self.config.branding_config, frame_w, frame_h
+                    ))
+                else:
+                    self.logger.warning(
+                        "Branding enabled but source dimensions are unavailable; skipping visible branding."
+                    )
 
             # Add subtitles filter if provided. The `subtitles=` filter option
             # value is itself parsed as filename[:key=value...], so a raw path
@@ -1078,6 +1107,12 @@ class Renderer:
             post_transform_config = self._post_subtitle_transform_config()
             if post_transform_config:
                 output = self._apply_transformations(output, post_transform_config)
+
+            if self.config.branding_config and self.config.branding_config.normalized().enabled:
+                stamp_fingerprint_metadata(output, self.config.branding_config, self.logger)
+                write_branding_manifest(
+                    output, self.config.branding_config, source_path=video_path, logger=self.logger
+                )
 
             return output
 

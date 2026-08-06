@@ -11,6 +11,14 @@ import subprocess
 import logging
 from pathlib import Path
 
+from universal_video_ai.render.branding import (
+    BrandingConfig,
+    build_branding_filters,
+    fingerprint_comment,
+    stamp_fingerprint_metadata,
+    write_branding_manifest,
+)
+
 
 class RenderStatus(str, Enum):
     """Render workflow status."""
@@ -134,6 +142,12 @@ class Renderer:
             duration = job.metadata.get("duration", 5.0)
             resolution = job.metadata.get("resolution", "1080x1920")
             
+            branding_config = BrandingConfig.from_dict(job.metadata.get("branding_config"))
+            if branding_config.enabled:
+                branding_config = branding_config.with_fingerprint_context(
+                    *(job.metadata.get("branding_context") or [job.user_id, job.run_id, job.job_id])
+                )
+
             # Create video with actual audio and subtitles
             self._create_simple_video(
                 output_path=job.output_path,
@@ -142,6 +156,7 @@ class Renderer:
                 subtitle_path=subtitle_path,
                 duration=duration,
                 assets=job.metadata.get("assets"),
+                branding_config=branding_config,
             )
             
             job.status = RenderStatus.COMPLETED
@@ -158,7 +173,16 @@ class Renderer:
         
         return job
     
-    def _create_simple_video(self, output_path: str, resolution: str, audio_path: Optional[str] = None, subtitle_path: Optional[str] = None, duration: float = 5.0, assets: Optional[Dict[str, Any]] = None) -> None:
+    def _create_simple_video(
+        self,
+        output_path: str,
+        resolution: str,
+        audio_path: Optional[str] = None,
+        subtitle_path: Optional[str] = None,
+        duration: float = 5.0,
+        assets: Optional[Dict[str, Any]] = None,
+        branding_config: Optional[BrandingConfig] = None,
+    ) -> None:
         """
         Create a video with audio and subtitles using FFmpeg.
         
@@ -286,11 +310,20 @@ class Renderer:
         else:
             video_filters.append("[0:v]format=yuv420p[basev]")
 
+        branding_config = (branding_config or BrandingConfig()).normalized()
+        base_label = "basev"
+        brand_filters = build_branding_filters(branding_config, int(width), int(height))
+        if brand_filters:
+            video_filters.append(f"[basev]{','.join(brand_filters)}[brandv]")
+            base_label = "brandv"
+
         if subtitle_filter:
-            video_filters.append(f"[basev]{subtitle_filter}[vout]")
+            # Keep captions above the branding layer for readability. The
+            # edge runner also avoids the lower subtitle-safe area.
+            video_filters.append(f"[{base_label}]{subtitle_filter}[vout]")
             video_map = "[vout]"
         else:
-            video_map = "[basev]"
+            video_map = f"[{base_label}]"
 
         if video_filters:
             cmd.extend(["-filter_complex", ";".join(video_filters)])
@@ -310,6 +343,9 @@ class Renderer:
         if audio_index is not None:
             cmd.extend(["-c:a", "aac", "-af", "apad"])
         cmd.extend(["-t", f"{duration:.3f}"])
+        comment = fingerprint_comment(branding_config)
+        if comment:
+            cmd.extend(["-metadata", f"comment={comment}", "-metadata", f"description={comment}"])
         cmd.extend([
             "-y",
             str(output_path_obj),
@@ -328,6 +364,10 @@ class Renderer:
         if result.returncode != 0:
             self.logger.error(f"FFmpeg stderr: {result.stderr}")
             raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+
+        if branding_config.enabled:
+            stamp_fingerprint_metadata(output_path_obj, branding_config, self.logger)
+            write_branding_manifest(output_path_obj, branding_config, logger=self.logger)
 
     def _store_render_job(self, job: RenderJob):
         """Store render job as artifact."""

@@ -4,6 +4,7 @@ Adapter to convert Content OS runs into existing localization jobs.
 Bridges the Content OS workflow with the existing video localization pipeline
 by creating jobs in the web store that the orchestrator can process.
 """
+import inspect
 import logging
 import time
 import uuid
@@ -220,14 +221,28 @@ class PipelineAdapter:
         store = Store(str(self.web_store_db_path))
         
         try:
-            created_job = store.create_job(
-                user_id=user_id,
-                source_url=source_url,
-                target_language=project.target_language,
-                source_language=f"content_os:{run_id}",
-                tts_provider="edge",
-                tts_voice="",
-            )
+            create_kwargs = {
+                "user_id": user_id,
+                "source_url": source_url,
+                "target_language": project.target_language,
+                "source_language": f"content_os:{run_id}",
+                "tts_provider": "edge",
+                "tts_voice": "",
+            }
+            branding_config = (project.settings or {}).get("branding_config", {})
+            try:
+                supports_branding = (
+                    "branding_config" in inspect.signature(store.create_job).parameters
+                )
+            except (TypeError, ValueError):
+                supports_branding = False
+            if supports_branding:
+                create_kwargs["branding_config"] = branding_config
+            created_job = store.create_job(**create_kwargs)
+            if branding_config and not supports_branding:
+                setter = getattr(store, "set_job_branding_config", None)
+                if callable(setter):
+                    setter(created_job.id, branding_config)
             self.logger.info(f"Store.create_job returned job {created_job.id}")
         except Exception as e:
             self.logger.error(f"Store.create_job failed: {e}")

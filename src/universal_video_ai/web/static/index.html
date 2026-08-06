@@ -742,6 +742,43 @@
       </div>
     </div>
 
+    <div class="field" style="margin-top:16px;">
+      <label>
+        <input type="checkbox" id="branding-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
+        Bảo vệ thương hiệu cho video đầu ra
+      </label>
+      <div class="muted-help">Áp dụng cho link đơn, upload, xử lý cả kênh, Creator và Content OS khi được bật.</div>
+    </div>
+    <div id="branding-panel" class="hidden" style="margin-bottom:14px;padding:16px;background:var(--panel-2);border-radius:var(--radius-sm);border:1px solid var(--border);">
+      <div class="row">
+        <div class="field">
+          <label>Tên kênh / watermark</label>
+          <input id="branding-text-input" maxlength="80" placeholder="VD: @TechReviewVN">
+        </div>
+        <div class="field" style="flex:.65">
+          <label>Mức bảo vệ</label>
+          <select id="branding-preset-select">
+            <option value="subtle">Nhẹ</option>
+            <option value="balanced" selected>Cân bằng</option>
+            <option value="strong">Mạnh</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="align-items:flex-start;">
+        <div class="field">
+          <label><input type="checkbox" id="branding-edge-checkbox" checked style="width:auto;margin-right:6px">Tên kênh chạy quanh viền</label>
+          <label><input type="checkbox" id="branding-diagonal-checkbox" checked style="width:auto;margin-right:6px">Quét chéo góc theo nhịp</label>
+          <label><input type="checkbox" id="branding-pattern-checkbox" checked style="width:auto;margin-right:6px">Pattern mờ chuyển động</label>
+          <label><input type="checkbox" id="branding-fingerprint-checkbox" checked style="width:auto;margin-right:6px">Fingerprint ẩn + manifest</label>
+        </div>
+        <div class="field">
+          <label><input type="checkbox" id="branding-avoid-subtitles-checkbox" checked style="width:auto;margin-right:6px">Tránh vùng subtitle</label>
+          <label><input type="checkbox" id="branding-avoid-center-checkbox" checked style="width:auto;margin-right:6px">Hạn chế che chủ thể giữa khung</label>
+        </div>
+      </div>
+      <div class="muted-help">Watermark giúp tăng chi phí xóa/reup và hỗ trợ truy vết, nhưng không thể đảm bảo chống xóa tuyệt đối. Quét chéo góc chỉ xuất hiện theo nhịp ngắn để khó xóa hơn mà vẫn đỡ che nội dung.</div>
+    </div>
+
     <div class="field">
       <label>
         <input type="checkbox" id="logo-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
@@ -1210,6 +1247,15 @@
         <button class="btn secondary small" id="creator-narration-generate" type="button">🎙️ Gen kịch bản voice</button>
       </div>
     </div>
+    <div class="field">
+      <label><input type="checkbox" id="creator-branding-enable" style="width:auto;margin-right:6px">Bảo vệ thương hiệu cho video AI</label>
+    </div>
+    <div id="creator-branding-panel" class="hidden" style="padding:12px;margin-bottom:12px;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);">
+      <div class="row">
+        <div class="field"><label>Tên kênh / watermark</label><input id="creator-branding-text" maxlength="80" placeholder="VD: @TechReviewVN"></div>
+        <div class="field" style="flex:.6"><label>Mức bảo vệ</label><select id="creator-branding-preset"><option value="subtle">Nhẹ</option><option value="balanced" selected>Cân bằng</option><option value="strong">Mạnh</option></select></div>
+      </div>
+    </div>
     <button class="btn gradient" id="creator-submit-btn" disabled>🎨 Tạo video AI</button>
     <div class="creator-progress hidden" id="creator-progress" aria-live="polite">
       <div class="creator-progress-head"><span id="creator-progress-label">Đang chuẩn bị...</span><strong id="creator-progress-percent">0%</strong></div>
@@ -1343,6 +1389,15 @@
           <option value="youtube_short">YouTube Short</option>
           <option value="facebook_reel">Facebook Reel</option>
         </select>
+      </div>
+      <div class="field">
+        <label><input type="checkbox" id="content-os-branding-enable" style="width:auto;margin-right:6px">Bảo vệ thương hiệu cho video Content OS</label>
+      </div>
+      <div id="content-os-branding-panel" class="hidden" style="padding:12px;margin-bottom:12px;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);">
+        <div class="row">
+          <div class="field"><label>Tên kênh</label><input id="content-os-branding-text" maxlength="80" placeholder="Mặc định dùng tên kênh ở trên"></div>
+          <div class="field" style="flex:.6"><label>Mức bảo vệ</label><select id="content-os-branding-preset"><option value="subtle">Nhẹ</option><option value="balanced" selected>Cân bằng</option><option value="strong">Mạnh</option></select></div>
+        </div>
       </div>
       <div class="field">
         <label>Hướng dẫn thêm (tùy chọn)</label>

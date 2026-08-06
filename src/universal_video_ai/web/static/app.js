@@ -857,6 +857,54 @@ $("#creator-lang-select").addEventListener("change", async () => {
   updateCreatorSubmitState();
 });
 
+// ---------------- global branding ----------------
+function getBrandingConfig() {
+  const enabled = Boolean($("#branding-enable-checkbox") && $("#branding-enable-checkbox").checked);
+  const text = enabled && $("#branding-text-input") ? $("#branding-text-input").value.trim() : "";
+  return {
+    enabled,
+    text,
+    preset: $("#branding-preset-select") ? $("#branding-preset-select").value : "balanced",
+    edge_runner_enabled: Boolean($("#branding-edge-checkbox") && $("#branding-edge-checkbox").checked),
+    diagonal_enabled: !$("#branding-diagonal-checkbox") || $("#branding-diagonal-checkbox").checked,
+    pattern_enabled: Boolean($("#branding-pattern-checkbox") && $("#branding-pattern-checkbox").checked),
+    fingerprint_enabled: Boolean($("#branding-fingerprint-checkbox") && $("#branding-fingerprint-checkbox").checked),
+    avoid_subtitles: !$("#branding-avoid-subtitles-checkbox") || $("#branding-avoid-subtitles-checkbox").checked,
+    avoid_center: !$("#branding-avoid-center-checkbox") || $("#branding-avoid-center-checkbox").checked,
+  };
+}
+
+if ($("#branding-enable-checkbox")) {
+  $("#branding-enable-checkbox").onchange = (ev) => {
+    $("#branding-panel").classList.toggle("hidden", !ev.target.checked);
+  };
+}
+if ($("#content-os-branding-enable")) {
+  $("#content-os-branding-enable").onchange = (ev) => {
+    $("#content-os-branding-panel").classList.toggle("hidden", !ev.target.checked);
+  };
+}
+if ($("#creator-branding-enable")) {
+  $("#creator-branding-enable").onchange = (ev) => {
+    $("#creator-branding-panel").classList.toggle("hidden", !ev.target.checked);
+  };
+}
+
+function getCreatorBrandingConfig() {
+  const enabled = Boolean($("#creator-branding-enable") && $("#creator-branding-enable").checked);
+  return {
+    enabled,
+    text: enabled ? $("#creator-branding-text").value.trim() : "",
+    preset: $("#creator-branding-preset") ? $("#creator-branding-preset").value : "balanced",
+    edge_runner_enabled: true,
+    diagonal_enabled: true,
+    pattern_enabled: true,
+    fingerprint_enabled: true,
+    avoid_subtitles: true,
+    avoid_center: true,
+  };
+}
+
 // ---------------- logo overlay ----------------
 let uploadedLogoId = null;
 
@@ -1707,6 +1755,11 @@ $("#submit-btn").onclick = async () => {
     showLocalizationStep(1);
     return;
   }
+  const brandingConfig = getBrandingConfig();
+  if (brandingConfig.enabled && !brandingConfig.text) {
+    $("#submit-error").textContent = "Đã bật bảo vệ thương hiệu nhưng chưa nhập tên kênh.";
+    return;
+  }
   const logoEnabled = $("#logo-enable-checkbox").checked;
   if (logoEnabled && !uploadedLogoId) {
     $("#submit-error").textContent = "Chọn ảnh logo trước (hoặc bỏ tick 'Chèn logo')";
@@ -1743,6 +1796,7 @@ $("#submit-btn").onclick = async () => {
     logo_path: logoEnabled ? uploadedLogoId : null,
     logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
     logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
+    branding_config: getBrandingConfig(),
     review_before_render: reviewMode,
     animated_subtitle_config: getAnimatedSubtitleConfig(),
     priority: $("#queue-priority-checkbox").checked ? "high" : "normal",
@@ -2206,6 +2260,11 @@ $("#creator-submit-btn").onclick = async () => {
   $("#creator-error").style.color = "var(--text-dim)";
   $("#creator-error").textContent = "";
   const topic = $("#creator-topic").value.trim();
+  const creatorBranding = getCreatorBrandingConfig();
+  if (creatorBranding.enabled && !creatorBranding.text) {
+    $("#creator-error").textContent = "Đã bật bảo vệ thương hiệu nhưng chưa nhập tên kênh.";
+    return;
+  }
   if (!creatorFormComplete()) {
     $("#creator-error").textContent = "Cần nhập đủ keyword, visual brief và kịch bản voice trước khi tạo video.";
     updateCreatorSubmitState();
@@ -2225,6 +2284,7 @@ $("#creator-submit-btn").onclick = async () => {
       tts_voice: $("#creator-voice-select").value || null,
       image_provider: $("#creator-image-provider").value,
       product_media_paths: affiliateProductMedia.map(item => item.media_id),
+      branding_config: getCreatorBrandingConfig(),
     })});
     activeCreatorJobId = job.id;
     showCreatorProgress(job);
@@ -3288,6 +3348,19 @@ $("#content-os-create-project-btn").onclick = async () => {
   const duration = parseInt($("#content-os-duration").value);
   const format = $("#content-os-format").value;
   const instructions = $("#content-os-instructions").value.trim();
+  const contentBrandingEnabled = $("#content-os-branding-enable").checked;
+  const contentBrandingText = $("#content-os-branding-text").value.trim() || channelName;
+  const contentBranding = {
+    enabled: contentBrandingEnabled,
+    text: contentBrandingText,
+    preset: $("#content-os-branding-preset").value,
+    edge_runner_enabled: true,
+    diagonal_enabled: true,
+    pattern_enabled: true,
+    fingerprint_enabled: true,
+    avoid_subtitles: true,
+    avoid_center: true,
+  };
 
   if (!channelName || !topic) {
     $("#content-os-project-error").textContent = "Vui lòng nhập tên kênh và chủ đề.";
@@ -3309,6 +3382,7 @@ $("#content-os-create-project-btn").onclick = async () => {
         max_source_items: 10,
         user_instructions: instructions,
         auto_download_sources: false,
+        branding_config: contentBranding,
       }),
     });
 
