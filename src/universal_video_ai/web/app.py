@@ -78,6 +78,9 @@ from universal_video_ai.tts.premium import (
     ElevenLabsTTSBackend,
 )
 from universal_video_ai.translate.adapt import AdaptationConfig
+from universal_video_ai.publishing import (
+    PublishingPackConfig, PublishingPackService, PublishingLLMClient, PublishingLLMConfig,
+)
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
 from universal_video_ai.config import REDIS_URL, TEMP_DIR
@@ -173,43 +176,62 @@ TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 store = Store(_DB_PATH)
 
 
-def _store_create_job(*args: Any, branding_config: Optional[Dict[str, Any]] = None, **kwargs: Any):
-    """Create a job while remaining compatible with pre-branding Store builds.
+def _store_create_job(
+        *args: Any,
+        branding_config: Optional[Dict[str, Any]] = None,
+        publishing_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+):
+    """Create a job while remaining compatible with partially applied stores.
 
-    A partially applied deployment can leave app.py newer than store.py. Passing
-    ``branding_config`` directly in that state raises ``unexpected keyword
-    argument`` before the server can start a job. This helper feature-detects
-    Store.create_job and persists branding through the dedicated setter when
-    the older call signature is still loaded.
+    Both branding and Publishing Pack are optional post-processing settings.
+    Feature-detect the live Store signature so an old process does not crash
+    with an unexpected keyword argument while files are being upgraded.
     """
-    normalized_branding = None
-    if branding_config:
-        normalized_branding = BrandingConfig.from_dict(branding_config).to_dict()
+    normalized_branding = (
+        BrandingConfig.from_dict(branding_config).to_dict() if branding_config else None
+    )
+    normalized_publishing = (
+        PublishingPackConfig.from_dict(publishing_config).to_dict()
+        if publishing_config else None
+    )
 
     create_method = store.create_job
     try:
-        supports_branding = "branding_config" in inspect.signature(create_method).parameters
+        parameters = inspect.signature(create_method).parameters
     except (TypeError, ValueError):
-        supports_branding = False
+        parameters = {}
+    supports_branding = "branding_config" in parameters
+    supports_publishing = "publishing_config" in parameters
 
     if supports_branding:
         kwargs["branding_config"] = normalized_branding
+    if supports_publishing:
+        kwargs["publishing_config"] = normalized_publishing
 
     job = create_method(*args, **kwargs)
 
-    if normalized_branding and not supports_branding:
+    if normalized_branding is not None and not supports_branding:
         setter = getattr(store, "set_job_branding_config", None)
         if callable(setter):
             setter(job.id, normalized_branding)
         else:
-            logger.warning(
-                "Store.create_job does not support branding_config and no "
-                "set_job_branding_config() fallback is available; apply the bundled store.py."
-            )
+            logger.warning("Store build does not support branding_config; apply the bundled store.py")
+    if normalized_publishing is not None and not supports_publishing:
+        setter = getattr(store, "set_job_publishing_config", None)
+        if callable(setter):
+            setter(job.id, normalized_publishing)
+        else:
+            logger.warning("Store build does not support publishing_config; apply the bundled store.py")
 
     if normalized_branding is not None:
         try:
             job.branding_config = normalized_branding
+        except Exception:
+            pass
+    if normalized_publishing is not None:
+        try:
+            job.publishing_config = normalized_publishing
         except Exception:
             pass
     return job
@@ -377,6 +399,8 @@ class NewJobBody(BaseModel):
     # Optional global text branding. This same payload is inherited by every
     # video created from a channel batch.
     branding_config: Optional[Dict[str, Any]] = None
+    # Optional AI Publishing Pack generated after the Reup render finishes.
+    publishing_config: Optional[Dict[str, Any]] = None
     # Explicit Edge-TTS voice id from GET /api/voices, e.g.
     # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
     tts_voice: Optional[str] = None
@@ -649,6 +673,10 @@ def _payment_config(amount_vnd: int = 0, transfer_content: str = "") -> Dict[str
         "account_number": account_number, "account_name": account_name,
         "qr_url": qr_url,
     }
+
+
+class PublishingPackRetryBody(BaseModel):
+    component: str = "failed"  # failed | all | one component id
 
 
 class PublishBody(BaseModel):
@@ -1324,7 +1352,7 @@ async def _run_job_unlocked(job_id: str) -> None:
 
             store.update_job(job_id, progress_note="Đang xử lý (dịch, lồng tiếng, render)...")
             result = await service.localize(job.source_url, job_output_dir, target_language=job.target_language)
-            _finish_job_from_result(job_id, job, result)
+            await asyncio.to_thread(_finish_job_from_result, job_id, job, result)
             return  # Success, exit retry loop
 
         except Exception as exc:
@@ -1359,6 +1387,142 @@ async def _run_job_unlocked(job_id: str) -> None:
             _running_tasks.pop(job_id, None)
 
 
+def _publishing_llm_client_for_job(job, config: PublishingPackConfig) -> PublishingLLMClient:
+    provider = config.provider
+    selected = provider
+    settings = None
+    if provider == "auto":
+        for candidate in ("gemini", "openai"):
+            candidate_settings = store.get_provider_settings(job.user_id, candidate)
+            if candidate_settings and candidate_settings.get("api_key"):
+                selected = candidate
+                settings = candidate_settings
+                break
+        else:
+            selected = "ollama" if _env_bool("PUBLISHING_OLLAMA_ENABLED", False) else "none"
+    elif provider in {"gemini", "openai"}:
+        settings = store.get_provider_settings(job.user_id, provider)
+
+    if selected == "gemini":
+        settings = settings or {}
+        discovered_models = (
+            (settings.get("extra") or {}).get("llm_models")
+            or (settings.get("extra") or {}).get("models")
+            or []
+        )
+        model = (
+            settings.get("default_model")
+            or _env_first("PUBLISHING_GEMINI_MODEL", "GEMINI_MODEL")
+            or (discovered_models[0] if discovered_models else None)
+            or "gemini-3.1-flash-lite"
+        )
+        llm_config = PublishingLLMConfig(
+            provider="gemini",
+            api_key=settings.get("api_key"),
+            model=model,
+            timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
+        )
+    elif selected == "openai":
+        settings = settings or {}
+        discovered_models = (
+            (settings.get("extra") or {}).get("llm_models")
+            or (settings.get("extra") or {}).get("models")
+            or []
+        )
+        llm_config = PublishingLLMConfig(
+            provider="openai",
+            api_key=settings.get("api_key"),
+            model=(
+                settings.get("default_model")
+                or _env_first("PUBLISHING_OPENAI_MODEL")
+                or (discovered_models[0] if discovered_models else None)
+                or "gpt-4.1-mini"
+            ),
+            base_url=(settings.get("extra") or {}).get("base_url") if settings else None,
+            timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
+        )
+    elif selected == "ollama":
+        llm_config = PublishingLLMConfig(
+            provider="ollama",
+            model=_env_first("PUBLISHING_OLLAMA_MODEL", "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL,
+            base_url=_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434",
+            timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
+        )
+    else:
+        llm_config = PublishingLLMConfig(provider="none")
+    return PublishingLLMClient(llm_config, logger=logger)
+
+
+def _generate_publishing_pack_for_result(job_id: str, job, result):
+    config = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+    if not config.enabled:
+        return None
+    store.update_job(
+        job_id,
+        publishing_pack_status="generating",
+        publishing_pack_error=None,
+        progress_note="[99%] Đang tạo AI Publishing Pack...",
+    )
+    try:
+        download = result.download_result
+        platform = getattr(getattr(download, "platform", None), "value", "")
+        source_metadata = {
+            "platform": platform,
+            "final_url": getattr(download, "final_url", job.source_url),
+            "title": getattr(download, "title", ""),
+            "description": getattr(download, "description", ""),
+            "uploader": getattr(download, "uploader", ""),
+            "thumbnail_url": getattr(download, "thumbnail_url", ""),
+            "duration": getattr(download, "duration", 0.0),
+            "tags": getattr(download, "tags", []) or [],
+            "raw_metadata": getattr(download, "raw_metadata", {}) or {},
+        }
+        translated_segments = [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in (getattr(result, "translated_segments", None) or [])
+        ]
+        source_segments = [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in (getattr(result, "source_segments", None) or [])
+        ]
+        service = PublishingPackService(
+            llm_client=_publishing_llm_client_for_job(job, config),
+            logger=logger,
+        )
+        generated = service.generate(
+            config=config,
+            output_dir=Path(result.final_video_path).parent,
+            final_video_path=Path(result.final_video_path),
+            source_video_path=Path(download.video_path) if getattr(download, "video_path", None) else None,
+            source_url=job.source_url,
+            source_metadata=source_metadata,
+            translated_segments=translated_segments,
+            source_segments=source_segments,
+            user_id=job.user_id,
+            job_id=job_id,
+            target_language=job.target_language,
+        )
+        store.update_job(
+            job_id,
+            publishing_pack_status=("ready" if generated.overall_status == "success" else "partial"),
+            publishing_pack_path=str(generated.pack_dir),
+            publish_ready_video_path=(
+                str(generated.publish_ready_video_path)
+                if generated.publish_ready_video_path else None
+            ),
+            publishing_pack_error=(" | ".join(generated.warnings) if generated.warnings else None),
+        )
+        return generated
+    except Exception as exc:
+        logger.exception("AI Publishing Pack failed for job %s (non-fatal)", job_id)
+        store.update_job(
+            job_id,
+            publishing_pack_status="error",
+            publishing_pack_error=str(exc)[:2000],
+        )
+        return None
+
+
 def _finish_job_from_result(job_id: str, job, result) -> None:
     current = store.get_job(job_id)
     if current and current.status == "cancelled":
@@ -1385,7 +1549,7 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
             if getattr(s, "has_timing", False)
         ]
         store.update_job(
-            job_id, status="done", progress_note="Hoàn tất",
+            job_id, status="running", progress_note="[98%] Đã render, đang hoàn thiện asset đăng bài...",
             final_video_path=str(result.final_video_path),
             source_video_path=str(result.download_result.video_path),
             title=title,
@@ -1395,9 +1559,6 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         if translated_segments:
             store.set_job_segments(job_id, translated_segments)
         _write_job_srt_artifacts(job_id, source_segments, translated_segments)
-        # Best-effort automated sanity check (quiet audio, wrong duration).
-        # Never fails the job over this — it's an informational warning
-        # badge in the UI, not a hard gate on publishing.
         try:
             source_duration = None
             if result.audio_pipeline_result and result.audio_pipeline_result.audio_result:
@@ -1407,6 +1568,11 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
                 store.set_job_qc_warnings(job_id, warnings)
         except Exception:
             logger.exception("Quality check failed for job %s (non-fatal)", job_id)
+
+        generated = _generate_publishing_pack_for_result(job_id, job, result)
+        if generated and generated.recommended_title:
+            title = generated.recommended_title
+        store.update_job(job_id, status="done", progress_note="Hoàn tất", title=title)
     else:
         store.update_job(job_id, status="error",
                          error="Không tạo được video đầu ra (final_video_path rỗng)")
@@ -1451,7 +1617,7 @@ async def _run_render_from_review(job_id: str) -> None:
                           ] or None
 
         result = await service.finalize_from_review(prepared, edited_segments)
-        _finish_job_from_result(job_id, job, result)
+        await asyncio.to_thread(_finish_job_from_result, job_id, job, result)
     except Exception as exc:
         logger.exception("Job %s failed to render from review", job_id)
         store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
@@ -4181,6 +4347,7 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         logo_corner=body.logo_corner or "bottom_right",
         logo_size_px=body.logo_size_px or 120,
         branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
+        publishing_config=PublishingPackConfig.from_dict(body.publishing_config).to_dict() if body.publishing_config else None,
         tts_voice=body.tts_voice or None,
         review_mode=body.review_before_render,
         animated_subtitle_config=body.animated_subtitle_config,
@@ -4460,6 +4627,7 @@ async def upload_video(
         logo_corner: str = Form("bottom_right"),
         logo_size_px: int = Form(120),
         branding_config: Optional[str] = Form(None),
+        publishing_config: Optional[str] = Form(None),
         tts_voice: Optional[str] = Form(None),
         review_before_render: bool = Form(False),
         animated_subtitle_config: Optional[str] = Form(None),
@@ -4504,6 +4672,7 @@ async def upload_video(
         animated_config = json.loads(animated_subtitle_config) if animated_subtitle_config else None
         template_config = json.loads(video_template_config) if video_template_config else None
         branding_data = BrandingConfig.from_dict(json.loads(branding_config)).to_dict() if branding_config else None
+        publishing_data = PublishingPackConfig.from_dict(json.loads(publishing_config)).to_dict() if publishing_config else None
     except json.JSONDecodeError:
         raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
 
@@ -4518,6 +4687,7 @@ async def upload_video(
         logo_corner=logo_corner,
         logo_size_px=logo_size_px,
         branding_config=branding_data,
+        publishing_config=publishing_data,
         tts_voice=tts_voice,
         review_mode=review_before_render,
         animated_subtitle_config=animated_config,
@@ -4639,6 +4809,32 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
             "severity": "ok", "code": "global_branding",
             "message": f"Watermark động và fingerprint sẽ được áp dụng với tên: {branding.text}.",
         })
+
+    publishing = PublishingPackConfig.from_dict(body.publishing_config)
+    if publishing.enabled:
+        if not publishing.channel_name:
+            issues.append({
+                "severity": "error", "code": "publishing_channel_name_missing",
+                "message": "Đã bật AI Publishing Pack nhưng chưa có tên kênh.",
+            })
+        else:
+            issues.append({
+                "severity": "ok", "code": "publishing_pack",
+                "message": (
+                    f"Sau render sẽ tạo title, description, hashtag, thumbnail và gói đăng cho "
+                    f"{', '.join(publishing.platforms)} theo profile {publishing.channel_name}."
+                ),
+            })
+            if publishing.provider in {"gemini", "openai"}:
+                settings = store.get_provider_settings(user_id, publishing.provider)
+                if not settings or not settings.get("api_key"):
+                    issues.append({
+                        "severity": "warning", "code": "publishing_llm_fallback",
+                        "message": (
+                            f"Chưa kết nối {publishing.provider}; Publishing Pack vẫn chạy bằng bộ sinh "
+                            "deterministic nhưng nội dung AI sẽ ít linh hoạt hơn."
+                        ),
+                    })
 
     user = store.get_user_by_id(user_id)
     required_credits = JOB_COST_CREDITS * max(1, url_count)
@@ -5980,6 +6176,14 @@ def bulk_download_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_
                 archive.writestr(f"{Path(name).stem}.vi.srt", _segments_to_srt_text(segments))
             if source_segments:
                 archive.writestr(f"{Path(name).stem}.source.srt", _segments_to_srt_text(source_segments))
+            pack_dir = Path(job.publishing_pack_path or "")
+            if pack_dir.is_dir():
+                for asset in pack_dir.rglob("*"):
+                    if asset.is_file():
+                        archive.write(
+                            asset,
+                            arcname=f"{Path(name).stem}.publishing_pack/{asset.relative_to(pack_dir)}",
+                        )
 
     return FileResponse(
         zip_path,
@@ -6050,6 +6254,265 @@ def get_job_source_video(job_id: str, user_id: int = Depends(get_current_user_id
     if not source_path.exists() or not source_path.is_file():
         raise HTTPException(404, "Không tìm thấy video nguồn của job")
     return FileResponse(source_path, media_type="video/mp4")
+
+
+@app.get("/api/jobs/{job_id}/publishing-pack")
+def get_publishing_pack(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    pack_dir = Path(job.publishing_pack_path or "")
+    if not pack_dir.is_dir():
+        if job.publishing_pack_status == "error":
+            raise HTTPException(422, job.publishing_pack_error or "AI Publishing Pack tạo thất bại")
+        raise HTTPException(404, "Job này chưa có AI Publishing Pack")
+
+    def read_json(name: str) -> Dict[str, Any]:
+        path = pack_dir / name
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    source_metadata = read_json("source_metadata.json")
+    youtube = read_json("youtube_metadata.json")
+    facebook = read_json("facebook_metadata.json")
+    analysis = read_json("content_analysis.json")
+    edit_plan = read_json("content_edit_plan.json")
+    originality = read_json("originality_report.json")
+    manifest = read_json("manifest.json")
+    component_state = read_json("component_status.json")
+    components = component_state.get("components", {}) if isinstance(component_state, dict) else {}
+    overall_status = (
+        component_state.get("overall_status")
+        if isinstance(component_state, dict)
+        else None
+    ) or manifest.get("overall_status") or ("success" if job.publishing_pack_status == "ready" else job.publishing_pack_status)
+    for platform_data in (youtube, facebook):
+        platform_data["thumbnail_urls"] = [
+            f"/api/jobs/{job_id}/publishing-assets/{urllib.parse.quote(name)}"
+            for name in platform_data.get("thumbnails", [])
+        ]
+    # Backward compatibility for Publishing Pack v1 directories created
+    # before component_status.json existed. Infer enough state from actual
+    # files so old completed jobs immediately gain selective retry controls.
+    if not components:
+        cfg = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+        now = time.time()
+        def inferred(status_value: str, error_value: Optional[str] = None) -> Dict[str, Any]:
+            return {"status": status_value, "attempts": 1 if status_value in {"success", "failed"} else 0, "error": error_value, "updated_at": now}
+        components = {
+            "analysis": inferred("success" if analysis else "failed", None if analysis else "Chưa có content_analysis.json"),
+            "youtube_metadata": inferred(
+                "success" if youtube else ("failed" if "youtube" in cfg.platforms else "skipped"),
+                None if youtube or "youtube" not in cfg.platforms else "Chưa có youtube_metadata.json",
+            ),
+            "facebook_metadata": inferred(
+                "success" if facebook else ("failed" if "facebook" in cfg.platforms else "skipped"),
+                None if facebook or "facebook" not in cfg.platforms else "Chưa có facebook_metadata.json",
+            ),
+            "youtube_thumbnails": inferred(
+                "success" if youtube.get("thumbnails") else ("failed" if cfg.generate_thumbnails and "youtube" in cfg.platforms else "skipped"),
+                None if youtube.get("thumbnails") or not (cfg.generate_thumbnails and "youtube" in cfg.platforms) else "Chưa có thumbnail YouTube",
+            ),
+            "facebook_thumbnails": inferred(
+                "success" if facebook.get("thumbnails") else ("failed" if cfg.generate_thumbnails and "facebook" in cfg.platforms else "skipped"),
+                None if facebook.get("thumbnails") or not (cfg.generate_thumbnails and "facebook" in cfg.platforms) else "Chưa có thumbnail Facebook",
+            ),
+            "publish_ready": inferred(
+                "success" if job.publish_ready_video_path and Path(job.publish_ready_video_path).is_file() else ("failed" if cfg.generate_publish_ready_video else "skipped"),
+                None if (job.publish_ready_video_path and Path(job.publish_ready_video_path).is_file()) or not cfg.generate_publish_ready_video else "Chưa có publish_ready.mp4",
+            ),
+        }
+        active_statuses = [item["status"] for item in components.values() if item["status"] != "skipped"]
+        if active_statuses and all(value == "success" for value in active_statuses):
+            overall_status = "success"
+        elif any(value == "success" for value in active_statuses):
+            overall_status = "partial"
+        else:
+            overall_status = "failed"
+
+    source_thumbnail_file = Path(str(source_metadata.get("source_thumbnail_file") or "")).name
+    source_metadata["source_thumbnail_url"] = (
+        f"/api/jobs/{job_id}/publishing-assets/{urllib.parse.quote(source_thumbnail_file)}"
+        if source_thumbnail_file and (pack_dir / source_thumbnail_file).is_file()
+        else None
+    )
+    return {
+        "status": job.publishing_pack_status,
+        "overall_status": overall_status,
+        "components": components,
+        "error": job.publishing_pack_error,
+        "source_metadata": source_metadata,
+        "content_analysis": analysis,
+        "youtube": youtube,
+        "facebook": facebook,
+        "content_edit_plan": edit_plan,
+        "originality_report": originality,
+        "manifest": manifest,
+        "download_url": f"/api/jobs/{job_id}/publishing-pack.zip",
+        "publish_ready_video_url": (
+            f"/api/jobs/{job_id}/publish-ready-video"
+            if job.publish_ready_video_path and Path(job.publish_ready_video_path).is_file()
+            else None
+        ),
+    }
+
+
+def _publishing_retry_source_metadata(job, pack_dir: Path) -> Dict[str, Any]:
+    path = pack_dir / "source_metadata.json"
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    return {
+        "source_url": job.source_url,
+        "final_url": job.source_url,
+        "title": job.title or "",
+        "description": "",
+        "uploader": "",
+        "thumbnail_url": "",
+        "duration": 0.0,
+        "tags": [],
+    }
+
+
+def _publishing_retry_segments(raw: Optional[str]) -> List[Dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+@app.post("/api/jobs/{job_id}/publishing-pack/retry")
+def retry_publishing_pack_component(
+    job_id: str,
+    body: PublishingPackRetryBody,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Retry only failed/selected publishing assets; never rerun localization/render."""
+    job = _get_owned_job(job_id, user_id)
+    config = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+    if not config.enabled:
+        raise HTTPException(400, "AI Publishing Pack đang bị tắt cho job này")
+    final_video_path = Path(job.final_video_path or "")
+    if not final_video_path.is_file():
+        raise HTTPException(404, "Không tìm thấy final.mp4 của job")
+    pack_dir = Path(job.publishing_pack_path or (final_video_path.parent / "publishing_pack"))
+    pack_dir.mkdir(parents=True, exist_ok=True)
+
+    component = str(body.component or "failed").strip().lower()
+    allowed = {
+        "failed", "all_failed", "all", "analysis", "youtube_metadata",
+        "facebook_metadata", "youtube_thumbnails", "facebook_thumbnails", "publish_ready",
+    }
+    if component not in allowed:
+        raise HTTPException(400, f"Publishing component không hợp lệ: {component}")
+
+    store.update_job(
+        job_id,
+        publishing_pack_status="generating",
+        publishing_pack_path=str(pack_dir),
+        publishing_pack_error=None,
+        progress_note="[99%] Đang tạo lại thành phần AI Publishing Pack...",
+    )
+    service = PublishingPackService(
+        llm_client=_publishing_llm_client_for_job(job, config),
+        logger=logger,
+    )
+    try:
+        result = service.retry_components(
+            component=component,
+            config=config,
+            output_dir=final_video_path.parent,
+            final_video_path=final_video_path,
+            source_video_path=Path(job.source_video_path) if job.source_video_path else None,
+            source_url=job.source_url,
+            source_metadata=_publishing_retry_source_metadata(job, pack_dir),
+            translated_segments=_publishing_retry_segments(job.segments_json),
+            source_segments=_publishing_retry_segments(job.source_segments_json),
+            user_id=job.user_id,
+            job_id=job.id,
+            target_language=job.target_language,
+        )
+    except ValueError as exc:
+        store.update_job(job_id, publishing_pack_status="partial", publishing_pack_error=str(exc)[:2000])
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Publishing Pack component retry failed for job %s", job_id)
+        store.update_job(job_id, publishing_pack_status="partial", publishing_pack_error=str(exc)[:2000])
+        raise HTTPException(500, f"Không thể tạo lại Publishing Pack: {exc}") from exc
+
+    store.update_job(
+        job_id,
+        publishing_pack_status=("ready" if result.overall_status == "success" else "partial"),
+        publishing_pack_path=str(result.pack_dir),
+        publish_ready_video_path=(str(result.publish_ready_video_path) if result.publish_ready_video_path else None),
+        publishing_pack_error=(" | ".join(result.warnings) if result.warnings else None),
+        progress_note="Hoàn tất video; AI Publishing Pack đã được cập nhật.",
+    )
+    return {
+        "ok": True,
+        "overall_status": result.overall_status,
+        "retried": component,
+        "warnings": result.warnings,
+    }
+
+
+@app.get("/api/jobs/{job_id}/publishing-assets/{asset_name}")
+def get_publishing_asset(asset_name: str, job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    pack_dir = Path(job.publishing_pack_path or "").resolve()
+    if not pack_dir.is_dir():
+        raise HTTPException(404, "Publishing Pack chưa sẵn sàng")
+    safe_name = Path(asset_name).name
+    asset = (pack_dir / safe_name).resolve()
+    if asset.parent != pack_dir or not asset.is_file():
+        raise HTTPException(404, "Không tìm thấy asset")
+    media_type = "image/jpeg" if asset.suffix.lower() in {".jpg", ".jpeg"} else "application/octet-stream"
+    return FileResponse(asset, media_type=media_type)
+
+
+@app.get("/api/jobs/{job_id}/publishing-pack.zip")
+def download_publishing_pack(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    pack_dir = Path(job.publishing_pack_path or "")
+    if not pack_dir.is_dir():
+        raise HTTPException(404, "Publishing Pack chưa sẵn sàng")
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(prefix=f"publishing_pack_{job_id}_", suffix=".zip", delete=False, dir=str(TEMP_DIR))
+    zip_path = Path(temp.name)
+    temp.close()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for asset in pack_dir.rglob("*"):
+            if asset.is_file():
+                archive.write(asset, arcname=f"publishing_pack/{asset.relative_to(pack_dir)}")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{job_id}_publishing_pack.zip",
+        background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True)),
+    )
+
+
+@app.get("/api/jobs/{job_id}/publish-ready-video")
+def get_publish_ready_video(job_id: str, download: bool = False, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    path = Path(job.publish_ready_video_path or "")
+    if not path.is_file():
+        raise HTTPException(404, "Chưa có bản publish-ready")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{job_id}_publish_ready.mp4" if download else None,
+    )
 
 
 @app.get("/api/jobs/{job_id}/prepublish-check")
@@ -6239,10 +6702,19 @@ def _segments_to_srt_response(segments: List[Dict[str, Any]], filename: str) -> 
     )
 
 
+def _social_publish_video_path(job) -> Path:
+    config = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+    publish_ready = Path(getattr(job, "publish_ready_video_path", None) or "")
+    if config.enabled and config.use_publish_ready_for_social_publish and publish_ready.is_file():
+        return publish_ready
+    return Path(job.final_video_path or "")
+
+
 @app.post("/api/jobs/{job_id}/publish")
 def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
-    if not job.final_video_path or not Path(job.final_video_path).exists():
+    publish_video_path = _social_publish_video_path(job)
+    if not publish_video_path.is_file():
         raise HTTPException(400, "Video chưa sẵn sàng để đăng")
 
     results = []
@@ -6255,7 +6727,7 @@ def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_curre
 
         access_token, account_ref = _resolve_publish_credentials(user_id, platform)
         result = uploader.upload(
-            Path(job.final_video_path), body.title, body.description, body.hashtags,
+            publish_video_path, body.title, body.description, body.hashtags,
             access_token=access_token, account_ref=account_ref,
         )
         store.log_publish(job_id, result.platform, result.success, result.message, result.remote_url)
@@ -6304,11 +6776,14 @@ def _run_scheduled_post(row) -> None:
         if not job or job.user_id != row["user_id"] or not job.final_video_path or not Path(
                 job.final_video_path).exists():
             raise RuntimeError("Video nguồn không còn tồn tại")
+        publish_video_path = _social_publish_video_path(job)
+        if not publish_video_path.is_file():
+            raise RuntimeError("Video publish-ready không còn tồn tại")
         for platform in json.loads(row["platforms_json"]):
             uploader = get_uploader(platform)
             token, account_ref = _resolve_publish_credentials(row["user_id"], platform)
             result = uploader.upload(
-                Path(job.final_video_path), row["title"], row["description"],
+                publish_video_path, row["title"], row["description"],
                 json.loads(row["hashtags_json"]), access_token=token, account_ref=account_ref,
             )
             store.log_publish(job.id, result.platform, result.success, result.message, result.remote_url)

@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
 
 _logger = logging.getLogger(__name__)
@@ -47,8 +47,8 @@ class DownloadCache:
         url_hash = self._get_url_hash(url)
         return self.cache_dir / f"{url_hash}.mp4"
     
-    def get(self, url: str) -> Optional[Path]:
-        """Get cached video path if available and not expired."""
+    def get_entry(self, url: str) -> Optional[Dict[str, Any]]:
+        """Return a valid cache entry including its source metadata."""
         cache_path = self._get_cache_path(url)
         url_hash = self._get_url_hash(url)
         
@@ -75,10 +75,23 @@ class DownloadCache:
             return None
         
         _logger.info(f"Cache hit for {url[:50]}... -> {cache_path}")
-        return cache_path
-    
-    def put(self, url: str, video_path: Path) -> None:
-        """Cache a downloaded video."""
+        result = dict(entry)
+        result["video_path"] = str(cache_path)
+        return result
+
+    def get(self, url: str) -> Optional[Path]:
+        """Backward-compatible cached video lookup."""
+        entry = self.get_entry(url)
+        return Path(entry["video_path"]) if entry else None
+
+    def put(
+        self,
+        url: str,
+        video_path: Path,
+        *,
+        source_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Cache a downloaded video and metadata required by Publishing Pack."""
         if not video_path.exists():
             _logger.warning(f"Cannot cache non-existent video: {video_path}")
             return
@@ -100,6 +113,7 @@ class DownloadCache:
                 "cached_at": datetime.now().isoformat(),
                 "file_size": cache_path.stat().st_size,
                 "original_path": str(video_path),
+                "source_metadata": dict(source_metadata or {}),
             }
             self._save_metadata()
             

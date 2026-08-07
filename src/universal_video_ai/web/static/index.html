@@ -783,6 +783,79 @@
       <div class="muted-help">Watermark giúp tăng chi phí xóa/reup và hỗ trợ truy vết, nhưng không thể đảm bảo chống xóa tuyệt đối. Quét chéo góc chỉ xuất hiện theo nhịp ngắn để khó xóa hơn mà vẫn đỡ che nội dung.</div>
     </div>
 
+    <div class="field" style="margin-top:16px;">
+      <label>
+        <input type="checkbox" id="publishing-enable-checkbox" checked style="width:auto;vertical-align:middle;margin-right:6px">
+        AI Publishing Pack cho task Reup
+      </label>
+      <div class="muted-help">Sau render tự phân tích subtitle/nội dung, tạo title, mô tả, hashtag, thumbnail và bản publish-ready.</div>
+    </div>
+    <div id="publishing-panel" style="margin-bottom:14px;padding:16px;background:var(--panel-2);border-radius:var(--radius-sm);border:1px solid var(--border);">
+      <div class="row">
+        <div class="field">
+          <label>Hồ sơ kênh</label>
+          <select id="publishing-profile-select">
+            <option value="van_diep_studio" selected>Vạn Diệp Studio · Tu tiên/Gia tộc</option>
+            <option value="generic_reup">Reup tổng quát</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Tên kênh</label>
+          <input id="publishing-channel-name" maxlength="80" value="Vạn Diệp Studio">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Phong cách title</label>
+          <select id="publishing-style-select">
+            <option value="search">Ưu tiên tìm kiếm</option>
+            <option value="balanced" selected>Cân bằng Search + tò mò</option>
+            <option value="curiosity">Ưu tiên tò mò nhưng đúng nội dung</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Mức biên tập</label>
+          <select id="publishing-edit-level-select">
+            <option value="light">Nhẹ · chỉ metadata/thumbnail</option>
+            <option value="balanced" selected>Cân bằng · thêm hook/CTA publish-ready</option>
+            <option value="deep">Chuyên sâu · hook dài hơn + kế hoạch tái cấu trúc</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>AI xử lý</label>
+          <select id="publishing-provider-select">
+            <option value="auto" selected>Tự chọn Gemini/OpenAI/Ollama</option>
+            <option value="gemini">Gemini đã kết nối</option>
+            <option value="openai">OpenAI đã kết nối</option>
+            <option value="ollama">Ollama local</option>
+            <option value="none">Không gọi AI · dùng template thông minh</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="align-items:flex-start;">
+        <div class="field">
+          <label><input type="checkbox" id="publishing-youtube-checkbox" checked style="width:auto;margin-right:6px">Tạo gói YouTube</label>
+          <label><input type="checkbox" id="publishing-facebook-checkbox" checked style="width:auto;margin-right:6px">Tạo gói Facebook</label>
+          <label><input type="checkbox" id="publishing-thumbnails-checkbox" checked style="width:auto;margin-right:6px">Tạo 3 thumbnail mỗi nền tảng</label>
+        </div>
+        <div class="field">
+          <label><input type="checkbox" id="publishing-ready-video-checkbox" checked style="width:auto;margin-right:6px">Tạo publish_ready.mp4 có hook/CTA</label>
+          <label><input type="checkbox" id="publishing-use-ready-checkbox" checked style="width:auto;margin-right:6px">Khi đăng tự động, ưu tiên bản publish-ready</label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Link playlist YouTube</label>
+          <input id="publishing-playlist-url" placeholder="Có thể để trống và điền sau">
+        </div>
+        <div class="field">
+          <label>Yêu cầu riêng cho AI</label>
+          <input id="publishing-custom-instructions" placeholder="Ví dụ: ưu tiên lão tổ, gia tộc, trường sinh; không clickbait sai">
+        </div>
+      </div>
+      <div class="muted-help">Tên truyện/nhân vật không đủ căn cứ sẽ ghi “Chưa xác định”, không tự bịa. Metadata mặc định: Tiếng Việt · Giải trí · Riêng tư · không dành riêng cho trẻ em.</div>
+    </div>
+
     <div class="field">
       <label>
         <input type="checkbox" id="logo-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
@@ -1635,6 +1708,15 @@
     <button class="modal-close" id="quality-close">×</button>
     <h3>Improve This Video</h3>
     <div id="quality-report-box" style="display:grid;gap:12px"></div>
+  </div>
+</div>
+
+<div id="publishing-pack-modal" class="modal-backdrop hidden">
+  <div class="modal" style="max-width:980px">
+    <button class="modal-close" id="publishing-pack-close">×</button>
+    <h3>AI Publishing Pack</h3>
+    <div id="publishing-pack-status" class="muted-help"></div>
+    <div id="publishing-pack-content" style="display:grid;gap:14px;margin-top:12px"></div>
   </div>
 </div>
 
