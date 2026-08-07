@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "script",
+  "version": 1,
+  "created_by_agent": "script_writer",
+  "created_at": "2026-07-31T15:42:25.709416",
+  "metadata": {},
+  "data": {
+    "title_options": [],
+    "hook": "",
+    "narration_text": "",
+    "segments": [],
+    "description": "",
+    "hashtags": [],
+    "estimated_duration_seconds": 0.0,
+    "source_attributions": []
+  }
+}

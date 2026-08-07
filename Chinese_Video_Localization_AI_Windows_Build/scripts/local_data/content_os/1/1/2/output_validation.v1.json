@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "output_validation",
+  "version": 1,
+  "created_by_agent": "MP4Validator",
+  "created_at": "2026-08-01T03:09:02.914180",
+  "metadata": {},
+  "data": {
+    "valid": false,
+    "file_path": "local_data/content_os/1/default/1/2/renders/final.mp4",
+    "file_size_bytes": 22930,
+    "duration_seconds": 5.0,
+    "resolution": "1080x1920",
+    "video_codec": "h264",
+    "audio_codec": "unknown",
+    "issues": [
+      "Duration mismatch: expected 45s, got 5.0s"
+    ],
+    "warnings": [
+      "Audio codec unknown may not be widely supported"
+    ]
+  }
+}
