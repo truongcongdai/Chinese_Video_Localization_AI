@@ -131,6 +131,9 @@ class DouyinDownloader(BaseDownloader):
 
             video_url = None
             title = f"douyin_{video_id}"
+            uploader = ""
+            thumbnail_url = ""
+            raw_metadata = {}
 
             # Duyệt qua TẤT CẢ keys, tìm key có video data
             for key, page_data in loader_data.items():
@@ -181,8 +184,19 @@ class DouyinDownloader(BaseDownloader):
                             break
 
                 if video_url:
-                    # Try to get title from desc
+                    # Preserve source metadata for the post-render Publishing Pack.
                     title = item.get('desc', title)
+                    author = item.get('author') or {}
+                    uploader = str(author.get('nickname') or author.get('unique_id') or '')
+                    cover = (video_data.get('cover') or video_data.get('dynamic_cover') or {})
+                    cover_urls = cover.get('url_list') if isinstance(cover, dict) else []
+                    thumbnail_url = str(cover_urls[0]) if cover_urls else ''
+                    raw_metadata = {
+                        "aweme_id": str(item.get("aweme_id") or video_id),
+                        "author": author,
+                        "statistics": item.get("statistics") or {},
+                        "create_time": item.get("create_time"),
+                    }
                     break
 
             if not video_url:
@@ -213,12 +227,15 @@ class DouyinDownloader(BaseDownloader):
                 final_url=url,
                 video_path=output_path,
                 title=title,
-                uploader="",
+                uploader=uploader,
                 duration=0,
                 width=0,
                 height=0,
                 filesize=file_size,
                 extension="mp4",
+                description=title,
+                thumbnail_url=thumbnail_url,
+                raw_metadata=raw_metadata,
             )
 
         except Exception as e:

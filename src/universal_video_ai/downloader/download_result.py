@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Dict, List
 
 from .platform import Platform
 
@@ -36,3 +37,11 @@ class DownloadResult:
     filesize: int = 0
 
     extension: str = "mp4"
+
+    description: str = ""
+
+    thumbnail_url: str = ""
+
+    tags: List[str] = field(default_factory=list)
+
+    raw_metadata: Dict[str, Any] = field(default_factory=dict)

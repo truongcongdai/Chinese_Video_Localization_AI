@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     logo_corner TEXT DEFAULT 'bottom_right',
     logo_size_px INTEGER DEFAULT 120,
     branding_config TEXT,
+    publishing_config TEXT,
+    publishing_pack_path TEXT,
+    publish_ready_video_path TEXT,
+    publishing_pack_status TEXT DEFAULT 'disabled',
+    publishing_pack_error TEXT,
     tts_voice TEXT,
     review_mode INTEGER NOT NULL DEFAULT 0,
     review_state_json TEXT,
@@ -484,6 +489,11 @@ _MIGRATIONS = [
     ("jobs", "logo_corner", "ALTER TABLE jobs ADD COLUMN logo_corner TEXT DEFAULT 'bottom_right'"),
     ("jobs", "logo_size_px", "ALTER TABLE jobs ADD COLUMN logo_size_px INTEGER DEFAULT 120"),
     ("jobs", "branding_config", "ALTER TABLE jobs ADD COLUMN branding_config TEXT"),
+    ("jobs", "publishing_config", "ALTER TABLE jobs ADD COLUMN publishing_config TEXT"),
+    ("jobs", "publishing_pack_path", "ALTER TABLE jobs ADD COLUMN publishing_pack_path TEXT"),
+    ("jobs", "publish_ready_video_path", "ALTER TABLE jobs ADD COLUMN publish_ready_video_path TEXT"),
+    ("jobs", "publishing_pack_status", "ALTER TABLE jobs ADD COLUMN publishing_pack_status TEXT DEFAULT 'disabled'"),
+    ("jobs", "publishing_pack_error", "ALTER TABLE jobs ADD COLUMN publishing_pack_error TEXT"),
     # TTS voice override (None = pick the language's default voice, see
     # tts.voices.VOICE_OPTIONS).
     ("jobs", "tts_voice", "ALTER TABLE jobs ADD COLUMN tts_voice TEXT"),
@@ -628,6 +638,11 @@ class Job:
     logo_corner: str = "bottom_right"
     logo_size_px: int = 120
     branding_config: Optional[Dict[str, Any]] = None
+    publishing_config: Optional[Dict[str, Any]] = None
+    publishing_pack_path: Optional[str] = None
+    publish_ready_video_path: Optional[str] = None
+    publishing_pack_status: str = "disabled"
+    publishing_pack_error: Optional[str] = None
     tts_voice: Optional[str] = None
     review_mode: int = 0
     review_state_json: Optional[str] = None
@@ -661,6 +676,12 @@ class Job:
                 or str(self.source_language or "").startswith("content_os")
         )
         d["has_video"] = bool(self.final_video_path and Path(self.final_video_path).exists())
+        d["has_publishing_pack"] = bool(
+            self.publishing_pack_path and Path(self.publishing_pack_path).is_dir()
+        )
+        d["has_publish_ready_video"] = bool(
+            self.publish_ready_video_path and Path(self.publish_ready_video_path).is_file()
+        )
         # review_state_json is an internal implementation detail (a
         # serialized PreparedLocalization, can be sizeable) — not useful to
         # the frontend and not something to leak. segments_json IS useful
@@ -873,6 +894,7 @@ class Store:
             source_language: str = "auto", logo_path: Optional[str] = None,
             logo_corner: str = "bottom_right", logo_size_px: int = 120,
             branding_config: Optional[Dict[str, Any]] = None,
+            publishing_config: Optional[Dict[str, Any]] = None,
             tts_voice: Optional[str] = None, review_mode: bool = False,
             animated_subtitle_config: Optional[Dict[str, Any]] = None,
             video_template_config: Optional[Dict[str, Any]] = None,
@@ -904,6 +926,8 @@ class Store:
             source_language=source_language, logo_path=logo_path,
             logo_corner=logo_corner, logo_size_px=logo_size_px,
             branding_config=branding_config,
+            publishing_config=publishing_config,
+            publishing_pack_status=("pending" if (publishing_config or {}).get("enabled") else "disabled"),
             tts_voice=tts_voice, review_mode=int(review_mode),
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
@@ -928,7 +952,9 @@ class Store:
         columns = (
             "id", "user_id", "source_url", "target_language", "source_language", "status",
             "progress_note", "error", "title", "final_video_path", "logo_path", "logo_corner",
-            "logo_size_px", "branding_config", "tts_voice", "review_mode", "review_state_json", "segments_json",
+            "logo_size_px", "branding_config", "publishing_config", "publishing_pack_path",
+            "publish_ready_video_path", "publishing_pack_status", "publishing_pack_error",
+            "tts_voice", "review_mode", "review_state_json", "segments_json",
             "qc_warnings_json", "created_at", "updated_at", "animated_subtitle_config",
             "video_template_config", "transform_config", "source_video_path", "source_segments_json",
             "processing_mode", "tts_provider", "tts_style", "translation_mode", "translation_tone",
@@ -941,7 +967,10 @@ class Store:
             job.status, job.progress_note, job.error, job.title, job.final_video_path,
             job.logo_path, job.logo_corner, job.logo_size_px,
             json.dumps(job.branding_config, ensure_ascii=False) if job.branding_config else None,
-            job.tts_voice, job.review_mode, job.review_state_json, job.segments_json, job.qc_warnings_json,
+            json.dumps(job.publishing_config, ensure_ascii=False) if job.publishing_config else None,
+            job.publishing_pack_path, job.publish_ready_video_path, job.publishing_pack_status,
+            job.publishing_pack_error, job.tts_voice, job.review_mode, job.review_state_json,
+            job.segments_json, job.qc_warnings_json,
             job.created_at, job.updated_at,
             json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
             json.dumps(job.video_template_config) if job.video_template_config else None,
@@ -975,6 +1004,7 @@ class Store:
             source_language=old.source_language, logo_path=old.logo_path,
             logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
             branding_config=old.branding_config,
+            publishing_config=old.publishing_config,
             tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
             animated_subtitle_config=old.animated_subtitle_config,
             video_template_config=old.video_template_config,
@@ -1211,6 +1241,17 @@ class Store:
             )
             return conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
 
+    def set_job_publishing_config(
+            self, job_id: str, publishing_config: Optional[Dict[str, Any]],
+    ) -> None:
+        payload = json.dumps(publishing_config, ensure_ascii=False) if publishing_config else None
+        status = "pending" if (publishing_config or {}).get("enabled") else "disabled"
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET publishing_config = ?, publishing_pack_status = ?, updated_at = ? WHERE id = ?",
+                (payload, status, time.time(), job_id),
+            )
+
     def set_job_branding_config(
             self, job_id: str, branding_config: Optional[Dict[str, Any]],
     ) -> None:
@@ -1291,6 +1332,8 @@ class Store:
             row_dict["transform_config"] = json.loads(row_dict["transform_config"])
         if row_dict.get("branding_config"):
             row_dict["branding_config"] = json.loads(row_dict["branding_config"])
+        if row_dict.get("publishing_config"):
+            row_dict["publishing_config"] = json.loads(row_dict["publishing_config"])
         return Job(**row_dict)
 
     def get_job(self, job_id: str) -> Optional[Job]:

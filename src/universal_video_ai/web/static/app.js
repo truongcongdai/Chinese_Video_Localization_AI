@@ -874,6 +874,41 @@ function getBrandingConfig() {
   };
 }
 
+function getPublishingPackConfig() {
+  const enabled = Boolean($("#publishing-enable-checkbox") && $("#publishing-enable-checkbox").checked);
+  const platforms = [];
+  if (!$("#publishing-youtube-checkbox") || $("#publishing-youtube-checkbox").checked) platforms.push("youtube");
+  if ($("#publishing-facebook-checkbox") && $("#publishing-facebook-checkbox").checked) platforms.push("facebook");
+  return {
+    enabled,
+    channel_profile: $("#publishing-profile-select") ? $("#publishing-profile-select").value : "van_diep_studio",
+    channel_name: $("#publishing-channel-name") ? $("#publishing-channel-name").value.trim() : "Vạn Diệp Studio",
+    platforms: platforms.length ? platforms : ["youtube"],
+    style: $("#publishing-style-select") ? $("#publishing-style-select").value : "balanced",
+    edit_level: $("#publishing-edit-level-select") ? $("#publishing-edit-level-select").value : "balanced",
+    provider: $("#publishing-provider-select") ? $("#publishing-provider-select").value : "auto",
+    generate_thumbnails: !$("#publishing-thumbnails-checkbox") || $("#publishing-thumbnails-checkbox").checked,
+    thumbnail_count: 3,
+    generate_publish_ready_video: !$("#publishing-ready-video-checkbox") || $("#publishing-ready-video-checkbox").checked,
+    use_publish_ready_for_social_publish: !$("#publishing-use-ready-checkbox") || $("#publishing-use-ready-checkbox").checked,
+    playlist_url: $("#publishing-playlist-url") ? $("#publishing-playlist-url").value.trim() || null : null,
+    custom_instructions: $("#publishing-custom-instructions") ? $("#publishing-custom-instructions").value.trim() || null : null,
+  };
+}
+
+if ($("#publishing-enable-checkbox")) {
+  $("#publishing-enable-checkbox").onchange = ev => {
+    $("#publishing-panel").classList.toggle("hidden", !ev.target.checked);
+  };
+}
+if ($("#publishing-profile-select")) {
+  $("#publishing-profile-select").onchange = ev => {
+    if (ev.target.value === "van_diep_studio") {
+      $("#publishing-channel-name").value = "Vạn Diệp Studio";
+    }
+  };
+}
+
 if ($("#branding-enable-checkbox")) {
   $("#branding-enable-checkbox").onchange = (ev) => {
     $("#branding-panel").classList.toggle("hidden", !ev.target.checked);
@@ -1842,6 +1877,7 @@ $("#submit-btn").onclick = async () => {
     logo_corner: activeCorner ? activeCorner.dataset.corner : "bottom_right",
     logo_size_px: parseInt($("#logo-size-input").value, 10) || 120,
     branding_config: getBrandingConfig(),
+    publishing_config: getPublishingPackConfig(),
     review_before_render: reviewMode,
     animated_subtitle_config: getAnimatedSubtitleConfig(),
     priority: $("#queue-priority-checkbox").checked ? "high" : "normal",
@@ -2576,7 +2612,7 @@ async function refreshJobs() {
         <div class="job-head">
           <div class="job-info">
             <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
-            <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}</div>
+            <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}${job.publishing_pack_status && job.publishing_pack_status !== "disabled" ? ` · Publishing: ${_escapeHtml(job.publishing_pack_status)}` : ""}</div>
             ${(job.status === "queued" || job.status === "running" || job.status === "review" || job.status === "done" || job.status === "cancelled") ? `
               <div class="job-progress">
                 <div class="progress-track"><div class="progress-fill" style="width:${jobProgress(job)}%"></div></div>
@@ -2592,6 +2628,7 @@ async function refreshJobs() {
             <button class="btn secondary small" data-preview="${job.id}">Xem trước</button>
             <button class="btn secondary small" data-download-zip="${job.id}">Tải ZIP</button>
             <button class="btn gradient small" data-improve="${job.id}">Improve</button>
+            ${job.has_publishing_pack ? `<button class="btn gradient small" data-publishing-pack="${job.id}">AI Publishing Pack</button>` : ""}
             <button class="btn secondary small" data-publish="${job.id}">Đăng lên MXH</button>
           ` : ""}
           ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>SRT dịch</a>` : ""}
@@ -2615,6 +2652,9 @@ async function refreshJobs() {
   });
   list.querySelectorAll("[data-improve]").forEach(btn => {
     btn.onclick = () => openQualityReview(btn.dataset.improve);
+  });
+  list.querySelectorAll("[data-publishing-pack]").forEach(btn => {
+    btn.onclick = () => openPublishingPack(btn.dataset.publishingPack);
   });
   list.querySelectorAll("[data-play-video]").forEach(title => {
     title.onclick = () => showHistoryVideo(window._jobsById[title.dataset.playVideo]);
@@ -2893,6 +2933,191 @@ $("#feedback-submit-btn").onclick = async () => {
   } catch (e) { $("#feedback-status").textContent = e.message; }
 };
 
+// ---------------- AI Publishing Pack ----------------
+function _copyText(value) {
+  if (!value) return;
+  navigator.clipboard?.writeText(value).catch(() => {});
+}
+
+const _publishingComponentLabels = {
+  analysis: "Phân tích nội dung",
+  youtube_metadata: "YouTube SEO",
+  facebook_metadata: "Facebook SEO",
+  youtube_thumbnails: "Thumbnail YouTube",
+  facebook_thumbnails: "Thumbnail Facebook",
+  publish_ready: "Publish-ready video",
+};
+
+function _publishingStatusLabel(status) {
+  const labels = {
+    pending: "⏳ Chờ",
+    running: "⏳ Đang chạy",
+    success: "✅ Hoàn tất",
+    failed: "❌ Lỗi",
+    skipped: "– Không bật",
+  };
+  return labels[status] || status || "Chưa có trạng thái";
+}
+
+function _publishingComponentGrid(jobId, components) {
+  const entries = Object.entries(_publishingComponentLabels);
+  return `<div class="stat-box" style="text-align:left">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+      <strong>Trạng thái từng thành phần</strong>
+      ${entries.some(([key]) => (components[key] || {}).status === "failed")
+        ? `<button class="btn gradient small" data-pack-retry="failed" data-job-id="${jobId}">🔄 Thử lại tất cả phần lỗi</button>`
+        : `<span class="muted-help">Không có thành phần lỗi cần chạy lại.</span>`}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px;margin-top:10px">
+      ${entries.map(([key, label]) => {
+        const item = components[key] || { status: "pending", attempts: 0 };
+        const failed = item.status === "failed";
+        const error = item.error ? `<div class="muted-help" style="color:var(--err);margin-top:4px">${_escapeHtml(item.error)}</div>` : "";
+        return `<div style="padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div><b>${_escapeHtml(label)}</b><div class="muted-help">${_publishingStatusLabel(item.status)} · ${Number(item.attempts || 0)} lần</div></div>
+            ${failed ? `<button class="btn secondary small" data-pack-retry="${key}" data-job-id="${jobId}">Tạo lại</button>` : ""}
+          </div>${error}
+        </div>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+
+function _publishingManualRegenerate(jobId, components) {
+  return `<details class="stat-box" style="text-align:left">
+    <summary style="cursor:pointer"><strong>Tạo lại thủ công</strong> <span class="muted-help">— chỉ chạy phần bạn chọn, không render lại video</span></summary>
+    <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">
+      ${Object.entries(_publishingComponentLabels).map(([key, label]) => {
+        const item = components[key] || {};
+        if (item.status === "skipped") return "";
+        return `<button class="btn secondary small" data-pack-retry="${key}" data-job-id="${jobId}">↻ ${_escapeHtml(label)}</button>`;
+      }).join("")}
+      <button class="btn secondary small" data-pack-retry="all" data-job-id="${jobId}">↻ Tạo lại toàn bộ Pack</button>
+    </div>
+  </details>`;
+}
+
+function _publishingThumbnailGrid(items) {
+  if (!items || !items.length) return `<div class="muted-help">Chưa có thumbnail.</div>`;
+  return `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">` +
+    items.map((url, idx) => `<a href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Thumbnail ${idx + 1}" style="width:100%;border-radius:10px;border:1px solid var(--border)"></a>`).join("") +
+    `</div>`;
+}
+
+async function retryPublishingComponent(jobId, component, button = null) {
+  const original = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Đang tạo lại...";
+  }
+  try {
+    await api(`/api/jobs/${jobId}/publishing-pack/retry`, {
+      method: "POST",
+      body: JSON.stringify({ component }),
+    });
+    await openPublishingPack(jobId);
+    if (typeof loadJobs === "function") loadJobs().catch(() => {});
+  } catch (e) {
+    const status = $("#publishing-pack-status");
+    if (status) status.textContent = `Tạo lại thất bại: ${e.message}`;
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+function _wirePublishingRetryButtons(jobId, root) {
+  root.querySelectorAll("[data-pack-retry]").forEach(btn => {
+    btn.onclick = () => retryPublishingComponent(jobId, btn.dataset.packRetry, btn);
+  });
+}
+
+async function openPublishingPack(jobId) {
+  const modal = $("#publishing-pack-modal");
+  const content = $("#publishing-pack-content");
+  $("#publishing-pack-status").textContent = "Đang tải gói đăng bài...";
+  content.innerHTML = "";
+  modal.classList.remove("hidden");
+  try {
+    const pack = await api(`/api/jobs/${jobId}/publishing-pack`);
+    window._publishingPackByJob = window._publishingPackByJob || {};
+    window._publishingPackByJob[jobId] = pack;
+    const source = pack.source_metadata || {};
+    const analysis = pack.content_analysis || {};
+    const yt = pack.youtube || {};
+    const fb = pack.facebook || {};
+    const originality = pack.originality_report || {};
+    const components = pack.components || {};
+    const overall = pack.overall_status || pack.status || "pending";
+    const channelFit = analysis.channel_fit === "review_before_publish"
+      ? "⚠ Nội dung có vẻ ngoài ngách kênh — cần duyệt trước khi đăng"
+      : "✓ Nội dung khớp profile kênh";
+    const overallLabel = {
+      success: "✅ Publishing Pack hoàn tất",
+      partial: "⚠ Publishing Pack hoàn thành một phần",
+      failed: "❌ Publishing Pack có lỗi",
+      running: "⏳ Publishing Pack đang chạy",
+      pending: "⏳ Publishing Pack đang chờ",
+    }[overall] || overall;
+    $("#publishing-pack-status").textContent = `${overallLabel} · Tên truyện: ${analysis.story_name || "Chưa xác định"} · confidence ${Math.round((analysis.story_name_confidence || 0) * 100)}% · originality score ${originality.score ?? "?"}`;
+    content.innerHTML = `
+      ${_publishingComponentGrid(jobId, components)}
+      <div class="stat-box" style="text-align:left">
+        <strong>Metadata nguồn đã lấy</strong>
+        <div style="margin-top:7px">Tiêu đề gốc: <b>${_escapeHtml(source.title || "Không có")}</b></div>
+        <div class="muted-help">Tác giả: ${_escapeHtml(source.uploader || "Không rõ")} · Nền tảng: ${_escapeHtml(source.platform || "Không rõ")}</div>
+        ${source.description ? `<details style="margin-top:7px"><summary>Mô tả gốc</summary><div class="muted-help" style="white-space:pre-wrap">${_escapeHtml(source.description)}</div></details>` : ""}
+        ${source.source_thumbnail_url ? `<div style="margin-top:9px"><a href="${source.source_thumbnail_url}" target="_blank" rel="noopener"><img src="${source.source_thumbnail_url}" alt="Thumbnail nguồn" style="max-width:320px;width:100%;border-radius:10px;border:1px solid var(--border)"></a></div>` : ""}
+      </div>
+      <div class="stat-box" style="text-align:left">
+        <strong>Phân tích nội dung</strong>
+        <div style="margin-top:7px">${_escapeHtml(channelFit)} · độ khớp ${Math.round((analysis.niche_match_score || 0) * 100)}%</div>
+        <div>Keyword chính: <b>${_escapeHtml(analysis.primary_keyword || "Chưa chọn vì ngoài ngách")}</b></div>
+        <div class="muted-help">${_escapeHtml(analysis.summary || "")}</div>
+      </div>
+      <div>
+        <label>YouTube · Tiêu đề đề xuất</label>
+        <div style="display:flex;gap:8px"><input id="pack-youtube-title" value="${_escapeHtml(yt.recommended_title || "")}" readonly><button class="btn secondary small" id="pack-copy-title">Copy</button></div>
+        <div style="display:grid;gap:6px;margin-top:8px">${(yt.alternative_titles || []).map(item => `<button class="btn secondary small pack-alt-title" data-title="${_escapeHtml(item)}" style="text-align:left">${_escapeHtml(item)}</button>`).join("")}</div>
+      </div>
+      <div><label>Mô tả YouTube</label><textarea id="pack-youtube-description" rows="10" readonly>${_escapeHtml(yt.description || "")}</textarea></div>
+      <div>
+        <label>Thumbnail YouTube</label>
+        ${_publishingThumbnailGrid(yt.thumbnail_urls || [])}
+        ${(components.youtube_thumbnails || {}).status === "failed" ? `<button class="btn gradient small" style="margin-top:8px" data-pack-retry="youtube_thumbnails" data-job-id="${jobId}">🔄 Tạo lại Thumbnail YouTube</button>` : ""}
+      </div>
+      <div><label>Facebook caption</label><textarea id="pack-facebook-caption" rows="6" readonly>${_escapeHtml(fb.caption || "")}</textarea></div>
+      <div>
+        <label>Thumbnail Facebook</label>
+        ${_publishingThumbnailGrid(fb.thumbnail_urls || [])}
+        ${(components.facebook_thumbnails || {}).status === "failed" ? `<button class="btn gradient small" style="margin-top:8px" data-pack-retry="facebook_thumbnails" data-job-id="${jobId}">🔄 Tạo lại Thumbnail Facebook</button>` : ""}
+      </div>
+      ${(components.publish_ready || {}).status === "failed" ? `<div class="stat-box" style="text-align:left;color:var(--err)">publish_ready.mp4 chưa tạo được. <button class="btn secondary small" data-pack-retry="publish_ready" data-job-id="${jobId}">Tạo lại publish_ready.mp4</button></div>` : ""}
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <a class="btn gradient" href="${pack.download_url}">Tải toàn bộ Publishing Pack</a>
+        ${pack.publish_ready_video_url ? `<a class="btn secondary" href="${pack.publish_ready_video_url}?download=true">Tải publish_ready.mp4</a>` : ""}
+        <button class="btn secondary" id="pack-use-publish">Dùng bộ này để đăng</button>
+      </div>
+      ${_publishingManualRegenerate(jobId, components)}`;
+    if ($("#pack-copy-title")) $("#pack-copy-title").onclick = () => _copyText(yt.recommended_title || "");
+    content.querySelectorAll(".pack-alt-title").forEach(btn => btn.onclick = () => _copyText(btn.dataset.title));
+    if ($("#pack-use-publish")) $("#pack-use-publish").onclick = () => {
+      modal.classList.add("hidden");
+      openPublish(jobId);
+    };
+    _wirePublishingRetryButtons(jobId, content);
+  } catch (e) {
+    $("#publishing-pack-status").textContent = e.message;
+    content.innerHTML = `<div style="color:var(--err)">${_escapeHtml(e.message)}</div>`;
+  }
+}
+if ($("#publishing-pack-close")) $("#publishing-pack-close").onclick = () => $("#publishing-pack-modal").classList.add("hidden");
+if ($("#publishing-pack-modal")) $("#publishing-pack-modal").addEventListener("click", ev => {
+  if (ev.target === $("#publishing-pack-modal")) $("#publishing-pack-modal").classList.add("hidden");
+});
+
 // ---------------- preview + publish ----------------
 function openPreview(jobId) {
   currentJobId = jobId;
@@ -3073,16 +3298,32 @@ function _suggestHashtags(text, max = 5) {
     .map(([w]) => "#" + w.replace(/\s+/g, ""));
 }
 
-function _prefillPublishSuggestions(jobId) {
+async function _prefillPublishSuggestions(jobId) {
   const job = (window._jobsById || {})[jobId];
   if (!job) return;
-  if (!$("#publish-title").value) $("#publish-title").value = job.title || "";
-
-  const suggestions = _suggestHashtags(job.title || "");
+  let baseText = job.title || "";
+  let suggestedHashtags = [];
+  if (job.has_publishing_pack) {
+    try {
+      const pack = await api(`/api/jobs/${jobId}/publishing-pack`);
+      window._publishingPackByJob = window._publishingPackByJob || {};
+      window._publishingPackByJob[jobId] = pack;
+      const yt = pack.youtube || {};
+      $("#publish-title").value = yt.recommended_title || baseText;
+      $("#publish-desc").value = yt.description || "";
+      $("#publish-hashtags").value = (yt.hashtags || []).join(" ");
+      baseText = yt.recommended_title || baseText;
+      suggestedHashtags = yt.hashtags || [];
+    } catch (e) {
+      console.warn("Could not prefill Publishing Pack", e);
+    }
+  }
+  if (!$("#publish-title").value) $("#publish-title").value = baseText;
+  if (!suggestedHashtags.length) suggestedHashtags = _suggestHashtags(baseText);
   const box = $("#publish-hashtag-suggestions");
-  if (!suggestions.length) { box.innerHTML = ""; return; }
+  if (!suggestedHashtags.length) { box.innerHTML = ""; return; }
   box.innerHTML = `<span style="font-size:12px;color:var(--text-dim)">Gợi ý: </span>` +
-    suggestions.map(tag => `<span class="hashtag-chip" data-tag="${tag}">${tag}</span>`).join(" ");
+    suggestedHashtags.map(tag => `<span class="hashtag-chip" data-tag="${_escapeHtml(tag)}">${_escapeHtml(tag)}</span>`).join(" ");
   box.querySelectorAll(".hashtag-chip").forEach(chip => {
     chip.onclick = () => {
       const current = $("#publish-hashtags").value.trim();

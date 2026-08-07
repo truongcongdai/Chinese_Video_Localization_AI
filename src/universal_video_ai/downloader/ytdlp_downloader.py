@@ -140,4 +140,21 @@ class YTDLPDownloader(BaseDownloader):
             filesize=info.get("filesize", 0),
 
             extension="mp4",
+
+            description=info.get("description", "") or "",
+
+            thumbnail_url=info.get("thumbnail", "") or "",
+
+            tags=[str(item) for item in (info.get("tags") or []) if str(item).strip()],
+
+            raw_metadata={
+                "id": info.get("id"),
+                "webpage_url": info.get("webpage_url"),
+                "upload_date": info.get("upload_date"),
+                "timestamp": info.get("timestamp"),
+                "view_count": info.get("view_count"),
+                "like_count": info.get("like_count"),
+                "comment_count": info.get("comment_count"),
+                "categories": info.get("categories") or [],
+            },
         )

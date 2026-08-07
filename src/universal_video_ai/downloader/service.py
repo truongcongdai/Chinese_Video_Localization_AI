@@ -39,21 +39,40 @@ class DownloadService:
     ) -> DownloadResult:
         # Check cache first
         if self.cache:
-            cached_path = self.cache.get(url)
-            if cached_path:
-                # Copy from cache to output dir
+            cached_entry = self.cache.get_entry(url)
+            if cached_entry:
+                # Copy from cache to output dir while preserving the metadata
+                # used by the Reup Publishing Pack. Older cache entries simply
+                # fall back to empty metadata without breaking downloads.
                 import shutil
+                cached_path = Path(cached_entry["video_path"])
                 output_path = output_dir / cached_path.name
                 shutil.copy2(cached_path, output_path)
-                
-                # Return cached result
+
                 from .platform import Platform
+                metadata = dict(cached_entry.get("source_metadata") or {})
+                platform_value = str(metadata.get("platform") or "other").lower()
+                try:
+                    cached_platform = Platform(platform_value)
+                except ValueError:
+                    cached_platform = Platform.OTHER
                 return DownloadResult(
                     success=True,
-                    platform=Platform.OTHER,
+                    platform=cached_platform,
                     original_url=url,
-                    final_url=url,
+                    final_url=str(metadata.get("final_url") or url),
                     video_path=output_path,
+                    title=str(metadata.get("title") or ""),
+                    uploader=str(metadata.get("uploader") or ""),
+                    duration=float(metadata.get("duration") or 0.0),
+                    width=int(metadata.get("width") or 0),
+                    height=int(metadata.get("height") or 0),
+                    filesize=int(metadata.get("filesize") or output_path.stat().st_size),
+                    extension=str(metadata.get("extension") or output_path.suffix.lstrip(".") or "mp4"),
+                    description=str(metadata.get("description") or ""),
+                    thumbnail_url=str(metadata.get("thumbnail_url") or ""),
+                    tags=[str(item) for item in (metadata.get("tags") or [])],
+                    raw_metadata=dict(metadata.get("raw_metadata") or {}),
                 )
         
         # Rate limiting is handled at the caller level (async)
@@ -71,6 +90,25 @@ class DownloadService:
         
         # Cache successful downloads
         if result.success and self.cache:
-            self.cache.put(url, result.video_path)
+            platform_value = getattr(result.platform, "value", str(result.platform))
+            self.cache.put(
+                url,
+                result.video_path,
+                source_metadata={
+                    "platform": platform_value,
+                    "final_url": result.final_url,
+                    "title": result.title,
+                    "uploader": result.uploader,
+                    "duration": result.duration,
+                    "width": result.width,
+                    "height": result.height,
+                    "filesize": result.filesize,
+                    "extension": result.extension,
+                    "description": result.description,
+                    "thumbnail_url": result.thumbnail_url,
+                    "tags": list(result.tags or []),
+                    "raw_metadata": dict(result.raw_metadata or {}),
+                },
+            )
         
         return result
