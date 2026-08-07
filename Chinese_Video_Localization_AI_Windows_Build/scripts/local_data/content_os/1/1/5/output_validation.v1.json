@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "output_validation",
+  "version": 1,
+  "created_by_agent": "MP4Validator",
+  "created_at": "2026-08-01T03:15:59.837439",
+  "metadata": {},
+  "data": {
+    "valid": false,
+    "file_path": "local_data/content_os/1/default/1/5/renders/final.mp4",
+    "file_size_bytes": 81690,
+    "duration_seconds": 4.608,
+    "resolution": "1080x1920",
+    "video_codec": "h264",
+    "audio_codec": "aac",
+    "issues": [
+      "Duration mismatch: expected 45s, got 4.608s"
+    ],
+    "warnings": []
+  }
+}

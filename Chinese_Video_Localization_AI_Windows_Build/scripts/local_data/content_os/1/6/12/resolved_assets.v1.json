@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "resolved_assets",
+  "version": 1,
+  "created_by_agent": "AssetResolver",
+  "created_at": "2026-08-02T10:20:31.237245",
+  "metadata": {},
+  "data": {
+    "assets": [
+      {
+        "scene_id": "scene_1",
+        "strategy": "generated",
+        "local_path": "local_data\\content_os\\generated_assets\\generated_1785666023.png",
+        "description": "Show 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn intro"
+      },
+      {
+        "scene_id": "scene_2",
+        "strategy": "generated",
+        "local_path": "local_data\\content_os\\generated_assets\\generated_1785666031.png",
+        "description": "Show 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn highlights"
+      },
+      {
+        "scene_id": "scene_3",
+        "strategy": "generated",
+        "local_path": "local_data\\content_os\\generated_assets\\generated_1785666031.png",
+        "description": "Show 3 tính năng AI trên điện thoại giúp học tiếng Anh hiệu quả hơn details"
+      },
+      {
+        "scene_id": "scene_4",
+        "strategy": "generated",
+        "local_path": "local_data\\content_os\\generated_assets\\generated_1785666031.png",
+        "description": "Show summary"
+      }
+    ],
+    "total_assets": 4
+  }
+}
