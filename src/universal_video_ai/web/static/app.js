@@ -1510,34 +1510,79 @@ $("#channel-max-videos").addEventListener("input", updateLocalizationSummary);
 $("#channel-skip-existing").addEventListener("change", updateLocalizationSummary);
 updateChannelModeUI();
 
-$("#channel-analyze-btn").addEventListener("click", async () => {
+function setChannelScanButtonsDisabled(disabled) {
+  for (const selector of [
+    "#channel-analyze-btn",
+    "#channel-continue-btn",
+    "#channel-deep-scan-btn",
+    "#channel-reset-scan-btn",
+  ]) {
+    const button = $(selector);
+    if (button) button.disabled = disabled;
+  }
+}
+
+function formatChannelScanStatus(result) {
+  const total = Number(result.catalog_total ?? result.video_count ?? 0);
+  const fresh = Number(result.new_video_count ?? 0);
+  const current = Number(result.current_scan_count ?? 0);
+  const state = result.complete
+    ? "đã quét hết theo tín hiệu phân trang"
+    : (result.has_more === true ? "vẫn còn video" : "chưa xác nhận đã hết");
+  const pieces = [
+    `Catalog: ${total} video`,
+    `lượt này thấy ${current}`,
+    `mới ${fresh}`,
+    state,
+  ];
+  if (result.channel_title) pieces.push(result.channel_title);
+  if (result.stop_reason) pieces.push(`dừng: ${result.stop_reason}`);
+  const warning = (result.warnings || []).join(" ");
+  return pieces.join(" · ") + (warning ? ` · ${warning}` : "");
+}
+
+async function scanChannel(mode) {
   $("#submit-error").textContent = "";
   const urls = localizationUrls();
   if (!channelModeEnabled() || urls.length !== 1) {
     $("#submit-error").textContent = "Bật chế độ tải toàn bộ kênh và dán đúng 1 link kênh trước khi quét.";
     return;
   }
-  const button = $("#channel-analyze-btn");
-  button.disabled = true;
-  $("#channel-analysis-status").textContent = "Đang quét danh sách video công khai...";
+  setChannelScanButtonsDisabled(true);
+  const labels = {
+    quick: "Đang quét nhanh danh sách công khai...",
+    continue: "Đang tiếp tục cuộn để tìm video chưa có trong catalog...",
+    deep: "Đang quét sâu toàn bộ kênh; thao tác này có thể mất vài phút...",
+    reset: "Đang xóa catalog cũ và quét lại từ đầu...",
+  };
+  $("#channel-analysis-status").textContent = labels[mode] || labels.quick;
   try {
     const result = await api("/api/channel-downloads/analyze", {
       method: "POST",
       body: JSON.stringify({
         url: urls[0],
         max_videos: parseInt($("#channel-max-videos").value, 10) || 0,
+        mode,
       }),
     });
-    const warning = (result.warnings || []).join(" ");
-    $("#channel-analysis-status").textContent =
-      `Tìm thấy ${result.video_count} video · ${result.platform}${result.channel_title ? ` · ${result.channel_title}` : ""}` +
-      (warning ? ` · ${warning}` : "");
+    $("#channel-analysis-status").textContent = formatChannelScanStatus(result);
   } catch (error) {
     $("#channel-analysis-status").textContent = `Quét thất bại: ${error.message}`;
   } finally {
-    button.disabled = false;
+    setChannelScanButtonsDisabled(false);
   }
-});
+}
+
+$("#channel-analyze-btn").addEventListener("click", () => scanChannel("quick"));
+if ($("#channel-continue-btn")) {
+  $("#channel-continue-btn").addEventListener("click", () => scanChannel("continue"));
+}
+if ($("#channel-deep-scan-btn")) {
+  $("#channel-deep-scan-btn").addEventListener("click", () => scanChannel("deep"));
+}
+if ($("#channel-reset-scan-btn")) {
+  $("#channel-reset-scan-btn").addEventListener("click", () => scanChannel("reset"));
+}
 for (const selector of ["#source-lang-select", "#lang-select", "#voice-select"]) {
   $(selector).addEventListener("change", updateLocalizationSummary);
 }
@@ -1817,11 +1862,14 @@ $("#submit-btn").onclick = async () => {
           url: urls[0],
           max_videos: parseInt($("#channel-max-videos").value, 10) || 0,
           skip_existing: $("#channel-skip-existing").checked,
+          deep_scan: true,
           ...commonBody,
         }),
       });
       const notes = [
-        `Đã quét ${result.scanned} video`,
+        `Catalog ${result.catalog_total ?? result.scanned} video`,
+        result.newly_discovered ? `mới phát hiện ${result.newly_discovered}` : "",
+        result.scan_complete ? "đã quét hết" : "catalog chưa hoàn tất",
         `tạo ${result.created_count} job`,
         `bỏ qua ${result.skipped_existing_count} video cũ`,
         result.failed_count ? `${result.failed_count} lỗi` : "",

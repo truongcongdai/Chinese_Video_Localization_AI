@@ -84,7 +84,7 @@ from universal_video_ai.config import REDIS_URL, TEMP_DIR
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
 from universal_video_ai.downloader.channel import (
-    ChannelListingService, URLIntent, VideoURLClassifier,
+    ChannelListingService, ChannelVideoCandidate, URLIntent, VideoURLClassifier,
 )
 
 from .store import Store
@@ -416,6 +416,8 @@ class ChannelAnalyzeBody(BaseModel):
     url: str
     # 0 means all public videos, capped by CHANNEL_SCAN_HARD_LIMIT.
     max_videos: int = Field(default=0, ge=0, le=10000)
+    # quick | continue | deep | reset
+    mode: str = "quick"
 
 
 class ChannelProcessBody(NewJobBody):
@@ -423,6 +425,10 @@ class ChannelProcessBody(NewJobBody):
     # channel-specific controls. `url` is the channel/profile URL.
     max_videos: int = Field(default=0, ge=0, le=10000)
     skip_existing: bool = True
+    # Run a fresh deep scan before creating jobs. Existing catalog entries are
+    # retained and deduplicated, so repeated runs continue instead of starting
+    # from nine items again.
+    deep_scan: bool = True
 
 
 class RemixPlanBody(BaseModel):
@@ -582,6 +588,17 @@ def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum:
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _parse_fractional_boxes_env(name: str) -> Tuple[Tuple[float, float, float, float], ...]:
@@ -1115,7 +1132,13 @@ def _build_service_for_job(job):
         translation_model = getattr(job, "translation_model", None) or ""
         translation_base_url = None
 
-    strict_translation_adapter = translation_provider == "gemini"
+    # Contextual adaptation is a quality pass, not a hard prerequisite for a
+    # usable localization. Keep fallback enabled by default even for Gemini;
+    # strict failure remains opt-in for debugging/QA.
+    strict_translation_adapter = (
+        translation_provider == "gemini"
+        and _env_bool("STRICT_TRANSLATION_ADAPTER", False)
+    )
     translation_adaptation = AdaptationConfig(
         enabled=use_contextual_translation,
         provider=translation_provider,
@@ -1134,6 +1157,12 @@ def _build_service_for_job(job):
         ),
         ollama_num_ctx=_env_int("OLLAMA_TRANSLATION_NUM_CTX", 8192, minimum=2048, maximum=131072),
         ollama_num_predict=_env_int("OLLAMA_TRANSLATION_NUM_PREDICT", 0, minimum=0, maximum=32768),
+        gemini_retry_count=_env_int("GEMINI_TRANSLATION_RETRIES", 2, minimum=0, maximum=5),
+        gemini_batch_size=_env_int("GEMINI_TRANSLATION_BATCH_SIZE", 24, minimum=2, maximum=100),
+        gemini_debug_dir=(
+            _env_first("GEMINI_TRANSLATION_DEBUG_DIR")
+            or str(Path(TEMP_DIR) / "translation_adaptation_debug")
+        ),
     )
 
     # Audio configuration: use job-specific settings if available, otherwise fall back to env vars
@@ -4186,19 +4215,87 @@ async def analyze_channel_download(
         body: ChannelAnalyzeBody,
         user_id: int = Depends(get_current_user_id),
 ):
-    del user_id  # Authentication/ownership gate; scan itself creates no data.
+    mode = str(body.mode or "quick").strip().lower()
+    if mode not in {"quick", "continue", "deep", "reset"}:
+        raise HTTPException(400, "mode phải là quick, continue, deep hoặc reset")
+
+    raw_url = _extract_first_video_url(body.url)
+    try:
+        classification, canonical_url = _channel_listing_service.canonicalize(raw_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if mode == "reset":
+        store.reset_channel_scan(user_id, canonical_url)
+
+    known_video_ids = store.get_channel_scan_video_ids(user_id, canonical_url)
     try:
         result = await asyncio.to_thread(
             _channel_listing_service.scan,
-            _extract_first_video_url(body.url),
+            raw_url,
             body.max_videos,
+            force_refresh=mode in {"continue", "deep", "reset"},
+            known_video_ids=known_video_ids,
+            deep=mode in {"continue", "deep", "reset"},
         )
     except (ValueError, RuntimeError) as exc:
         logger.warning("Channel analyze failed for %s: %s", body.url, exc, exc_info=True)
+        state = store.get_channel_scan_state(user_id, canonical_url)
+        if state and int(state.get("total_discovered") or 0) > 0:
+            # Preserve already discovered videos and expose the current scan
+            # failure instead of pretending the catalog disappeared.
+            return {
+                "channel_url": body.url,
+                "resolved_url": canonical_url,
+                "platform": classification.platform.value,
+                "channel_title": state.get("channel_title") or "",
+                "channel_id": state.get("channel_id") or "",
+                "video_count": int(state.get("total_discovered") or 0),
+                "current_scan_count": 0,
+                "new_video_count": 0,
+                "warnings": [f"Lượt quét mới thất bại: {exc}"],
+                "truncated": not bool(state.get("complete")),
+                "complete": bool(state.get("complete")),
+                "has_more": state.get("has_more"),
+                "cursor": state.get("cursor") or "",
+                "scan_source": state.get("scan_source") or "saved_catalog",
+                "stop_reason": state.get("stop_reason") or "scan_error",
+                "network_pages": int(state.get("network_pages") or 0),
+                "catalog_total": int(state.get("total_discovered") or 0),
+                "preview": store.list_channel_scan_videos(user_id, canonical_url, limit=50),
+                "preview_truncated": int(state.get("total_discovered") or 0) > 50,
+                "scan_error": str(exc),
+            }
         raise HTTPException(400, str(exc)) from exc
+
+    state = store.merge_channel_scan_result(
+        user_id,
+        original_url=result.channel_url,
+        canonical_url=canonical_url,
+        platform=result.platform.value,
+        channel_id=result.channel_id,
+        channel_title=result.channel_title,
+        videos=[video.to_dict() for video in result.videos],
+        cursor=result.cursor,
+        has_more=result.has_more,
+        complete=result.complete,
+        stop_reason=result.stop_reason,
+        scan_source=result.scan_source,
+        network_pages=result.network_pages,
+    )
+    total = int(state.get("total_discovered") or 0)
     payload = result.to_dict(include_videos=False)
-    payload["preview"] = [video.to_dict() for video in result.videos[:50]]
-    payload["preview_truncated"] = len(result.videos) > 50
+    payload.update({
+        "video_count": total,
+        "current_scan_count": len(result.videos),
+        "new_video_count": int(state.get("new_count") or 0),
+        "catalog_total": total,
+        "complete": bool(state.get("complete")),
+        "has_more": state.get("has_more"),
+        "cursor": state.get("cursor") or "",
+        "preview": store.list_channel_scan_videos(user_id, canonical_url, limit=50),
+        "preview_truncated": total > 50,
+    })
     return payload
 
 
@@ -4213,17 +4310,76 @@ async def process_channel_download(
             "Chế độ xem/sửa phụ đề thủ công không dùng được khi xử lý toàn bộ kênh.",
         )
 
+    raw_url = _extract_first_video_url(body.url)
     try:
-        scan = await asyncio.to_thread(
-            _channel_listing_service.scan,
-            _extract_first_video_url(body.url),
-            body.max_videos,
-        )
-    except (ValueError, RuntimeError) as exc:
-        logger.warning("Channel process scan failed for %s: %s", body.url, exc, exc_info=True)
+        classification, canonical_url = _channel_listing_service.canonicalize(raw_url)
+    except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    candidates = list(scan.videos)
+    scan = None
+    scan_error = ""
+    newly_discovered = 0
+    known_video_ids = store.get_channel_scan_video_ids(user_id, canonical_url)
+    state = store.get_channel_scan_state(user_id, canonical_url)
+    should_scan = bool(body.deep_scan or state is None or not state.get("complete"))
+    if should_scan:
+        try:
+            scan = await asyncio.to_thread(
+                _channel_listing_service.scan,
+                raw_url,
+                body.max_videos,
+                force_refresh=True,
+                known_video_ids=known_video_ids,
+                deep=True,
+            )
+            state = store.merge_channel_scan_result(
+                user_id,
+                original_url=scan.channel_url,
+                canonical_url=canonical_url,
+                platform=scan.platform.value,
+                channel_id=scan.channel_id,
+                channel_title=scan.channel_title,
+                videos=[video.to_dict() for video in scan.videos],
+                cursor=scan.cursor,
+                has_more=scan.has_more,
+                complete=scan.complete,
+                stop_reason=scan.stop_reason,
+                scan_source=scan.scan_source,
+                network_pages=scan.network_pages,
+            )
+            newly_discovered = int(state.get("new_count") or 0)
+        except (ValueError, RuntimeError) as exc:
+            scan_error = str(exc)
+            logger.warning("Channel process scan failed for %s: %s", body.url, exc, exc_info=True)
+            state = store.get_channel_scan_state(user_id, canonical_url)
+            if not state or int(state.get("total_discovered") or 0) <= 0:
+                raise HTTPException(400, str(exc)) from exc
+
+    catalog_rows = store.list_channel_scan_videos(
+        user_id,
+        canonical_url,
+        limit=body.max_videos if body.max_videos > 0 else 0,
+    )
+    candidates: list[ChannelVideoCandidate] = []
+    for item in catalog_rows:
+        try:
+            duration = float(item.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        candidates.append(ChannelVideoCandidate(
+            source_url=str(item.get("source_url") or ""),
+            platform=classification.platform,
+            video_id=str(item.get("video_id") or ""),
+            title=str(item.get("title") or item.get("desc") or ""),
+            uploader=str(item.get("uploader") or ""),
+            duration=duration,
+            thumbnail_url=str(item.get("thumbnail_url") or item.get("thumbnail") or ""),
+            published_at=str(item.get("published_at") or item.get("timestamp") or ""),
+        ))
+    candidates = [candidate for candidate in candidates if candidate.source_url]
+    if not candidates:
+        raise HTTPException(400, "Catalog kênh chưa có video hợp lệ. Hãy chạy Quét sâu toàn bộ trước.")
+
     skipped_existing: list[str] = []
     if body.skip_existing:
         existing = store.existing_source_urls_for_user(
@@ -4244,6 +4400,7 @@ async def process_channel_download(
     base_payload = body.model_dump()
     base_payload.pop("max_videos", None)
     base_payload.pop("skip_existing", None)
+    base_payload.pop("deep_scan", None)
     created: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
     for candidate in candidates:
@@ -4261,18 +4418,35 @@ async def process_channel_download(
             logger.exception("Could not create channel job for %s", candidate.source_url)
             failed.append({"source_url": candidate.source_url, "error": str(exc)})
 
+    state = store.get_channel_scan_state(user_id, canonical_url) or {}
+    warnings = list(scan.warnings if scan is not None else [])
+    if scan_error:
+        warnings.append(
+            f"Không quét thêm được trong lượt này ({scan_error}); đã dùng catalog đã lưu."
+        )
+    if not bool(state.get("complete")):
+        warnings.append(
+            "Catalog Douyin hiện vẫn được đánh dấu chưa hoàn tất. Bấm Quét tiếp hoặc Quét sâu "
+            "để thu thập thêm; bật bỏ qua video cũ để lần sau chỉ tạo job cho video mới."
+        )
+
     return {
         "ok": bool(created) or not candidates,
-        "platform": scan.platform.value,
-        "channel_title": scan.channel_title,
-        "scanned": len(scan.videos),
+        "platform": classification.platform.value,
+        "channel_title": state.get("channel_title") or (scan.channel_title if scan else ""),
+        "scanned": int(state.get("total_discovered") or len(catalog_rows)),
+        "catalog_total": int(state.get("total_discovered") or len(catalog_rows)),
+        "newly_discovered": newly_discovered,
+        "scan_complete": bool(state.get("complete")),
+        "has_more": state.get("has_more"),
+        "stop_reason": state.get("stop_reason") or "",
         "created_count": len(created),
         "skipped_existing_count": len(skipped_existing),
         "failed_count": len(failed),
         "created": created,
         "skipped_existing": skipped_existing,
         "failed": failed,
-        "warnings": scan.warnings,
+        "warnings": warnings,
         "max_concurrent_processing": _WEB_MAX_CONCURRENT_JOBS,
     }
 

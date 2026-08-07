@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import requests
 
@@ -29,6 +32,9 @@ class AdaptationConfig:
     request_timeout_seconds: int = 90
     ollama_num_ctx: int = 8192
     ollama_num_predict: int = 0
+    gemini_retry_count: int = 2
+    gemini_batch_size: int = 24
+    gemini_debug_dir: Optional[str] = None
 
 
 class SegmentAdapter:
@@ -180,10 +186,8 @@ class SegmentAdapter:
             raise RuntimeError(f"OpenAI adaptation failed: {response.status_code} {response.text[:300]}")
         data = response.json()
         content = _extract_response_text(data)
-        parsed = json.loads(content)
-        items = parsed.get("segments") or []
-        by_index = {int(item.get("i")): str(item.get("text") or "") for item in items}
-        return [by_index.get(index, translated_segments[index].text) for index in range(len(translated_segments))]
+        parsed = _parse_json_object(content)
+        return _extract_segment_texts(parsed, len(translated_segments))
 
     def _adapt_with_gemini(
         self,
@@ -192,9 +196,147 @@ class SegmentAdapter:
         source_lang: str,
         target_lang: str,
     ) -> list[str]:
+        """Adapt with Gemini, retrying malformed JSON and degrading to batches.
+
+        A single large Gemini response can be truncated or contain one missing
+        comma even when JSON MIME mode is requested. We first preserve full
+        context by trying the whole script. Only after those attempts fail do
+        we split into smaller batches. Failed batches fall back to their base
+        translations when fallback_on_error is enabled, so an optional quality
+        pass cannot destroy an otherwise usable localization job.
+        """
+        try:
+            return self._request_gemini_with_retries(
+                source_segments,
+                translated_segments,
+                source_lang,
+                target_lang,
+                label="full",
+            )
+        except Exception as full_error:
+            if len(translated_segments) <= 1:
+                raise
+            self.logger.warning(
+                "Gemini full-script adaptation failed; retrying in smaller batches: %s",
+                full_error,
+            )
+
+        configured_size = max(2, int(self.config.gemini_batch_size or 24))
+        # When the full request itself was already smaller than the configured
+        # batch size, halve it so the fallback actually reduces response size.
+        batch_size = min(configured_size, max(1, len(translated_segments) // 2))
+        results: list[str] = []
+        failed_batches = 0
+
+        for start_index in range(0, len(translated_segments), batch_size):
+            source_batch = source_segments[start_index:start_index + batch_size]
+            translated_batch = translated_segments[start_index:start_index + batch_size]
+            label = f"batch-{start_index}-{start_index + len(translated_batch) - 1}"
+            try:
+                batch_texts = self._request_gemini_with_retries(
+                    source_batch,
+                    translated_batch,
+                    source_lang,
+                    target_lang,
+                    label=label,
+                )
+            except Exception as batch_error:
+                failed_batches += 1
+                if not self.config.fallback_on_error:
+                    raise RuntimeError(
+                        f"Gemini adaptation failed for {label}: {batch_error}"
+                    ) from batch_error
+                self.logger.warning(
+                    "Gemini %s failed; keeping base translation for this batch: %s",
+                    label,
+                    batch_error,
+                )
+                batch_texts = [segment.text for segment in translated_batch]
+            results.extend(batch_texts)
+
+        if failed_batches:
+            self.logger.warning(
+                "Gemini adaptation used base translation for %d failed batch(es)",
+                failed_batches,
+            )
+        return results
+
+    def _request_gemini_with_retries(
+        self,
+        source_segments: list[TranscriptSegment],
+        translated_segments: list[TranscriptSegment],
+        source_lang: str,
+        target_lang: str,
+        *,
+        label: str,
+    ) -> list[str]:
+        attempts = max(1, int(self.config.gemini_retry_count or 0) + 1)
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._request_gemini_once(
+                    source_segments,
+                    translated_segments,
+                    source_lang,
+                    target_lang,
+                    label=label,
+                    repair_attempt=attempt > 1,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                self.logger.warning(
+                    "Gemini adaptation %s attempt %d/%d failed: %s",
+                    label,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                time.sleep(min(1.5, 0.35 * attempt))
+        assert last_error is not None
+        raise last_error
+
+    def _request_gemini_once(
+        self,
+        source_segments: list[TranscriptSegment],
+        translated_segments: list[TranscriptSegment],
+        source_lang: str,
+        target_lang: str,
+        *,
+        label: str,
+        repair_attempt: bool,
+    ) -> list[str]:
         prompt = self._build_prompt(source_segments, translated_segments, source_lang, target_lang)
+        if repair_attempt:
+            prompt["retry_instruction"] = (
+                "The previous response could not be parsed. Return one compact JSON object only. "
+                "Do not use markdown fences, comments, prose, trailing commas, or omit commas."
+            )
         model = self.config.model or "gemini-3.1-flash-lite"
         timeout_seconds = max(10, int(self.config.request_timeout_seconds or 90))
+        generation_config: dict[str, Any] = {
+            "temperature": 0.0 if repair_attempt else 0.1,
+            "maxOutputTokens": max(1024, min(8192, len(translated_segments) * 112)),
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "segments": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "i": {"type": "INTEGER"},
+                                "text": {"type": "STRING"},
+                            },
+                            "required": ["i", "text"],
+                        },
+                    }
+                },
+                "required": ["segments"],
+            },
+        }
         request_payload = {
             "contents": [
                 {
@@ -205,42 +347,94 @@ class SegmentAdapter:
                                 "Bạn là biên tập viên localization phim ngắn Trung Quốc sang tiếng Việt. "
                                 "Dịch lại từ thoại gốc, sửa xưng hô và ngữ cảnh. "
                                 "Không được chép lại draft_translation nếu draft còn máy móc. "
-                                "Chỉ trả về JSON hợp lệ theo output_schema.\n\n"
+                                "Chỉ trả về một JSON object hợp lệ theo output_schema, không markdown.\n\n"
                                 + json.dumps(prompt, ensure_ascii=False)
                             ),
                         }
                     ],
                 }
             ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": max(1024, min(8192, len(translated_segments) * 96)),
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": generation_config,
         }
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            headers={"x-goog-api-key": self.config.api_key, "Content-Type": "application/json"},
-            json=request_payload,
-            timeout=timeout_seconds,
-        )
-        if response.status_code == 400 and "responseMimeType" in response.text:
-            request_payload["generationConfig"].pop("responseMimeType", None)
+        response = self._post_gemini_request(model, request_payload, timeout_seconds)
+        if response.status_code >= 400:
+            raise RuntimeError(f"Gemini adaptation failed: {response.status_code} {response.text[:500]}")
+
+        data = response.json()
+        candidates = data.get("candidates") or []
+        candidate = candidates[0] if candidates else {}
+        parts = ((candidate.get("content") or {}).get("parts") or [])
+        content = "".join(str(part.get("text") or "") for part in parts).strip()
+        finish_reason = str(candidate.get("finishReason") or "").strip()
+        if not content:
+            self._write_gemini_debug(label, content, data, "empty response")
+            raise RuntimeError(f"Gemini returned no text for {label}; finishReason={finish_reason or 'unknown'}")
+        try:
+            parsed = _parse_json_object(content)
+            return _extract_segment_texts(parsed, len(translated_segments))
+        except Exception as exc:
+            self._write_gemini_debug(label, content, data, str(exc))
+            truncation = finish_reason.upper() in {"MAX_TOKENS", "LENGTH"}
+            reason = "truncated output" if truncation else "invalid JSON/output schema"
+            raise RuntimeError(
+                f"Gemini {reason} for {label} (finishReason={finish_reason or 'unknown'}): {exc}"
+            ) from exc
+
+    def _post_gemini_request(self, model: str, payload: dict, timeout_seconds: int):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {"x-goog-api-key": self.config.api_key, "Content-Type": "application/json"}
+        current_payload = json.loads(json.dumps(payload))
+        response = None
+        for _ in range(3):
             response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": self.config.api_key, "Content-Type": "application/json"},
-                json=request_payload,
+                url,
+                headers=headers,
+                json=current_payload,
                 timeout=timeout_seconds,
             )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Gemini adaptation failed: {response.status_code} {response.text[:300]}")
-        data = response.json()
-        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-        content = "".join(str(part.get("text") or "") for part in parts).strip()
-        parsed = _parse_json_object(content)
-        items = parsed.get("segments") or []
-        by_index = {int(item.get("i")): str(item.get("text") or "") for item in items}
-        return [by_index.get(index, translated_segments[index].text) for index in range(len(translated_segments))]
+            if response.status_code != 400:
+                return response
+            error_text = response.text or ""
+            normalized_error = re.sub(r"[^a-z]", "", error_text.lower())
+            generation_config = current_payload.get("generationConfig") or {}
+            changed = False
+            if "responseschema" in normalized_error and "responseSchema" in generation_config:
+                generation_config.pop("responseSchema", None)
+                changed = True
+            if "responsemimetype" in normalized_error and "responseMimeType" in generation_config:
+                generation_config.pop("responseMimeType", None)
+                changed = True
+            if not changed:
+                return response
+        assert response is not None
+        return response
+
+    def _write_gemini_debug(self, label: str, content: str, response_data: dict, error: str) -> None:
+        configured = str(self.config.gemini_debug_dir or "").strip()
+        if not configured:
+            return
+        try:
+            debug_dir = Path(configured).expanduser()
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)[:80] or "response"
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            path = debug_dir / f"gemini-adaptation-{stamp}-{safe_label}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "label": label,
+                        "error": error,
+                        "raw_content": content,
+                        "response": response_data,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            self.logger.warning("Saved malformed Gemini adaptation response to %s", path)
+        except Exception as debug_error:
+            self.logger.debug("Could not save Gemini adaptation debug response: %s", debug_error)
 
     def _adapt_with_ollama(
         self,
@@ -299,9 +493,7 @@ class SegmentAdapter:
         data = response.json()
         content = ((data.get("message") or {}).get("content") or data.get("response") or "").strip()
         parsed = _parse_json_object(content)
-        items = parsed.get("segments") or []
-        by_index = {int(item.get("i")): str(item.get("text") or "") for item in items}
-        return [by_index.get(index, translated_segments[index].text) for index in range(len(translated_segments))]
+        return _extract_segment_texts(parsed, len(translated_segments))
 
 
 def _extract_response_text(data: dict) -> str:
@@ -319,18 +511,159 @@ def _extract_response_text(data: dict) -> str:
 
 
 def _parse_json_object(content: str) -> dict:
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    # Some local models still wrap JSON in prose or <think> blocks even when
-    # Ollama's JSON mode is requested. Extract the outermost object as a last
-    # resort, then let json.loads validate it.
-    start = content.find("{")
-    end = content.rfind("}")
-    if start >= 0 and end > start:
-        return json.loads(content[start:end + 1])
-    raise RuntimeError("Model response did not include a JSON object")
+    """Parse model JSON with conservative repairs for common LLM damage.
+
+    Repairs are deliberately narrow: markdown fences/think blocks, trailing
+    commas, missing commas between adjacent JSON records/fields, and raw control
+    characters inside quoted strings. The result still has to pass json.loads.
+    """
+    errors: list[str] = []
+    for candidate in _json_object_candidates(content):
+        for variant in (candidate, _repair_json_candidate(candidate)):
+            try:
+                parsed = json.loads(variant)
+            except json.JSONDecodeError as exc:
+                errors.append(f"line {exc.lineno} column {exc.colno}: {exc.msg}")
+                continue
+            if not isinstance(parsed, dict):
+                errors.append("top-level JSON value is not an object")
+                continue
+            return parsed
+    detail = errors[-1] if errors else "no balanced JSON object found"
+    raise RuntimeError(f"Model response did not include valid JSON: {detail}")
+
+
+def _json_object_candidates(content: str) -> list[str]:
+    text = str(content or "").lstrip("\ufeff").strip()
+    if not text:
+        return []
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    candidates: list[str] = [text]
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+        fenced = match.group(1).strip()
+        if fenced:
+            candidates.append(fenced)
+    candidates.extend(_balanced_json_objects(text))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
+def _balanced_json_objects(text: str) -> list[str]:
+    objects: list[str] = []
+    start: Optional[int] = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start:index + 1])
+                start = None
+    # A truncated response may never close its last object. Keep it as a
+    # repair candidate only when adding the missing braces is unambiguous.
+    if start is not None and depth > 0 and not in_string:
+        objects.append(text[start:] + ("}" * depth))
+    return objects
+
+
+def _repair_json_candidate(candidate: str) -> str:
+    repaired = _escape_control_characters_in_json_strings(candidate)
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    repaired = re.sub(r"}\s*{", "},{", repaired)
+    # A frequent Gemini formatting defect is a missing comma at a newline
+    # between a completed value and the next object key.
+    repaired = re.sub(
+        r"([}\]\"0-9])\s*\n\s*(\"(?:[^\"\\]|\\.)+\"\s*:)",
+        r"\1,\n\2",
+        repaired,
+    )
+    return repaired
+
+
+def _escape_control_characters_in_json_strings(candidate: str) -> str:
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    for char in candidate:
+        if in_string:
+            if escaped:
+                output.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                output.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                output.append(char)
+                in_string = False
+                continue
+            if char == "\n":
+                output.append("\\n")
+                continue
+            if char == "\r":
+                output.append("\\r")
+                continue
+            if char == "\t":
+                output.append("\\t")
+                continue
+            if ord(char) < 0x20:
+                output.append(f"\\u{ord(char):04x}")
+                continue
+            output.append(char)
+            continue
+        output.append(char)
+        if char == '"':
+            in_string = True
+    return "".join(output)
+
+
+def _extract_segment_texts(payload: dict, expected_count: int) -> list[str]:
+    items = payload.get("segments")
+    if not isinstance(items, list):
+        raise RuntimeError("JSON output does not contain a segments array")
+    by_index: dict[int, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("segments contains a non-object item")
+        try:
+            index = int(item.get("i"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("segment item has an invalid i value") from exc
+        if index in by_index:
+            raise RuntimeError(f"duplicate segment index {index}")
+        text = str(item.get("text") or "").strip()
+        if not text:
+            raise RuntimeError(f"segment {index} has empty text")
+        by_index[index] = text
+    expected = set(range(expected_count))
+    actual = set(by_index)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise RuntimeError(f"segment indices mismatch; missing={missing[:10]} extra={extra[:10]}")
+    return [by_index[index] for index in range(expected_count)]
 
 
 def _adaptation_quality_issue(

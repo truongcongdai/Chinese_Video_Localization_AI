@@ -498,7 +498,11 @@ class LocalizationService:
         else:
             # Regular download from URL
             self._progress(5, "Đang tải video nguồn...")
-            self.logger.info("LocalizationService: downloading video")
+            self.logger.info(
+                "LocalizationService: downloading video url=%s output_dir=%s",
+                url,
+                output_dir,
+            )
 
             # Apply rate limiting before download
             rate_limiter = get_rate_limiter()
@@ -513,7 +517,12 @@ class LocalizationService:
             if not download_result.success:
                 raise ValueError(f"Download failed for {url}")
 
-            self.logger.info("LocalizationService: download successful: %s", download_result.video_path)
+            self.logger.info(
+                "LocalizationService: download successful requested_url=%s final_url=%s path=%s",
+                url,
+                getattr(download_result, "final_url", None),
+                download_result.video_path,
+            )
             self._progress(15, "Đã tải video ✓")
 
         # Step 2: Process audio (extract → demucs → transcribe)

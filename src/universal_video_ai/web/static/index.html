@@ -311,7 +311,7 @@
             <div class="field" style="flex:1">
               <label>Số video tối đa</label>
               <input id="channel-max-videos" type="number" min="0" max="10000" value="0">
-              <small class="muted-help">0 = toàn bộ video công khai (theo giới hạn an toàn của server).</small>
+              <small class="muted-help">0 = cố gắng quét toàn bộ video công khai. Catalog được lưu để lần sau tiếp tục và không quay lại mãi 9 video đầu.</small>
             </div>
             <div class="field" style="flex:1">
               <div class="check-row" style="margin-top:26px">
@@ -320,10 +320,14 @@
               </div>
             </div>
           </div>
-          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-            <button class="btn secondary small" type="button" id="channel-analyze-btn">🔎 Quét thử kênh</button>
-            <span id="channel-analysis-status" class="muted-help">Chưa quét.</span>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn secondary small" type="button" id="channel-analyze-btn">🔎 Quét nhanh</button>
+            <button class="btn secondary small" type="button" id="channel-continue-btn">↘ Quét tiếp</button>
+            <button class="btn secondary small" type="button" id="channel-deep-scan-btn">🌐 Quét sâu toàn bộ</button>
+            <button class="btn secondary small" type="button" id="channel-reset-scan-btn">♻ Quét lại từ đầu</button>
           </div>
+          <div id="channel-analysis-status" class="muted-help" style="margin-top:8px">Chưa quét.</div>
+          <div class="muted-help" style="margin-top:5px">Quét tiếp giữ catalog cũ và tìm video mới. Quét lại từ đầu xóa catalog của riêng kênh này. Khi Douyin yêu cầu xác minh, mở browser không headless và đăng nhập một lần.</div>
         </div>
       </div>
       <div class="localization-step-actions">

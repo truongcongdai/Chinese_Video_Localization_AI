@@ -381,6 +381,50 @@ CREATE TABLE IF NOT EXISTS content_os_memories (
     FOREIGN KEY(source_run_id) REFERENCES content_os_runs(id)
 );
 
+-- Persistent channel catalog used by deep/continued profile scans.
+CREATE TABLE IF NOT EXISTS channel_scan_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    channel_id TEXT,
+    channel_title TEXT,
+    cursor TEXT,
+    has_more INTEGER,
+    complete INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'incomplete',
+    stop_reason TEXT,
+    scan_source TEXT,
+    network_pages INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    total_discovered INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, canonical_url)
+);
+
+CREATE TABLE IF NOT EXISTS channel_scan_videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    state_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    metadata_json TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    discovered_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    UNIQUE(state_id, video_id),
+    UNIQUE(state_id, source_url),
+    FOREIGN KEY(state_id) REFERENCES channel_scan_states(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_scan_states_user_url
+    ON channel_scan_states(user_id, canonical_url);
+CREATE INDEX IF NOT EXISTS idx_channel_scan_videos_state_position
+    ON channel_scan_videos(state_id, position);
+CREATE INDEX IF NOT EXISTS idx_channel_scan_videos_source_url
+    ON channel_scan_videos(source_url);
+
 -- Content OS indexes
 CREATE INDEX IF NOT EXISTS idx_content_os_projects_user_id ON content_os_projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_content_os_projects_status ON content_os_projects(status);
@@ -1277,6 +1321,187 @@ class Store:
                 ).fetchall()
                 found.update(str(row["source_url"]) for row in rows)
         return found
+
+    def get_channel_scan_state(self, user_id: int, canonical_url: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM channel_scan_states WHERE user_id = ? AND canonical_url = ?",
+                (user_id, str(canonical_url).strip()),
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        if data.get("has_more") is not None:
+            data["has_more"] = bool(data["has_more"])
+        data["complete"] = bool(data.get("complete"))
+        return data
+
+    def get_channel_scan_video_ids(self, user_id: int, canonical_url: str) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT v.video_id FROM channel_scan_videos v "
+                "JOIN channel_scan_states s ON s.id = v.state_id "
+                "WHERE s.user_id = ? AND s.canonical_url = ?",
+                (user_id, str(canonical_url).strip()),
+            ).fetchall()
+        return {str(row["video_id"]) for row in rows if row["video_id"]}
+
+    def reset_channel_scan(self, user_id: int, canonical_url: str) -> bool:
+        canonical_url = str(canonical_url).strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM channel_scan_states WHERE user_id = ? AND canonical_url = ?",
+                (user_id, canonical_url),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM channel_scan_videos WHERE state_id = ?", (row["id"],))
+            conn.execute("DELETE FROM channel_scan_states WHERE id = ?", (row["id"],))
+            return True
+
+    def merge_channel_scan_result(
+            self,
+            user_id: int,
+            *,
+            original_url: str,
+            canonical_url: str,
+            platform: str,
+            channel_id: str = "",
+            channel_title: str = "",
+            videos: List[Dict[str, Any]],
+            cursor: str = "",
+            has_more: Optional[bool] = None,
+            complete: bool = False,
+            stop_reason: str = "",
+            scan_source: str = "",
+            network_pages: int = 0,
+            last_error: str = "",
+    ) -> Dict[str, Any]:
+        """Merge one scan into the user's persistent channel catalog.
+
+        Video identity is primarily `video_id`/aweme_id and falls back to the
+        canonical source URL. Existing rows are refreshed without changing
+        their original catalog position, so repeated scans never create nine
+        duplicate entries at the top.
+        """
+        now = time.time()
+        canonical_url = str(canonical_url).strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM channel_scan_states WHERE user_id = ? AND canonical_url = ?",
+                (user_id, canonical_url),
+            ).fetchone()
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO channel_scan_states ("
+                    "user_id, platform, original_url, canonical_url, channel_id, channel_title, "
+                    "cursor, has_more, complete, status, stop_reason, scan_source, network_pages, "
+                    "last_error, total_discovered, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    (
+                        user_id, platform, original_url, canonical_url, channel_id, channel_title,
+                        cursor or None, None if has_more is None else int(bool(has_more)),
+                        int(bool(complete)), "complete" if complete else "incomplete",
+                        stop_reason or None, scan_source or None, int(network_pages or 0),
+                        last_error or None, now, now,
+                    ),
+                )
+                state_id = int(cur.lastrowid)
+                next_position = 0
+            else:
+                state_id = int(row["id"])
+                next_position_row = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 AS next_position "
+                    "FROM channel_scan_videos WHERE state_id = ?",
+                    (state_id,),
+                ).fetchone()
+                next_position = int(next_position_row["next_position"] or 0)
+
+            new_count = 0
+            seen_in_request: set[tuple[str, str]] = set()
+            for raw_video in videos or []:
+                source_url = str(raw_video.get("source_url") or "").strip()
+                video_id = str(raw_video.get("video_id") or raw_video.get("aweme_id") or "").strip()
+                if not video_id and source_url:
+                    video_id = source_url.rstrip("/").rsplit("/", 1)[-1]
+                if not source_url or not video_id:
+                    continue
+                identity = (video_id, source_url)
+                if identity in seen_in_request:
+                    continue
+                seen_in_request.add(identity)
+                metadata_json = json.dumps(raw_video, ensure_ascii=False)
+                existing = conn.execute(
+                    "SELECT id FROM channel_scan_videos "
+                    "WHERE state_id = ? AND (video_id = ? OR source_url = ?) LIMIT 1",
+                    (state_id, video_id, source_url),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO channel_scan_videos ("
+                        "state_id, video_id, source_url, metadata_json, position, discovered_at, last_seen_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (state_id, video_id, source_url, metadata_json, next_position, now, now),
+                    )
+                    next_position += 1
+                    new_count += 1
+                else:
+                    conn.execute(
+                        "UPDATE channel_scan_videos SET source_url = ?, metadata_json = ?, last_seen_at = ? "
+                        "WHERE id = ?",
+                        (source_url, metadata_json, now, existing["id"]),
+                    )
+
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS total FROM channel_scan_videos WHERE state_id = ?",
+                (state_id,),
+            ).fetchone()
+            total = int(total_row["total"] or 0)
+            conn.execute(
+                "UPDATE channel_scan_states SET platform = ?, original_url = ?, channel_id = ?, "
+                "channel_title = ?, cursor = ?, has_more = ?, complete = ?, status = ?, "
+                "stop_reason = ?, scan_source = ?, network_pages = ?, last_error = ?, "
+                "total_discovered = ?, updated_at = ? WHERE id = ?",
+                (
+                    platform, original_url, channel_id or None, channel_title or None,
+                    cursor or None, None if has_more is None else int(bool(has_more)),
+                    int(bool(complete)), "complete" if complete else ("error" if last_error else "incomplete"),
+                    stop_reason or None, scan_source or None, int(network_pages or 0),
+                    last_error or None, total, now, state_id,
+                ),
+            )
+
+        state = self.get_channel_scan_state(user_id, canonical_url) or {}
+        state["new_count"] = new_count
+        state["total_discovered"] = total
+        return state
+
+    def list_channel_scan_videos(
+            self, user_id: int, canonical_url: str, limit: int = 0,
+    ) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT v.video_id, v.source_url, v.metadata_json, v.position, "
+            "v.discovered_at, v.last_seen_at FROM channel_scan_videos v "
+            "JOIN channel_scan_states s ON s.id = v.state_id "
+            "WHERE s.user_id = ? AND s.canonical_url = ? ORDER BY v.position ASC"
+        )
+        params: List[Any] = [user_id, str(canonical_url).strip()]
+        if int(limit or 0) > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        output: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            metadata["video_id"] = str(metadata.get("video_id") or row["video_id"] or "")
+            metadata["source_url"] = str(metadata.get("source_url") or row["source_url"] or "")
+            metadata["catalog_position"] = int(row["position"] or 0)
+            output.append(metadata)
+        return output
 
     def list_jobs_for_user(self, user_id: int, limit: int = 100) -> List[Job]:
         with self._connect() as conn:

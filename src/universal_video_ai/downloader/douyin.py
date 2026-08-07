@@ -227,13 +227,26 @@ class DouyinDownloader(BaseDownloader):
 
     def download(self, url: str, output_dir: Path) -> DownloadResult:
         """Smart download with scraping fallback to yt-dlp"""
-        logger.info(f"📥 Downloading Douyin video from: {url}")
+        requested_video_id = self._extract_video_id(url)
+        logger.info(
+            "📥 Downloading Douyin video url=%s requested_video_id=%s output_dir=%s",
+            url,
+            requested_video_id or "unknown",
+            output_dir,
+        )
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Strategy 1: HTML scraping (no login required)
         resolved_url = self._resolve_short_url(url)
-        video_id = self._extract_video_id(resolved_url) or self._extract_video_id(url)
+        resolved_video_id = self._extract_video_id(resolved_url)
+        if requested_video_id and resolved_video_id and requested_video_id != resolved_video_id:
+            logger.warning(
+                "Douyin redirect changed video id from %s to %s; preserving requested id",
+                requested_video_id,
+                resolved_video_id,
+            )
+        video_id = requested_video_id or resolved_video_id
 
         if video_id:
             logger.info("🎯 Strategy 1: Douyin HTML scraping...")
