@@ -71,6 +71,18 @@ async function initAuth() {
   const boot = await api("/api/bootstrap");
   bootstrapConfig = boot;
   needsRegistrationGlobal = boot.needs_registration;
+  
+  // Load license features
+  try {
+    const licenseFeatures = await api("/api/license/features");
+    window.enabledFeatures = licenseFeatures.features || [];
+    window.licenseEnabled = licenseFeatures.enabled;
+    applyLicenseFeatures();
+  } catch (e) {
+    // On error, assume all features are available
+    window.enabledFeatures = ["localization", "trend", "content-os", "ai-video", "affiliate"];
+    window.licenseEnabled = true;
+  }
 
   if (needsRegistrationGlobal) {
     $("#auth-title").textContent = "Tạo tài khoản admin";
@@ -4025,6 +4037,148 @@ async function loadAdmin() {
       <td>${new Date(f.created_at * 1000).toLocaleString(uiLocale())}</td>
     </tr>
   `).join("");
+  
+  // License management event handlers
+  setupLicenseHandlers();
+}
+
+function applyLicenseFeatures() {
+  const features = window.enabledFeatures || ["localization", "trend", "content-os", "ai-video", "affiliate"];
+  
+  // Hide/show feature tabs based on license
+  document.querySelectorAll(".feature-tab").forEach(tab => {
+    const feature = tab.dataset.feature;
+    if (features.includes(feature)) {
+      tab.classList.remove("hidden");
+    } else {
+      tab.classList.add("hidden");
+    }
+  });
+  
+  // Hide/show feature panels based on license
+  document.querySelectorAll(".feature-panel").forEach(panel => {
+    const feature = panel.dataset.feature;
+    if (features.includes(feature)) {
+      panel.classList.remove("hidden");
+    } else {
+      panel.classList.add("hidden");
+    }
+  });
+  
+  // If first visible tab is not active, switch to it
+  const firstVisibleTab = document.querySelector(".feature-tab:not(.hidden)");
+  if (firstVisibleTab && firstVisibleTab.classList.contains("hidden") === false) {
+    const firstFeature = firstVisibleTab.dataset.feature;
+    // Activate first visible tab
+    document.querySelectorAll(".feature-tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".feature-panel").forEach(p => p.classList.remove("active"));
+    firstVisibleTab.classList.add("active");
+    document.querySelector(`.feature-panel[data-feature="${firstFeature}"]`).classList.add("active");
+  }
+}
+
+function setupLicenseHandlers() {
+  // Check license status
+  $("#license-status-btn").onclick = async () => {
+    try {
+      const status = await api("/api/admin/license/status");
+      $("#license-status-section").classList.remove("hidden");
+      if (!status.enabled) {
+        $("#license-status-display").innerHTML = `<span style="color:var(--err)">License system không được bật</span>`;
+      } else if (!status.valid) {
+        $("#license-status-display").innerHTML = `<span style="color:var(--err)">${escapeHtml(status.message)}</span>`;
+      } else {
+        $("#license-status-display").innerHTML = `
+          <div><strong>User:</strong> ${escapeHtml(status.user_name)} (${escapeHtml(status.user_email)})</div>
+          <div><strong>Type:</strong> ${escapeHtml(status.license_type)}</div>
+          <div><strong>Expiration:</strong> ${escapeHtml(status.expiration_date)}</div>
+          <div><strong>Days remaining:</strong> ${status.days_remaining}</div>
+          <div><strong>Token limit:</strong> ${status.token_limit === 0 ? 'Unlimited' : status.token_limit}</div>
+          <div><strong>Tokens used:</strong> ${status.tokens_used}</div>
+          <div><strong>Hardware binding:</strong> ${status.hardware_binding ? 'Yes' : 'No'}</div>
+        `;
+      }
+    } catch (e) {
+      $("#license-status-display").innerHTML = `<span style="color:var(--err)">Error: ${escapeHtml(e.message)}</span>`;
+    }
+  };
+  
+  // Generate key pair
+  $("#license-generate-keys-btn").onclick = async () => {
+    try {
+      const keys = await api("/api/admin/license/generate-keys");
+      $("#license-keys-section").classList.remove("hidden");
+      $("#license-private-key").value = keys.private_key;
+      $("#license-public-key").value = keys.public_key;
+    } catch (e) {
+      alert("Failed to generate keys: " + e.message);
+    }
+  };
+  
+  // Create license
+  $("#license-create-btn").onclick = async () => {
+    $("#license-error").textContent = "";
+    try {
+      // Collect enabled features
+      const features = [];
+      if ($("#feature-localization").checked) features.push("localization");
+      if ($("#feature-trend").checked) features.push("trend");
+      if ($("#feature-content-os").checked) features.push("content-os");
+      if ($("#feature-ai-video").checked) features.push("ai-video");
+      if ($("#feature-affiliate").checked) features.push("affiliate");
+      
+      // If no features selected, send null (all features enabled)
+      const enabledFeatures = features.length > 0 ? features : null;
+      
+      const body = {
+        user_id: $("#license-user-id").value,
+        user_name: $("#license-user-name").value,
+        user_email: $("#license-user-email").value,
+        license_type: $("#license-type").value,
+        duration_days: parseInt($("#license-duration").value, 10),
+        token_limit: parseInt($("#license-token-limit").value, 10),
+        bind_to_hardware: $("#license-bind-hardware").checked,
+        notes: $("#license-notes").value,
+        enabled_features: enabledFeatures
+      };
+      
+      const result = await api("/api/admin/license/create", { method: "POST", body: JSON.stringify(body) });
+      $("#license-result").classList.remove("hidden");
+      $("#license-key-output").value = result.license_key;
+    } catch (e) {
+      $("#license-error").textContent = "Error: " + e.message;
+    }
+  };
+  
+  // Copy license key
+  $("#license-copy-btn").onclick = () => {
+    $("#license-key-output").select();
+    document.execCommand("copy");
+  };
+  
+  // Renew license
+  $("#license-renew-btn").onclick = async () => {
+    $("#renew-error").textContent = "";
+    try {
+      const body = {
+        user_id: $("#renew-user-id").value,
+        duration_days: parseInt($("#renew-duration").value, 10),
+        token_limit: $("#renew-token-limit").value ? parseInt($("#renew-token-limit").value, 10) : null
+      };
+      
+      const result = await api("/api/admin/license/renew", { method: "POST", body: JSON.stringify(body) });
+      $("#renew-result").classList.remove("hidden");
+      $("#renew-key-output").value = result.license_key;
+    } catch (e) {
+      $("#renew-error").textContent = "Error: " + e.message;
+    }
+  };
+  
+  // Copy renewed license key
+  $("#renew-copy-btn").onclick = () => {
+    $("#renew-key-output").select();
+    document.execCommand("copy");
+  };
 }
 
 function _escapeHtml(s) {

@@ -99,9 +99,16 @@ from . import oauth as oauth_module
 from . import identity_oauth
 from .content_os_router import router as content_os_router
 
+# License system
+from universal_video_ai.license import LicenseManager, LicenseValidationError
+
 logger = logging.getLogger("universal_video_ai.web")
 
 app = FastAPI(title="Video Localization AI")
+
+# Global license manager instance
+license_manager: Optional[LicenseManager] = None
+license_enabled = os.environ.get("LICENSE_ENABLED", "false").lower() == "true"
 
 
 def _redact_redis_url(url: str) -> str:
@@ -174,6 +181,38 @@ DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
+
+# Initialize license manager if enabled
+if license_enabled:
+    public_key = os.environ.get("LICENSE_PUBLIC_KEY", "")
+    private_key = os.environ.get("LICENSE_PRIVATE_KEY", "")
+    license_file = Path(os.environ.get("LICENSE_FILE_PATH", "./local_data/license.key"))
+    hardware_binding = os.environ.get("LICENSE_HARDWARE_BINDING", "false").lower() == "true"
+    
+    license_manager = LicenseManager(
+        public_key_pem=public_key if public_key else None,
+        private_key_pem=private_key if private_key else None,
+        license_file_path=license_file,
+        enable_hardware_binding=hardware_binding
+    )
+    logger.info("License system enabled")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Validate license on startup if enabled"""
+    if license_enabled and license_manager:
+        try:
+            license_status = license_manager.get_license_status()
+            if license_status["valid"]:
+                logger.info(f"License valid for user: {license_status['user_name']} ({license_status['user_email']})")
+                logger.info(f"License type: {license_status['license_type']}, Days remaining: {license_status['days_remaining']}")
+                if license_status['token_limit'] > 0:
+                    logger.info(f"Tokens: {license_status['tokens_used']}/{license_status['token_limit']}")
+            else:
+                logger.warning(f"License check failed: {license_status['message']}")
+        except Exception as e:
+            logger.error(f"License validation error: {e}")
 
 
 def _store_create_job(
@@ -4325,6 +4364,17 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
             f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS}). "
             "Liên hệ admin để được cấp thêm.",
         )
+    
+    # Check license tokens if license system is enabled
+    if license_enabled and license_manager:
+        license_status = license_manager.get_license_status()
+        if license_status["valid"] and license_status["token_limit"] > 0:
+            if license_status["tokens_remaining"] <= 0:
+                raise HTTPException(
+                    402,
+                    f"License token đã hết hạn (đã dùng {license_status['tokens_used']}/{license_status['token_limit']}). "
+                    "Liên hệ admin để gia hạn license."
+                )
 
     logo_path = None
     if body.logo_path:
@@ -4372,6 +4422,14 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    
+    # Deduct license token if license system is enabled
+    if license_enabled and license_manager:
+        license_status = license_manager.get_license_status()
+        if license_status["valid"] and license_status["token_limit"] > 0:
+            if not license_manager.use_token(1):
+                logger.warning("Failed to deduct license token")
+    
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
     return job.to_dict()
@@ -7098,7 +7156,195 @@ def admin_adjust_credits(target_user_id: int, body: CreditsAdjustBody,
     else:
         raise HTTPException(400, "Cần truyền delta hoặc set_to")
     user = store.get_user_by_id(target_user_id)
-    return {"ok": True, "credits": user["credits"]}
+
+
+# ------------------------------------------------------------------ license management --
+
+class CreateLicenseRequest(BaseModel):
+    user_id: str = Field(..., description="Unique user identifier")
+    user_name: str = Field(..., description="User's name")
+    user_email: str = Field(..., description="User's email")
+    license_type: str = Field(..., description="License type: trial, monthly, lifetime")
+    duration_days: int = Field(..., description="Duration in days (ignored for lifetime)")
+    token_limit: int = Field(0, description="Token limit (0 = unlimited)")
+    bind_to_hardware: bool = Field(False, description="Bind to current hardware")
+    notes: str = Field("", description="Additional notes")
+    enabled_features: Optional[List[str]] = Field(None, description="List of enabled features (empty = all features)")
+
+
+class RenewLicenseRequest(BaseModel):
+    user_id: str = Field(..., description="User ID to renew")
+    duration_days: int = Field(..., description="Additional days to add")
+    token_limit: int = Field(None, description="New token limit (None to keep current)")
+
+
+@app.get("/api/admin/license/status")
+def get_license_status(_admin_id: int = Depends(require_admin_user_id)):
+    """Get current license status"""
+    if not license_manager:
+        return {"enabled": False, "message": "License system not enabled"}
+    
+    try:
+        status = license_manager.get_license_status()
+        return {"enabled": True, **status}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get license status: {str(e)}")
+
+
+@app.get("/api/license/features")
+def get_enabled_features():
+    """Get list of enabled features for current license (public endpoint)"""
+    if not license_manager or not license_enabled:
+        # License system disabled - all features available
+        return {"enabled": True, "features": ["localization", "trend", "content-os", "ai-video", "affiliate"]}
+    
+    try:
+        license_info = license_manager.load_license()
+        if license_info is None:
+            # No license - all features available
+            return {"enabled": True, "features": ["localization", "trend", "content-os", "ai-video", "affiliate"]}
+        
+        if not license_info.is_expired():
+            features = license_info.get_enabled_features()
+            # If empty list, all features are available
+            if not features:
+                features = ["localization", "trend", "content-os", "ai-video", "affiliate"]
+            return {"enabled": True, "features": features}
+        else:
+            # License expired - no features
+            return {"enabled": False, "features": []}
+    except Exception as e:
+        logger.warning(f"Failed to get license features: {e}")
+        # On error, allow all features
+        return {"enabled": True, "features": ["localization", "trend", "content-os", "ai-video", "affiliate"]}
+
+
+@app.post("/api/admin/license/create")
+def create_license(body: CreateLicenseRequest, _admin_id: int = Depends(require_admin_user_id)):
+    """Create a new license key (admin only)"""
+    if not license_manager:
+        raise HTTPException(400, "License system not enabled")
+    
+    if not license_manager.crypto.private_key:
+        raise HTTPException(400, "Private key not configured. Cannot create licenses.")
+    
+    try:
+        license_key = license_manager.create_license(
+            user_id=body.user_id,
+            user_name=body.user_name,
+            user_email=body.user_email,
+            license_type=body.license_type,
+            duration_days=body.duration_days,
+            token_limit=body.token_limit,
+            bind_to_hardware=body.bind_to_hardware,
+            notes=body.notes,
+            enabled_features=body.enabled_features
+        )
+        return {"ok": True, "license_key": license_key}
+    except Exception as e:
+        logger.exception("License creation failed")
+        raise HTTPException(500, f"Failed to create license: {str(e)}")
+
+
+@app.post("/api/admin/license/renew")
+def renew_license(body: RenewLicenseRequest, _admin_id: int = Depends(require_admin_user_id)):
+    """Renew an existing license (admin only)"""
+    if not license_manager:
+        raise HTTPException(400, "License system not enabled")
+    
+    if not license_manager.crypto.private_key:
+        raise HTTPException(400, "Private key not configured. Cannot renew licenses.")
+    
+    try:
+        # Load current license
+        current_status = license_manager.get_license_status()
+        if not current_status["valid"]:
+            raise HTTPException(404, "No valid license found")
+        
+        # Create renewed license
+        license_key = license_manager.create_license(
+            user_id=body.user_id,
+            user_name=current_status["user_name"],
+            user_email=current_status["user_email"],
+            license_type=current_status["license_type"],
+            duration_days=body.duration_days,
+            token_limit=body.token_limit if body.token_limit is not None else current_status["token_limit"],
+            bind_to_hardware=current_status["hardware_binding"],
+            notes=f"Renewed from previous license. {current_status.get('notes', '')}"
+        )
+        return {"ok": True, "license_key": license_key}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("License renewal failed")
+        raise HTTPException(500, f"Failed to renew license: {str(e)}")
+
+
+@app.post("/api/admin/license/validate")
+def validate_license_key(license_key: str = Form(...), _admin_id: int = Depends(require_admin_user_id)):
+    """Validate a license key without saving it (admin only)"""
+    if not license_manager:
+        raise HTTPException(400, "License system not enabled")
+    
+    try:
+        license_info = license_manager.validate_license(license_key)
+        return {
+            "ok": True,
+            "valid": True,
+            "user_id": license_info.user_id,
+            "user_name": license_info.user_name,
+            "user_email": license_info.user_email,
+            "license_type": license_info.license_type,
+            "expiration_date": license_info.expiration_date,
+            "days_remaining": license_info.days_remaining(),
+            "token_limit": license_info.token_limit,
+            "tokens_used": license_info.tokens_used,
+            "tokens_remaining": license_info.tokens_remaining(),
+            "hardware_binding": license_info.hardware_binding is not None
+        }
+    except LicenseValidationError as e:
+        return {"ok": True, "valid": False, "message": str(e)}
+    except Exception as e:
+        logger.exception("License validation failed")
+        raise HTTPException(500, f"Failed to validate license: {str(e)}")
+
+
+@app.post("/api/admin/license/install")
+def install_license(license_key: str = Form(...), _admin_id: int = Depends(require_admin_user_id)):
+    """Install a license key to the system (admin only)"""
+    if not license_manager:
+        raise HTTPException(400, "License system not enabled")
+    
+    try:
+        # Validate first
+        license_manager.validate_license(license_key)
+        # Save to file
+        license_manager.save_license(license_key)
+        return {"ok": True, "message": "License installed successfully"}
+    except LicenseValidationError as e:
+        raise HTTPException(400, f"Invalid license: {str(e)}")
+    except Exception as e:
+        logger.exception("License installation failed")
+        raise HTTPException(500, f"Failed to install license: {str(e)}")
+
+
+@app.get("/api/admin/license/generate-keys")
+def generate_key_pair(_admin_id: int = Depends(require_admin_user_id)):
+    """Generate new RSA key pair for license system (admin only)"""
+    if not license_manager:
+        raise HTTPException(400, "License system not enabled")
+    
+    try:
+        private_key, public_key = LicenseCrypto.generate_key_pair()
+        return {
+            "ok": True,
+            "private_key": private_key,
+            "public_key": public_key,
+            "message": "Save these keys securely. Private key is needed to create licenses. Public key is needed to validate licenses."
+        }
+    except Exception as e:
+        logger.exception("Key generation failed")
+        raise HTTPException(500, f"Failed to generate keys: {str(e)}")
 
 
 @app.get("/api/admin/stats")

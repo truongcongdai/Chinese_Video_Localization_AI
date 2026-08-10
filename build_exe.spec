@@ -61,11 +61,13 @@ hiddenimports = [
     'bcrypt',
     'googletrans',
     'mutagen',
+    'cryptography',
     
     # Universal Video AI modules
     'universal_video_ai.config',
     'universal_video_ai.orchestrator',
     'universal_video_ai.web',
+    'universal_video_ai.license',
 ]
 
 a = Analysis(

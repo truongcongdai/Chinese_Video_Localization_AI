@@ -45,3 +45,4 @@ passlib[bcrypt]>=1.7.4
 # regardless of the actual password length. Pin bcrypt below that line
 # until passlib cuts a release with a fix.
 bcrypt<4.1.0
+cryptography>=41.0.0

@@ -58,6 +58,7 @@ python -m nuitka ^
     --include-module=universal_video_ai.web.app ^
     --include-module=universal_video_ai.orchestrator ^
     --include-module=universal_video_ai.config ^
+    --include-module=universal_video_ai.license ^
     --include-package=universal_video_ai ^
     --assume-yes-for-downloads ^
     --show-progress ^
