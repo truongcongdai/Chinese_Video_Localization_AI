@@ -390,20 +390,51 @@ LANGUAGE_LABELS = {
 _running_tasks: dict[str, asyncio.Task] = {}
 
 # Channel/profile mode uses the same localization pipeline as single-video
-# jobs. Limit actual concurrent processing server-wide so a large channel
-# does not spawn hundreds of FFmpeg/ASR/TTS workloads at once.
-_WEB_MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("WEB_MAX_CONCURRENT_JOBS", "2")))
-_job_run_semaphore: Optional[asyncio.Semaphore] = None
+# jobs. The environment value is only the startup fallback; each submission
+# updates the live limit from NewJobBody.max_concurrent (the UI's 1-5 selector).
+_WEB_DEFAULT_MAX_CONCURRENT_JOBS = min(
+    5, max(1, int(os.environ.get("WEB_MAX_CONCURRENT_JOBS", "2")))
+)
+_job_run_limit = _WEB_DEFAULT_MAX_CONCURRENT_JOBS
+_job_run_active = 0
+_job_run_condition: Optional[asyncio.Condition] = None
 _video_url_classifier = VideoURLClassifier()
 _channel_listing_service = ChannelListingService()
 _CHANNEL_SCAN_VERSION = 2  # v2 adds strict Douyin profile ownership filtering
 
 
-def _get_job_run_semaphore() -> asyncio.Semaphore:
-    global _job_run_semaphore
-    if _job_run_semaphore is None:
-        _job_run_semaphore = asyncio.Semaphore(_WEB_MAX_CONCURRENT_JOBS)
-    return _job_run_semaphore
+def _get_job_run_condition() -> asyncio.Condition:
+    global _job_run_condition
+    if _job_run_condition is None:
+        _job_run_condition = asyncio.Condition()
+    return _job_run_condition
+
+
+async def _configure_job_run_limit(max_concurrent: int) -> int:
+    """Apply the concurrency selected in the UI to the live web queue."""
+    global _job_run_limit
+    normalized = min(5, max(1, int(max_concurrent)))
+    condition = _get_job_run_condition()
+    async with condition:
+        _job_run_limit = normalized
+        condition.notify_all()
+    return normalized
+
+
+async def _acquire_job_run_slot() -> None:
+    global _job_run_active
+    condition = _get_job_run_condition()
+    async with condition:
+        await condition.wait_for(lambda: _job_run_active < _job_run_limit)
+        _job_run_active += 1
+
+
+async def _release_job_run_slot() -> None:
+    global _job_run_active
+    condition = _get_job_run_condition()
+    async with condition:
+        _job_run_active = max(0, _job_run_active - 1)
+        condition.notify_all()
 
 
 def require_admin_user_id(user_id: int = Depends(get_current_user_id)) -> int:
@@ -468,7 +499,7 @@ class NewJobBody(BaseModel):
     animated_subtitle_config: Optional[Dict[str, Any]] = None
     # Queue management
     priority: str = "normal"  # normal | high
-    max_concurrent: int = 2
+    max_concurrent: int = Field(default=2, ge=1, le=5)
     # Video template configuration
     video_template_config: Optional[Dict[str, Any]] = None
     # Video transformation configuration (flip, border, split-screen, etc.)
@@ -1330,15 +1361,20 @@ def _is_content_os_job(job) -> bool:
 
 
 def _is_non_retryable_job_error(exc: Exception) -> bool:
-    message = str(exc)
+    message = str(exc).lower()
     return any(
-        marker in message
+        marker.lower() in message
         for marker in (
             "Ollama local chưa chạy",
             "Ollama model chưa có",
             "missing_tts_provider_connection",
             "Chưa kết nối",
             "Provider này cần API key",
+            # Re-running the identical whole-file Demucs command cannot cure
+            # an allocator OOM and only burns another retry interval.
+            "DefaultCPUAllocator: not enough memory",
+            "No space left on device",
+            "not enough disk space",
         )
     )
 
@@ -1348,12 +1384,16 @@ RETRY_DELAY_SECONDS = 30
 
 
 async def _run_job(job_id: str) -> None:
+    slot_acquired = False
     try:
-        async with _get_job_run_semaphore():
-            await _run_job_unlocked(job_id)
+        await _acquire_job_run_slot()
+        slot_acquired = True
+        await _run_job_unlocked(job_id)
     finally:
-        # Also covers a task cancelled while still waiting for a semaphore
-        # slot; _run_job_unlocked performs the same pop after normal runs.
+        if slot_acquired:
+            await _release_job_run_slot()
+        # Also covers a task cancelled while waiting for a queue slot;
+        # _run_job_unlocked performs the same pop after normal runs.
         _running_tasks.pop(job_id, None)
 
 
@@ -4520,6 +4560,7 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    await _configure_job_run_limit(body.max_concurrent)
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
     return job.to_dict()
@@ -4637,6 +4678,9 @@ async def process_channel_download(
         body: ChannelProcessBody,
         user_id: int = Depends(get_current_user_id),
 ):
+    # Apply the batch's UI selection before scanning/creating tasks, including
+    # the case where every discovered video is skipped as an existing job.
+    await _configure_job_run_limit(body.max_concurrent)
     if body.review_before_render:
         raise HTTPException(
             400,
@@ -4809,7 +4853,7 @@ async def process_channel_download(
         "skipped_existing": skipped_existing,
         "failed": failed,
         "warnings": warnings,
-        "max_concurrent_processing": _WEB_MAX_CONCURRENT_JOBS,
+        "max_concurrent_processing": _job_run_limit,
     }
 
 
@@ -6316,15 +6360,44 @@ def job_queue_status(user_id: int = Depends(get_current_user_id)):
         "running": running,
         "review": review,
         "active": queued + running + review,
+        "processing_active": _job_run_active,
+        "max_concurrent_processing": _job_run_limit,
         "total_jobs": int(stats.get("total_jobs", 0) or 0),
     }
 
 
+def _delete_job_artifacts(job_id: str) -> None:
+    """Remove only the output directory owned by an exact, validated job id."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id or ""):
+        logger.warning("Refusing to remove artifacts for invalid job id %r", job_id)
+        return
+    jobs_root = (_OUTPUT_BASE_DIR / "web_jobs").resolve()
+    job_dir = (jobs_root / job_id).resolve()
+    if job_dir.parent != jobs_root:
+        logger.warning("Refusing to remove job artifacts outside %s: %s", jobs_root, job_dir)
+        return
+    try:
+        shutil.rmtree(job_dir, ignore_errors=False)
+        logger.info("Removed deleted job artifacts: %s", job_dir)
+    except FileNotFoundError:
+        return
+    except OSError:
+        # The DB deletion should still succeed even if Windows temporarily has
+        # an output file open. The directory remains visible for later cleanup.
+        logger.exception("Failed to remove deleted job artifacts: %s", job_dir)
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    task = _running_tasks.get(job_id)
+    if task:
+        task.cancel()
     deleted = store.delete_job(job_id, user_id)
     if not deleted:
         raise HTTPException(404, "Không tìm thấy job")
+    if job.status != "running":
+        _delete_job_artifacts(job_id)
     return {"ok": True}
 
 
@@ -6332,7 +6405,19 @@ def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
 def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
     if not body.job_ids:
         raise HTTPException(400, "Chưa chọn video cần xoá")
-    return {"ok": True, "deleted": store.delete_jobs(body.job_ids, user_id)}
+    owned_jobs = []
+    for job_id in list(dict.fromkeys(body.job_ids))[:200]:
+        job = store.get_job(job_id)
+        if job and job.user_id == user_id:
+            owned_jobs.append(job)
+            task = _running_tasks.get(job_id)
+            if task:
+                task.cancel()
+    deleted = store.delete_jobs([job.id for job in owned_jobs], user_id)
+    for job in owned_jobs:
+        if job.status != "running":
+            _delete_job_artifacts(job.id)
+    return {"ok": True, "deleted": deleted}
 
 
 @app.post("/api/jobs/bulk-download")

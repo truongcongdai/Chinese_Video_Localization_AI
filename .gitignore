@@ -2,6 +2,24 @@ __pycache__/
 *.pyc
 
 .env
+venv
+BUILD_EXE_GUIDE.md
+Chinese_Video_Localization_AI_Windows_Build.zip
+Chinese_Video_Localization_AI_Windows_Build/
+build_exe.bat
+build_exe.spec
+build_nuitka.bat
+prepare_for_windows_build.sh
+scripts/verify_web_environment.py
+src/universal_video_ai/downloader/channel.py
+src/universal_video_ai/publishing/
+src/universal_video_ai/render/branding.py
+tests/test_channel_download_mode.py
+tests/test_channel_store_dedup.py
+tests/test_douyin_deep_scan.py
+tests/test_reup_ai_publishing_pack.py
+tests/test_translation_adaptation_resilience.py
+
 
 logs/*
 temp/*

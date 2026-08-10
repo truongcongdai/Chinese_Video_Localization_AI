@@ -2,6 +2,8 @@
 import hashlib
 import json
 import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
@@ -19,6 +21,10 @@ class DownloadCache:
         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
         self.metadata_file = self.cache_dir / "cache_metadata.json"
         self.metadata = self._load_metadata()
+        # Enforce the configured bound at startup too. Previously cleanup ran
+        # only before the next successful download, allowing an overfull cache
+        # to remain indefinitely after a restart.
+        self._cleanup_if_needed()
         
     def _load_metadata(self) -> dict:
         """Load cache metadata from disk."""
@@ -102,10 +108,17 @@ class DownloadCache:
         cache_path = self._get_cache_path(url)
         url_hash = self._get_url_hash(url)
         
-        # Copy video to cache
+        # Prefer a hard link on the same volume. Job files and cache entries
+        # then have independent names/lifetimes without storing the same
+        # multi-gigabyte video twice.
         try:
-            import shutil
-            shutil.copy2(video_path, cache_path)
+            cache_path.unlink(missing_ok=True)
+            try:
+                os.link(video_path, cache_path)
+                storage_method = "hardlink"
+            except OSError:
+                shutil.copy2(video_path, cache_path)
+                storage_method = "copy"
             
             # Update metadata
             self.metadata[url_hash] = {
@@ -117,7 +130,11 @@ class DownloadCache:
             }
             self._save_metadata()
             
-            _logger.info(f"Cached video for {url[:50]}... -> {cache_path}")
+            _logger.info(
+                "Cached video for %s... -> %s (%s)",
+                url[:50], cache_path, storage_method,
+            )
+            self._cleanup_if_needed()
         except Exception as e:
             _logger.error(f"Failed to cache video: {e}")
     

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
+import shutil
 from typing import Optional
 
 from .factory import DownloaderFactory
@@ -41,13 +44,27 @@ class DownloadService:
         if self.cache:
             cached_entry = self.cache.get_entry(url)
             if cached_entry:
-                # Copy from cache to output dir while preserving the metadata
-                # used by the Reup Publishing Pack. Older cache entries simply
-                # fall back to empty metadata without breaking downloads.
-                import shutil
+                # Materialize the cached video as a hard link whenever the
+                # cache and job directory share a volume. This avoids another
+                # 4-6 GB allocation for every retry/job while keeping each path
+                # independently deletable.
                 cached_path = Path(cached_entry["video_path"])
                 output_path = output_dir / cached_path.name
-                shutil.copy2(cached_path, output_path)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if output_path.exists():
+                    output_path.unlink()
+                try:
+                    os.link(cached_path, output_path)
+                except OSError:
+                    required = cached_path.stat().st_size
+                    free = shutil.disk_usage(output_dir).free
+                    if free < required + 512 * 1024 * 1024:
+                        raise OSError(
+                            errno.ENOSPC,
+                            "Not enough disk space to materialize cached video",
+                            str(output_path),
+                        )
+                    shutil.copy2(cached_path, output_path)
 
                 from .platform import Platform
                 metadata = dict(cached_entry.get("source_metadata") or {})

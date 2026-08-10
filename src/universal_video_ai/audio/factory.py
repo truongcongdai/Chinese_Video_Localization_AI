@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -90,6 +91,11 @@ def create_audio_pipeline(
         run_transcription=run_transcription,
         transcription_language=transcription_language,
         transcription_model=transcription_model,
+        demucs_max_duration_seconds=(
+            None
+            if float(os.getenv("DEMUCS_MAX_DURATION_SECONDS", "7200")) <= 0
+            else float(os.getenv("DEMUCS_MAX_DURATION_SECONDS", "7200"))
+        ),
     )
 
     # Create pipeline

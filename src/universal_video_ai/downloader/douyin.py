@@ -1,5 +1,7 @@
+import errno
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -14,6 +16,10 @@ from .platform import Platform
 from .ytdlp_downloader import YTDLPDownloader
 
 logger = logging.getLogger(__name__)
+
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+_DOWNLOAD_MAX_ATTEMPTS = 6
+_DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 
 
 def _safe_video_filename(title: str, video_id: str, max_bytes: int = 200) -> str:
@@ -87,6 +93,106 @@ class DouyinDownloader(BaseDownloader):
         except Exception as e:
             logger.error(f"Failed to resolve URL: {e}")
             return url
+
+    @staticmethod
+    def _response_total_size(response: requests.Response, offset: int) -> Optional[int]:
+        """Return the full object size advertised by a streaming response."""
+        content_range = response.headers.get("Content-Range", "")
+        match = re.search(r"bytes\s+(?:\d+-\d+|\*)/(\d+)", content_range, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+        content_length = response.headers.get("Content-Length")
+        if content_length and content_length.isdigit():
+            return offset + int(content_length) if response.status_code == 206 else int(content_length)
+        return None
+
+    def _download_stream_with_resume(
+        self,
+        video_url: str,
+        output_path: Path,
+        headers: dict[str, str],
+    ) -> Optional[int]:
+        """Download a large CDN object while preserving a resumable ``.part`` file."""
+        part_path = output_path.with_suffix(f"{output_path.suffix}.part")
+
+        # Older versions wrote incomplete data directly to the final name.
+        # Preserve it and let the CDN confirm/complement it with a Range request.
+        if output_path.exists() and not part_path.exists():
+            os.replace(output_path, part_path)
+
+        for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
+            offset = part_path.stat().st_size if part_path.exists() else 0
+            request_headers = dict(headers)
+            request_headers.setdefault("Accept-Encoding", "identity")
+            if offset:
+                request_headers["Range"] = f"bytes={offset}-"
+                logger.info(
+                    "Resuming Douyin download at %.2f MB (attempt %d/%d)",
+                    offset / (1024 * 1024), attempt, _DOWNLOAD_MAX_ATTEMPTS,
+                )
+
+            try:
+                with requests.get(
+                    video_url,
+                    headers=request_headers,
+                    stream=True,
+                    timeout=(30, 120),
+                ) as video_response:
+                    if video_response.status_code == 416 and offset:
+                        total_size = self._response_total_size(video_response, offset)
+                        if total_size is not None and total_size == offset:
+                            os.replace(part_path, output_path)
+                            return offset
+                        logger.warning("Douyin CDN rejected stale partial download; restarting")
+                        part_path.unlink(missing_ok=True)
+                        continue
+
+                    if video_response.status_code not in {200, 206}:
+                        logger.error("Douyin video download failed: HTTP %s", video_response.status_code)
+                        return None
+
+                    append = bool(offset and video_response.status_code == 206)
+                    if offset and not append:
+                        logger.warning("Douyin CDN ignored Range; restarting download from byte 0")
+                        offset = 0
+
+                    expected_size = self._response_total_size(video_response, offset)
+                    mode = "ab" if append else "wb"
+                    with open(part_path, mode) as output_file:
+                        for chunk in video_response.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
+                            if chunk:
+                                output_file.write(chunk)
+
+                received_size = part_path.stat().st_size
+                if expected_size is not None and received_size != expected_size:
+                    raise requests.exceptions.ChunkedEncodingError(
+                        f"incomplete Douyin download: received {received_size} of {expected_size} bytes"
+                    )
+
+                os.replace(part_path, output_path)
+                return received_size
+            except (requests.exceptions.RequestException, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                    # Disk exhaustion is not a network interruption. Preserve
+                    # the .part file and surface the real error immediately;
+                    # falling through to yt-dlp would misleadingly ask for
+                    # Douyin cookies and can never create free space.
+                    raise
+                if attempt >= _DOWNLOAD_MAX_ATTEMPTS:
+                    logger.error(
+                        "Douyin download still incomplete after %d attempts; keeping %s for a later resume: %s",
+                        _DOWNLOAD_MAX_ATTEMPTS, part_path, exc,
+                    )
+                    return None
+                delay = min(_DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (attempt - 1)), 10.0)
+                logger.warning(
+                    "Douyin download interrupted (%s); retrying from the partial file in %.1fs",
+                    exc, delay,
+                )
+                time.sleep(delay)
+
+        return None
 
     def _download_douyin_scraping(self, video_id: str, output_dir: Path) -> Optional[DownloadResult]:
         """Download Douyin by scraping HTML from iesdouyin.com"""
@@ -207,17 +313,9 @@ class DouyinDownloader(BaseDownloader):
             output_path = output_dir / _safe_video_filename(title, video_id)
             logger.info(f"📥 Downloading video to: {output_path}")
             
-            video_response = requests.get(video_url, headers=headers, stream=True, timeout=120)
-
-            if video_response.status_code != 200:
-                logger.error(f"❌ Video download failed: {video_response.status_code}")
+            file_size = self._download_stream_with_resume(video_url, output_path, headers)
+            if file_size is None:
                 return None
-
-            with open(output_path, 'wb') as f:
-                for chunk in video_response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            file_size = output_path.stat().st_size
             logger.info(f"✅ Downloaded via scraping: {output_path} ({file_size / (1024 * 1024):.2f} MB)")
 
             return DownloadResult(
@@ -238,6 +336,11 @@ class DouyinDownloader(BaseDownloader):
                 raw_metadata=raw_metadata,
             )
 
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise
+            logger.error(f"❌ Scraping error: {e}", exc_info=True)
+            return None
         except Exception as e:
             logger.error(f"❌ Scraping error: {e}", exc_info=True)
             return None
