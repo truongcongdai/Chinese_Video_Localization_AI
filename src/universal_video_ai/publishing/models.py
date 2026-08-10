@@ -8,15 +8,17 @@ from typing import Any, Dict, List, Optional
 class PublishingPackConfig:
     """Per-job configuration for the Reup AI Publishing Pack.
 
-    The feature is deliberately optional and best-effort. A failure in this
-    post-render step must never invalidate an otherwise usable localized video.
+    `channel_profile` identifies a built-in generic profile or a per-user
+    saved profile. `profile_data` is the resolved snapshot stored with the
+    job, so a retry does not depend on mutable account settings.
     """
 
     enabled: bool = False
-    channel_profile: str = "van_diep_studio"
-    channel_name: str = "Vạn Diệp Studio"
+    channel_profile: str = "generic_reup"
+    channel_name: str = ""
+    profile_data: Optional[Dict[str, Any]] = None
     platforms: List[str] = field(default_factory=lambda: ["youtube", "facebook"])
-    style: str = "balanced"  # search | curiosity | balanced
+    style: str = "balanced"  # seo | search | balanced | curiosity | hook | drama | viral
     edit_level: str = "balanced"  # light | balanced | deep
     provider: str = "auto"  # auto | gemini | openai | ollama | none
     generate_thumbnails: bool = True
@@ -35,10 +37,12 @@ class PublishingPackConfig:
         return cls(**values).normalized()
 
     def normalized(self) -> "PublishingPackConfig":
-        profile = str(self.channel_profile or "van_diep_studio").strip().lower()
-        channel_name = " ".join(str(self.channel_name or "Vạn Diệp Studio").split())[:80]
+        profile = str(self.channel_profile or "generic_reup").strip()[:100] or "generic_reup"
+        channel_name = " ".join(str(self.channel_name or "").split())[:100]
         style = str(self.style or "balanced").strip().lower()
-        if style not in {"search", "curiosity", "balanced"}:
+        aliases = {"search": "seo", "curiosity": "hook"}
+        style = aliases.get(style, style)
+        if style not in {"seo", "balanced", "hook", "drama", "viral"}:
             style = "balanced"
         edit_level = str(self.edit_level or "balanced").strip().lower()
         if edit_level not in {"light", "balanced", "deep"}:
@@ -55,11 +59,13 @@ class PublishingPackConfig:
             platforms = ["youtube"]
         playlist_url = str(self.playlist_url or "").strip() or None
         custom = str(self.custom_instructions or "").strip()[:4000] or None
+        profile_data = dict(self.profile_data) if isinstance(self.profile_data, dict) else None
         return replace(
             self,
             enabled=bool(self.enabled),
             channel_profile=profile,
             channel_name=channel_name,
+            profile_data=profile_data,
             platforms=platforms,
             style=style,
             edit_level=edit_level,

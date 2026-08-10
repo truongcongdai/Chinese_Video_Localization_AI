@@ -81,6 +81,9 @@ from universal_video_ai.translate.adapt import AdaptationConfig
 from universal_video_ai.publishing import (
     PublishingPackConfig, PublishingPackService, PublishingLLMClient, PublishingLLMConfig,
 )
+from universal_video_ai.publishing.profiles import (
+    normalize_channel_profile, generic_channel_profile, legacy_van_diep_profile,
+)
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
 from universal_video_ai.config import REDIS_URL, TEMP_DIR
@@ -89,6 +92,7 @@ from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadB
 from universal_video_ai.downloader.channel import (
     ChannelListingService, ChannelVideoCandidate, URLIntent, VideoURLClassifier,
 )
+from universal_video_ai.downloader.platform import Platform
 
 from .store import Store
 from .auth import (
@@ -176,6 +180,39 @@ TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 store = Store(_DB_PATH)
 
 
+def _resolve_publishing_config_for_user(
+        user_id: int, raw: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    config = PublishingPackConfig.from_dict(raw)
+    data = config.to_dict()
+    selected = str(config.channel_profile or "generic_reup")
+
+    if config.profile_data:
+        snapshot = normalize_channel_profile(config.profile_data, profile_id=selected)
+    elif selected == "generic_reup":
+        snapshot = generic_channel_profile(config.channel_name)
+    else:
+        saved = store.get_publishing_profile(user_id, selected)
+        if saved:
+            snapshot = normalize_channel_profile(saved.get("profile"), profile_id=selected)
+            snapshot["name"] = saved.get("name") or snapshot.get("name")
+        else:
+            # Never expose another user's profile and never silently fall back
+            # to an old global channel preset for a newly submitted job.
+            logger.warning("Publishing profile %s not found for user %s; using generic", selected, user_id)
+            selected = "generic_reup"
+            data["channel_profile"] = selected
+            snapshot = generic_channel_profile(config.channel_name)
+
+    if config.channel_name:
+        snapshot["channel_name"] = config.channel_name
+    data["channel_name"] = snapshot.get("channel_name") or config.channel_name or ""
+    data["profile_data"] = snapshot
+    return PublishingPackConfig.from_dict(data).to_dict()
+
+
 def _store_create_job(
         *args: Any,
         branding_config: Optional[Dict[str, Any]] = None,
@@ -191,9 +228,13 @@ def _store_create_job(
     normalized_branding = (
         BrandingConfig.from_dict(branding_config).to_dict() if branding_config else None
     )
+    resolved_user_id = kwargs.get("user_id")
+    if resolved_user_id is None and args:
+        resolved_user_id = args[0]
     normalized_publishing = (
-        PublishingPackConfig.from_dict(publishing_config).to_dict()
-        if publishing_config else None
+        _resolve_publishing_config_for_user(int(resolved_user_id), publishing_config)
+        if publishing_config and resolved_user_id is not None else
+        (PublishingPackConfig.from_dict(publishing_config).to_dict() if publishing_config else None)
     )
 
     create_method = store.create_job
@@ -355,6 +396,7 @@ _WEB_MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("WEB_MAX_CONCURRENT_JOBS", 
 _job_run_semaphore: Optional[asyncio.Semaphore] = None
 _video_url_classifier = VideoURLClassifier()
 _channel_listing_service = ChannelListingService()
+_CHANNEL_SCAN_VERSION = 2  # v2 adds strict Douyin profile ownership filtering
 
 
 def _get_job_run_semaphore() -> asyncio.Semaphore:
@@ -434,6 +476,26 @@ class NewJobBody(BaseModel):
     # Audio configuration for uploaded videos
     keep_original_audio: int = 0
     background_music_strategy: str = "deterministic"
+
+
+class PublishingProfileBody(BaseModel):
+    name: str
+    channel_name: str = ""
+    language: str = "vi"
+    niche: str = ""
+    audience: str = ""
+    brand_line: str = ""
+    category: str = "Entertainment"
+    made_for_kids: bool = False
+    default_privacy: str = "private"
+    keywords: List[str] = Field(default_factory=list)
+    base_tags: List[str] = Field(default_factory=list)
+    base_hashtags: List[str] = Field(default_factory=list)
+    title_formula: str = ""
+    thumbnail_examples: List[str] = Field(default_factory=list)
+    description_template: str = ""
+    custom_instructions: str = ""
+    is_default: bool = False
 
 
 class ChannelAnalyzeBody(BaseModel):
@@ -4233,6 +4295,92 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
         _running_tasks.pop(job_id, None)
 
 
+def _profile_body_to_data(body: PublishingProfileBody, profile_id: str = "custom") -> Dict[str, Any]:
+    return normalize_channel_profile({
+        "id": profile_id,
+        "name": body.name,
+        "channel_name": body.channel_name,
+        "language": body.language,
+        "niche": body.niche,
+        "audience": body.audience,
+        "brand_line": body.brand_line,
+        "category": body.category,
+        "made_for_kids": body.made_for_kids,
+        "default_privacy": body.default_privacy,
+        "primary_keyword_groups": {"keywords": body.keywords},
+        "base_tags": body.base_tags,
+        "base_hashtags": body.base_hashtags,
+        "title_formula": body.title_formula,
+        "thumbnail_rules": {"max_words": 5, "examples": body.thumbnail_examples},
+        "description_template": body.description_template,
+        "custom_instructions": body.custom_instructions,
+    }, profile_id=profile_id)
+
+
+def _maybe_import_legacy_publishing_profile(user_id: int) -> None:
+    if store.list_publishing_profiles(user_id):
+        return
+    previous = store.latest_job_publishing_config(user_id) or {}
+    if str(previous.get("channel_profile") or "") != "van_diep_studio" and str(previous.get("channel_name") or "") != "Vạn Diệp Studio":
+        return
+    legacy = legacy_van_diep_profile()
+    store.save_publishing_profile(
+        user_id, name="Vạn Diệp Studio", profile=legacy, is_default=True,
+    )
+
+
+@app.get("/api/publishing/profiles")
+def list_publishing_profiles(user_id: int = Depends(get_current_user_id)):
+    _maybe_import_legacy_publishing_profile(user_id)
+    saved = store.list_publishing_profiles(user_id)
+    return {
+        "generic": {
+            "id": "generic_reup", "name": "Reup tổng quát", "is_default": not any(item.get("is_default") for item in saved),
+            "profile": generic_channel_profile(),
+        },
+        "profiles": saved,
+    }
+
+
+@app.post("/api/publishing/profiles")
+def create_publishing_profile(body: PublishingProfileBody, user_id: int = Depends(get_current_user_id)):
+    profile = _profile_body_to_data(body)
+    try:
+        return store.save_publishing_profile(
+            user_id, name=body.name, profile=profile, is_default=body.is_default,
+        )
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise HTTPException(409, "Bạn đã có hồ sơ kênh với tên này") from exc
+        raise
+
+
+@app.put("/api/publishing/profiles/{profile_id}")
+def update_publishing_profile(profile_id: str, body: PublishingProfileBody, user_id: int = Depends(get_current_user_id)):
+    if not store.get_publishing_profile(user_id, profile_id):
+        raise HTTPException(404, "Không tìm thấy hồ sơ kênh")
+    profile = _profile_body_to_data(body, profile_id=profile_id)
+    return store.save_publishing_profile(
+        user_id, profile_id=profile_id, name=body.name, profile=profile, is_default=body.is_default,
+    )
+
+
+@app.delete("/api/publishing/profiles/{profile_id}", status_code=204)
+def delete_publishing_profile(profile_id: str, user_id: int = Depends(get_current_user_id)):
+    if not store.delete_publishing_profile(user_id, profile_id):
+        raise HTTPException(404, "Không tìm thấy hồ sơ kênh")
+    return Response(status_code=204)
+
+
+@app.post("/api/publishing/profiles/{profile_id}/default")
+def set_default_publishing_profile(profile_id: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        store.set_default_publishing_profile(user_id, profile_id)
+    except ValueError as exc:
+        raise HTTPException(404, "Không tìm thấy hồ sơ kênh") from exc
+    return {"ok": True}
+
+
 @app.post("/api/remix/plan")
 async def remix_plan(body: RemixPlanBody, user_id: int = Depends(get_current_user_id)):
     plan = build_remix_plan(
@@ -4392,6 +4540,18 @@ async def analyze_channel_download(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+    legacy_catalog_reset = False
+    existing_state = store.get_channel_scan_state(user_id, canonical_url)
+    if (
+        classification.platform == Platform.DOUYIN
+        and existing_state
+        and int(existing_state.get("scan_version") or 1) < _CHANNEL_SCAN_VERSION
+    ):
+        # Older scanners could collect recommendation awemes from other creators.
+        # Purge that one legacy catalog once, then rebuild with Ownership Guard.
+        store.reset_channel_scan(user_id, canonical_url)
+        legacy_catalog_reset = True
+
     if mode == "reset":
         store.reset_channel_scan(user_id, canonical_url)
 
@@ -4449,6 +4609,7 @@ async def analyze_channel_download(
         stop_reason=result.stop_reason,
         scan_source=result.scan_source,
         network_pages=result.network_pages,
+        scan_version=_CHANNEL_SCAN_VERSION,
     )
     total = int(state.get("total_discovered") or 0)
     payload = result.to_dict(include_videos=False)
@@ -4463,6 +4624,11 @@ async def analyze_channel_download(
         "preview": store.list_channel_scan_videos(user_id, canonical_url, limit=50),
         "preview_truncated": total > 50,
     })
+    if legacy_catalog_reset:
+        payload.setdefault("warnings", []).insert(
+            0,
+            "Đã tự xóa catalog Douyin cũ vì phiên bản trước có thể lẫn video đề xuất từ kênh khác; catalog hiện được dựng lại bằng Ownership Guard.",
+        )
     return payload
 
 
@@ -4482,6 +4648,16 @@ async def process_channel_download(
         classification, canonical_url = _channel_listing_service.canonicalize(raw_url)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+    legacy_catalog_reset = False
+    existing_state = store.get_channel_scan_state(user_id, canonical_url)
+    if (
+        classification.platform == Platform.DOUYIN
+        and existing_state
+        and int(existing_state.get("scan_version") or 1) < _CHANNEL_SCAN_VERSION
+    ):
+        store.reset_channel_scan(user_id, canonical_url)
+        legacy_catalog_reset = True
 
     scan = None
     scan_error = ""
@@ -4513,6 +4689,7 @@ async def process_channel_download(
                 stop_reason=scan.stop_reason,
                 scan_source=scan.scan_source,
                 network_pages=scan.network_pages,
+                scan_version=_CHANNEL_SCAN_VERSION,
             )
             newly_discovered = int(state.get("new_count") or 0)
         except (ValueError, RuntimeError) as exc:
@@ -4576,9 +4753,22 @@ async def process_channel_download(
             payload["url"] = candidate.source_url
             single_body = NewJobBody(**payload)
             job = await create_job(single_body, user_id)
+            job_id = str(job.get("id") or "")
+            if job_id:
+                store.set_job_source_channel(
+                    job_id,
+                    user_id,
+                    channel_url=canonical_url,
+                    channel_title=str((state or {}).get("channel_title") or (scan.channel_title if scan else "")),
+                    channel_id=str((state or {}).get("channel_id") or (scan.channel_id if scan else "")),
+                    uploader=candidate.uploader,
+                )
             created.append({
-                "job_id": job.get("id"),
+                "job_id": job_id,
                 "source_url": candidate.source_url,
+                "source_channel_url": canonical_url,
+                "source_channel_title": str((state or {}).get("channel_title") or (scan.channel_title if scan else "")),
+                "uploader": candidate.uploader,
                 "title": candidate.title,
             })
         except Exception as exc:
@@ -4587,6 +4777,11 @@ async def process_channel_download(
 
     state = store.get_channel_scan_state(user_id, canonical_url) or {}
     warnings = list(scan.warnings if scan is not None else [])
+    if legacy_catalog_reset:
+        warnings.insert(
+            0,
+            "Đã tự làm sạch catalog Douyin cũ có nguy cơ lẫn video ngoài kênh và quét lại bằng Ownership Guard.",
+        )
     if scan_error:
         warnings.append(
             f"Không quét thêm được trong lượt này ({scan_error}); đã dùng catalog đã lưu."
@@ -4846,8 +5041,13 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
         })
 
     aspect = ((body.video_template_config or {}).get("target_aspect_ratio") or "source").strip()
-    if aspect not in {"source", "9:16", "16:9", "1:1"}:
+    if aspect not in {"auto", "source", "9:16", "16:9", "1:1"}:
         issues.append({"severity": "warning", "code": "unknown_aspect", "message": f"Tỷ lệ đầu ra lạ: {aspect}."})
+    elif aspect == "auto":
+        issues.append({
+            "severity": "ok", "code": "auto_aspect",
+            "message": "Auto khung hình đang bật: mỗi video trong batch giữ orientation riêng theo source (dọc/ngang), không ép cả kênh về một tỷ lệ cố định.",
+        })
     elif aspect == "16:9":
         issues.append(
             {"severity": "ok", "code": "youtube_16_9", "message": "Preset YouTube 16:9 sẵn sàng cho video ngang."})

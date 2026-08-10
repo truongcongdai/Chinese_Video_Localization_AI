@@ -16,16 +16,20 @@ from universal_video_ai.publishing import (
 from universal_video_ai.web.store import Store
 
 
-def test_publishing_config_normalizes_platforms_and_profile():
+def test_publishing_config_defaults_to_generic_and_normalizes_platforms():
+    default = PublishingPackConfig()
+    assert default.channel_profile == "generic_reup"
+    assert default.channel_name == ""
+
     config = PublishingPackConfig.from_dict({
         "enabled": True,
-        "channel_profile": "van_diep_studio",
-        "channel_name": "  Vạn   Diệp Studio  ",
+        "channel_profile": "user-profile-1",
+        "channel_name": "  Kênh   Của Tôi  ",
         "platforms": ["youtube", "youtube", "invalid", "facebook"],
         "thumbnail_count": 99,
     })
     assert config.enabled is True
-    assert config.channel_name == "Vạn Diệp Studio"
+    assert config.channel_name == "Kênh Của Tôi"
     assert config.platforms == ["youtube", "facebook"]
     assert config.thumbnail_count == 3
 
@@ -35,8 +39,8 @@ def test_store_roundtrip_and_retry_preserve_publishing_config(tmp_path):
     user_id = store.create_user("publisher", "hash")
     publishing = {
         "enabled": True,
-        "channel_profile": "van_diep_studio",
-        "channel_name": "Vạn Diệp Studio",
+        "channel_profile": "generic_reup",
+        "channel_name": "Kênh A",
         "platforms": ["youtube", "facebook"],
     }
     job = store.create_job(
@@ -71,7 +75,21 @@ def test_publishing_service_creates_metadata_thumbnails_and_publish_ready(tmp_pa
         PublishingLLMClient(PublishingLLMConfig(provider="none"))
     )
     generated = service.generate(
-        config=PublishingPackConfig(enabled=True),
+        config=PublishingPackConfig(
+            enabled=True,
+            channel_profile="profile-demo",
+            channel_name="Kênh Demo",
+            profile_data={
+                "id": "profile-demo",
+                "name": "Kênh Demo",
+                "channel_name": "Kênh Demo",
+                "niche": "truyện tu tiên và gia tộc",
+                "audience": "khán giả Việt Nam yêu thích truyện",
+                "primary_keyword_groups": {"main": ["tu tiên gia tộc", "lão tổ"]},
+                "base_hashtags": ["#KenhDemo"],
+                "description_template": "{episode_summary}\n\n{hashtags}",
+            },
+        ),
         output_dir=tmp_path,
         final_video_path=source,
         source_video_path=source,
@@ -101,7 +119,7 @@ def test_publishing_service_creates_metadata_thumbnails_and_publish_ready(tmp_pa
     assert youtube["privacy_status"] == "private"
     assert youtube["made_for_kids"] is False
     assert youtube["recommended_title"]
-    assert "Vạn Diệp Studio" in (generated.pack_dir / "publishing_pack.md").read_text(encoding="utf-8")
+    assert "Kênh Demo" in (generated.pack_dir / "publishing_pack.md").read_text(encoding="utf-8")
 
 
 def test_static_ui_contains_reup_publishing_pack_controls():
@@ -109,7 +127,9 @@ def test_static_ui_contains_reup_publishing_pack_controls():
     html = (root / "src/universal_video_ai/web/static/index.html").read_text(encoding="utf-8")
     js = (root / "src/universal_video_ai/web/static/app.js").read_text(encoding="utf-8")
     assert "publishing-enable-checkbox" in html
-    assert "Vạn Diệp Studio · Tu tiên/Gia tộc" in html
+    assert "Reup tổng quát · mặc định hệ thống" in html
+    assert "publishing-profile-save" in html
+    assert "publishing-profile-niche" in html
     assert "getPublishingPackConfig" in js
     assert "AI Publishing Pack" in js
 
@@ -248,3 +268,117 @@ def test_backend_exposes_selective_publishing_retry_route():
     assert '/api/jobs/{job_id}/publishing-pack/retry' in app_source
     assert "PublishingPackRetryBody" in app_source
     assert "retry_components(" in app_source
+
+
+def test_saved_publishing_profiles_are_isolated_per_user(tmp_path):
+    store = Store(tmp_path / "web.sqlite")
+    user_a = store.create_user("a", "hash")
+    user_b = store.create_user("b", "hash")
+    saved = store.save_publishing_profile(
+        user_a,
+        name="Kênh A",
+        profile={
+            "channel_name": "Kênh A",
+            "niche": "động vật",
+            "primary_keyword_groups": {"main": ["động vật", "thỏ"]},
+        },
+        is_default=True,
+    )
+    assert len(store.list_publishing_profiles(user_a)) == 1
+    assert store.list_publishing_profiles(user_b) == []
+    assert store.get_publishing_profile(user_b, saved["id"]) is None
+
+
+def test_custom_profile_niche_matching_is_not_van_diep_hardcoded():
+    from universal_video_ai.publishing.profiles import normalize_channel_profile
+    from universal_video_ai.publishing.service import _deterministic_pack
+
+    profile = normalize_channel_profile({
+        "id": "pets",
+        "name": "Kênh Thú Cưng",
+        "channel_name": "Kênh Thú Cưng",
+        "niche": "động vật, thú cưng và kiến thức về thỏ",
+        "audience": "người yêu động vật",
+        "primary_keyword_groups": {"main": ["giống thỏ", "thú cưng", "động vật"]},
+        "base_hashtags": ["#ThuCung"],
+        "description_template": "{episode_summary}\n\n{hashtags}",
+    }, profile_id="pets")
+    payload = _deterministic_pack(
+        profile=profile,
+        config=PublishingPackConfig(enabled=True, channel_profile="pets", channel_name="Kênh Thú Cưng"),
+        source_metadata={"title": "Top 3 giống thỏ đắt nhất thế giới"},
+        translated_segments=[],
+        translated_text="Ba giống thỏ quý hiếm có bộ lông đẹp và giá rất cao. Giống thỏ cuối cùng có giá hơn hai nghìn đô la.",
+        source_text="",
+    )
+    assert payload["content_analysis"]["channel_fit"] == "matched"
+    assert "tu tiên" not in payload["youtube"]["recommended_title"].lower()
+
+
+def test_static_ui_no_longer_auto_selects_van_diep_globally():
+    root = Path(__file__).parents[1]
+    html = (root / "src/universal_video_ai/web/static/index.html").read_text(encoding="utf-8")
+    js = (root / "src/universal_video_ai/web/static/app.js").read_text(encoding="utf-8")
+    assert 'value="van_diep_studio" selected' not in html
+    assert 'value="generic_reup" selected' in html
+    assert 'loadPublishingProfiles();' in js
+    assert '/api/publishing/profiles' in js
+
+
+def test_publishing_config_accepts_hook_drama_viral_styles():
+    assert PublishingPackConfig.from_dict({"style": "hook"}).style == "hook"
+    assert PublishingPackConfig.from_dict({"style": "drama"}).style == "drama"
+    assert PublishingPackConfig.from_dict({"style": "viral"}).style == "viral"
+    assert PublishingPackConfig.from_dict({"style": "search"}).style == "seo"
+    assert PublishingPackConfig.from_dict({"style": "curiosity"}).style == "hook"
+
+
+def test_deterministic_pack_generates_clickable_titles_and_thumbnail_texts():
+    from universal_video_ai.publishing.service import _deterministic_pack
+
+    profile = {
+        "id": "profile-demo",
+        "name": "Kênh Demo",
+        "channel_name": "Kênh Demo",
+        "niche": "review truyện và drama cổ trang",
+        "audience": "khán giả thích chuyện drama",
+        "category": "Entertainment",
+        "made_for_kids": False,
+        "default_privacy": "private",
+        "primary_keyword_groups": {"main": ["review truyện"]},
+        "base_tags": [],
+        "base_hashtags": ["#KenhDemo"],
+        "thumbnail_rules": {"max_words": 5, "examples": []},
+        "description_template": "{episode_summary}\n\n{hashtags}",
+    }
+    payload = _deterministic_pack(
+        profile=profile,
+        config=PublishingPackConfig(enabled=True, style="drama"),
+        source_metadata={"title": "Đòi lại của hồi môn ở phủ Tướng gia"},
+        translated_segments=[],
+        translated_text=(
+            "Thẩm Nam Kiều quyết liệt đòi lại của hồi môn ngay trước phủ Tướng gia. "
+            "Mẹ kế và cha ruột tìm cách ngăn cản nhưng cô không nhịn nữa. "
+            "Cuối cùng sự thật bị vạch trần trước đám đông."
+        ),
+        source_text="",
+    )
+    assert payload["youtube"]["recommended_title"]
+    assert any(
+        word in payload["youtube"]["recommended_title"].lower()
+        for word in ["bùng nổ", "gây sốc", "đòi", "vạch trần"]
+    )
+    assert len(payload["thumbnail_texts"]) == 3
+    assert all(1 <= len(item.split()) <= 7 for item in payload["thumbnail_texts"])
+
+
+def test_ui_has_auto_aspect_and_channel_provenance_history():
+    root = Path(__file__).parents[1]
+    html = (root / "src/universal_video_ai/web/static/index.html").read_text(encoding="utf-8")
+    js = (root / "src/universal_video_ai/web/static/app.js").read_text(encoding="utf-8")
+    assert 'value="auto" selected' in html
+    assert "Auto theo từng video" in html
+    assert "source_channel_title" in js
+    assert "Kênh nguồn:" in js
+    assert "Video gốc:" in js
+    assert 'aspect === "auto"' in js
