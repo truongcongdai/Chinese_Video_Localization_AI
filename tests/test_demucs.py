@@ -258,3 +258,48 @@ def test_demucs_output_frozen():
     # Should not be able to modify frozen dataclass
     with pytest.raises(AttributeError):
         output.vocals = Path("/tmp/different.wav")
+
+
+def test_large_audio_is_split_separated_and_concatenated(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "long_audio.wav"
+    audio_file.write_bytes(b"large-enough-for-test")
+    calls = []
+
+    def successful_result():
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        result.stdout = ""
+        return result
+
+    def mock_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[0] == "ffmpeg" and "segment" in cmd:
+            pattern = str(cmd[-1])
+            Path(pattern.replace("%05d", "00000")).write_bytes(b"chunk-0")
+            Path(pattern.replace("%05d", "00001")).write_bytes(b"chunk-1")
+        elif cmd[0] == "demucs":
+            separated_dir = Path(cmd[cmd.index("-o") + 1])
+            chunk_paths = [Path(value) for value in cmd if str(value).endswith(".wav")]
+            for chunk_path in chunk_paths:
+                stems_dir = separated_dir / "htdemucs" / chunk_path.stem
+                stems_dir.mkdir(parents=True, exist_ok=True)
+                for stem in ("vocals", "drums", "bass", "other"):
+                    (stems_dir / f"{stem}.wav").write_bytes(b"stem")
+        elif cmd[0] == "ffmpeg" and "concat" in cmd:
+            Path(cmd[-1]).write_bytes(b"joined-stem")
+        return successful_result()
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("shutil.which", lambda command: command)
+
+    processor = DemucsProcessor(
+        DemucsConfig(chunk_threshold_bytes=1, chunk_length_seconds=60)
+    )
+    output = processor.separate(audio_file)
+
+    assert output.vocals.read_bytes() == b"joined-stem"
+    assert output.drums.exists()
+    demucs_calls = [cmd for cmd, _ in calls if cmd[0] == "demucs"]
+    assert len(demucs_calls) == 1
+    assert sum(str(value).endswith(".wav") for value in demucs_calls[0]) == 2

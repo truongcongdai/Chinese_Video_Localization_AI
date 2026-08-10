@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import shutil
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,6 +29,11 @@ class AudioPipelineConfig:
     run_transcription: bool = False
     transcription_language: Optional[str] = None
     transcription_model: Optional[str] = None
+    # Source-effect separation is optional. Multi-hour Demucs jobs generate
+    # many gigabytes of stems and intermediate WAV data; skip it beyond this
+    # duration so transcription/localization can still finish. None disables
+    # the limit.
+    demucs_max_duration_seconds: Optional[float] = 2 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -102,9 +108,38 @@ class AudioPipeline:
                 raise RuntimeError("Demucs requested but not available and no demucs_processor injected")
             if self.demucs_processor is None:
                 raise RuntimeError("Demucs requested but no demucs_processor was provided")
-            self.logger.info("AudioPipeline: running demucs for %s", audio_result.audio_path)
-            demucs_output = self.demucs_processor.separate(audio_result.audio_path, output_dir=self.config.demucs_output_dir)
-            self.logger.debug("AudioPipeline: demucs_output=%s", demucs_output)
+            max_duration = self.config.demucs_max_duration_seconds
+            skip_for_duration = bool(
+                max_duration
+                and audio_result.duration > max_duration
+            )
+            # A regular WAV Demucs run plus chunk and stem assembly can peak at
+            # well over 10x the input size. If the disk cannot sustain that,
+            # source effects are optional and the safe fallback is dub + the
+            # licensed replacement track.
+            free_bytes = shutil.disk_usage(audio_result.audio_path.parent).free
+            estimated_required = max(8 * 1024 ** 3, audio_result.filesize * 12)
+            skip_for_disk = free_bytes < estimated_required
+            if skip_for_duration:
+                self.logger.warning(
+                    "Skipping Demucs for %.2f-hour audio (configured maximum %.2f hours); "
+                    "continuing localization without source effects",
+                    audio_result.duration / 3600,
+                    float(max_duration) / 3600,
+                )
+            elif skip_for_disk:
+                self.logger.warning(
+                    "Skipping Demucs because free disk space is %.2f GB but an estimated %.2f GB is required; "
+                    "continuing localization without source effects",
+                    free_bytes / 1024 ** 3,
+                    estimated_required / 1024 ** 3,
+                )
+            else:
+                self.logger.info("AudioPipeline: running demucs for %s", audio_result.audio_path)
+                demucs_output = self.demucs_processor.separate(
+                    audio_result.audio_path, output_dir=self.config.demucs_output_dir
+                )
+                self.logger.debug("AudioPipeline: demucs_output=%s", demucs_output)
 
         # Transcription step (optional) via SpeechService.
         # We always request per-sentence segments (transcribe_segments); the

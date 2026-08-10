@@ -91,6 +91,7 @@ def test_preflight_surfaces_remix_plan_for_long_form(monkeypatch):
 
 def test_create_job_remix_applies_visible_transform_defaults(monkeypatch):
     captured = {}
+    configured_limits = []
 
     def fake_create_job(*args, **kwargs):
         captured.update(kwargs)
@@ -100,11 +101,16 @@ def test_create_job_remix_applies_visible_transform_defaults(monkeypatch):
         coro.close()
         return SimpleNamespace(cancel=lambda: None)
 
+    async def fake_configure_job_run_limit(value):
+        configured_limits.append(value)
+        return value
+
     monkeypatch.setattr(web_app.store, "get_provider_settings", lambda user_id, provider: None)
     monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
     monkeypatch.setattr(web_app.store, "create_job", fake_create_job)
     monkeypatch.setattr(web_app.store, "adjust_credits", lambda user_id, delta: 998)
     monkeypatch.setattr(web_app.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(web_app, "_configure_job_run_limit", fake_configure_job_run_limit)
     monkeypatch.setattr(
         web_app.requests,
         "get",
@@ -118,6 +124,7 @@ def test_create_job_remix_applies_visible_transform_defaults(monkeypatch):
             remix_platforms=["tiktok"],
             remix_strength="strong",
             tts_provider="edge",
+            max_concurrent=4,
         ),
         user_id=1,
     ))
@@ -129,6 +136,7 @@ def test_create_job_remix_applies_visible_transform_defaults(monkeypatch):
     assert captured["transform_config"]["enable_randomization"] is True
     assert captured["transform_config"]["crop_percent"] == 1.2
     assert captured["transform_config"]["speed_factor"] == 1.0
+    assert configured_limits == [4]
 
 
 def test_preflight_blocks_gemini_mode_without_saved_key(monkeypatch):
