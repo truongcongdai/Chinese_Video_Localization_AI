@@ -587,7 +587,8 @@
       <div class="field preset-output-field">
         <label>Khung hình đầu ra</label>
         <select id="output-aspect-ratio">
-          <option value="source">Giữ nguyên video nguồn</option>
+          <option value="auto" selected>Auto theo từng video — tự giữ dọc/ngang của source</option>
+          <option value="source">Giữ nguyên video nguồn (thủ công)</option>
           <option value="9:16">Dọc 9:16 — 1080×1920</option>
           <option value="16:9">Ngang 16:9 — 1920×1080</option>
           <option value="1:1">Vuông 1:1 — 1080×1080</option>
@@ -795,23 +796,58 @@
         <div class="field">
           <label>Hồ sơ kênh</label>
           <select id="publishing-profile-select">
-            <option value="van_diep_studio" selected>Vạn Diệp Studio · Tu tiên/Gia tộc</option>
-            <option value="generic_reup">Reup tổng quát</option>
+            <option value="generic_reup" selected>Reup tổng quát · mặc định hệ thống</option>
           </select>
+          <div class="muted-help">Mỗi tài khoản chỉ thấy hồ sơ do chính mình lưu. Không dùng hồ sơ kênh của người khác.</div>
         </div>
         <div class="field">
           <label>Tên kênh</label>
-          <input id="publishing-channel-name" maxlength="80" value="Vạn Diệp Studio">
+          <input id="publishing-channel-name" maxlength="100" placeholder="VD: Vạn Diệp Studio">
         </div>
       </div>
+      <details id="publishing-profile-editor" style="margin:8px 0 14px;">
+        <summary style="cursor:pointer;font-weight:600;">Hồ sơ SEO của kênh · lưu riêng cho tài khoản này</summary>
+        <div style="padding-top:12px;display:grid;gap:10px;">
+          <div class="row">
+            <div class="field"><label>Tên hồ sơ</label><input id="publishing-profile-name" maxlength="100" placeholder="VD: Kênh Tu Tiên"></div>
+            <div class="field"><label>Ngách kênh</label><input id="publishing-profile-niche" maxlength="1000" placeholder="VD: review truyện tu tiên, gia tộc, trường sinh"></div>
+            <div class="field"><label>Khán giả mục tiêu</label><input id="publishing-profile-audience" maxlength="1000" placeholder="VD: người xem Việt Nam yêu thích truyện tiên hiệp"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>Keyword nền · phân cách bằng dấu phẩy</label><textarea id="publishing-profile-keywords" rows="2" placeholder="tu tiên gia tộc, gia tộc trường sinh, lão tổ..."></textarea></div>
+            <div class="field"><label>Tags nền · phân cách bằng dấu phẩy</label><textarea id="publishing-profile-tags" rows="2"></textarea></div>
+            <div class="field"><label>Hashtag nền · phân cách bằng dấu phẩy</label><textarea id="publishing-profile-hashtags" rows="2" placeholder="#TenKenh, #ChuDe"></textarea></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>Công thức tiêu đề</label><input id="publishing-profile-title-formula" maxlength="800" placeholder="Hook/mâu thuẫn + payoff + keyword chính"></div>
+            <div class="field"><label>Tagline thương hiệu</label><input id="publishing-profile-brand-line" maxlength="300"></div>
+          </div>
+          <div class="field">
+            <label>Mẫu mô tả</label>
+            <textarea id="publishing-profile-description-template" rows="5" placeholder="Có thể dùng {channel_name}, {story_name}, {episode_summary}, {episode_journey}, {playlist_url}, {hashtags}"></textarea>
+          </div>
+          <div class="row" style="align-items:center;">
+            <label><input type="checkbox" id="publishing-profile-default" style="width:auto;margin-right:6px">Dùng làm hồ sơ mặc định của tài khoản</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn small" id="publishing-profile-new">Hồ sơ mới</button>
+              <button type="button" class="btn gradient small" id="publishing-profile-save">Lưu hồ sơ</button>
+              <button type="button" class="btn small hidden" id="publishing-profile-delete">Xóa hồ sơ</button>
+            </div>
+          </div>
+          <div id="publishing-profile-status" class="muted-help"></div>
+        </div>
+      </details>
       <div class="row">
         <div class="field">
-          <label>Phong cách title</label>
+          <label>Phong cách title / thumbnail</label>
           <select id="publishing-style-select">
-            <option value="search">Ưu tiên tìm kiếm</option>
-            <option value="balanced" selected>Cân bằng Search + tò mò</option>
-            <option value="curiosity">Ưu tiên tò mò nhưng đúng nội dung</option>
+            <option value="seo">Ưu tiên SEO / tìm kiếm</option>
+            <option value="balanced" selected>Cân bằng SEO + hook</option>
+            <option value="hook">Hook mạnh nhưng vẫn đúng nội dung</option>
+            <option value="drama">Drama / mâu thuẫn / tò mò</option>
+            <option value="viral">Ngắn gọn kiểu short / viral</option>
           </select>
+          <div class="muted-help" style="margin-top:6px">Balanced giờ ưu tiên hút click hơn trước. Với truyện, recap, drama nên chọn Hook hoặc Drama.</div>
         </div>
         <div class="field">
           <label>Mức biên tập</label>

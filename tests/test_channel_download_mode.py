@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import sys
 import types
 
@@ -190,3 +192,47 @@ def test_channel_scan_cache_avoids_scanning_same_profile_twice(monkeypatch) -> N
     assert calls["count"] == 1
     assert first is not second
     assert first.videos[0].source_url == second.videos[0].source_url
+
+
+def test_douyin_auth_requirement_retries_visible_browser(monkeypatch) -> None:
+    from universal_video_ai.downloader.channel import DouyinAuthRequired
+    from universal_video_ai.downloader.platform import Platform
+
+    service = ChannelListingService(hard_limit=100)
+    monkeypatch.setenv("DOUYIN_CHANNEL_AUTO_LOGIN_RECOVERY", "true")
+    monkeypatch.setattr(
+        service,
+        "_scan_with_ytdlp",
+        lambda classification, canonical_url, effective_limit: (None, "skipped"),
+    )
+    calls = []
+
+    def fake_browser(classification, canonical_url, effective_limit, **kwargs):
+        calls.append(dict(kwargs))
+        if kwargs.get("headless_override") is not False:
+            raise DouyinAuthRequired("login required")
+        return service._result_from_entries(
+            classification=classification,
+            canonical_url=canonical_url,
+            entries=[{"aweme_id": "7659744912519121521", "desc": "owned"}],
+            channel_title="Demo",
+            channel_id="SEC_UID",
+            effective_limit=effective_limit,
+        )
+
+    monkeypatch.setattr(service, "_scan_douyin_with_playwright", fake_browser)
+    result = service.scan("https://www.douyin.com/user/SEC_UID", force_refresh=True)
+    assert result.platform == Platform.DOUYIN
+    assert len(calls) == 2
+    assert calls[1]["headless_override"] is False
+    assert calls[1]["allow_auth_wait"] is True
+
+
+def test_managed_douyin_profile_dir_defaults_inside_project(monkeypatch, tmp_path) -> None:
+    from universal_video_ai.downloader import channel as channel_module
+
+    monkeypatch.delenv("DOUYIN_CHANNEL_BROWSER_USER_DATA_DIR", raising=False)
+    path = Path(channel_module._managed_douyin_profile_dir())
+    assert path.name == "douyin_channel"
+    assert path.parent.name == "browser_profiles"
+    assert path.is_dir()

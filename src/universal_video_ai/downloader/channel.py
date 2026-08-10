@@ -41,6 +41,35 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+class DouyinAuthRequired(RuntimeError):
+    """Raised when Douyin blocks profile enumeration behind login/verification."""
+
+
+def _managed_douyin_profile_dir() -> str:
+    configured = (os.environ.get("DOUYIN_CHANNEL_BROWSER_USER_DATA_DIR") or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+    else:
+        # Dedicated app-managed profile. Never attach to the user's normal Chrome profile.
+        project_root = Path(__file__).resolve().parents[3]
+        path = project_root / "local_data" / "browser_profiles" / "douyin_channel"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _douyin_auth_text(text: str, url: str = "") -> bool:
+    body = str(text or "")
+    lower = body.lower()
+    url_lower = str(url or "").lower()
+    tokens = ("验证码", "安全验证", "扫码登录", "登录后", "请登录", "访问过于频繁")
+    return (
+        any(token in body for token in tokens)
+        or "captcha" in lower
+        or "passport.douyin.com" in url_lower
+        or "/verify" in url_lower
+    )
+
+
 class URLIntent(str, Enum):
     VIDEO = "video"
     CHANNEL = "channel"
@@ -512,6 +541,47 @@ class ChannelListingService:
         return deduplicated
 
     @staticmethod
+    def _expected_douyin_author_id(canonical_url: str) -> str:
+        match = re.search(r"/user/([^/?#]+)", str(canonical_url or ""), re.I)
+        return unquote(match.group(1)).strip() if match else ""
+
+    @staticmethod
+    def _douyin_record_owner_ids(record: dict[str, Any]) -> set[str]:
+        values = {
+            str(record.get("author_sec_uid") or "").strip(),
+            str(record.get("author_uid") or "").strip(),
+            str(record.get("author_unique_id") or "").strip(),
+        }
+        return {value for value in values if value}
+
+    @classmethod
+    def _douyin_record_matches_owner(cls, record: dict[str, Any], expected_author_id: str) -> bool:
+        expected = str(expected_author_id or "").strip()
+        if not expected:
+            return True
+        owner_ids = cls._douyin_record_owner_ids(record)
+        return expected in owner_ids
+
+    @staticmethod
+    def _douyin_post_response_matches_profile(response_url: str, expected_author_id: str) -> bool:
+        url = unquote(str(response_url or ""))
+        lower = url.lower()
+        if not any(marker in lower for marker in ("aweme/post", "aweme/v1/web/aweme/post", "/post/")):
+            return False
+        expected = str(expected_author_id or "").strip()
+        if not expected:
+            return True
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        candidates: set[str] = set()
+        for key in ("sec_user_id", "sec_uid", "user_id", "uid"):
+            for value in query.get(key, []):
+                candidates.add(str(value).strip())
+        # When Douyin changes the query key but still embeds the sec_uid in the
+        # URL, accept it. Otherwise reject pagination from unrelated feeds.
+        return expected in candidates or expected in url
+
+    @staticmethod
     def _douyin_record_from_item(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
         video_id = str(
             item.get("aweme_id")
@@ -554,9 +624,13 @@ class ChannelListingService:
             "aweme_id": video_id,
             "desc": str(item.get("desc") or item.get("title") or ""),
             "uploader": str(author.get("nickname") or author.get("unique_id") or ""),
+            "author_sec_uid": str(author.get("sec_uid") or author.get("secUid") or ""),
+            "author_uid": str(author.get("uid") or author.get("user_id") or author.get("userId") or ""),
+            "author_unique_id": str(author.get("unique_id") or author.get("uniqueId") or ""),
             "duration": duration_value,
             "thumbnail": thumbnail,
             "timestamp": str(item.get("create_time") or item.get("createTime") or ""),
+            "owner_verified": False,
         }
 
     @classmethod
@@ -564,24 +638,38 @@ class ChannelListingService:
         cls,
         payload: Any,
         records: dict[str, dict[str, Any]],
+        *,
+        expected_author_id: str = "",
+        require_owner: bool = False,
     ) -> None:
         for item in cls._walk_json(payload):
             parsed = cls._douyin_record_from_item(item)
             if parsed is None:
                 continue
             video_id, record = parsed
+            owner_ids = cls._douyin_record_owner_ids(record)
+            if expected_author_id:
+                if owner_ids and not cls._douyin_record_matches_owner(record, expected_author_id):
+                    # This is the core contamination guard: profile pages also
+                    # load recommendations/related awemes from other creators.
+                    continue
+                if require_owner and not owner_ids:
+                    continue
+                record["owner_verified"] = bool(owner_ids and cls._douyin_record_matches_owner(record, expected_author_id))
             if video_id not in records:
                 records[video_id] = record
             else:
-                # Preserve insertion order while filling missing metadata from
-                # later network responses.
                 existing = records[video_id]
                 for key, value in record.items():
-                    if value not in (None, "", 0, 0.0) and existing.get(key) in (None, "", 0, 0.0):
+                    if value not in (None, "", 0, 0.0, False) and existing.get(key) in (None, "", 0, 0.0, False):
                         existing[key] = value
+                if record.get("owner_verified"):
+                    existing["owner_verified"] = True
 
     @classmethod
-    def _extract_douyin_records_from_html(cls, page: str) -> dict[str, dict[str, Any]]:
+    def _extract_douyin_records_from_html(
+        cls, page: str, *, expected_author_id: str = "", require_owner: bool = False,
+    ) -> dict[str, dict[str, Any]]:
         decoded_page = html.unescape(page or "")
         records: dict[str, dict[str, Any]] = {}
         script_patterns = (
@@ -596,21 +684,26 @@ class ChannelListingService:
                 if not raw:
                     continue
                 try:
-                    cls._merge_douyin_payload(json.loads(raw), records)
+                    cls._merge_douyin_payload(
+                        json.loads(raw), records,
+                        expected_author_id=expected_author_id,
+                        require_owner=require_owner,
+                    )
                 except Exception:
                     continue
 
         # Douyin changes bootstrap nesting frequently. Keep conservative ID
         # fallbacks so the per-video downloader can retrieve metadata later.
-        for match in re.finditer(
-            r'(?:aweme_id|awemeId|item_id|itemId|video_id)["\']?\s*[:=]\s*["\'](\d{10,})',
-            decoded_page,
-        ):
-            video_id = match.group(1)
-            records.setdefault(video_id, {"id": video_id, "aweme_id": video_id})
-        for match in re.finditer(r"/video/(\d{10,})", decoded_page):
-            video_id = match.group(1)
-            records.setdefault(video_id, {"id": video_id, "aweme_id": video_id})
+        if not require_owner:
+            for match in re.finditer(
+                r'(?:aweme_id|awemeId|item_id|itemId|video_id)["\']?\s*[:=]\s*["\'](\d{10,})',
+                decoded_page,
+            ):
+                video_id = match.group(1)
+                records.setdefault(video_id, {"id": video_id, "aweme_id": video_id})
+            for match in re.finditer(r"/video/(\d{10,})", decoded_page):
+                video_id = match.group(1)
+                records.setdefault(video_id, {"id": video_id, "aweme_id": video_id})
         return records
 
     @staticmethod
@@ -725,20 +818,27 @@ class ChannelListingService:
         except Exception:
             return {}
 
-    def _open_playwright_context(self, playwright: Any, *, headless: bool) -> tuple[Any, Any, str]:
+    def _open_playwright_context(
+        self,
+        playwright: Any,
+        *,
+        headless: bool,
+        user_data_dir_override: Optional[str] = None,
+    ) -> tuple[Any, Any, str]:
         viewport = {"width": 1440, "height": 1000}
         user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
-        user_data_dir = (os.environ.get("DOUYIN_CHANNEL_BROWSER_USER_DATA_DIR") or "").strip()
+        user_data_dir = (user_data_dir_override or _managed_douyin_profile_dir()).strip()
         launch_errors: list[str] = []
         for label, launch_options in self._playwright_launch_candidates(headless):
             browser = None
             try:
                 if user_data_dir:
-                    # Use only an explicitly configured dedicated profile. Do
-                    # not silently attach to the user's normal Chrome profile.
+                    # Always use a dedicated app-managed profile so a one-time
+                    # Douyin login/captcha survives server restarts. This is never
+                    # the user's normal Chrome profile.
                     context = playwright.chromium.launch_persistent_context(
                         user_data_dir=user_data_dir,
                         viewport=viewport,
@@ -777,6 +877,8 @@ class ChannelListingService:
         *,
         known_video_ids: Optional[set[str]] = None,
         deep_scan: bool = False,
+        headless_override: Optional[bool] = None,
+        allow_auth_wait: bool = False,
     ) -> ChannelScanResult:
         if not _bool_env("DOUYIN_CHANNEL_BROWSER_ENABLED", True):
             raise RuntimeError("Douyin browser fallback is disabled")
@@ -797,14 +899,16 @@ class ChannelListingService:
         deep_timeout_seconds = max(60, int(os.environ.get("DOUYIN_CHANNEL_DEEP_SCAN_TIMEOUT_SECONDS", "600")))
         total_timeout_seconds = deep_timeout_seconds if deep_scan else max(60, timeout_ms // 1000 + 60)
         deadline = time.monotonic() + total_timeout_seconds
-        headless = _bool_env("DOUYIN_CHANNEL_BROWSER_HEADLESS", True)
+        headless = _bool_env("DOUYIN_CHANNEL_BROWSER_HEADLESS", True) if headless_override is None else bool(headless_override)
+        auth_wait_seconds = max(30, int(os.environ.get("DOUYIN_CHANNEL_LOGIN_WAIT_SECONDS", "180")))
         known_video_ids = {str(value) for value in (known_video_ids or set()) if str(value)}
+        expected_author_id = self._expected_douyin_author_id(canonical_url)
 
         result = ChannelScanResult(
             channel_url=classification.original_url,
             resolved_url=canonical_url,
             platform=Platform.DOUYIN,
-            channel_id=canonical_url.rsplit("/", 1)[-1],
+            channel_id=self._expected_douyin_author_id(canonical_url) or canonical_url.rsplit("/", 1)[-1],
         )
         records: dict[str, dict[str, Any]] = {}
         body_text = ""
@@ -838,14 +942,20 @@ class ChannelListingService:
                             if "json" not in content_type:
                                 return
                             payload = response.json()
-                            self._merge_douyin_payload(payload, records)
-                            for page_meta in self._extract_douyin_pagination(payload):
-                                pagination["saw_pagination"] = True
-                                pagination["pages"] += 1
-                                if page_meta.get("has_more") is not None:
-                                    pagination["has_more"] = page_meta["has_more"]
-                                if page_meta.get("cursor"):
-                                    pagination["cursor"] = str(page_meta["cursor"])
+                            self._merge_douyin_payload(
+                                payload,
+                                records,
+                                expected_author_id=expected_author_id,
+                                require_owner=bool(expected_author_id),
+                            )
+                            if self._douyin_post_response_matches_profile(response_url, expected_author_id):
+                                for page_meta in self._extract_douyin_pagination(payload):
+                                    pagination["saw_pagination"] = True
+                                    pagination["pages"] += 1
+                                    if page_meta.get("has_more") is not None:
+                                        pagination["has_more"] = page_meta["has_more"]
+                                    if page_meta.get("cursor"):
+                                        pagination["cursor"] = str(page_meta["cursor"])
                         except Exception:
                             # Some responses are compressed/streamed or blocked;
                             # DOM and bootstrap extraction remain available.
@@ -855,6 +965,43 @@ class ChannelListingService:
                     page.goto(canonical_url, wait_until="domcontentloaded", timeout=timeout_ms)
                     page.wait_for_timeout(min(6000, wait_ms * 3))
                     result.channel_title = page.title() or ""
+
+                    def page_requires_auth() -> bool:
+                        try:
+                            body = page.locator("body").inner_text(timeout=3000)
+                        except Exception:
+                            body = ""
+                        return _douyin_auth_text(body, getattr(page, "url", ""))
+
+                    if page_requires_auth():
+                        if headless or not allow_auth_wait:
+                            raise DouyinAuthRequired(
+                                "Douyin yêu cầu đăng nhập/xác minh cho profile này."
+                            )
+                        logger.warning(
+                            "Douyin yêu cầu đăng nhập/xác minh. Đã mở Chromium có profile riêng; "
+                            "hãy đăng nhập/quét QR/xác minh trong cửa sổ browser. Tool sẽ tự tiếp tục sau khi hoàn tất."
+                        )
+                        auth_deadline = time.monotonic() + auth_wait_seconds
+                        cleared = False
+                        while time.monotonic() < auth_deadline:
+                            page.wait_for_timeout(1500)
+                            if not page_requires_auth():
+                                cleared = True
+                                try:
+                                    page.goto(canonical_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                                    page.wait_for_timeout(min(5000, wait_ms * 3))
+                                except Exception:
+                                    pass
+                                break
+                        if not cleared:
+                            raise DouyinAuthRequired(
+                                f"Hết {auth_wait_seconds}s chờ đăng nhập/xác minh Douyin. "
+                                "Hãy hoàn tất xác minh trong cửa sổ Chromium rồi thử lại."
+                            )
+                        result.warnings.append(
+                            "Đã dùng phiên Douyin đã xác minh trong profile browser riêng; session được lưu cho lần quét sau."
+                        )
 
                     # Some profile links open on a non-post tab. Best-effort
                     # activate the public works/posts tab before scrolling.
@@ -876,13 +1023,12 @@ class ChannelListingService:
                     ):
                         try:
                             hydration_payload = page.evaluate(f"() => ({expression})")
-                            self._merge_douyin_payload(hydration_payload, records)
-                            for page_meta in self._extract_douyin_pagination(hydration_payload):
-                                pagination["saw_pagination"] = True
-                                if page_meta.get("has_more") is not None:
-                                    pagination["has_more"] = page_meta["has_more"]
-                                if page_meta.get("cursor"):
-                                    pagination["cursor"] = str(page_meta["cursor"])
+                            self._merge_douyin_payload(
+                                hydration_payload,
+                                records,
+                                expected_author_id=expected_author_id,
+                                require_owner=bool(expected_author_id),
+                            )
                         except Exception:
                             pass
 
@@ -902,17 +1048,22 @@ class ChannelListingService:
                             )
                         except Exception:
                             hrefs = []
-                        for href in hrefs or []:
-                            match = re.search(r"/video/(\d{10,})", str(href))
-                            if match:
-                                video_id = match.group(1)
-                                records.setdefault(video_id, {"id": video_id, "aweme_id": video_id})
+                        # Do not inject every /video/ link from the page into
+                        # the catalog. Douyin profile pages also contain related
+                        # and recommendation cards from other creators. Only
+                        # owner-verified awemes captured from profile payloads
+                        # are allowed into `records`.
+                        _ = hrefs
 
                         # Periodically parse live HTML for virtualized cards and
                         # bootstrap fragments that do not expose anchor tags.
                         if round_index == 0 or round_index % 4 == 0:
                             try:
-                                html_records = self._extract_douyin_records_from_html(page.content())
+                                html_records = self._extract_douyin_records_from_html(
+                                    page.content(),
+                                    expected_author_id=expected_author_id,
+                                    require_owner=bool(expected_author_id),
+                                )
                                 for video_id, item in html_records.items():
                                     records.setdefault(video_id, item)
                             except Exception:
@@ -963,7 +1114,11 @@ class ChannelListingService:
                     except Exception:
                         body_text = ""
                     try:
-                        html_records = self._extract_douyin_records_from_html(page.content())
+                        html_records = self._extract_douyin_records_from_html(
+                            page.content(),
+                            expected_author_id=expected_author_id,
+                            require_owner=bool(expected_author_id),
+                        )
                         for video_id, item in html_records.items():
                             records.setdefault(video_id, item)
                     except Exception:
@@ -974,6 +1129,8 @@ class ChannelListingService:
                     finally:
                         if browser is not None:
                             browser.close()
+        except DouyinAuthRequired:
+            raise
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(f"Douyin profile browser timed out: {exc}") from exc
         except Exception as exc:
@@ -981,12 +1138,8 @@ class ChannelListingService:
 
         if not records:
             lower_text = body_text.lower()
-            if any(token in body_text for token in ("验证码", "安全验证", "登录", "扫码", "访问过于频繁")) or "captcha" in lower_text:
-                raise RuntimeError(
-                    "Douyin yêu cầu xác minh/đăng nhập. Hãy dùng profile browser riêng: "
-                    "DOUYIN_CHANNEL_BROWSER_HEADLESS=false và "
-                    "DOUYIN_CHANNEL_BROWSER_USER_DATA_DIR=<thu_muc_profile_rieng>, rồi đăng nhập/xác minh một lần."
-                )
+            if _douyin_auth_text(body_text):
+                raise DouyinAuthRequired("Douyin yêu cầu đăng nhập/xác minh cho profile này.")
             raise RuntimeError(
                 "Browser đã mở profile nhưng không thu được video từ DOM hoặc network responses. "
                 "Thử DOUYIN_CHANNEL_BROWSER_HEADLESS=false, cấu hình cookie/profile riêng, và cập nhật Playwright."
@@ -1000,6 +1153,10 @@ class ChannelListingService:
         result.complete = bool(pagination["saw_pagination"] and pagination["has_more"] is False)
         result.truncated = not result.complete
         result.warnings.append(f"Đã quét profile bằng browser fallback ({launch_label}).")
+        if expected_author_id:
+            result.warnings.append(
+                f"Ownership Guard đã bật: chỉ nhận video có author.sec_uid khớp profile {expected_author_id[:12]}…"
+            )
         new_records = len(set(records) - known_video_ids)
         if not result.complete:
             if pagination["has_more"] is True:
@@ -1053,16 +1210,23 @@ class ChannelListingService:
         except requests.RequestException as exc:
             raise RuntimeError(f"Douyin profile HTML request failed: {exc}") from exc
 
-        records = self._extract_douyin_records_from_html(response.text)
+        expected_author_id = self._expected_douyin_author_id(canonical_url)
+        records = self._extract_douyin_records_from_html(
+            response.text,
+            expected_author_id=expected_author_id,
+            require_owner=bool(expected_author_id),
+        )
 
         if not records:
-            raise RuntimeError("Profile HTML did not contain public video bootstrap data")
+            raise RuntimeError(
+                "Profile HTML không có video nào xác minh đúng chủ kênh; đã bỏ qua các aweme/recommendation không thuộc profile."
+            )
 
         result = ChannelScanResult(
             channel_url=classification.original_url,
             resolved_url=canonical_url,
             platform=Platform.DOUYIN,
-            channel_id=canonical_url.rsplit("/", 1)[-1],
+            channel_id=self._expected_douyin_author_id(canonical_url) or canonical_url.rsplit("/", 1)[-1],
             warnings=[
                 "Đã dùng fallback HTML của Douyin. Kết quả có thể chỉ gồm các video được preload; "
                 "cài Playwright để cuộn toàn bộ profile."
@@ -1121,11 +1285,20 @@ class ChannelListingService:
                 if cached:
                     self._scan_cache.pop(cache_key, None)
 
-        ytdlp_result, ytdlp_error = self._scan_with_ytdlp(
-            classification,
-            canonical_url,
-            effective_limit,
-        )
+        if (
+            classification.platform == Platform.DOUYIN
+            and not _bool_env("DOUYIN_CHANNEL_TRUST_YTDLP_PROFILE", False)
+        ):
+            # yt-dlp profile enumeration cannot reliably prove every aweme's
+            # author against the sec_uid in the requested profile URL. Use the
+            # browser/HTML paths below where author.sec_uid can be validated.
+            ytdlp_result, ytdlp_error = None, "skipped: ownership guard requires author.sec_uid verification"
+        else:
+            ytdlp_result, ytdlp_error = self._scan_with_ytdlp(
+                classification,
+                canonical_url,
+                effective_limit,
+            )
         if ytdlp_result is not None:
             result = ytdlp_result
         elif classification.platform == Platform.DOUYIN:
@@ -1139,6 +1312,48 @@ class ChannelListingService:
                     deep_scan=deep,
                 )
                 result.warnings.append("yt-dlp không enumerate được profile Douyin; đã dùng Chromium fallback.")
+            except DouyinAuthRequired as auth_exc:
+                fallback_errors.append(str(auth_exc))
+                if _bool_env("DOUYIN_CHANNEL_AUTO_LOGIN_RECOVERY", True):
+                    logger.warning(
+                        "Douyin auth required for %s. Retrying in visible Chromium with managed persistent profile %s",
+                        canonical_url, _managed_douyin_profile_dir(),
+                    )
+                    try:
+                        result = self._scan_douyin_with_playwright(
+                            classification,
+                            canonical_url,
+                            effective_limit,
+                            known_video_ids=known_video_ids,
+                            deep_scan=deep,
+                            headless_override=False,
+                            allow_auth_wait=True,
+                        )
+                        result.warnings.insert(
+                            0,
+                            "Douyin yêu cầu xác minh nên tool đã tự mở Chromium. Phiên đăng nhập được lưu trong profile riêng để tái sử dụng.",
+                        )
+                    except RuntimeError as visible_exc:
+                        fallback_errors.append(str(visible_exc))
+                        result = None
+                else:
+                    result = None
+                if result is None:
+                    try:
+                        result = self._scan_douyin_bootstrap(
+                            classification,
+                            canonical_url,
+                            effective_limit,
+                        )
+                        result.warnings.insert(0, "Chromium fallback không khả dụng; đã dùng HTML bootstrap fallback.")
+                    except RuntimeError as html_exc:
+                        fallback_errors.append(str(html_exc))
+                        raise RuntimeError(
+                            "Douyin đang yêu cầu đăng nhập/xác minh. Tool đã thử tự phục hồi nhưng chưa hoàn tất. "
+                            f"Mở Chromium vừa được tool bật và hoàn tất QR/CAPTCHA trong tối đa "
+                            f"{os.environ.get('DOUYIN_CHANNEL_LOGIN_WAIT_SECONDS', '180')} giây, sau đó chạy lại. "
+                            f"Profile đăng nhập được lưu tại {_managed_douyin_profile_dir()}."
+                        ) from html_exc
             except RuntimeError as exc:
                 fallback_errors.append(str(exc))
                 try:
@@ -1156,9 +1371,8 @@ class ChannelListingService:
                         else ""
                     )
                     raise RuntimeError(
-                        "Không quét được profile Douyin sau các phương án yt-dlp, Chromium và HTML. "
-                        f"yt-dlp: {ytdlp_error or 'no details'}; fallback: {' | '.join(fallback_errors)}."
-                        f"{cookie_hint}"
+                        "Không quét được profile Douyin sau các phương án Chromium và HTML. "
+                        f"fallback: {' | '.join(fallback_errors)}.{cookie_hint}"
                     ) from html_exc
         else:
             platform_name = classification.platform.value

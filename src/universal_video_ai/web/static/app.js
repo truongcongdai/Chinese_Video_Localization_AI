@@ -214,6 +214,7 @@ function showApp(me) {
     updateJobEstimate();
   });
   loadProviderSettings();
+  loadPublishingProfiles();
   loadPersonalStats();
   refreshJobQueueStatus();
   requestNotificationPermission();
@@ -874,15 +875,46 @@ function getBrandingConfig() {
   };
 }
 
+let publishingProfiles = new Map();
+let publishingGenericProfile = null;
+
+function _publishingCsv(selector) {
+  const el = $(selector);
+  if (!el) return [];
+  return String(el.value || "").split(/[,\n]+/).map(v => v.trim()).filter(Boolean);
+}
+
+function getPublishingProfileData() {
+  return {
+    name: $("#publishing-profile-name")?.value.trim() || $("#publishing-channel-name")?.value.trim() || "Hồ sơ tạm",
+    channel_name: $("#publishing-channel-name")?.value.trim() || "",
+    language: "vi",
+    niche: $("#publishing-profile-niche")?.value.trim() || "",
+    audience: $("#publishing-profile-audience")?.value.trim() || "",
+    brand_line: $("#publishing-profile-brand-line")?.value.trim() || "",
+    category: "Entertainment",
+    made_for_kids: false,
+    default_privacy: "private",
+    primary_keyword_groups: { keywords: _publishingCsv("#publishing-profile-keywords") },
+    base_tags: _publishingCsv("#publishing-profile-tags"),
+    base_hashtags: _publishingCsv("#publishing-profile-hashtags"),
+    title_formula: $("#publishing-profile-title-formula")?.value.trim() || "Hook hoặc mâu thuẫn chính + chủ đề cụ thể",
+    thumbnail_rules: { max_words: 5, examples: [] },
+    description_template: $("#publishing-profile-description-template")?.value || "{episode_summary}\n\n{hashtags}",
+  };
+}
+
 function getPublishingPackConfig() {
   const enabled = Boolean($("#publishing-enable-checkbox") && $("#publishing-enable-checkbox").checked);
   const platforms = [];
   if (!$("#publishing-youtube-checkbox") || $("#publishing-youtube-checkbox").checked) platforms.push("youtube");
   if ($("#publishing-facebook-checkbox") && $("#publishing-facebook-checkbox").checked) platforms.push("facebook");
+  const selectedProfile = $("#publishing-profile-select") ? $("#publishing-profile-select").value : "generic_reup";
   return {
     enabled,
-    channel_profile: $("#publishing-profile-select") ? $("#publishing-profile-select").value : "van_diep_studio",
-    channel_name: $("#publishing-channel-name") ? $("#publishing-channel-name").value.trim() : "Vạn Diệp Studio",
+    channel_profile: selectedProfile || "generic_reup",
+    channel_name: $("#publishing-channel-name") ? $("#publishing-channel-name").value.trim() : "",
+    profile_data: getPublishingProfileData(),
     platforms: platforms.length ? platforms : ["youtube"],
     style: $("#publishing-style-select") ? $("#publishing-style-select").value : "balanced",
     edit_level: $("#publishing-edit-level-select") ? $("#publishing-edit-level-select").value : "balanced",
@@ -896,6 +928,67 @@ function getPublishingPackConfig() {
   };
 }
 
+function _applyPublishingProfile(entry) {
+  const profile = entry?.profile || publishingGenericProfile || {};
+  $("#publishing-profile-name").value = entry?.id === "generic_reup" ? "" : (entry?.name || profile.name || "");
+  $("#publishing-channel-name").value = profile.channel_name || "";
+  $("#publishing-profile-niche").value = profile.niche || "";
+  $("#publishing-profile-audience").value = profile.audience || "";
+  $("#publishing-profile-brand-line").value = profile.brand_line || "";
+  const groups = profile.primary_keyword_groups || {};
+  $("#publishing-profile-keywords").value = Object.values(groups).flat().join(", ");
+  $("#publishing-profile-tags").value = (profile.base_tags || []).join(", ");
+  $("#publishing-profile-hashtags").value = (profile.base_hashtags || []).join(", ");
+  $("#publishing-profile-title-formula").value = profile.title_formula || "";
+  $("#publishing-profile-description-template").value = profile.description_template || "";
+  $("#publishing-profile-default").checked = Boolean(entry?.is_default);
+  $("#publishing-profile-delete").classList.toggle("hidden", !entry || entry.id === "generic_reup");
+}
+
+async function loadPublishingProfiles(preferredId = null) {
+  const select = $("#publishing-profile-select");
+  if (!select) return;
+  try {
+    const data = await api("/api/publishing/profiles");
+    publishingProfiles = new Map();
+    publishingGenericProfile = data.generic?.profile || null;
+    const generic = data.generic || { id: "generic_reup", name: "Reup tổng quát", profile: {} };
+    publishingProfiles.set("generic_reup", generic);
+    for (const item of (data.profiles || [])) publishingProfiles.set(String(item.id), item);
+    select.innerHTML = `<option value="generic_reup">Reup tổng quát · mặc định hệ thống</option>` +
+      (data.profiles || []).map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}${item.is_default ? " · mặc định của tôi" : ""}</option>`).join("");
+    const defaultProfile = (data.profiles || []).find(item => item.is_default);
+    const wanted = preferredId || defaultProfile?.id || "generic_reup";
+    select.value = publishingProfiles.has(String(wanted)) ? String(wanted) : "generic_reup";
+    _applyPublishingProfile(publishingProfiles.get(select.value));
+  } catch (e) {
+    $("#publishing-profile-status").textContent = `Không tải được hồ sơ kênh: ${e.message}`;
+  }
+}
+
+function _publishingProfileRequestBody() {
+  const profile = getPublishingProfileData();
+  return {
+    name: $("#publishing-profile-name").value.trim() || profile.channel_name || "Hồ sơ kênh",
+    channel_name: profile.channel_name,
+    language: profile.language,
+    niche: profile.niche,
+    audience: profile.audience,
+    brand_line: profile.brand_line,
+    category: profile.category,
+    made_for_kids: profile.made_for_kids,
+    default_privacy: profile.default_privacy,
+    keywords: Object.values(profile.primary_keyword_groups || {}).flat(),
+    base_tags: profile.base_tags,
+    base_hashtags: profile.base_hashtags,
+    title_formula: profile.title_formula,
+    thumbnail_examples: profile.thumbnail_rules?.examples || [],
+    description_template: profile.description_template,
+    custom_instructions: $("#publishing-custom-instructions")?.value.trim() || "",
+    is_default: Boolean($("#publishing-profile-default")?.checked),
+  };
+}
+
 if ($("#publishing-enable-checkbox")) {
   $("#publishing-enable-checkbox").onchange = ev => {
     $("#publishing-panel").classList.toggle("hidden", !ev.target.checked);
@@ -903,11 +996,55 @@ if ($("#publishing-enable-checkbox")) {
 }
 if ($("#publishing-profile-select")) {
   $("#publishing-profile-select").onchange = ev => {
-    if (ev.target.value === "van_diep_studio") {
-      $("#publishing-channel-name").value = "Vạn Diệp Studio";
+    _applyPublishingProfile(publishingProfiles.get(String(ev.target.value)) || publishingProfiles.get("generic_reup"));
+    $("#publishing-profile-status").textContent = "";
+  };
+}
+if ($("#publishing-profile-new")) {
+  $("#publishing-profile-new").onclick = () => {
+    $("#publishing-profile-select").value = "generic_reup";
+    _applyPublishingProfile({ id: "generic_reup", profile: publishingGenericProfile || {} });
+    $("#publishing-profile-name").value = "";
+    $("#publishing-channel-name").value = "";
+    $("#publishing-profile-status").textContent = "Điền thông tin rồi bấm Lưu hồ sơ.";
+    $("#publishing-profile-editor").open = true;
+  };
+}
+if ($("#publishing-profile-save")) {
+  $("#publishing-profile-save").onclick = async () => {
+    const selected = $("#publishing-profile-select").value;
+    const body = _publishingProfileRequestBody();
+    if (!body.channel_name) {
+      $("#publishing-profile-status").textContent = "Hãy nhập tên kênh trước khi lưu.";
+      return;
+    }
+    try {
+      const saved = selected && selected !== "generic_reup"
+        ? await api(`/api/publishing/profiles/${encodeURIComponent(selected)}`, { method: "PUT", body: JSON.stringify(body) })
+        : await api("/api/publishing/profiles", { method: "POST", body: JSON.stringify(body) });
+      $("#publishing-profile-status").textContent = "Đã lưu hồ sơ riêng cho tài khoản này ✓";
+      await loadPublishingProfiles(saved.id);
+    } catch (e) {
+      $("#publishing-profile-status").textContent = e.message;
     }
   };
 }
+if ($("#publishing-profile-delete")) {
+  $("#publishing-profile-delete").onclick = async () => {
+    const selected = $("#publishing-profile-select").value;
+    if (!selected || selected === "generic_reup") return;
+    const ok = await showConfirmDialog("Xóa hồ sơ kênh", "Chỉ xóa hồ sơ đã lưu. Các job cũ vẫn giữ snapshot SEO của chính job đó.", "Xóa");
+    if (!ok) return;
+    try {
+      await api(`/api/publishing/profiles/${encodeURIComponent(selected)}`, { method: "DELETE" });
+      await loadPublishingProfiles();
+      $("#publishing-profile-status").textContent = "Đã xóa hồ sơ.";
+    } catch (e) {
+      $("#publishing-profile-status").textContent = e.message;
+    }
+  };
+}
+
 
 if ($("#branding-enable-checkbox")) {
   $("#branding-enable-checkbox").onchange = (ev) => {
@@ -1324,7 +1461,7 @@ $("#video-transform-checkbox").onchange = (ev) => {
 
 function getTransformConfig() {
   const aspect = $("#output-aspect-ratio").value;
-  if (!$("#video-transform-checkbox").checked && aspect === "source") {
+  if (!$("#video-transform-checkbox").checked && (aspect === "source" || aspect === "auto")) {
     return null;
   }
   
@@ -1343,6 +1480,7 @@ function getTransformConfig() {
     speed_factor: parseFloat($("#transform-speed-factor").value),
     brightness_adjust: parseFloat($("#transform-brightness").value),
     contrast_adjust: parseFloat($("#transform-contrast").value),
+    target_aspect_mode: aspect === "auto" ? "auto" : "fixed",
   };
   const dimensions = {
     "9:16": [1080, 1920],
@@ -1783,7 +1921,7 @@ const SUBTITLE_TEMPLATES = {
 };
 
 function applyRecommendedLocalizationDefaults() {
-  $("#output-aspect-ratio").value = "9:16";
+  $("#output-aspect-ratio").value = "auto";
   $("#video-template-checkbox").checked = true;
   $("#video-template-panel").classList.remove("hidden");
   $("#video-template-select").value = "social";
@@ -2613,6 +2751,8 @@ async function refreshJobs() {
           <div class="job-info">
             <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
             <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}${job.publishing_pack_status && job.publishing_pack_status !== "disabled" ? ` · Publishing: ${_escapeHtml(job.publishing_pack_status)}` : ""}</div>
+            ${job.source_channel_url || job.source_channel_title || job.source_uploader ? `<div class="job-meta" style="margin-top:4px">Kênh nguồn: <b>${_escapeHtml(job.source_channel_title || job.source_uploader || "Không rõ")}</b>${job.source_channel_url ? ` · <a href="${_escapeHtml(job.source_channel_url)}" target="_blank" rel="noopener">Mở kênh</a>` : ""}</div>` : ""}
+            ${job.source_url && /^https?:\/\//i.test(job.source_url) ? `<div class="job-meta" style="margin-top:3px">Video gốc: <a href="${_escapeHtml(job.source_url)}" target="_blank" rel="noopener">${_escapeHtml(job.source_url)}</a></div>` : ""}
             ${(job.status === "queued" || job.status === "running" || job.status === "review" || job.status === "done" || job.status === "cancelled") ? `
               <div class="job-progress">
                 <div class="progress-track"><div class="progress-fill" style="width:${jobProgress(job)}%"></div></div>
@@ -3075,7 +3215,9 @@ async function openPublishingPack(jobId) {
         <strong>Phân tích nội dung</strong>
         <div style="margin-top:7px">${_escapeHtml(channelFit)} · độ khớp ${Math.round((analysis.niche_match_score || 0) * 100)}%</div>
         <div>Keyword chính: <b>${_escapeHtml(analysis.primary_keyword || "Chưa chọn vì ngoài ngách")}</b></div>
+        <div>Hook score: <b>${Number(analysis.hook_score || 0)}/100</b></div>
         <div class="muted-help">${_escapeHtml(analysis.summary || "")}</div>
+        ${Array.isArray(analysis.thumbnail_concepts) && analysis.thumbnail_concepts.length ? `<div class="muted-help" style="margin-top:8px">Concept thumbnail: ${analysis.thumbnail_concepts.map(item => _escapeHtml(`${item.label || item.concept}: ${item.text || ''}`)).join(' · ')}</div>` : ""}
       </div>
       <div>
         <label>YouTube · Tiêu đề đề xuất</label>
@@ -3086,13 +3228,13 @@ async function openPublishingPack(jobId) {
       <div>
         <label>Thumbnail YouTube</label>
         ${_publishingThumbnailGrid(yt.thumbnail_urls || [])}
-        ${(components.youtube_thumbnails || {}).status === "failed" ? `<button class="btn gradient small" style="margin-top:8px" data-pack-retry="youtube_thumbnails" data-job-id="${jobId}">🔄 Tạo lại Thumbnail YouTube</button>` : ""}
+        ${(components.youtube_thumbnails || {}).status === "failed" ? `<button class="btn gradient small" style="margin-top:8px" data-pack-retry="youtube_thumbnails" data-job-id="${jobId}">🔄 Tạo lại Thumbnail YouTube hook hơn</button>` : ""}
       </div>
       <div><label>Facebook caption</label><textarea id="pack-facebook-caption" rows="6" readonly>${_escapeHtml(fb.caption || "")}</textarea></div>
       <div>
         <label>Thumbnail Facebook</label>
         ${_publishingThumbnailGrid(fb.thumbnail_urls || [])}
-        ${(components.facebook_thumbnails || {}).status === "failed" ? `<button class="btn gradient small" style="margin-top:8px" data-pack-retry="facebook_thumbnails" data-job-id="${jobId}">🔄 Tạo lại Thumbnail Facebook</button>` : ""}
+        ${(components.facebook_thumbnails || {}).status === "failed" ? `<button class="btn gradient small" style="margin-top:8px" data-pack-retry="facebook_thumbnails" data-job-id="${jobId}">🔄 Tạo lại Thumbnail Facebook hook hơn</button>` : ""}
       </div>
       ${(components.publish_ready || {}).status === "failed" ? `<div class="stat-box" style="text-align:left;color:var(--err)">publish_ready.mp4 chưa tạo được. <button class="btn secondary small" data-pack-retry="publish_ready" data-job-id="${jobId}">Tạo lại publish_ready.mp4</button></div>` : ""}
       <div style="display:flex;gap:8px;flex-wrap:wrap">

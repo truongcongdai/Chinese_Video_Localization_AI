@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
     source_url TEXT NOT NULL,
+    source_channel_url TEXT,
+    source_channel_title TEXT,
+    source_channel_id TEXT,
+    source_uploader TEXT,
     target_language TEXT NOT NULL,
     source_language TEXT DEFAULT 'auto',
     status TEXT NOT NULL,           -- queued | running | review | done | error
@@ -386,6 +390,23 @@ CREATE TABLE IF NOT EXISTS content_os_memories (
     FOREIGN KEY(source_run_id) REFERENCES content_os_runs(id)
 );
 
+
+-- Reusable AI Publishing Pack channel profiles. These are strictly scoped to
+-- one app user; no user's channel name/SEO rules become global defaults.
+CREATE TABLE IF NOT EXISTS publishing_channel_profiles (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_publishing_profiles_user
+    ON publishing_channel_profiles(user_id, updated_at);
+
 -- Persistent channel catalog used by deep/continued profile scans.
 CREATE TABLE IF NOT EXISTS channel_scan_states (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -404,6 +425,7 @@ CREATE TABLE IF NOT EXISTS channel_scan_states (
     network_pages INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     total_discovered INTEGER NOT NULL DEFAULT 0,
+    scan_version INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(user_id, canonical_url)
@@ -485,6 +507,10 @@ _MIGRATIONS = [
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
+    ("jobs", "source_channel_url", "ALTER TABLE jobs ADD COLUMN source_channel_url TEXT"),
+    ("jobs", "source_channel_title", "ALTER TABLE jobs ADD COLUMN source_channel_title TEXT"),
+    ("jobs", "source_channel_id", "ALTER TABLE jobs ADD COLUMN source_channel_id TEXT"),
+    ("jobs", "source_uploader", "ALTER TABLE jobs ADD COLUMN source_uploader TEXT"),
     ("jobs", "logo_path", "ALTER TABLE jobs ADD COLUMN logo_path TEXT"),
     ("jobs", "logo_corner", "ALTER TABLE jobs ADD COLUMN logo_corner TEXT DEFAULT 'bottom_right'"),
     ("jobs", "logo_size_px", "ALTER TABLE jobs ADD COLUMN logo_size_px INTEGER DEFAULT 120"),
@@ -541,6 +567,7 @@ _MIGRATIONS = [
     ("jobs", "keep_original_audio", "ALTER TABLE jobs ADD COLUMN keep_original_audio INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "background_music_strategy",
      "ALTER TABLE jobs ADD COLUMN background_music_strategy TEXT NOT NULL DEFAULT 'deterministic'"),
+    ("channel_scan_states", "scan_version", "ALTER TABLE channel_scan_states ADD COLUMN scan_version INTEGER NOT NULL DEFAULT 1"),
     # Content OS migrations - add missing columns
     ("content_os_projects", "channel_id", "ALTER TABLE content_os_projects ADD COLUMN channel_id INTEGER"),
     ("content_os_projects", "mode", "ALTER TABLE content_os_projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'ai_video'"),
@@ -633,6 +660,10 @@ class Job:
     source_video_path: Optional[str]
     created_at: float
     updated_at: float
+    source_channel_url: Optional[str] = None
+    source_channel_title: Optional[str] = None
+    source_channel_id: Optional[str] = None
+    source_uploader: Optional[str] = None
     source_language: str = "auto"
     logo_path: Optional[str] = None
     logo_corner: str = "bottom_right"
@@ -718,7 +749,7 @@ class Store:
                 for table in
                 ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
                  "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
-                 "content_os_memories")
+                 "content_os_memories", "channel_scan_states", "channel_scan_videos")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -999,7 +1030,7 @@ class Store:
         old = self.get_job(job_id)
         if old is None or old.user_id != user_id:
             return None
-        return self.create_job(
+        retried = self.create_job(
             user_id, old.source_url, old.target_language,
             source_language=old.source_language, logo_path=old.logo_path,
             logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
@@ -1026,6 +1057,128 @@ class Store:
             keep_original_audio=old.keep_original_audio,
             background_music_strategy=old.background_music_strategy,
         )
+        if any((old.source_channel_url, old.source_channel_title, old.source_channel_id, old.source_uploader)):
+            self.set_job_source_channel(
+                retried.id, user_id,
+                channel_url=old.source_channel_url or "",
+                channel_title=old.source_channel_title or "",
+                channel_id=old.source_channel_id or "",
+                uploader=old.source_uploader or "",
+            )
+            retried = self.get_job(retried.id) or retried
+        return retried
+
+    # ---- publishing channel profiles ----
+    def list_publishing_profiles(self, user_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM publishing_channel_profiles WHERE user_id = ? "
+                "ORDER BY is_default DESC, updated_at DESC, name ASC",
+                (user_id,),
+            ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                profile = json.loads(row["profile_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                profile = {}
+            result.append({
+                "id": row["id"],
+                "name": row["name"],
+                "is_default": bool(row["is_default"]),
+                "profile": profile if isinstance(profile, dict) else {},
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            })
+        return result
+
+    def get_publishing_profile(self, user_id: int, profile_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM publishing_channel_profiles WHERE user_id = ? AND id = ?",
+                (user_id, str(profile_id)),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            profile = json.loads(row["profile_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            profile = {}
+        return {
+            "id": row["id"], "name": row["name"], "is_default": bool(row["is_default"]),
+            "profile": profile if isinstance(profile, dict) else {},
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
+    def save_publishing_profile(
+            self, user_id: int, *, name: str, profile: Dict[str, Any],
+            profile_id: Optional[str] = None, is_default: bool = False,
+    ) -> Dict[str, Any]:
+        profile_id = str(profile_id or uuid.uuid4().hex)
+        clean_name = " ".join(str(name or "Hồ sơ kênh").split())[:100] or "Hồ sơ kênh"
+        now = time.time()
+        payload = json.dumps(profile or {}, ensure_ascii=False)
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM publishing_channel_profiles WHERE user_id = ? AND id = ?",
+                (user_id, profile_id),
+            ).fetchone()
+            if is_default:
+                conn.execute(
+                    "UPDATE publishing_channel_profiles SET is_default = 0 WHERE user_id = ?",
+                    (user_id,),
+                )
+            if existing:
+                conn.execute(
+                    "UPDATE publishing_channel_profiles SET name = ?, profile_json = ?, "
+                    "is_default = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+                    (clean_name, payload, int(is_default), now, user_id, profile_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO publishing_channel_profiles "
+                    "(id, user_id, name, profile_json, is_default, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (profile_id, user_id, clean_name, payload, int(is_default), now, now),
+                )
+        saved = self.get_publishing_profile(user_id, profile_id)
+        assert saved is not None
+        return saved
+
+    def delete_publishing_profile(self, user_id: int, profile_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM publishing_channel_profiles WHERE user_id = ? AND id = ?",
+                (user_id, str(profile_id)),
+            )
+            return cur.rowcount > 0
+
+    def set_default_publishing_profile(self, user_id: int, profile_id: Optional[str]) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE publishing_channel_profiles SET is_default = 0 WHERE user_id = ?", (user_id,))
+            if profile_id:
+                cur = conn.execute(
+                    "UPDATE publishing_channel_profiles SET is_default = 1, updated_at = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (time.time(), user_id, str(profile_id)),
+                )
+                if cur.rowcount <= 0:
+                    raise ValueError("Publishing profile not found")
+
+    def latest_job_publishing_config(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT publishing_config FROM jobs WHERE user_id = ? AND publishing_config IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        if not row or not row["publishing_config"]:
+            return None
+        try:
+            data = json.loads(row["publishing_config"])
+            return data if isinstance(data, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     # ---- provider settings ----
     def upsert_provider_settings(
@@ -1365,6 +1518,32 @@ class Store:
                 found.update(str(row["source_url"]) for row in rows)
         return found
 
+    def set_job_source_channel(
+            self,
+            job_id: str,
+            user_id: int,
+            *,
+            channel_url: str = "",
+            channel_title: str = "",
+            channel_id: str = "",
+            uploader: str = "",
+    ) -> bool:
+        """Attach source-channel provenance to a job created from channel mode."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET source_channel_url = ?, source_channel_title = ?, "
+                "source_channel_id = ?, source_uploader = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ?",
+                (
+                    str(channel_url or "").strip() or None,
+                    str(channel_title or "").strip() or None,
+                    str(channel_id or "").strip() or None,
+                    str(uploader or "").strip() or None,
+                    time.time(), job_id, user_id,
+                ),
+            )
+            return cur.rowcount > 0
+
     def get_channel_scan_state(self, user_id: int, canonical_url: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             row = conn.execute(
@@ -1419,6 +1598,7 @@ class Store:
             scan_source: str = "",
             network_pages: int = 0,
             last_error: str = "",
+            scan_version: int = 2,
     ) -> Dict[str, Any]:
         """Merge one scan into the user's persistent channel catalog.
 
@@ -1439,14 +1619,14 @@ class Store:
                     "INSERT INTO channel_scan_states ("
                     "user_id, platform, original_url, canonical_url, channel_id, channel_title, "
                     "cursor, has_more, complete, status, stop_reason, scan_source, network_pages, "
-                    "last_error, total_discovered, created_at, updated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    "last_error, total_discovered, scan_version, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                     (
                         user_id, platform, original_url, canonical_url, channel_id, channel_title,
                         cursor or None, None if has_more is None else int(bool(has_more)),
                         int(bool(complete)), "complete" if complete else "incomplete",
                         stop_reason or None, scan_source or None, int(network_pages or 0),
-                        last_error or None, now, now,
+                        last_error or None, int(scan_version or 2), now, now,
                     ),
                 )
                 state_id = int(cur.lastrowid)
@@ -1495,6 +1675,24 @@ class Store:
                         (source_url, metadata_json, now, existing["id"]),
                     )
 
+                # Backfill provenance for older channel jobs when a newly
+                # owner-verified catalog sees the same source URL again.
+                conn.execute(
+                    "UPDATE jobs SET source_channel_url = COALESCE(source_channel_url, ?), "
+                    "source_channel_title = COALESCE(source_channel_title, ?), "
+                    "source_channel_id = COALESCE(source_channel_id, ?), "
+                    "source_uploader = COALESCE(source_uploader, ?), updated_at = updated_at "
+                    "WHERE user_id = ? AND source_url = ?",
+                    (
+                        canonical_url or None,
+                        channel_title or None,
+                        channel_id or None,
+                        str(raw_video.get("uploader") or "").strip() or None,
+                        user_id,
+                        source_url,
+                    ),
+                )
+
             total_row = conn.execute(
                 "SELECT COUNT(*) AS total FROM channel_scan_videos WHERE state_id = ?",
                 (state_id,),
@@ -1504,13 +1702,13 @@ class Store:
                 "UPDATE channel_scan_states SET platform = ?, original_url = ?, channel_id = ?, "
                 "channel_title = ?, cursor = ?, has_more = ?, complete = ?, status = ?, "
                 "stop_reason = ?, scan_source = ?, network_pages = ?, last_error = ?, "
-                "total_discovered = ?, updated_at = ? WHERE id = ?",
+                "total_discovered = ?, scan_version = ?, updated_at = ? WHERE id = ?",
                 (
                     platform, original_url, channel_id or None, channel_title or None,
                     cursor or None, None if has_more is None else int(bool(has_more)),
                     int(bool(complete)), "complete" if complete else ("error" if last_error else "incomplete"),
                     stop_reason or None, scan_source or None, int(network_pages or 0),
-                    last_error or None, total, now, state_id,
+                    last_error or None, total, int(scan_version or 2), now, state_id,
                 ),
             )
 
@@ -1574,9 +1772,9 @@ class Store:
         params: List[Any] = [user_id]
 
         if query:
-            clauses.append("(title LIKE ? OR source_url LIKE ?)")
+            clauses.append("(title LIKE ? OR source_url LIKE ? OR source_channel_title LIKE ? OR source_channel_url LIKE ?)")
             like = f"%{query}%"
-            params.extend([like, like])
+            params.extend([like, like, like, like])
         if status:
             clauses.append("status = ?")
             params.append(status)
