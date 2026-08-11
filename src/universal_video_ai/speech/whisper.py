@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import re
 import threading
+import time
 from typing import List, Optional
 
 from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
@@ -17,9 +19,45 @@ _MODEL_CACHE_LOCK = threading.Lock()
 _MODEL_INFERENCE_LOCKS: dict[tuple[str, Optional[str], bool], threading.Lock] = {}
 
 
+def _resolve_whisper_device(torch_module, requested_device: Optional[str]) -> str:
+    """Resolve ``auto`` to a concrete device for predictable deployments.
+
+    Passing ``None`` through to openai-whisper technically lets that library
+    choose a device, but it leaves our precision selection and diagnostics
+    guessing. Resolve it once here so GPU machines use CUDA and machines with
+    a CPU-only PyTorch build fall back cleanly to CPU.
+    """
+    requested = (requested_device or "auto").strip().lower()
+    if requested == "auto":
+        return "cuda" if torch_module.cuda.is_available() else "cpu"
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda" or requested.startswith("cuda:"):
+        if not torch_module.cuda.is_available():
+            cuda_build = getattr(getattr(torch_module, "version", None), "cuda", None)
+            detail = (
+                "the installed PyTorch build has no CUDA support"
+                if not cuda_build
+                else f"PyTorch CUDA {cuda_build} cannot access an NVIDIA GPU"
+            )
+            raise RuntimeError(
+                f"Whisper device {requested!r} was requested, but {detail}. "
+                "Use WHISPER_DEVICE=auto (recommended) or WHISPER_DEVICE=cpu."
+            )
+        return requested
+    raise RuntimeError(
+        f"Unsupported Whisper device {requested_device!r}; expected auto, cpu, cuda, or cuda:<index>"
+    )
+
+
 def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str], fp16: bool = False):
-    """Load Whisper model with caching and dtype consistency."""
-    # Include fp16 in cache key to ensure dtype consistency
+    """Load a cached Whisper model on the requested device.
+
+    Do not call ``model.half()`` here. openai-whisper deliberately keeps
+    normalization weights in fp32 and applies fp16 to inference inputs through
+    its ``fp16`` transcribe option. Converting every module to half breaks
+    LayerNorm on CUDA with ``expected scalar type Float but found Half``.
+    """
     key = (model_name, device, fp16)
     model = _MODEL_CACHE.get(key)
     if model is not None:
@@ -28,9 +66,6 @@ def _cached_whisper_model(whisper_module, model_name: str, device: Optional[str]
         model = _MODEL_CACHE.get(key)
         if model is None:
             model = whisper_module.load_model(model_name, device=device)
-            # Convert model dtype based on fp16 setting
-            if fp16 and model.device.type == "cuda":
-                model = model.half()
             _MODEL_CACHE[key] = model
     return model
 
@@ -59,12 +94,14 @@ class WhisperConfig:
     Attributes:
         model: model name (e.g. "tiny", "base", "small", "medium", "large").
                base = balanced accuracy/speed (recommended for quality), small = higher accuracy.
-        device: device string passed to whisper (e.g. "cpu", "cuda:0") or None to let library decide.
+        device: "auto" (default), "cpu", "cuda", or a CUDA index such as
+                "cuda:0". None is retained as a backwards-compatible alias
+                for "auto".
         task: "transcribe" or "translate" (if supported).
         fp16: use fp16 for faster inference (default True for GPU, False for CPU).
     """
     model: str = "base"
-    device: Optional[str] = None
+    device: Optional[str] = "auto"
     task: str = "transcribe"
     fp16: Optional[bool] = None  # None = auto-detect (True for GPU, False for CPU)
 
@@ -157,6 +194,7 @@ class WhisperTranscriber:
         :raises RuntimeError: if whisper is not installed or transcription fails
         """
         try:
+            import torch  # type: ignore
             import whisper  # type: ignore
         except Exception as exc:  # ImportError or other import-time errors
             self.logger.error("Whisper package is not available: %s", exc)
@@ -167,15 +205,43 @@ class WhisperTranscriber:
             ) from exc
 
         try:
-            # Auto-detect fp16: True for GPU, False for CPU (unless explicitly set)
+            requested_device = self.config.device or "auto"
+            resolved_device = _resolve_whisper_device(torch, requested_device)
+
+            device_description = resolved_device
+            gpu_name = ""
+            if resolved_device.startswith("cuda"):
+                try:
+                    device_index = (
+                        int(resolved_device.split(":", 1)[1])
+                        if ":" in resolved_device
+                        else torch.cuda.current_device()
+                    )
+                    gpu_name = torch.cuda.get_device_name(device_index)
+                    device_description = f"{resolved_device} ({gpu_name})"
+                except Exception:
+                    pass
+
+            # Auto-detect fp16 from the concrete device, not from the original
+            # "auto" value. GTX 16xx cards are kept on CUDA/fp32 because
+            # openai-whisper produces NaN logits with fp16 on these cards on
+            # Windows; this was verified on the project's GTX 1660 SUPER.
             use_fp16 = self.config.fp16
             if use_fp16 is None:
-                # Auto-detect based on device
-                use_fp16 = self.config.device is not None and "cuda" in self.config.device.lower()
+                use_fp16 = resolved_device.startswith("cuda") and not re.search(
+                    r"\bGTX\s*16\d{2}\b", gpu_name, re.IGNORECASE
+                )
+            self.logger.info(
+                "Whisper selected device=%s model=%s precision=%s (requested=%s)",
+                device_description,
+                self.config.model,
+                "fp16" if use_fp16 else "fp32",
+                requested_device,
+            )
 
             # Load model (this can be heavy; caller is responsible for environment)
-            self.logger.debug("Loading whisper model %s (device=%s, fp16=%s)", self.config.model, self.config.device, use_fp16)
-            model = _cached_whisper_model(whisper, self.config.model, self.config.device, use_fp16)
+            self.logger.debug("Loading whisper model %s (device=%s, fp16=%s)", self.config.model, resolved_device, use_fp16)
+            model = _cached_whisper_model(whisper, self.config.model, resolved_device, use_fp16)
             self.logger.debug("Model loaded, starting transcription for %s", audio_path)
 
             # whisper.transcribe accepts language and task
@@ -189,9 +255,12 @@ class WhisperTranscriber:
             # config resolved use_fp16=False, which can produce NaN logits on
             # some Windows/GPU/driver combinations.
             whisper_kwargs["fp16"] = bool(use_fp16)
+            # openai-whisper only displays its tqdm progress bar when verbose
+            # is explicitly False. Multi-hour inputs must not look frozen.
+            whisper_kwargs["verbose"] = False
 
             inference_lock = _whisper_inference_lock(
-                self.config.model, self.config.device, bool(use_fp16)
+                self.config.model, resolved_device, bool(use_fp16)
             )
             def retry_cpu_fp32() -> dict:
                 self.logger.warning(
@@ -206,6 +275,7 @@ class WhisperTranscriber:
                 with cpu_lock:
                     return cpu_model.transcribe(str(audio_path), **retry_kwargs)  # type: ignore[attr-defined]
 
+            started_at = time.monotonic()
             with inference_lock:
                 try:
                     result = model.transcribe(str(audio_path), **whisper_kwargs)  # type: ignore[attr-defined]
@@ -220,6 +290,7 @@ class WhisperTranscriber:
                         "dtype" in lower_message
                         or "invalid values" in lower_message
                         or "nan" in lower_message
+                        or "expected scalar type" in lower_message
                     )
                     if use_fp16 and is_numeric_cuda_failure:
                         self.logger.warning(
@@ -238,6 +309,7 @@ class WhisperTranscriber:
                                 "dtype" in retry_message
                                 or "invalid values" in retry_message
                                 or "nan" in retry_message
+                                or "expected scalar type" in retry_message
                             ):
                                 result = retry_cpu_fp32()
                             else:
@@ -246,6 +318,13 @@ class WhisperTranscriber:
                         result = retry_cpu_fp32()
                     else:
                         raise
+            elapsed = time.monotonic() - started_at
+            self.logger.info(
+                "Whisper inference finished on %s in %.1f minutes for %s",
+                resolved_device,
+                elapsed / 60,
+                audio_path,
+            )
             if not isinstance(result, dict):
                 # Defensive: some mocks/backends might return a plain string.
                 result = {"text": str(result), "segments": []}

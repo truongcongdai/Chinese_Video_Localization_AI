@@ -29,6 +29,25 @@ def test_create_pipeline_with_transcription():
     # We don't assert speech_service is not None here — test machines may not have whisper
 
 
+def test_create_pipeline_uses_portable_whisper_device_default(monkeypatch):
+    monkeypatch.delenv("WHISPER_DEVICE", raising=False)
+    monkeypatch.delenv("SPEECH_DEVICE", raising=False)
+
+    pipeline = create_audio_pipeline(run_transcription=True)
+
+    assert pipeline.speech_service is not None
+    assert pipeline.speech_service.backend._transcriber.config.device == "auto"
+
+
+def test_create_pipeline_allows_forced_whisper_device(monkeypatch):
+    monkeypatch.setenv("WHISPER_DEVICE", "cpu")
+
+    pipeline = create_audio_pipeline(run_transcription=True)
+
+    assert pipeline.speech_service is not None
+    assert pipeline.speech_service.backend._transcriber.config.device == "cpu"
+
+
 def test_create_pipeline_with_demucs():
     """Test pipeline creation with demucs requested."""
     pipeline = create_audio_pipeline(run_demucs=True)
