@@ -65,7 +65,10 @@ class FFprobe:
         ]
         _logger.debug("Running ffprobe: %s", " ".join(cmd))
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            # Read bytes explicitly. Windows otherwise decodes subprocess
+            # output with the active ANSI code page, which can crash the
+            # reader thread when FFmpeg includes a UTF-8 path in diagnostics.
+            proc = subprocess.run(cmd, capture_output=True, text=False, check=False, timeout=30)
         except FileNotFoundError as exc:
             _logger.warning("ffprobe not found at runtime: %s", exc)
             return None
@@ -76,12 +79,23 @@ class FFprobe:
             _logger.exception("Unexpected error running ffprobe for %s: %s", audio_path, exc)
             return None
 
+        stdout = (
+            proc.stdout.decode("utf-8", errors="replace")
+            if isinstance(proc.stdout, bytes)
+            else str(proc.stdout or "")
+        )
+        stderr = (
+            proc.stderr.decode("utf-8", errors="replace")
+            if isinstance(proc.stderr, bytes)
+            else str(proc.stderr or "")
+        )
+
         if proc.returncode != 0:
-            _logger.warning("ffprobe returned non-zero for %s: %s", audio_path, proc.stderr or proc.stdout)
+            _logger.warning("ffprobe returned non-zero for %s: %s", audio_path, stderr or stdout)
             return None
 
         try:
-            payload: Dict[str, Any] = json.loads(proc.stdout or "{}")
+            payload: Dict[str, Any] = json.loads(stdout or "{}")
         except Exception as exc:
             _logger.exception("Failed to parse ffprobe output for %s: %s", audio_path, exc)
             raise FFprobeError("Failed to parse ffprobe output", exc)

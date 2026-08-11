@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 
 import yt_dlp
@@ -8,6 +9,9 @@ import yt_dlp
 from .base import BaseDownloader
 from .download_result import DownloadResult
 from .platform import Platform
+from universal_video_ai.cookies.manager import CookieManager
+
+logger = logging.getLogger(__name__)
 
 # Optional cookies for yt-dlp, only used if actually configured/present.
 # Some platforms (Douyin in particular) intermittently require "fresh
@@ -24,8 +28,40 @@ def _cookiefile_for(platform: Platform) -> str | None:
     env_key = f"{platform.name.upper()}_COOKIES_FILE"
     candidate = os.environ.get(env_key) or os.environ.get("YTDLP_COOKIES_FILE")
     if candidate and Path(candidate).is_file():
-        return candidate
+        return str(Path(candidate).resolve())
+    domain_by_platform = {
+        Platform.DOUYIN: "douyin.com",
+        Platform.TIKTOK: "tiktok.com",
+        Platform.YOUTUBE: "youtube.com",
+        Platform.FACEBOOK: "facebook.com",
+    }
+    domain = domain_by_platform.get(platform)
+    if domain:
+        managed = CookieManager().find_cookie_for_domain(domain)
+        if managed and managed.is_file():
+            return str(managed)
     return None
+
+
+def _cookies_from_browser_for(platform: Platform) -> tuple[str, ...] | None:
+    """Return yt-dlp's opt-in browser-cookie tuple.
+
+    Reading a browser profile is never enabled implicitly. Set, for example,
+    ``DOUYIN_COOKIES_FROM_BROWSER=chrome`` when the local operator wants it.
+    """
+    env_key = f"{platform.name.upper()}_COOKIES_FROM_BROWSER"
+    configured = (
+        os.environ.get(env_key)
+        or os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
+        or ""
+    ).strip()
+    if not configured:
+        return None
+    browser, _, profile = configured.partition(":")
+    browser = browser.strip().lower()
+    if not browser:
+        return None
+    return (browser, profile.strip()) if profile.strip() else (browser,)
 
 
 class YTDLPDownloader(BaseDownloader):
@@ -101,6 +137,16 @@ class YTDLPDownloader(BaseDownloader):
         cookiefile = _cookiefile_for(self.platform)
         if cookiefile:
             options["cookiefile"] = cookiefile
+            logger.info("yt-dlp using cookie file for %s: %s", self.platform.value, cookiefile)
+        else:
+            browser_cookies = _cookies_from_browser_for(self.platform)
+            if browser_cookies:
+                options["cookiesfrombrowser"] = browser_cookies
+                logger.info(
+                    "yt-dlp loading %s cookies from browser %s",
+                    self.platform.value,
+                    browser_cookies[0],
+                )
 
         options.update(self.get_extra_options())
 

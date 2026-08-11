@@ -1,4 +1,5 @@
 import errno
+from http.cookiejar import MozillaCookieJar
 import json
 import logging
 import os
@@ -12,8 +13,9 @@ import requests
 
 from .base import BaseDownloader
 from .download_result import DownloadResult
+from .media_validation import validate_video_file
 from .platform import Platform
-from .ytdlp_downloader import YTDLPDownloader
+from .ytdlp_downloader import YTDLPDownloader, _cookiefile_for
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,22 @@ class DouyinDownloader(BaseDownloader):
         if content_length and content_length.isdigit():
             return offset + int(content_length) if response.status_code == 206 else int(content_length)
         return None
+
+    @staticmethod
+    def _is_plausible_video_url(url: str) -> bool:
+        """Reject known placeholder/static URLs returned as play addresses."""
+        candidate = str(url or "").strip()
+        if not candidate.startswith(("http://", "https://")):
+            return False
+        lowered = candidate.lower()
+        if any(marker in lowered for marker in ("static.bytednsdoc.com", "/nulog", ".png", ".jpg")):
+            return False
+        query = parse_qs(urlparse(candidate).query)
+        for value in query.get("video_id", []):
+            decoded = unquote(value).strip().lower()
+            if decoded.startswith(("http://", "https://")):
+                return False
+        return True
 
     def _download_stream_with_resume(
         self,
@@ -209,7 +227,17 @@ class DouyinDownloader(BaseDownloader):
         try:
             # 1. Fetch HTML
             logger.info(f"🌐 Fetching: {url}")
-            response = requests.get(url, headers=headers, timeout=30)
+            cookies = None
+            cookiefile = _cookiefile_for(Platform.DOUYIN)
+            if cookiefile:
+                try:
+                    cookie_jar = MozillaCookieJar(cookiefile)
+                    cookie_jar.load(ignore_discard=True, ignore_expires=True)
+                    cookies = cookie_jar
+                    logger.info("Using configured Douyin cookies for HTML scraping")
+                except Exception as exc:
+                    logger.warning("Could not read Douyin cookie file %s: %s", cookiefile, exc)
+            response = requests.get(url, headers=headers, cookies=cookies, timeout=30)
 
             if response.status_code != 200:
                 logger.error(f"❌ Failed to fetch HTML: {response.status_code}")
@@ -271,7 +299,20 @@ class DouyinDownloader(BaseDownloader):
                     if addr_data and isinstance(addr_data, dict):
                         url_list = addr_data.get('url_list', [])
                         if url_list and isinstance(url_list, list) and len(url_list) > 0:
-                            video_url = url_list[0]
+                            video_url = next(
+                                (
+                                    str(candidate)
+                                    for candidate in url_list
+                                    if self._is_plausible_video_url(str(candidate))
+                                ),
+                                None,
+                            )
+                            if not video_url:
+                                logger.warning(
+                                    "Ignoring implausible %s URL candidate(s) for video %s",
+                                    field_name, video_id,
+                                )
+                                continue
                             # Douyin's own returned URL is the WATERMARKED
                             # stream — it's the same video served from a
                             # "/playwm/" path ("wm" = watermark). Swapping
@@ -315,6 +356,11 @@ class DouyinDownloader(BaseDownloader):
             
             file_size = self._download_stream_with_resume(video_url, output_path, headers)
             if file_size is None:
+                return None
+            valid, reason = validate_video_file(output_path)
+            if not valid:
+                logger.error("Downloaded Douyin response is not a valid video: %s", reason)
+                output_path.unlink(missing_ok=True)
                 return None
             logger.info(f"✅ Downloaded via scraping: {output_path} ({file_size / (1024 * 1024):.2f} MB)")
 
@@ -395,4 +441,13 @@ class DouyinDownloader(BaseDownloader):
         fallback_url = f"https://www.douyin.com/video/{video_id}" if video_id else url
         if fallback_url != url:
             logger.info(f"🔧 Normalized URL for yt-dlp: {fallback_url}")
-        return self._ytdlp_fallback.download(fallback_url, output_dir)
+        try:
+            return self._ytdlp_fallback.download(fallback_url, output_dir)
+        except Exception as exc:
+            if "fresh cookies" in str(exc).lower():
+                raise RuntimeError(
+                    "Douyin yêu cầu cookie mới. Hãy xuất cookie Netscape từ trình duyệt vào "
+                    "local_data/cookies/douyin.com.cookies.txt, hoặc cấu hình "
+                    "DOUYIN_COOKIES_FILE / DOUYIN_COOKIES_FROM_BROWSER rồi thử lại."
+                ) from exc
+            raise

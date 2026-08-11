@@ -1,9 +1,14 @@
 import requests
+import pytest
 
 from universal_video_ai.downloader.douyin import DouyinDownloader, _safe_video_filename
 from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.downloader.platform_detector import PlatformDetector
-from universal_video_ai.web.app import _extract_first_video_url
+from universal_video_ai.downloader.ytdlp_downloader import (
+    _cookiefile_for,
+    _cookies_from_browser_for,
+)
+from universal_video_ai.web.app import _extract_first_video_url, _is_non_retryable_job_error
 
 
 def test_safe_video_filename_limits_utf8_bytes_and_preserves_extension():
@@ -64,6 +69,63 @@ def test_extract_video_id_from_aweme_id_query():
         )
         == "7661876018903083641"
     )
+
+
+def test_rejects_nested_placeholder_as_douyin_video_url():
+    placeholder = (
+        "https://aweme.snssdk.com/aweme/v1/play/"
+        "?video_id=https%3A%2F%2Flf3-static.bytednsdoc.com%2Fobj%2Feden-cn%2Fnulog"
+    )
+
+    assert DouyinDownloader._is_plausible_video_url(placeholder) is False
+    assert (
+        DouyinDownloader._is_plausible_video_url(
+            "https://aweme.snssdk.com/aweme/v1/play/?video_id=v0300abc&ratio=720p"
+        )
+        is True
+    )
+
+
+def test_ytdlp_discovers_managed_cookie_file(tmp_path, monkeypatch):
+    cookie_file = tmp_path / "douyin.com.cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    monkeypatch.delenv("DOUYIN_COOKIES_FILE", raising=False)
+    monkeypatch.delenv("YTDLP_COOKIES_FILE", raising=False)
+
+    class ManagedCookies:
+        def find_cookie_for_domain(self, domain):
+            assert domain == "douyin.com"
+            return cookie_file
+
+    monkeypatch.setattr(
+        "universal_video_ai.downloader.ytdlp_downloader.CookieManager",
+        ManagedCookies,
+    )
+
+    assert _cookiefile_for(Platform.DOUYIN) == str(cookie_file.resolve())
+
+
+def test_browser_cookie_loading_is_explicit_and_supports_profile(monkeypatch):
+    monkeypatch.delenv("YTDLP_COOKIES_FROM_BROWSER", raising=False)
+    monkeypatch.setenv("DOUYIN_COOKIES_FROM_BROWSER", "chrome:Profile 1")
+
+    assert _cookies_from_browser_for(Platform.DOUYIN) == ("chrome", "Profile 1")
+
+
+def test_fresh_cookie_error_is_actionable_and_not_hidden(tmp_path, monkeypatch):
+    downloader = DouyinDownloader()
+    monkeypatch.setattr(downloader, "_resolve_short_url", lambda url: url)
+    monkeypatch.setattr(downloader, "_download_douyin_scraping", lambda video_id, output_dir: None)
+    monkeypatch.setattr(
+        downloader._ytdlp_fallback,
+        "download",
+        lambda url, output_dir: (_ for _ in ()).throw(RuntimeError("Fresh cookies are needed")),
+    )
+
+    with pytest.raises(RuntimeError, match="Douyin yêu cầu cookie mới"):
+        downloader.download("https://www.douyin.com/video/7638999539815756520", tmp_path)
+
+    assert _is_non_retryable_job_error(RuntimeError("Fresh cookies are needed")) is True
 
 
 def test_extract_video_url_from_douyin_share_text():

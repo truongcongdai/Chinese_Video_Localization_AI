@@ -85,6 +85,24 @@ def test_ffmpeg_failure_raises(tmp_path: Path, monkeypatch):
         extractor.extract(video)
 
 
+def test_ffmpeg_failure_decodes_non_windows_bytes_safely(tmp_path: Path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"v")
+
+    def fake_fail(cmd, capture_output, text, check, timeout):
+        assert text is False
+        result = MagicMock()
+        result.returncode = 1
+        result.stderr = b"bad path: \x8d.mp4"
+        result.stdout = b""
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_fail)
+
+    with pytest.raises(AudioExtractionError, match="bad path"):
+        AudioExtractor().extract(video)
+
+
 def test_ffprobe_unavailable_fallback(tmp_path: Path, monkeypatch):
     video = tmp_path / "v2.mp4"
     video.write_bytes(b"v")

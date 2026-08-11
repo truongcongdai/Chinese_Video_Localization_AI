@@ -1022,51 +1022,31 @@ class Store:
         return job
 
     def retry_job(self, job_id: str, user_id: int) -> Optional[Job]:
-        """Create a brand-new job with the exact same settings as a
-        previously failed one — used by the history panel's "Thử lại"
-        button. Deliberately creates a NEW job row rather than resetting
-        the old one in place, so the failed attempt stays visible in
-        history alongside the retry."""
-        old = self.get_job(job_id)
-        if old is None or old.user_id != user_id:
-            return None
-        retried = self.create_job(
-            user_id, old.source_url, old.target_language,
-            source_language=old.source_language, logo_path=old.logo_path,
-            logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
-            branding_config=old.branding_config,
-            publishing_config=old.publishing_config,
-            tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
-            animated_subtitle_config=old.animated_subtitle_config,
-            video_template_config=old.video_template_config,
-            transform_config=old.transform_config,
-            processing_mode=old.processing_mode,
-            tts_provider=old.tts_provider,
-            tts_style=old.tts_style,
-            tts_model=old.tts_model,
-            translation_mode=old.translation_mode,
-            translation_model=old.translation_model,
-            translation_tone=old.translation_tone,
-            translation_audience=old.translation_audience,
-            translation_glossary=old.translation_glossary,
-            remix_enabled=bool(old.remix_enabled),
-            remix_platforms=json.loads(old.remix_platforms_json or "[]"),
-            remix_goal=old.remix_goal,
-            remix_strength=old.remix_strength,
-            subtitle_offset_seconds=old.subtitle_offset_seconds,
-            keep_original_audio=old.keep_original_audio,
-            background_music_strategy=old.background_music_strategy,
-        )
-        if any((old.source_channel_url, old.source_channel_title, old.source_channel_id, old.source_uploader)):
-            self.set_job_source_channel(
-                retried.id, user_id,
-                channel_url=old.source_channel_url or "",
-                channel_title=old.source_channel_title or "",
-                channel_id=old.source_channel_id or "",
-                uploader=old.source_uploader or "",
+        """Reset a failed job in place and return the same history entry.
+
+        Command settings and source metadata are preserved. Attempt-specific
+        output is cleared. The conditional UPDATE also makes a double-click
+        safe: only the first request can move ``error`` to ``queued``.
+        """
+        now = time.time()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET "
+                "status = 'queued', progress_note = ?, error = NULL, title = NULL, "
+                "final_video_path = NULL, source_video_path = NULL, "
+                "review_state_json = NULL, segments_json = NULL, source_segments_json = NULL, "
+                "qc_warnings_json = NULL, publishing_pack_path = NULL, "
+                "publish_ready_video_path = NULL, publishing_pack_status = CASE "
+                "WHEN COALESCE(json_extract(publishing_config, '$.enabled'), 0) = 1 "
+                "THEN 'pending' ELSE 'disabled' END, "
+                "publishing_pack_error = NULL, created_at = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND status = 'error'",
+                ("Đã xếp hàng chạy lại", now, now, job_id, user_id),
             )
-            retried = self.get_job(retried.id) or retried
-        return retried
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_job(row) if row else None
 
     # ---- publishing channel profiles ----
     def list_publishing_profiles(self, user_id: int) -> List[Dict[str, Any]]:

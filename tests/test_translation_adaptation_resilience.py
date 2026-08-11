@@ -83,6 +83,62 @@ def test_gemini_full_failure_degrades_to_smaller_batches(monkeypatch):
     assert result == [f"đã sửa nháp {i}" for i in range(5)]
 
 
+def test_oversized_gemini_script_skips_guaranteed_to_truncate_full_request(monkeypatch):
+    source = _segments("source", 60)
+    draft = _segments("draft", 60)
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test",
+            gemini_retry_count=0,
+            gemini_batch_size=10,
+        )
+    )
+    labels: list[str] = []
+
+    def fake_request(source_segments, translated_segments, source_lang, target_lang, *, label):
+        labels.append(label)
+        return [segment.text for segment in translated_segments]
+
+    monkeypatch.setattr(adapter, "_request_gemini_with_retries", fake_request)
+
+    result = adapter._adapt_with_gemini(source, draft, "zh", "vi")
+
+    assert len(result) == 60
+    assert "full" not in labels
+    assert labels == [f"batch-{start}-{start + 9}" for start in range(0, 60, 10)]
+
+
+def test_gemini_batch_circuit_breaker_stops_repeating_provider_failure(monkeypatch):
+    source = _segments("source", 20)
+    draft = _segments("draft", 20)
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test",
+            fallback_on_error=True,
+            gemini_retry_count=0,
+            gemini_batch_size=2,
+        )
+    )
+    labels: list[str] = []
+
+    def fake_request(source_segments, translated_segments, source_lang, target_lang, *, label):
+        labels.append(label)
+        if label == "full":
+            raise RuntimeError("malformed full JSON")
+        raise RuntimeError("malformed batch JSON")
+
+    monkeypatch.setattr(adapter, "_request_gemini_with_retries", fake_request)
+
+    result = adapter._adapt_with_gemini(source, draft, "zh", "vi")
+
+    assert labels == ["full", "batch-0-1", "batch-2-3", "batch-4-5"]
+    assert result == [segment.text for segment in draft]
+
+
 def test_optional_adaptation_failure_keeps_base_translation(monkeypatch):
     source = _segments("nguồn", 3)
     draft = _segments("bản dịch", 3)

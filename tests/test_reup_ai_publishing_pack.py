@@ -53,9 +53,12 @@ def test_store_roundtrip_and_retry_preserve_publishing_config(tmp_path):
     assert loaded is not None
     assert loaded.publishing_config == publishing
     assert loaded.publishing_pack_status == "pending"
+    store.update_job(job.id, status="error", publishing_pack_status="error")
     retry = store.retry_job(job.id, user_id)
     assert retry is not None
+    assert retry.id == job.id
     assert retry.publishing_config == publishing
+    assert retry.publishing_pack_status == "pending"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg not installed")
@@ -159,7 +162,7 @@ def test_van_diep_profile_flags_unrelated_content_instead_of_forcing_tu_tien(tmp
     assert analysis["story_name"] == "Chưa xác định"
 
 
-def test_download_cache_preserves_source_metadata(tmp_path):
+def test_download_cache_preserves_source_metadata(tmp_path, monkeypatch):
     import importlib.util
     import sys
 
@@ -169,6 +172,7 @@ def test_download_cache_preserves_source_metadata(tmp_path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "validate_video_file", lambda path: (True, "ok"))
     DownloadCache = module.DownloadCache
 
     video = tmp_path / "source.mp4"

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -38,9 +39,25 @@ class AdaptationConfig:
 
 
 class SegmentAdapter:
-    def __init__(self, config: AdaptationConfig, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        config: AdaptationConfig,
+        logger: Optional[logging.Logger] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> None:
         self.config = config
         self.logger = logger or _logger
+        self.progress_callback = progress_callback
+        self.cancellation_checker = cancellation_checker
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancellation_checker and self.cancellation_checker():
+            raise RuntimeError("Job cancelled by user")
+
+    def _report_progress(self, done: int, total: int, label: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(done, total, label)
 
     async def adapt_segments(
         self,
@@ -56,14 +73,24 @@ class SegmentAdapter:
         try:
             provider = (self.config.provider or "").strip().lower()
             if provider == "openai" and self.config.api_key:
-                adapted_texts = self._adapt_with_openai(source_segments, translated_segments, source_lang, target_lang)
+                adapted_texts = await asyncio.to_thread(
+                    self._adapt_with_openai,
+                    source_segments, translated_segments, source_lang, target_lang,
+                )
             elif provider == "gemini" and self.config.api_key:
-                adapted_texts = self._adapt_with_gemini(source_segments, translated_segments, source_lang, target_lang)
+                adapted_texts = await asyncio.to_thread(
+                    self._adapt_with_gemini,
+                    source_segments, translated_segments, source_lang, target_lang,
+                )
             elif provider == "ollama":
-                adapted_texts = self._adapt_with_ollama(source_segments, translated_segments, source_lang, target_lang)
+                adapted_texts = await asyncio.to_thread(
+                    self._adapt_with_ollama,
+                    source_segments, translated_segments, source_lang, target_lang,
+                )
             else:
                 return translated_segments
         except Exception as exc:
+            self._raise_if_cancelled()
             if not self.config.fallback_on_error:
                 raise RuntimeError(f"Contextual translation adaptation failed: {exc}") from exc
             self.logger.warning("Contextual translation adaptation failed; keeping base translation: %s", exc)
@@ -205,30 +232,47 @@ class SegmentAdapter:
         translations when fallback_on_error is enabled, so an optional quality
         pass cannot destroy an otherwise usable localization job.
         """
-        try:
-            return self._request_gemini_with_retries(
-                source_segments,
-                translated_segments,
-                source_lang,
-                target_lang,
-                label="full",
-            )
-        except Exception as full_error:
-            if len(translated_segments) <= 1:
-                raise
-            self.logger.warning(
-                "Gemini full-script adaptation failed; retrying in smaller batches: %s",
-                full_error,
+        configured_size = max(2, int(self.config.gemini_batch_size or 24))
+        # A 1,000+ cue script cannot fit the configured 8K output-token cap.
+        # Retrying that guaranteed-to-truncate request three times used to
+        # waste many minutes before useful batching even began.
+        full_script_limit = max(48, configured_size * 2)
+        if len(translated_segments) <= full_script_limit:
+            try:
+                return self._request_gemini_with_retries(
+                    source_segments,
+                    translated_segments,
+                    source_lang,
+                    target_lang,
+                    label="full",
+                )
+            except Exception as full_error:
+                if len(translated_segments) <= 1 or self._is_systemic_gemini_error(full_error):
+                    raise
+                self.logger.warning(
+                    "Gemini full-script adaptation failed; retrying in smaller batches: %s",
+                    full_error,
+                )
+        else:
+            self.logger.info(
+                "Skipping oversized Gemini full-script request (%d segments); using batches of %d",
+                len(translated_segments), configured_size,
             )
 
-        configured_size = max(2, int(self.config.gemini_batch_size or 24))
         # When the full request itself was already smaller than the configured
         # batch size, halve it so the fallback actually reduces response size.
         batch_size = min(configured_size, max(1, len(translated_segments) // 2))
         results: list[str] = []
         failed_batches = 0
+        consecutive_failures = 0
+        total_batches = (len(translated_segments) + batch_size - 1) // batch_size
+        self._report_progress(0, total_batches, "gemini")
 
-        for start_index in range(0, len(translated_segments), batch_size):
+        for batch_index, start_index in enumerate(
+            range(0, len(translated_segments), batch_size),
+            start=1,
+        ):
+            self._raise_if_cancelled()
             source_batch = source_segments[start_index:start_index + batch_size]
             translated_batch = translated_segments[start_index:start_index + batch_size]
             label = f"batch-{start_index}-{start_index + len(translated_batch) - 1}"
@@ -242,6 +286,7 @@ class SegmentAdapter:
                 )
             except Exception as batch_error:
                 failed_batches += 1
+                consecutive_failures += 1
                 if not self.config.fallback_on_error:
                     raise RuntimeError(
                         f"Gemini adaptation failed for {label}: {batch_error}"
@@ -252,7 +297,27 @@ class SegmentAdapter:
                     batch_error,
                 )
                 batch_texts = [segment.text for segment in translated_batch]
+                if (
+                    self._is_systemic_gemini_error(batch_error)
+                    or consecutive_failures >= 3
+                ):
+                    remaining_start = start_index + len(translated_batch)
+                    results.extend(batch_texts)
+                    results.extend(
+                        segment.text for segment in translated_segments[remaining_start:]
+                    )
+                    self.logger.warning(
+                        "Gemini adaptation circuit breaker opened after %d consecutive failed batch(es); "
+                        "keeping base translation for the remaining %d segment(s)",
+                        consecutive_failures,
+                        len(translated_segments) - remaining_start,
+                    )
+                    self._report_progress(total_batches, total_batches, "gemini-fallback")
+                    break
+            else:
+                consecutive_failures = 0
             results.extend(batch_texts)
+            self._report_progress(batch_index, total_batches, label)
 
         if failed_batches:
             self.logger.warning(
@@ -260,6 +325,22 @@ class SegmentAdapter:
                 failed_batches,
             )
         return results
+
+    @staticmethod
+    def _is_systemic_gemini_error(exc: Exception) -> bool:
+        """Return True when splitting the same request cannot cure the error."""
+        if isinstance(exc, requests.exceptions.RequestException):
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                " 401 ", " 403 ", " 429 ",
+                " 500 ", " 502 ", " 503 ", " 504 ",
+                "timed out", "timeout", "connection",
+                "name resolution", "api key",
+            )
+        )
 
     def _request_gemini_with_retries(
         self,
@@ -273,6 +354,7 @@ class SegmentAdapter:
         attempts = max(1, int(self.config.gemini_retry_count or 0) + 1)
         last_error: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
+            self._raise_if_cancelled()
             try:
                 return self._request_gemini_once(
                     source_segments,

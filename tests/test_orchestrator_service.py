@@ -1060,3 +1060,53 @@ def test_missing_visual_windows_are_interpolated_into_one_canonical_clock():
     assert resolved[0].start == pytest.approx(0.4)
     assert resolved[0].end <= resolved[1].start
     assert resolved[1].end <= resolved[2].start
+
+
+def test_long_video_ocr_sampling_is_bounded_and_keeps_validation_prefix():
+    indices = LocalizationService._bounded_sample_indices(
+        1550,
+        80,
+        required_prefix=3,
+    )
+
+    assert len(indices) == 80
+    assert indices[:3] == [0, 1, 2]
+    assert indices[-1] == 1549
+    assert indices == sorted(set(indices))
+
+
+def test_long_video_alignment_scans_only_bounded_anchors(tmp_path: Path):
+    detector = OnScreenTextDetector()
+
+    def detect_windows(video_path, segments, **kwargs):
+        return [
+            SubtitleTimingWindow(start=start + 0.2, end=end + 0.2, confidence=0.9)
+            for start, end, _text in segments
+        ]
+
+    detector.detect_subtitle_windows_for_segments = MagicMock(side_effect=detect_windows)
+    service = LocalizationService(
+        text_detector=detector,
+        config=LocalizationConfig(
+            enable_text_cover=True,
+            source_subtitle_timing_max_segments=5,
+            source_subtitle_timing_min_coverage=0.6,
+            validate_source_timing_match=False,
+        ),
+    )
+    source = [
+        TranscriptSegment(start=index * 1.2, end=index * 1.2 + 0.8, text=str(index))
+        for index in range(20)
+    ]
+
+    aligned = service._align_source_segments_to_burned_subtitles(
+        tmp_path / "video.mp4",
+        source,
+        "zh",
+        audio_duration=30.0,
+    )
+
+    scanned = detector.detect_subtitle_windows_for_segments.call_args.args[1]
+    assert len(scanned) == 5
+    assert len(aligned) == len(source)
+    assert all(item.start == pytest.approx(original.start + 0.2) for item, original in zip(aligned, source))

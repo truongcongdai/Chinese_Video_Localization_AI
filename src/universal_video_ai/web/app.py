@@ -1272,7 +1272,7 @@ def _build_service_for_job(job):
         glossary=getattr(job, "translation_glossary", None),
         fallback_on_error=not strict_translation_adapter,
         request_timeout_seconds=(
-            _env_int("GEMINI_TRANSLATION_TIMEOUT", 180, minimum=10, maximum=1800)
+            _env_int("GEMINI_TRANSLATION_TIMEOUT", 90, minimum=10, maximum=1800)
             if translation_provider == "gemini"
             else _env_int("OLLAMA_TRANSLATION_TIMEOUT", 90, minimum=10, maximum=1800)
         ),
@@ -1375,6 +1375,10 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             "DefaultCPUAllocator: not enough memory",
             "No space left on device",
             "not enough disk space",
+            # Retrying the same Douyin request without changing its browser
+            # session cannot manufacture the fresh cookie the extractor needs.
+            "fresh cookies",
+            "Douyin yêu cầu cookie mới",
         )
     )
 
@@ -1392,8 +1396,8 @@ async def _run_job(job_id: str) -> None:
     finally:
         if slot_acquired:
             await _release_job_run_slot()
-        # Also covers a task cancelled while waiting for a queue slot;
-        # _run_job_unlocked performs the same pop after normal runs.
+        # Covers normal completion as well as cancellation while waiting for
+        # a queue slot. Tracking belongs to the outer task, not each attempt.
         _running_tasks.pop(job_id, None)
 
 
@@ -1412,7 +1416,6 @@ async def _run_job_unlocked(job_id: str) -> None:
                 "Hay tao/chay lai tu man Content OS thay vi nut Thu lai cua lich su job."
             ),
         )
-        _running_tasks.pop(job_id, None)
         return
 
     retry_count = 0
@@ -1485,8 +1488,6 @@ async def _run_job_unlocked(job_id: str) -> None:
                 # Max retries reached, mark as failed
                 store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
                 _refund_job_credits(job)
-        finally:
-            _running_tasks.pop(job_id, None)
 
 
 def _publishing_llm_client_for_job(job, config: PublishingPackConfig) -> PublishingLLMClient:
@@ -6838,8 +6839,7 @@ def get_quality_review(job_id: str, user_id: int = Depends(get_current_user_id))
 
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
-    """Re-submit a failed job with identical settings, as a brand-new job
-    (the failed attempt stays in history too, for reference)."""
+    """Run a failed command again in the same history entry/job id."""
     old_job = _get_owned_job(job_id, user_id)
     if old_job.status != "error":
         raise HTTPException(400, "Chỉ có thể thử lại job bị lỗi")
@@ -6855,11 +6855,16 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
         raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
 
-    new_job = store.retry_job(job_id, user_id)
-    if new_job is None:
-        raise HTTPException(404, "Không tìm thấy job")
+    retried_job = store.retry_job(job_id, user_id)
+    if retried_job is None:
+        raise HTTPException(409, "Job đã được chạy lại hoặc trạng thái đã thay đổi")
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    # A failed attempt can leave partial media behind. It must not be mixed
+    # into the next attempt even though retry deliberately reuses job_id.
+    # Reset state atomically first; no second request can delete artifacts
+    # after the replacement task has started.
+    _delete_job_artifacts(job_id)
     if old_job.source_language.startswith("creator"):
         topic = old_job.source_url.removeprefix("creator:").strip()
         image_provider = old_job.source_language.partition(":")[2] or "stock"
@@ -6867,11 +6872,11 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
             topic=topic, target_language=old_job.target_language,
             image_provider=image_provider,
         )
-        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, new_job.id, retry_body))
+        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, retried_job.id, retry_body))
     else:
-        task = asyncio.create_task(_run_job(new_job.id))
-    _running_tasks[new_job.id] = task
-    return new_job.to_dict()
+        task = asyncio.create_task(_run_job(retried_job.id))
+    _running_tasks[retried_job.id] = task
+    return retried_job.to_dict()
 
 
 @app.get("/api/jobs/{job_id}/segments")

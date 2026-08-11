@@ -45,6 +45,7 @@ _logger = logging.getLogger(__name__)
 # once on a 16 GB CPU host causes thread oversubscription and swapping.
 _DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "10"))))
 _TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "5"))))
+_OCR_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("OCR_CONCURRENCY", "1"))))
 _RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
 _TTS_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TTS_CONCURRENCY", "8"))))
 
@@ -161,6 +162,12 @@ class LocalizationConfig:
     source_subtitle_timing_search_radius: float = 2.5
     source_subtitle_timing_step: float = 0.2
     source_subtitle_timing_min_coverage: float = 0.60
+    # Long videos can contain thousands of ASR cues. OCR'ing every cue used
+    # to launch ffmpeg thousands of times and could block the web app for
+    # hours. Sample bounded anchors and interpolate the visual clock between
+    # them instead. Set to 0 only for offline jobs that explicitly need an
+    # unbounded per-cue scan.
+    source_subtitle_timing_max_segments: int = 80
     # Validate that source timing roughly matches visual timing before using it.
     # If the first N source segments can't find any visual presence within
     # search_radius, disable source timing and use visual-only detection.
@@ -171,6 +178,10 @@ class LocalizationConfig:
     # detected source-subtitle timeline. Non-zero values are only for users
     # who explicitly prefer wider cover boxes over exact subtitle timing.
     visual_subtitle_timing_padding: float = 0.0
+    # The subtitle band/box geometry normally changes slowly. A bounded,
+    # evenly-spaced sample is enough to learn it; missing windows are filled
+    # from neighbouring detections by _fill_missing_text_regions.
+    text_cover_max_ocr_windows: int = 80
     # Global offset to apply to all subtitle timestamps when OCR alignment
     # is disabled or not working. Positive values shift subtitles later,
     # negative values shift them earlier. Use this when Whisper timestamps
@@ -551,12 +562,18 @@ class LocalizationService:
 
         self._last_subtitle_alignment_estimate = None
         self._used_source_subtitle_timing = False
-        visual_source_segments = self._align_source_segments_to_burned_subtitles(
-            video_path=download_result.video_path,
-            source_segments=audio_source_segments,
-            detected_language=audio_result.detected_language,
-            audio_duration=audio_result.audio_result.duration,
-        )
+        # OCR is synchronous and can take minutes on a long source. Keeping it
+        # on the event-loop thread made every API request look frozen until the
+        # scan ended. Run it in a worker so history/progress/cancel stay alive.
+        self._progress(40, "Đang chờ lượt nhận diện phụ đề gốc...")
+        async with _OCR_SLOTS:
+            visual_source_segments = await asyncio.to_thread(
+                self._align_source_segments_to_burned_subtitles,
+                video_path=download_result.video_path,
+                source_segments=audio_source_segments,
+                detected_language=audio_result.detected_language,
+                audio_duration=audio_result.audio_result.duration,
+            )
 
         translated_text: Optional[str] = None
         translated_segments: Optional[List[TranscriptSegment]] = None
@@ -658,6 +675,40 @@ class LocalizationService:
             target_language=effective_target_language,
             output_dir=output_dir,
         )
+
+    @staticmethod
+    def _bounded_sample_indices(
+        total: int,
+        limit: int,
+        *,
+        required_prefix: int = 0,
+    ) -> List[int]:
+        """Return deterministic, evenly-spaced indices with a required prefix."""
+        total = max(0, int(total))
+        limit = int(limit)
+        if limit <= 0 or total <= limit:
+            return list(range(total))
+
+        prefix_count = min(total, limit, max(0, int(required_prefix)))
+        selected = set(range(prefix_count))
+        remaining = limit - len(selected)
+        candidate_count = total - prefix_count
+        if remaining > 0 and candidate_count > 0:
+            if remaining == 1:
+                selected.add(total - 1)
+            else:
+                span = candidate_count - 1
+                for position in range(remaining):
+                    selected.add(prefix_count + round(position * span / (remaining - 1)))
+
+        # Rounding can theoretically collide for very small spans. Fill any
+        # gap deterministically without exceeding the requested workload.
+        if len(selected) < limit:
+            for index in range(prefix_count, total):
+                selected.add(index)
+                if len(selected) >= limit:
+                    break
+        return sorted(selected)[:limit]
 
     @staticmethod
     def _fill_missing_subtitle_windows(
@@ -862,41 +913,81 @@ class LocalizationService:
                 self.config.ocr_languages, detected_language
             )
             detector = OnScreenTextDetector(languages=resolved_ocr_languages)
+            # Reuse the loaded EasyOCR reader for region/static-text passes in
+            # this same job instead of loading another GPU model each time.
+            self.text_detector = detector
 
         if self.config.use_source_subtitle_timing:
             detect_windows = getattr(type(detector), "detect_subtitle_windows_for_segments", None)
             if callable(detect_windows):
+                total_segments = len(source_segments)
+                max_segments = int(self.config.source_subtitle_timing_max_segments or 0)
+                sampled_indices = self._bounded_sample_indices(
+                    total_segments,
+                    max_segments,
+                    required_prefix=self.config.source_timing_validation_segments,
+                )
+                sampled_segments = [source_segments[index] for index in sampled_indices]
+                bounded_scan = len(sampled_segments) < total_segments
+                if bounded_scan:
+                    self.logger.info(
+                        "LocalizationService: bounding long-video subtitle timing OCR to %d/%d anchor(s)",
+                        len(sampled_segments), total_segments,
+                    )
+
+                def timing_progress(done: int, total: int) -> None:
+                    phase_percent = 40 + min(4, int((done / max(1, total)) * 4))
+                    self._progress(
+                        phase_percent,
+                        f"Đang căn timing phụ đề gốc ({done}/{total} mẫu)...",
+                    )
+
                 try:
-                    windows = detector.detect_subtitle_windows_for_segments(
+                    sampled_windows = detector.detect_subtitle_windows_for_segments(
                         video_path,
-                        [(s.start, s.end, s.text) for s in source_segments],
+                        [(s.start, s.end, s.text) for s in sampled_segments],
                         audio_duration=audio_duration,
-                        search_radius=self.config.source_subtitle_timing_search_radius,
-                        step=self.config.source_subtitle_timing_step,
+                        search_radius=(
+                            min(1.0, self.config.source_subtitle_timing_search_radius)
+                            if bounded_scan else self.config.source_subtitle_timing_search_radius
+                        ),
+                        step=(
+                            max(0.25, self.config.source_subtitle_timing_step)
+                            if bounded_scan else self.config.source_subtitle_timing_step
+                        ),
+                        progress_callback=timing_progress,
+                        cancellation_checker=self.cancellation_checker,
                     )
                 except Exception as exc:
+                    self._raise_if_cancelled()
                     self.logger.warning(
                         "Per-cue burned-subtitle timing detection failed; falling back to global offset: %s",
                         exc,
                     )
                 else:
-                    if len(windows) != len(source_segments):
+                    if len(sampled_windows) != len(sampled_segments):
                         self.logger.warning(
                             "Per-cue burned-subtitle timing returned %d window(s) for %d segment(s); "
                             "falling back to global offset",
-                            len(windows),
-                            len(source_segments),
+                            len(sampled_windows),
+                            len(sampled_segments),
                         )
-                        windows = []
-                    detected = [window for window in windows if window is not None]
-                    coverage = len(detected) / len(source_segments) if source_segments else 0.0
+                        sampled_windows = []
+                    windows: List[Optional[Any]] = [None] * total_segments
+                    for index, window in zip(sampled_indices, sampled_windows):
+                        windows[index] = window
+                    detected = [window for window in sampled_windows if window is not None]
+                    coverage = len(detected) / len(sampled_segments) if sampled_segments else 0.0
 
                     # Validate that source timing roughly matches visual timing
                     if self.config.validate_source_timing_match and detected:
-                        validation_count = min(self.config.source_timing_validation_segments, len(source_segments))
+                        validation_count = min(
+                            self.config.source_timing_validation_segments,
+                            len(sampled_windows),
+                        )
                         valid_matches = 0
                         for i in range(validation_count):
-                            if windows[i] is not None:
+                            if sampled_windows[i] is not None:
                                 valid_matches += 1
                         validation_ratio = valid_matches / validation_count if validation_count > 0 else 0.0
                         if validation_ratio < 0.5:
@@ -906,6 +997,7 @@ class LocalizationService:
                                 valid_matches,
                                 validation_count,
                             )
+                            sampled_windows = []
                             windows = []
                             detected = []
 
@@ -919,10 +1011,11 @@ class LocalizationService:
                         self._used_source_subtitle_timing = True
                         self.logger.info(
                             "LocalizationService: using one canonical visual subtitle clock for %d/%d "
-                            "segment(s) (%d direct OCR anchor(s))",
+                            "segment(s) (%d direct OCR anchor(s), %d sampled)",
                             resolved_count,
                             len(source_segments),
                             len(detected),
+                            len(sampled_segments),
                         )
                         self._progress(42, "Đã bắt timing phụ đề gốc theo từng câu")
                         return [
@@ -1147,12 +1240,15 @@ class LocalizationService:
             and visual_source_segments
             and download_result.video_path
         ):
-            text_overlays = self._build_text_overlays(
-                video_path=download_result.video_path,
-                source_segments=visual_source_segments,
-                translated_segments=visual_translated_segments,
-                detected_language=audio_result.detected_language,
-            )
+            self._progress(80, "Đang nhận diện vùng chữ gốc...")
+            async with _OCR_SLOTS:
+                text_overlays = await asyncio.to_thread(
+                    self._build_text_overlays,
+                    video_path=download_result.video_path,
+                    source_segments=visual_source_segments,
+                    translated_segments=visual_translated_segments,
+                    detected_language=audio_result.detected_language,
+                )
             if text_overlays and subtitles_path and subtitle_segments:
                 common_font_size = text_overlays[0].font_size or 48
                 positions = None
@@ -1271,11 +1367,13 @@ class LocalizationService:
                 try:
                     # Use mixed audio if available, otherwise use TTS audio, otherwise use original audio
                     audio_for_render = mixed_audio_path or tts_audio_path or audio_result.audio_result.audio_path
-                    static_text_boxes = self._detect_static_text_watermark_boxes(
-                        video_path=download_result.video_path,
-                        detected_language=audio_result.detected_language,
-                        duration=audio_result.audio_result.duration,
-                    )
+                    async with _OCR_SLOTS:
+                        static_text_boxes = await asyncio.to_thread(
+                            self._detect_static_text_watermark_boxes,
+                            video_path=download_result.video_path,
+                            detected_language=audio_result.detected_language,
+                            duration=audio_result.audio_result.duration,
+                        )
                     if static_text_boxes:
                         existing_boxes = tuple(self.renderer.config.watermark_boxes_fractional or ())
                         self.renderer.config = replace(
@@ -1877,14 +1975,32 @@ class LocalizationService:
             )
             detector = OnScreenTextDetector(languages=resolved_ocr_languages)
         windows = [(s.start, s.end) for s in source_segments]
+        max_windows = int(self.config.text_cover_max_ocr_windows or 0)
+        sampled_indices = self._bounded_sample_indices(len(windows), max_windows)
+        scan_windows = [windows[index] for index in sampled_indices]
+        if len(scan_windows) < len(windows):
+            self.logger.info(
+                "LocalizationService: bounding long-video text-cover OCR to %d/%d window(s)",
+                len(scan_windows), len(windows),
+            )
+
+        def region_progress(done: int, total: int) -> None:
+            phase_percent = 80 + min(3, int((done / max(1, total)) * 3))
+            self._progress(
+                phase_percent,
+                f"Đang nhận diện vùng chữ gốc ({done}/{total} mẫu)...",
+            )
 
         try:
             regions = detector.detect_regions_for_windows(
-                video_path, windows,
+                video_path, scan_windows,
                 samples_per_window=self.config.text_cover_samples_per_segment,
                 exclude_regions_fractional=self.config.watermark_exclude_regions_fractional,
+                progress_callback=region_progress,
+                cancellation_checker=self.cancellation_checker,
             )
         except Exception as exc:
+            self._raise_if_cancelled()
             self.logger.warning(
                 "On-screen text detection unavailable/failed; skipping text-cover overlays: %s", exc
             )

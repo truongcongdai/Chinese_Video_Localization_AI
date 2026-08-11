@@ -121,7 +121,20 @@ def create_localization_service(
         except Exception as exc:
             logger.warning("TranslatorBackend not available; translation disabled: %s", exc)
         if translation_adaptation and translation_adaptation.enabled:
-            segment_adapter = SegmentAdapter(translation_adaptation, logger=logger)
+            def adaptation_progress(done: int, total: int, label: str) -> None:
+                if progress_callback:
+                    percent = 54 + min(3, int((done / max(1, total)) * 3))
+                    progress_callback(
+                        percent,
+                        f"Đang tối ưu bản dịch ({done}/{total} lô)...",
+                    )
+
+            segment_adapter = SegmentAdapter(
+                translation_adaptation,
+                logger=logger,
+                progress_callback=adaptation_progress,
+                cancellation_checker=cancellation_checker,
+            )
 
     # TTS service (optional)
     tts_service = None

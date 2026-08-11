@@ -31,7 +31,7 @@ import subprocess
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # easyocr runs PyTorch on CPU in most deployments (no GPU in the container).
 # PyTorch then emits two purely cosmetic warnings that have nothing to do
@@ -520,6 +520,8 @@ class OnScreenTextDetector:
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
             0.06, 0.55, 0.94, 0.96,
         ),
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> List[Optional[SubtitleTimingWindow]]:
         """Detect per-cue hard-sub timing windows near ASR segments.
 
@@ -572,7 +574,12 @@ class OnScreenTextDetector:
 
         with tempfile.TemporaryDirectory(prefix="subtitle_windows_") as tmp:
             tmp_dir = Path(tmp)
-            for start, end, source_text in source_segments:
+            total_segments = len(source_segments)
+            for segment_index, (start, end, source_text) in enumerate(source_segments):
+                if cancellation_checker and cancellation_checker():
+                    raise RuntimeError("Job cancelled by user")
+                if progress_callback:
+                    progress_callback(segment_index, total_segments)
                 if end <= start or audio_duration <= 0:
                     results.append(None)
                     continue
@@ -692,6 +699,9 @@ class OnScreenTextDetector:
                         confidence=round(confidence, 3),
                     )
                 )
+
+            if progress_callback:
+                progress_callback(total_segments, total_segments)
 
         results = self._trim_overlapping_subtitle_windows(results)
         detected = sum(1 for item in results if item is not None)
@@ -1029,6 +1039,8 @@ class OnScreenTextDetector:
             0.06, 0.55, 0.94, 0.96,
         ),
         fill_undetected_windows: bool = True,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> List[TextRegion]:
         """
         For each (start, end) time window, sample a few frames, run OCR, and
@@ -1149,7 +1161,12 @@ class OnScreenTextDetector:
 
         with tempfile.TemporaryDirectory(prefix="ocr_frames_") as tmp:
             tmp_dir = Path(tmp)
+            total_windows = len(windows)
             for w_idx, (start, end) in enumerate(windows):
+                if cancellation_checker and cancellation_checker():
+                    raise RuntimeError("Job cancelled by user")
+                if progress_callback:
+                    progress_callback(w_idx, total_windows)
                 if end <= start:
                     continue
                 sample_count = max(1, samples_per_window)
@@ -1184,6 +1201,9 @@ class OnScreenTextDetector:
                     )
                     raw_boxes = candidate_boxes
                 per_window_boxes.append((start, end, raw_boxes, max_presence_score))
+
+            if progress_callback:
+                progress_callback(total_windows, total_windows)
 
         # ---- Learn where this video's subtitle line actually sits ----
         all_boxes = [b for (_s, _e, boxes, _score) in per_window_boxes for b in boxes]

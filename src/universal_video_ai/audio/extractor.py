@@ -114,7 +114,17 @@ class AudioExtractor:
 
         start_ts = time.time()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=self.config.ffmpeg_timeout)
+            # Capture bytes and decode explicitly. On Windows, text=True uses
+            # the active ANSI code page (often cp1252); FFmpeg can emit UTF-8
+            # file names and otherwise crash subprocess' reader thread before
+            # we receive the actual diagnostic.
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=False,
+                check=False,
+                timeout=self.config.ffmpeg_timeout,
+            )
         except FileNotFoundError as exc:
             self.logger.exception("ffmpeg not found at runtime: %s", exc)
             raise AudioExtractionError("ffmpeg not found at runtime", cause=exc) from exc
@@ -123,7 +133,12 @@ class AudioExtractor:
             raise AudioExtractionError("ffmpeg timed out", cause=exc) from exc
 
         if proc.returncode != 0:
-            stderr = proc.stderr or proc.stdout or ""
+            raw_error = proc.stderr or proc.stdout or b""
+            stderr = (
+                raw_error.decode("utf-8", errors="replace")
+                if isinstance(raw_error, bytes)
+                else str(raw_error)
+            )
             self.logger.error("ffmpeg extraction failed: %s", stderr)
             raise AudioExtractionError(f"ffmpeg extraction failed: {stderr}")
 

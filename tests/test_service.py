@@ -24,7 +24,10 @@ def test_download_service_selects_downloader_without_network(tmp_path: Path) -> 
     with patch(
         "universal_video_ai.downloader.service.DownloaderFactory.create",
         return_value=downloader,
-    ) as create:
+    ) as create, patch(
+        "universal_video_ai.downloader.service.validate_video_file",
+        return_value=(True, "ok"),
+    ):
         result = service.download(url, tmp_path)
 
     create.assert_called_once_with(Platform.YOUTUBE)

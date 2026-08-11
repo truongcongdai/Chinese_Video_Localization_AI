@@ -11,6 +11,7 @@ from .platform_detector import PlatformDetector
 from .download_result import DownloadResult
 from .rate_limiter import get_rate_limiter
 from .download_cache import get_download_cache
+from .media_validation import validate_video_file
 
 
 class DownloadService:
@@ -104,6 +105,14 @@ class DownloadService:
             url=url,
             output_dir=output_dir,
         )
+
+        if result.success:
+            valid, reason = validate_video_file(result.video_path)
+            if not valid:
+                Path(result.video_path).unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Downloaded media is not a valid video: {reason}"
+                )
         
         # Cache successful downloads
         if result.success and self.cache:

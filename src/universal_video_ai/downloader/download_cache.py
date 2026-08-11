@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
 
+from universal_video_ai.downloader.media_validation import validate_video_file
+
 _logger = logging.getLogger(__name__)
 
 
@@ -79,6 +81,15 @@ class DownloadCache:
         if not cache_path.exists():
             self.remove(url)
             return None
+
+        valid, reason = validate_video_file(cache_path)
+        if not valid:
+            _logger.warning(
+                "Discarding invalid cached video for %s...: %s (%s)",
+                url[:50], cache_path, reason,
+            )
+            self.remove(url)
+            return None
         
         _logger.info(f"Cache hit for {url[:50]}... -> {cache_path}")
         result = dict(entry)
@@ -100,6 +111,10 @@ class DownloadCache:
         """Cache a downloaded video and metadata required by Publishing Pack."""
         if not video_path.exists():
             _logger.warning(f"Cannot cache non-existent video: {video_path}")
+            return
+        valid, reason = validate_video_file(video_path)
+        if not valid:
+            _logger.warning("Refusing to cache invalid video %s: %s", video_path, reason)
             return
         
         # Check cache size before adding
