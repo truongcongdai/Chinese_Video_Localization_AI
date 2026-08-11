@@ -92,7 +92,7 @@ def test_cached_model_inference_is_serialized(monkeypatch, tmp_path: Path):
     assert max_active == 1
 
 
-def test_whisper_passes_fp16_false_when_device_is_auto(monkeypatch, tmp_path: Path):
+def test_whisper_auto_selects_cuda_and_fp16(monkeypatch, tmp_path: Path):
     audio_file = tmp_path / "audio.wav"
     audio_file.write_bytes(b"fake audio")
     captured = {}
@@ -104,13 +104,102 @@ def test_whisper_passes_fp16_false_when_device_is_auto(monkeypatch, tmp_path: Pa
             captured["kwargs"] = kwargs
             return {"text": "ok", "segments": [], "language": "en"}
 
-    fake_whisper = SimpleNamespace(load_model=lambda *_args, **_kwargs: FakeModel())
+    loaded_devices = []
+
+    def load_model(*_args, **kwargs):
+        loaded_devices.append(kwargs.get("device"))
+        return FakeModel()
+
+    fake_whisper = SimpleNamespace(load_model=load_model)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _index: "Test GPU",
+        ),
+        version=SimpleNamespace(cuda="12.8"),
+    )
     monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     whisper_module._MODEL_CACHE.clear()
     whisper_module._MODEL_INFERENCE_LOCKS.clear()
 
     WhisperTranscriber(WhisperConfig(model="tiny", device=None)).transcribe(audio_file)
 
+    assert loaded_devices == ["cuda"]
+    assert captured["kwargs"]["fp16"] is True
+    assert captured["kwargs"]["verbose"] is False
+
+
+def test_whisper_auto_falls_back_to_cpu(monkeypatch, tmp_path: Path):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"fake audio")
+    captured = {}
+
+    class FakeModel:
+        device = SimpleNamespace(type="cpu")
+
+        def transcribe(self, _audio_path, **kwargs):
+            captured["kwargs"] = kwargs
+            return {"text": "ok", "segments": [], "language": "en"}
+
+    loaded_devices = []
+
+    def load_model(_model_name, device=None):
+        loaded_devices.append(device)
+        return FakeModel()
+
+    fake_whisper = SimpleNamespace(load_model=load_model)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+        version=SimpleNamespace(cuda=None),
+    )
+    monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    whisper_module._MODEL_CACHE.clear()
+    whisper_module._MODEL_INFERENCE_LOCKS.clear()
+
+    WhisperTranscriber(WhisperConfig(model="tiny", device="auto")).transcribe(audio_file)
+
+    assert loaded_devices == ["cpu"]
+    assert captured["kwargs"]["fp16"] is False
+
+
+def test_whisper_gtx_16_series_stays_on_cuda_fp32(monkeypatch, tmp_path: Path):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"fake audio")
+    captured = {}
+
+    class FakeModel:
+        device = SimpleNamespace(type="cuda")
+
+        def transcribe(self, _audio_path, **kwargs):
+            captured["kwargs"] = kwargs
+            return {"text": "ok", "segments": [], "language": "en"}
+
+    loaded_devices = []
+
+    def load_model(_model_name, device=None):
+        loaded_devices.append(device)
+        return FakeModel()
+
+    fake_whisper = SimpleNamespace(load_model=load_model)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _index: "NVIDIA GeForce GTX 1660 SUPER",
+        ),
+        version=SimpleNamespace(cuda="12.8"),
+    )
+    monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    whisper_module._MODEL_CACHE.clear()
+    whisper_module._MODEL_INFERENCE_LOCKS.clear()
+
+    WhisperTranscriber(WhisperConfig(model="tiny", device="auto")).transcribe(audio_file)
+
+    assert loaded_devices == ["cuda"]
     assert captured["kwargs"]["fp16"] is False
 
 
@@ -137,11 +226,20 @@ def test_whisper_retries_cpu_fp32_after_cuda_invalid_values(monkeypatch, tmp_pat
         return CpuModel() if device == "cpu" else FailingCudaModel()
 
     fake_whisper = SimpleNamespace(load_model=load_model)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _index: "Test GPU",
+        ),
+        version=SimpleNamespace(cuda="12.8"),
+    )
     monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     whisper_module._MODEL_CACHE.clear()
     whisper_module._MODEL_INFERENCE_LOCKS.clear()
 
     text = WhisperTranscriber(WhisperConfig(model="tiny", device=None)).transcribe(audio_file)
 
     assert text == "cpu ok"
-    assert loaded_devices == [None, "cpu"]
+    assert loaded_devices == ["cuda", "cpu"]

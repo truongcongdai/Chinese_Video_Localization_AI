@@ -77,10 +77,24 @@ def create_audio_pipeline(
             from universal_video_ai.speech.whisper import WhisperConfig
             from universal_video_ai.speech.service import SpeechService
 
-            backend_config = WhisperConfig(model=transcription_model) if transcription_model else None
+            # ``auto`` is portable across GPU workers and CPU-only machines;
+            # operators can still force a device for diagnostics.
+            whisper_device = (
+                os.getenv("WHISPER_DEVICE")
+                or os.getenv("SPEECH_DEVICE")
+                or "auto"
+            )
+            backend_config = WhisperConfig(
+                model=transcription_model or "base",
+                device=whisper_device,
+            )
             backend = WhisperBackend(config=backend_config, logger=logger)
             speech_service = SpeechService(backend=backend, logger=logger)
-            logger.debug("Created SpeechService with WhisperBackend for pipeline")
+            logger.info(
+                "Created SpeechService with Whisper model=%s requested_device=%s",
+                backend_config.model,
+                backend_config.device,
+            )
         except Exception as exc:
             logger.warning("Failed to construct SpeechService with WhisperBackend: %s", exc)
 
