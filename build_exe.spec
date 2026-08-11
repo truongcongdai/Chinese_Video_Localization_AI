@@ -5,10 +5,11 @@ Usage: pyinstaller build_exe.spec
 """
 
 import sys
+import os
 from pathlib import Path
 
-# Get the repository root
-REPO_ROOT = Path(__file__).parent.resolve()
+# Get the repository root - use current working directory
+REPO_ROOT = Path(os.getcwd()).resolve()
 SRC_DIR = REPO_ROOT / "src"
 WEB_STATIC_DIR = SRC_DIR / "universal_video_ai" / "web" / "static"
 
@@ -58,15 +59,20 @@ hiddenimports = [
     'yt_dlp',
     'redis',
     'passlib',
+    'passlib.handlers',
+    'passlib.handlers.bcrypt',
     'bcrypt',
     'googletrans',
     'mutagen',
     'cryptography',
     
-    # Universal Video AI modules
+    # Universal Video AI modules - include all submodules
+    'universal_video_ai',
     'universal_video_ai.config',
     'universal_video_ai.orchestrator',
     'universal_video_ai.web',
+    'universal_video_ai.web.app',
+    'universal_video_ai.web.routes',
     'universal_video_ai.license',
 ]
 

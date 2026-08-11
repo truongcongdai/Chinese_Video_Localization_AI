@@ -3,6 +3,12 @@ __pycache__/
 
 .env
 
+dist/
+build/
+*.zip
+*.exe
+scripts/local_data/
+
 logs/*
 temp/*
 local_data/*
