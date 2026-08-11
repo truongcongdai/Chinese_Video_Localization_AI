@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -51,6 +52,40 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+
+def _resolve_ocr_device(torch_module, requested_device: Optional[str]) -> str:
+    """Resolve a portable EasyOCR device setting to a concrete device."""
+    requested = (requested_device or "auto").strip().lower()
+    cuda_available = bool(torch_module.cuda.is_available())
+    mps_backend = getattr(getattr(torch_module, "backends", None), "mps", None)
+    mps_available = bool(mps_backend and mps_backend.is_available())
+
+    if requested == "auto":
+        if cuda_available:
+            return "cuda"
+        if mps_available:
+            return "mps"
+        return "cpu"
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda" or requested.startswith("cuda:"):
+        if not cuda_available:
+            raise RuntimeError(
+                f"EasyOCR device {requested!r} was requested, but CUDA is unavailable. "
+                "Use OCR_DEVICE=auto (recommended) or OCR_DEVICE=cpu."
+            )
+        return requested
+    if requested == "mps":
+        if not mps_available:
+            raise RuntimeError(
+                "EasyOCR device 'mps' was requested, but Apple MPS is unavailable. "
+                "Use OCR_DEVICE=auto (recommended) or OCR_DEVICE=cpu."
+            )
+        return "mps"
+    raise RuntimeError(
+        f"Unsupported EasyOCR device {requested_device!r}; expected auto, cpu, cuda, cuda:<index>, or mps"
+    )
 
 
 def _check_ocr_available() -> bool:
@@ -110,8 +145,10 @@ class OnScreenTextDetector:
         self,
         languages: Sequence[str] = ("ch_sim", "en"),
         logger: Optional[logging.Logger] = None,
+        device: Optional[str] = None,
     ) -> None:
         self.languages = list(languages)
+        self.requested_device = device or os.getenv("OCR_DEVICE") or "auto"
         self.logger = logger or _logger
         self._reader = None
         self.last_typical_line_height: Optional[int] = None
@@ -129,13 +166,58 @@ class OnScreenTextDetector:
             return self._reader
         try:
             import easyocr  # type: ignore
+            import torch  # type: ignore
         except Exception as exc:
             raise RuntimeError(
                 "OnScreenTextDetector requires the 'easyocr' package, which is not installed. "
                 "Install it with: pip install easyocr"
             ) from exc
-        self.logger.debug("Loading easyocr reader for languages=%s", self.languages)
-        self._reader = easyocr.Reader(self.languages, gpu=False)
+        resolved_device = _resolve_ocr_device(torch, self.requested_device)
+        device_description = resolved_device
+        if resolved_device.startswith("cuda"):
+            try:
+                device_index = (
+                    int(resolved_device.split(":", 1)[1])
+                    if ":" in resolved_device
+                    else torch.cuda.current_device()
+                )
+                device_description = (
+                    f"{resolved_device} ({torch.cuda.get_device_name(device_index)})"
+                )
+            except Exception:
+                pass
+        self.logger.info(
+            "EasyOCR selected device=%s languages=%s (requested=%s)",
+            device_description,
+            self.languages,
+            self.requested_device,
+        )
+
+        # EasyOCR accepts False for CPU or a concrete torch device string for
+        # accelerators. If an auto-selected accelerator fails to initialize
+        # (for example due to insufficient VRAM), retry once on CPU so OCR
+        # remains portable across heterogeneous workers.
+        easyocr_gpu = False if resolved_device == "cpu" else resolved_device
+        try:
+            self._reader = easyocr.Reader(self.languages, gpu=easyocr_gpu)
+        except Exception as exc:
+            if self.requested_device.strip().lower() != "auto" or resolved_device == "cpu":
+                raise
+            self.logger.warning(
+                "EasyOCR failed to initialize on %s (%s); retrying on CPU",
+                resolved_device,
+                exc,
+            )
+            if resolved_device.startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            self._reader = easyocr.Reader(self.languages, gpu=False)
+        self.logger.info(
+            "EasyOCR reader ready on device=%s",
+            getattr(self._reader, "device", resolved_device),
+        )
         return self._reader
 
     def _get_video_dimensions(self, video_path: Path) -> Optional[Tuple[int, int]]:
