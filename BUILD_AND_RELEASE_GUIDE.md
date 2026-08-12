@@ -187,6 +187,10 @@ OPEN_REGISTRATION=true  # Cho phép user tự đăng ký
 # AI Models
 SPEECH_MODEL=base  # tiny, base, small, medium, large
 IMAGE_AI_MODEL=stabilityai/sd-turbo
+
+# License Server (Centralized License Management)
+LICENSE_SERVER_URL=  # Để trống để dùng database local
+# LICENSE_SERVER_URL=http://your-license-server.com  # Để dùng license server centralized
 ```
 
 ### Sử Dụng
@@ -195,6 +199,166 @@ IMAGE_AI_MODEL=stabilityai/sd-turbo
 - **Admin UI:** Đăng nhập với user đầu tiên (tự động là admin)
 - **License Management:** Trong trang admin, tạo license cho user
 - **Free Trial:** User có thể dùng trial miễn phí (10 tokens, 7 ngày)
+
+## License Server (Centralized License Management)
+
+### Tổng Quan
+
+License Server là hệ thống quản lý license centralized cho phép bạn:
+- Quản lý license từ một server duy nhất
+- Theo dõi usage (jobs, tokens) theo thời gian thực
+- Revoke license khi cần
+- Bind license vào máy cụ thể
+
+### Yêu Cầu Server
+
+- **CPU:** 1 core minimum
+- **RAM:** 512MB minimum
+- **OS:** Ubuntu 20.04+ (hoặc bất kỳ Linux)
+- **Python:** 3.8+
+- **Disk:** 100MB minimum
+
+### Deploy License Server
+
+#### Bước 1: Upload Files
+
+```bash
+scp license_server/server.py root@your-server:/opt/license-server/
+scp license_server/static/admin.html root@your-server:/opt/license-server/static/
+scp license_server/deploy_ubuntu.sh root@your-server:/opt/license-server/
+```
+
+#### Bước 2: Deploy
+
+```bash
+ssh root@your-server
+cd /opt/license-server
+chmod +x deploy_ubuntu.sh
+./deploy_ubuntu.sh
+```
+
+#### Bước 3: Configure Domain
+
+```bash
+nano /etc/nginx/sites-available/license-server
+# Update server_name to your domain
+nginx -t
+systemctl restart nginx
+```
+
+#### Bước 4: Enable HTTPS (Khuyên dùng)
+
+```bash
+certbot --nginx -d your-domain.com
+```
+
+#### Bước 5: Access Admin Panel
+
+Truy cập: `http://your-domain.com/static/admin.html`
+
+### Cấu Hình Client
+
+Để sử dụng license server với ứng dụng:
+
+1. Set `LICENSE_SERVER_URL` trong file `.env`:
+   ```env
+   LICENSE_SERVER_URL=http://your-license-server.com
+   ```
+
+2. Để trống để dùng database local (backward compatibility):
+   ```env
+   LICENSE_SERVER_URL=
+   ```
+
+### Quản Lý License
+
+#### Tạo License
+
+1. Truy cập admin panel: `http://your-domain.com/static/admin.html`
+2. Điền thông tin:
+   - Customer Name
+   - Customer Email
+   - Plan Type (basic, pro, enterprise)
+   - Features
+   - Expiry Days (để trống cho lifetime)
+   - Max Jobs
+   - Max Tokens
+   - Machine ID (optional - để bind vào máy cụ thể)
+3. Click "Create License"
+4. Copy license key và gửi cho user
+
+#### Validate License
+
+Khi user nhập license key, ứng dụng sẽ tự động:
+- Gọi API để validate license
+- Check usage limits
+- Update usage statistics
+
+#### Revoke License
+
+1. Truy cập admin panel
+2. Tìm license muốn revoke
+3. Click "Edit"
+4. Change status thành "revoked"
+5. Save
+
+### Service Management
+
+```bash
+# Start service
+systemctl start license-server
+
+# Stop service
+systemctl stop license-server
+
+# Restart service
+systemctl restart license-server
+
+# Check status
+systemctl status license-server
+
+# View logs
+journalctl -u license-server -f
+```
+
+### Backup Database
+
+```bash
+# Backup
+cp /opt/license-server/licenses.db /backup/licenses.db.$(date +%Y%m%d)
+
+# Restore
+cp /backup/licenses.db.20240101 /opt/license-server/licenses.db
+```
+
+### Troubleshooting
+
+#### Service không start
+
+```bash
+# Check logs
+journalctl -u license-server -n 50
+
+# Check port conflicts
+netstat -tlnp | grep 8000
+```
+
+#### Database locked
+
+```bash
+# Restart service
+systemctl restart license-server
+```
+
+#### Nginx errors
+
+```bash
+# Test nginx configuration
+nginx -t
+
+# Check nginx logs
+tail -f /var/log/nginx/error.log
+```
 
 ## Troubleshooting
 

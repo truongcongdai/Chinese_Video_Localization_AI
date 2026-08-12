@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>License Server Admin</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: #2c3e50; color: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
+        .header h1 { font-size: 24px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stat-card h3 { color: #7f8c8d; font-size: 14px; margin-bottom: 10px; }
+        .stat-card .value { font-size: 32px; font-weight: bold; color: #2c3e50; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .card h2 { margin-bottom: 15px; color: #2c3e50; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; color: #34495e; font-weight: 500; }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
+        }
+        .form-group textarea { min-height: 80px; resize: vertical; }
+        .btn { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-primary:hover { background: #2980b9; }
+        .btn-danger { background: #e74c3c; color: white; }
+        .btn-danger:hover { background: #c0392b; }
+        .btn-success { background: #27ae60; color: white; }
+        .btn-success:hover { background: #1e8449; }
+        .table { width: 100%; border-collapse: collapse; }
+        .table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #ecf0f1; }
+        .table th { background: #f8f9fa; font-weight: 600; color: #2c3e50; }
+        .table tr:hover { background: #f8f9fa; }
+        .badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
+        .badge-active { background: #27ae60; color: white; }
+        .badge-revoked { background: #e74c3c; color: white; }
+        .badge-expired { background: #f39c12; color: white; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
+        .modal.active { display: flex; align-items: center; justify-content: center; }
+        .modal-content { background: white; padding: 30px; border-radius: 8px; max-width: 500px; width: 90%; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .modal-header h3 { margin: 0; }
+        .close { background: none; border: none; font-size: 24px; cursor: pointer; }
+        .actions { display: flex; gap: 10px; }
+        .actions .btn { flex: 1; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 License Server Admin</h1>
+            <p>Centralized License Management System</p>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h3>Total Licenses</h3>
+                <div class="value" id="totalLicenses">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Active Licenses</h3>
+                <div class="value" id="activeLicenses">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Revoked Licenses</h3>
+                <div class="value" id="revokedLicenses">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Expired Licenses</h3>
+                <div class="value" id="expiredLicenses">0</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Create New License</h2>
+            <form id="createLicenseForm">
+                <div class="form-group">
+                    <label>Customer Name</label>
+                    <input type="text" id="customerName" required>
+                </div>
+                <div class="form-group">
+                    <label>Customer Email</label>
+                    <input type="email" id="customerEmail" required>
+                </div>
+                <div class="form-group">
+                    <label>Plan Type</label>
+                    <select id="planType" required>
+                        <option value="basic">Basic</option>
+                        <option value="pro">Pro</option>
+                        <option value="enterprise">Enterprise</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Features (comma-separated)</label>
+                    <input type="text" id="features" value="video_localization,transcription,translation" required>
+                </div>
+                <div class="form-group">
+                    <label>Expiry Days (empty for lifetime)</label>
+                    <input type="number" id="expiryDays" placeholder="e.g., 365">
+                </div>
+                <div class="form-group">
+                    <label>Max Jobs</label>
+                    <input type="number" id="maxJobs" value="100" required>
+                </div>
+                <div class="form-group">
+                    <label>Max Tokens</label>
+                    <input type="number" id="maxTokens" value="1000" required>
+                </div>
+                <div class="form-group">
+                    <label>Machine ID (optional - for machine binding)</label>
+                    <input type="text" id="machineId" placeholder="Leave empty for no binding">
+                </div>
+                <div class="form-group">
+                    <label>Notes</label>
+                    <textarea id="notes"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Create License</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>Licenses</h2>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>License Key</th>
+                        <th>Customer</th>
+                        <th>Plan</th>
+                        <th>Status</th>
+                        <th>Expiry</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="licensesTable">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="modal" id="editModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Edit License</h3>
+                <button class="close" onclick="closeModal()">&times;</button>
+            </div>
+            <form id="editLicenseForm">
+                <input type="hidden" id="editLicenseId">
+                <div class="form-group">
+                    <label>Status</label>
+                    <select id="editStatus">
+                        <option value="active">Active</option>
+                        <option value="revoked">Revoked</option>
+                        <option value="expired">Expired</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Expiry Days (empty for lifetime)</label>
+                    <input type="number" id="editExpiryDays">
+                </div>
+                <div class="form-group">
+                    <label>Max Jobs</label>
+                    <input type="number" id="editMaxJobs">
+                </div>
+                <div class="form-group">
+                    <label>Max Tokens</label>
+                    <input type="number" id="editMaxTokens">
+                </div>
+                <div class="form-group">
+                    <label>Notes</label>
+                    <textarea id="editNotes"></textarea>
+                </div>
+                <div class="actions">
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="button" class="btn btn-danger" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000/api';
+
+        async function fetchLicenses() {
+            const response = await fetch(`${API_BASE}/licenses`);
+            const licenses = await response.json();
+            return licenses;
+        }
+
+        async function updateStats() {
+            const licenses = await fetchLicenses();
+            
+            document.getElementById('totalLicenses').textContent = licenses.length;
+            document.getElementById('activeLicenses').textContent = licenses.filter(l => l.status === 'active').length;
+            document.getElementById('revokedLicenses').textContent = licenses.filter(l => l.status === 'revoked').length;
+            document.getElementById('expiredLicenses').textContent = licenses.filter(l => l.status === 'expired').length;
+        }
+
+        async function renderLicenses() {
+            const licenses = await fetchLicenses();
+            const tbody = document.getElementById('licensesTable');
+            
+            tbody.innerHTML = licenses.map(license => `
+                <tr>
+                    <td><code>${license.license_key.substring(0, 20)}...</code></td>
+                    <td>${license.customer_name}<br><small>${license.customer_email}</small></td>
+                    <td>${license.plan_type}</td>
+                    <td><span class="badge badge-${license.status}">${license.status}</span></td>
+                    <td>${license.expiry_date ? new Date(license.expiry_date * 1000).toLocaleDateString() : 'Lifetime'}</td>
+                    <td>
+                        <button class="btn btn-primary" onclick="editLicense(${license.id})">Edit</button>
+                        <button class="btn btn-danger" onclick="deleteLicense(${license.id})">Delete</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function createLicense(e) {
+            e.preventDefault();
+            
+            const data = {
+                customer_name: document.getElementById('customerName').value,
+                customer_email: document.getElementById('customerEmail').value,
+                plan_type: document.getElementById('planType').value,
+                features: document.getElementById('features').value.split(',').map(f => f.trim()),
+                expiry_days: document.getElementById('expiryDays').value ? parseInt(document.getElementById('expiryDays').value) : null,
+                max_jobs: parseInt(document.getElementById('maxJobs').value),
+                max_tokens: parseInt(document.getElementById('maxTokens').value),
+                machine_id: document.getElementById('machineId').value || null,
+                notes: document.getElementById('notes').value || null
+            };
+            
+            const response = await fetch(`${API_BASE}/licenses`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                alert(`License created successfully!\n\nLicense Key: ${result.license_key}\n\nPlease save this key securely.`);
+                document.getElementById('createLicenseForm').reset();
+                renderLicenses();
+                updateStats();
+            } else {
+                alert('Failed to create license');
+            }
+        }
+
+        async function editLicense(id) {
+            const response = await fetch(`${API_BASE}/licenses/${id}`);
+            const license = await response.json();
+            
+            document.getElementById('editLicenseId').value = license.id;
+            document.getElementById('editStatus').value = license.status;
+            document.getElementById('editExpiryDays').value = '';
+            document.getElementById('editMaxJobs').value = license.max_jobs;
+            document.getElementById('editMaxTokens').value = license.max_tokens;
+            document.getElementById('editNotes').value = license.notes || '';
+            
+            document.getElementById('editModal').classList.add('active');
+        }
+
+        async function saveLicense(e) {
+            e.preventDefault();
+            
+            const id = document.getElementById('editLicenseId').value;
+            const data = {
+                status: document.getElementById('editStatus').value,
+                expiry_days: document.getElementById('editExpiryDays').value ? parseInt(document.getElementById('editExpiryDays').value) : null,
+                max_jobs: parseInt(document.getElementById('editMaxJobs').value),
+                max_tokens: parseInt(document.getElementById('editMaxTokens').value),
+                notes: document.getElementById('editNotes').value || null
+            };
+            
+            const response = await fetch(`${API_BASE}/licenses/${id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                closeModal();
+                renderLicenses();
+                updateStats();
+            } else {
+                alert('Failed to update license');
+            }
+        }
+
+        async function deleteLicense(id) {
+            if (!confirm('Are you sure you want to delete this license?')) return;
+            
+            const response = await fetch(`${API_BASE}/licenses/${id}`, {
+                method: 'DELETE'
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                renderLicenses();
+                updateStats();
+            } else {
+                alert('Failed to delete license');
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('editModal').classList.remove('active');
+        }
+
+        document.getElementById('createLicenseForm').addEventListener('submit', createLicense);
+        document.getElementById('editLicenseForm').addEventListener('submit', saveLicense);
+
+        // Initial load
+        renderLicenses();
+        updateStats();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(() => {
+            renderLicenses();
+            updateStats();
+        }, 30000);
+    </script>
+</body>
+</html>

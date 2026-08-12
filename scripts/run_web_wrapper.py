@@ -20,11 +20,31 @@ if str(script_dir.parent) not in sys.path:
 import uvicorn
 from dotenv import load_dotenv
 
-# Load .env from parent directory (dist folder when running from exe)
-repo_root = script_dir.parent
-env_file = repo_root / ".env"
-if env_file.exists():
-    load_dotenv(env_file)
+# Load .env from multiple possible locations
+# When running from .exe, the current directory is dist/
+# We need to check dist/.env and dist/ChineseVideoLocalizationAI/.env
+env_locations = [
+    Path.cwd() / ".env",  # Current directory (dist/)
+    Path.cwd() / "ChineseVideoLocalizationAI" / ".env",  # Subdirectory
+    Path(__file__).parent.parent / ".env",  # Parent of scripts (repo root)
+    Path(__file__).parent / ".env",  # Same directory as script
+    Path(__file__).parent.parent / "dist" / ".env",  # dist/ folder
+    Path(__file__).parent.parent / "dist" / "ChineseVideoLocalizationAI" / ".env",  # dist/ChineseVideoLocalizationAI/
+]
+
+env_loaded = False
+for env_file in env_locations:
+    if env_file.exists():
+        print(f"Loading .env from: {env_file}")
+        load_dotenv(env_file)
+        env_loaded = True
+        break
+
+if not env_loaded:
+    print("WARNING: .env file not found in any of these locations:")
+    for loc in env_locations:
+        print(f"  - {loc}")
+    print("WEB_SESSION_SECRET may not be set!")
 
 def main():
     # Import the app directly instead of using string
@@ -36,7 +56,7 @@ def main():
         print(f"Current directory: {os.getcwd()}")
         print(f"Script directory: {script_dir}")
         print(f"Src directory: {src_dir}")
-        print(f"Repo root: {repo_root}")
+        print(f"Repo root: {script_dir.parent}")
         raise
 
     port = int(os.environ.get("WEB_PORT", "8080"))

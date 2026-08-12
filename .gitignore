@@ -3,13 +3,8 @@ __pycache__/
 
 .env
 venv
-BUILD_EXE_GUIDE.md
 Chinese_Video_Localization_AI_Windows_Build.zip
 Chinese_Video_Localization_AI_Windows_Build/
-build_exe.bat
-build_exe.spec
-build_nuitka.bat
-prepare_for_windows_build.sh
 scripts/verify_web_environment.py
 src/universal_video_ai/downloader/channel.py
 src/universal_video_ai/publishing/

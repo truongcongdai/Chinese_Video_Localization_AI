@@ -177,7 +177,55 @@ WEB_WHISPER_PRO_MODEL = os.environ.get("WEB_WHISPER_PRO_MODEL", "medium")
 DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
+# License Server Configuration
+LICENSE_SERVER_URL = os.environ.get("LICENSE_SERVER_URL", "").strip()
+USE_LICENSE_SERVER = bool(LICENSE_SERVER_URL)
+
 store = Store(_DB_PATH)
+
+
+def validate_license_with_server(license_key: str, machine_id: str) -> Optional[Dict]:
+    """Validate license with centralized license server"""
+    if not USE_LICENSE_SERVER:
+        return None
+    
+    try:
+        response = requests.post(
+            f"{LICENSE_SERVER_URL}/api/licenses/validate",
+            json={"license_key": license_key, "machine_id": machine_id},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"License server returned error: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to validate license with server: {e}")
+        return None
+
+
+def update_license_usage_on_server(license_id: int, machine_id: str, jobs_delta: int = 0, tokens_delta: int = 0) -> bool:
+    """Update license usage on centralized license server"""
+    if not USE_LICENSE_SERVER:
+        return False
+    
+    try:
+        response = requests.post(
+            f"{LICENSE_SERVER_URL}/api/licenses/{license_id}/usage",
+            json={
+                "machine_id": machine_id,
+                "jobs_delta": jobs_delta,
+                "tokens_delta": tokens_delta
+            },
+            timeout=10
+        )
+        
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to update license usage on server: {e}")
+        return False
 
 
 def _resolve_publishing_config_for_user(
@@ -953,6 +1001,8 @@ def bootstrap():
         "needs_registration": not store.any_users_exist(),
         "open_registration": OPEN_REGISTRATION,
         "job_cost_credits": JOB_COST_CREDITS,
+        "use_license_server": USE_LICENSE_SERVER,
+        "license_server_url": LICENSE_SERVER_URL if USE_LICENSE_SERVER else None,
         "top_up_packages": [
             {"credits": credits, "amount_vnd": amount}
             for credits, amount in sorted(TOP_UP_PACKAGES.items())
@@ -4567,23 +4617,53 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         )
 
     # Check license limits
-    license = store.get_license_by_user(user_id)
-    if license:
-        can_proceed, limit_error = store.check_license_limits(license, user_id)
-        if not can_proceed:
-            raise HTTPException(403, f"License limit: {limit_error}")
-    else:
-        # Check free trial
+    if USE_LICENSE_SERVER:
+        # Use centralized license server
         machine_id = store.get_machine_id()
-        trial = store.get_free_trial(user_id, machine_id)
-        if trial:
-            if trial.expiry_date < time.time():
-                raise HTTPException(403, "Trial đã hết hạn. Vui lòng kích hoạt license để tiếp tục.")
-            if trial.tokens_remaining <= 0:
-                raise HTTPException(403, "Đã hết token trial. Vui lòng kích hoạt license để tiếp tục.")
+        user_license = store.get_license_by_user(user_id)
+        
+        if user_license:
+            # Validate with centralized server
+            validation_result = validate_license_with_server(user_license.license_key, machine_id)
+            
+            if validation_result and validation_result.get("valid"):
+                license_data = validation_result.get("license", {})
+                
+                # Check limits from server response
+                jobs_used = license_data.get("jobs_used", 0)
+                tokens_used = license_data.get("tokens_used", 0)
+                max_jobs = license_data.get("max_jobs", 100)
+                max_tokens = license_data.get("max_tokens", 1000)
+                
+                if jobs_used >= max_jobs:
+                    raise HTTPException(403, f"Đã đạt giới hạn số jobs ({max_jobs}).")
+                if tokens_used >= max_tokens:
+                    raise HTTPException(403, f"Đã đạt giới hạn số tokens ({max_tokens}).")
+            else:
+                error = validation_result.get("error", "License không hợp lệ") if validation_result else "Không thể kết nối đến license server"
+                raise HTTPException(403, f"License validation failed: {error}")
         else:
-            # No license and no trial - allow for now (backward compatibility)
-            pass
+            # No license - check if free trial is allowed
+            raise HTTPException(403, "Vui lòng nhập license key để sử dụng. Liên hệ admin để được cấp license.")
+    else:
+        # Use local database (backward compatibility)
+        license = store.get_license_by_user(user_id)
+        if license:
+            can_proceed, limit_error = store.check_license_limits(license, user_id)
+            if not can_proceed:
+                raise HTTPException(403, f"License limit: {limit_error}")
+        else:
+            # Check free trial
+            machine_id = store.get_machine_id()
+            trial = store.get_free_trial(user_id, machine_id)
+            if trial:
+                if trial.expiry_date < time.time():
+                    raise HTTPException(403, "Trial đã hết hạn. Vui lòng kích hoạt license để tiếp tục.")
+                if trial.tokens_remaining <= 0:
+                    raise HTTPException(403, "Đã hết token trial. Vui lòng kích hoạt license để tiếp tục.")
+            else:
+                # No license and no trial - allow for now (backward compatibility)
+                pass
 
     logo_path = None
     if body.logo_path:
