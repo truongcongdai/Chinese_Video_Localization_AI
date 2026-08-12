@@ -480,6 +480,62 @@ CREATE INDEX IF NOT EXISTS idx_content_os_approvals_user_id ON content_os_approv
 CREATE INDEX IF NOT EXISTS idx_content_os_memories_user_id ON content_os_memories(user_id);
 CREATE INDEX IF NOT EXISTS idx_content_os_memories_channel_key ON content_os_memories(channel_key);
 CREATE INDEX IF NOT EXISTS idx_content_os_memories_active ON content_os_memories(active);
+
+-- License management system
+CREATE TABLE IF NOT EXISTS licenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_key TEXT UNIQUE NOT NULL,
+    user_id INTEGER,
+    customer_name TEXT,
+    customer_email TEXT,
+    plan_type TEXT NOT NULL DEFAULT 'basic',  -- basic | pro | enterprise
+    features_json TEXT NOT NULL DEFAULT '[]',  -- List of enabled features
+    expiry_date REAL,
+    max_jobs INTEGER NOT NULL DEFAULT -1,  -- -1 = unlimited
+    max_tokens INTEGER NOT NULL DEFAULT -1,  -- -1 = unlimited
+    status TEXT NOT NULL DEFAULT 'active',  -- active | suspended | expired | revoked
+    notes TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key);
+CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id);
+CREATE INDEX IF NOT EXISTS idx_licenses_status ON licenses(status);
+
+-- License usage tracking
+CREATE TABLE IF NOT EXISTS license_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    jobs_completed INTEGER NOT NULL DEFAULT 0,
+    last_used_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(license_id) REFERENCES licenses(id),
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    UNIQUE(license_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_license_usage_license_id ON license_usage(license_id);
+CREATE INDEX IF NOT EXISTS idx_license_usage_user_id ON license_usage(user_id);
+
+-- Free trial tracking (token-based)
+CREATE TABLE IF NOT EXISTS free_trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    machine_id TEXT,  -- Hardware fingerprint for offline tracking
+    tokens_remaining INTEGER NOT NULL DEFAULT 10,
+    expiry_date REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_free_trials_user_id ON free_trials(user_id);
+CREATE INDEX IF NOT EXISTS idx_free_trials_machine_id ON free_trials(machine_id);
 """
 
 _MIGRATIONS = [
@@ -589,6 +645,7 @@ _MIGRATIONS = [
     ("content_os_projects", "status",
      "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
     # Trend Scanner tables (new feature, no migration needed for fresh installs)
+    # License system tables (new feature, no migration needed for fresh installs)
 ]
 
 
@@ -728,6 +785,102 @@ class Job:
         remix_platforms_json = d.pop("remix_platforms_json", None)
         d["remix_platforms"] = json.loads(remix_platforms_json) if remix_platforms_json else []
         return d
+
+
+@dataclass
+class License:
+    id: Optional[int]
+    license_key: str
+    user_id: Optional[int]
+    customer_name: Optional[str]
+    customer_email: Optional[str]
+    plan_type: str
+    features: List[str]
+    expiry_date: Optional[float]
+    max_jobs: int
+    max_tokens: int
+    status: str
+    notes: Optional[str]
+    created_at: float
+    updated_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = self.__dict__.copy()
+        d["features_json"] = json.dumps(d.pop("features", []))
+        return d
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "License":
+        return cls(
+            id=row["id"],
+            license_key=row["license_key"],
+            user_id=row["user_id"],
+            customer_name=row["customer_name"],
+            customer_email=row["customer_email"],
+            plan_type=row["plan_type"],
+            features=json.loads(row["features_json"]) if row["features_json"] else [],
+            expiry_date=row["expiry_date"],
+            max_jobs=row["max_jobs"],
+            max_tokens=row["max_tokens"],
+            status=row["status"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class LicenseUsage:
+    id: Optional[int]
+    license_id: int
+    user_id: int
+    tokens_used: int
+    jobs_completed: int
+    last_used_at: Optional[float]
+    created_at: float
+    updated_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "LicenseUsage":
+        return cls(
+            id=row["id"],
+            license_id=row["license_id"],
+            user_id=row["user_id"],
+            tokens_used=row["tokens_used"],
+            jobs_completed=row["jobs_completed"],
+            last_used_at=row["last_used_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class FreeTrial:
+    id: Optional[int]
+    user_id: int
+    machine_id: Optional[str]
+    tokens_remaining: int
+    expiry_date: float
+    created_at: float
+    updated_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "FreeTrial":
+        return cls(
+            id=row["id"],
+            user_id=row["user_id"],
+            machine_id=row["machine_id"],
+            tokens_remaining=row["tokens_remaining"],
+            expiry_date=row["expiry_date"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
 
 class Store:
@@ -1887,6 +2040,217 @@ class Store:
                 (time.time(), post_id, user_id),
             )
             return cur.rowcount > 0
+
+    # ---- License management ----
+    def create_license(self, license_data: Dict[str, Any]) -> License:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO licenses (license_key, user_id, customer_name, customer_email, 
+                   plan_type, features_json, expiry_date, max_jobs, max_tokens, status, notes, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    license_data["license_key"],
+                    license_data.get("user_id"),
+                    license_data.get("customer_name"),
+                    license_data.get("customer_email"),
+                    license_data.get("plan_type", "basic"),
+                    json.dumps(license_data.get("features", [])),
+                    license_data.get("expiry_date"),
+                    license_data.get("max_jobs", -1),
+                    license_data.get("max_tokens", -1),
+                    license_data.get("status", "active"),
+                    license_data.get("notes"),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM licenses WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return License.from_row(row)
+
+    def get_license_by_key(self, license_key: str) -> Optional[License]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,)).fetchone()
+            return License.from_row(row) if row else None
+
+    def get_license_by_user(self, user_id: int) -> Optional[License]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM licenses WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            return License.from_row(row) if row else None
+
+    def list_licenses(self, status: Optional[str] = None, limit: int = 100) -> List[License]:
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM licenses WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM licenses ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [License.from_row(row) for row in rows]
+
+    def update_license(self, license_id: int, updates: Dict[str, Any]) -> bool:
+        now = time.time()
+        allowed_fields = {
+            "user_id", "customer_name", "customer_email", "plan_type",
+            "features", "expiry_date", "max_jobs", "max_tokens", "status", "notes"
+        }
+        set_clauses = []
+        values = []
+        
+        for field, value in updates.items():
+            if field in allowed_fields:
+                if field == "features":
+                    set_clauses.append("features_json = ?")
+                    values.append(json.dumps(value))
+                else:
+                    set_clauses.append(f"{field} = ?")
+                    values.append(value)
+        
+        if not set_clauses:
+            return False
+        
+        set_clauses.append("updated_at = ?")
+        values.append(now)
+        values.append(license_id)
+        
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE licenses SET {', '.join(set_clauses)} WHERE id = ?",
+                values,
+            )
+            return cur.rowcount > 0
+
+    def delete_license(self, license_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM licenses WHERE id = ?", (license_id,))
+            return cur.rowcount > 0
+
+    def validate_license(self, license_key: str) -> Tuple[bool, Optional[License], Optional[str]]:
+        """Validate license key and return (is_valid, license, error_message)"""
+        license = self.get_license_by_key(license_key)
+        if not license:
+            return False, None, "License key không tồn tại"
+        
+        if license.status != "active":
+            return False, license, f"License đã bị {license.status}"
+        
+        if license.expiry_date and license.expiry_date < time.time():
+            self.update_license(license.id, {"status": "expired"})
+            return False, license, "License đã hết hạn"
+        
+        return True, license, None
+
+    def get_license_usage(self, license_id: int, user_id: int) -> Optional[LicenseUsage]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM license_usage WHERE license_id = ? AND user_id = ?",
+                (license_id, user_id),
+            ).fetchone()
+            return LicenseUsage.from_row(row) if row else None
+
+    def update_license_usage(self, license_id: int, user_id: int, tokens_delta: int = 0, jobs_delta: int = 0) -> LicenseUsage:
+        now = time.time()
+        with self._connect() as conn:
+            # Try to update existing record
+            cur = conn.execute(
+                """UPDATE license_usage 
+                   SET tokens_used = tokens_used + ?, jobs_completed = jobs_completed + ?, 
+                       last_used_at = ?, updated_at = ?
+                   WHERE license_id = ? AND user_id = ?""",
+                (tokens_delta, jobs_delta, now, now, license_id, user_id),
+            )
+            
+            if cur.rowcount == 0:
+                # Create new record
+                cur = conn.execute(
+                    """INSERT INTO license_usage (license_id, user_id, tokens_used, jobs_completed, last_used_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (license_id, user_id, tokens_delta, jobs_delta, now, now, now),
+                )
+            
+            row = conn.execute(
+                "SELECT * FROM license_usage WHERE license_id = ? AND user_id = ?",
+                (license_id, user_id),
+            ).fetchone()
+            return LicenseUsage.from_row(row)
+
+    def check_license_limits(self, license: License, user_id: int) -> Tuple[bool, Optional[str]]:
+        """Check if user has reached license limits"""
+        usage = self.get_license_usage(license.id, user_id)
+        if not usage:
+            return True, None
+        
+        if license.max_jobs > 0 and usage.jobs_completed >= license.max_jobs:
+            return False, f"Đã đạt giới hạn số job ({license.max_jobs})"
+        
+        if license.max_tokens > 0 and usage.tokens_used >= license.max_tokens:
+            return False, f"Đã đạt giới hạn số token ({license.max_tokens})"
+        
+        return True, None
+
+    # ---- Free trial management ----
+    def create_free_trial(self, user_id: int, machine_id: Optional[str], tokens: int = 10, days: int = 7) -> FreeTrial:
+        now = time.time()
+        expiry = now + (days * 24 * 60 * 60)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO free_trials (user_id, machine_id, tokens_remaining, expiry_date, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, machine_id, tokens, expiry, now, now),
+            )
+            row = conn.execute("SELECT * FROM free_trials WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return FreeTrial.from_row(row)
+
+    def get_free_trial(self, user_id: int, machine_id: Optional[str] = None) -> Optional[FreeTrial]:
+        with self._connect() as conn:
+            if machine_id:
+                row = conn.execute(
+                    "SELECT * FROM free_trials WHERE user_id = ? AND machine_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (user_id, machine_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM free_trials WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+            return FreeTrial.from_row(row) if row else None
+
+    def consume_trial_token(self, user_id: int, machine_id: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """Consume one trial token, return (success, error_message)"""
+        trial = self.get_free_trial(user_id, machine_id)
+        if not trial:
+            return False, "Không tìm thấy trial"
+        
+        if trial.expiry_date < time.time():
+            return False, "Trial đã hết hạn"
+        
+        if trial.tokens_remaining <= 0:
+            return False, "Đã hết token trial"
+        
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE free_trials SET tokens_remaining = tokens_remaining - 1, updated_at = ? WHERE id = ?",
+                (time.time(), trial.id),
+            )
+            if cur.rowcount > 0:
+                return True, None
+            return False, "Không thể cập nhật trial"
+
+    def get_machine_id(self) -> str:
+        """Generate a machine ID based on hardware fingerprint"""
+        import platform
+        import hashlib
+        
+        # Create a fingerprint from machine info
+        machine_info = f"{platform.node()}-{platform.system()}-{platform.machine()}"
+        return hashlib.sha256(machine_info.encode()).hexdigest()[:32]
 
     # ---- publish log ----
     def log_publish(self, job_id: str, platform: str, success: bool, message: str,

@@ -5,10 +5,11 @@ Usage: pyinstaller build_exe.spec
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Get the repository root
-REPO_ROOT = Path(__file__).parent.resolve()
+REPO_ROOT = Path(os.getcwd()).resolve()
 SRC_DIR = REPO_ROOT / "src"
 WEB_STATIC_DIR = SRC_DIR / "universal_video_ai" / "web" / "static"
 
@@ -33,44 +34,52 @@ hiddenimports = [
     'torch.nn',
     'torchvision',
     'torchaudio',
-    
+
     # Diffusers & Transformers
     'diffusers',
     'transformers',
     'accelerate',
     'safetensors',
-    
+
     # Audio processing
     'librosa',
     'demucs',
     'openai.whisper',
     'edge_tts',
-    
+
     # OCR
     'easyocr',
-    
+
     # Web framework
     'uvicorn',
     'fastapi',
     'starlette',
-    
+
     # Other dependencies
     'yt_dlp',
     'redis',
     'passlib',
+    'passlib.handlers',
+    'passlib.handlers.bcrypt',
+    'passlib.handlers.sha2_crypt',
     'bcrypt',
     'googletrans',
     'mutagen',
-    
-    # Universal Video AI modules
+
+    # Universal Video AI modules - collect all submodules
+    'universal_video_ai',
     'universal_video_ai.config',
     'universal_video_ai.orchestrator',
     'universal_video_ai.web',
+    'universal_video_ai.web.app',
+    'universal_video_ai.web.store',
+    'universal_video_ai.web.auth',
+    'universal_video_ai.web.static',
 ]
 
 a = Analysis(
-    ['scripts/run_web.py'],
-    pathex=[str(REPO_ROOT), str(SRC_DIR)],
+    ['scripts/run_web_wrapper.py'],
+    pathex=[str(REPO_ROOT), str(SRC_DIR), str(SRC_DIR / "universal_video_ai")],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
@@ -105,7 +114,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Set to False to hide console window
+    console=True,  # Keep console to see errors and startup messages
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

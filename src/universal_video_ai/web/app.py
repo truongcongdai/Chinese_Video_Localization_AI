@@ -94,7 +94,7 @@ from universal_video_ai.downloader.channel import (
 )
 from universal_video_ai.downloader.platform import Platform
 
-from .store import Store
+from .store import Store, License, LicenseUsage, FreeTrial
 from .auth import (
     COOKIE_NAME, hash_password, verify_password,
     create_session_cookie_value, get_current_user_id,
@@ -792,6 +792,40 @@ class CreateUserBody(BaseModel):
     username: str
     password: str
     credits: int = 10
+
+
+class LicenseBody(BaseModel):
+    license_key: str
+    user_id: Optional[int] = None
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    plan_type: str = "basic"  # basic | pro | enterprise
+    features: List[str] = Field(default_factory=list)
+    expiry_days: Optional[int] = None  # Days from now, None = lifetime
+    max_jobs: int = -1  # -1 = unlimited
+    max_tokens: int = -1  # -1 = unlimited
+    status: str = "active"
+    notes: Optional[str] = None
+
+
+class LicenseUpdateBody(BaseModel):
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    plan_type: Optional[str] = None
+    features: Optional[List[str]] = None
+    expiry_days: Optional[int] = None
+    max_jobs: Optional[int] = None
+    max_tokens: Optional[int] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LicenseValidateBody(BaseModel):
+    license_key: str
+
+
+class LicenseActivateBody(BaseModel):
+    license_key: str
 
 
 # ----------------------------------------------------------------- pages --
@@ -1675,10 +1709,27 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         if generated and generated.recommended_title:
             title = generated.recommended_title
         store.update_job(job_id, status="done", progress_note="Hoàn tất", title=title)
+        _update_license_usage(job.user_id, job_id)
     else:
         store.update_job(job_id, status="error",
                          error="Không tạo được video đầu ra (final_video_path rỗng)")
         _refund_job_credits(job)
+
+
+def _update_license_usage(user_id: int, job_id: str) -> None:
+    """Update license usage when a job completes successfully"""
+    try:
+        license = store.get_license_by_user(user_id)
+        if license:
+            store.update_license_usage(license.id, user_id, tokens_delta=1, jobs_delta=1)
+        else:
+            # Consume trial token
+            machine_id = store.get_machine_id()
+            success, error = store.consume_trial_token(user_id, machine_id)
+            if not success:
+                logger.warning(f"Failed to consume trial token for user {user_id}: {error}")
+    except Exception as e:
+        logger.exception(f"Failed to update license usage for user {user_id}: {e}")
 
 
 def _write_job_srt_artifacts(
@@ -4327,6 +4378,7 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
             ),
             final_video_path=str(output_path), title=body.topic.strip()[:80],
         )
+        _update_license_usage(user_id, job_id)
     except Exception as exc:
         logger.exception("Creator job %s failed", job_id)
         store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
@@ -4513,6 +4565,25 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
             f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS}). "
             "Liên hệ admin để được cấp thêm.",
         )
+
+    # Check license limits
+    license = store.get_license_by_user(user_id)
+    if license:
+        can_proceed, limit_error = store.check_license_limits(license, user_id)
+        if not can_proceed:
+            raise HTTPException(403, f"License limit: {limit_error}")
+    else:
+        # Check free trial
+        machine_id = store.get_machine_id()
+        trial = store.get_free_trial(user_id, machine_id)
+        if trial:
+            if trial.expiry_date < time.time():
+                raise HTTPException(403, "Trial đã hết hạn. Vui lòng kích hoạt license để tiếp tục.")
+            if trial.tokens_remaining <= 0:
+                raise HTTPException(403, "Đã hết token trial. Vui lòng kích hoạt license để tiếp tục.")
+        else:
+            # No license and no trial - allow for now (backward compatibility)
+            pass
 
     logo_path = None
     if body.logo_path:
@@ -7436,6 +7507,180 @@ def admin_reject_top_up_request(
     if row is None:
         raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
     return {"ok": True, "status": row["status"]}
+
+
+# ---------------------------------------------------------------- License Management --
+
+@app.post("/api/admin/licenses")
+def admin_create_license(body: LicenseBody, _admin_id: int = Depends(require_admin_user_id)):
+    """Create a new license key (admin only)"""
+    # Generate expiry date from days
+    expiry_date = None
+    if body.expiry_days:
+        expiry_date = time.time() + (body.expiry_days * 24 * 60 * 60)
+    
+    license_data = {
+        "license_key": body.license_key,
+        "user_id": body.user_id,
+        "customer_name": body.customer_name,
+        "customer_email": body.customer_email,
+        "plan_type": body.plan_type,
+        "features": body.features,
+        "expiry_date": expiry_date,
+        "max_jobs": body.max_jobs,
+        "max_tokens": body.max_tokens,
+        "status": body.status,
+        "notes": body.notes,
+    }
+    
+    try:
+        license = store.create_license(license_data)
+        return license.to_dict()
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "License key đã tồn tại")
+
+
+@app.get("/api/admin/licenses")
+def admin_list_licenses(
+    status: Optional[str] = None,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    """List all licenses (admin only)"""
+    licenses = store.list_licenses(status=status)
+    return [license.to_dict() for license in licenses]
+
+
+@app.get("/api/admin/licenses/{license_id}")
+def admin_get_license(license_id: int, _admin_id: int = Depends(require_admin_user_id)):
+    """Get a specific license by ID (admin only)"""
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM licenses WHERE id = ?", (license_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Không tìm thấy license")
+        return License.from_row(row).to_dict()
+
+
+@app.put("/api/admin/licenses/{license_id}")
+def admin_update_license(
+    license_id: int,
+    body: LicenseUpdateBody,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    """Update a license (admin only)"""
+    updates = {}
+    if body.customer_name is not None:
+        updates["customer_name"] = body.customer_name
+    if body.customer_email is not None:
+        updates["customer_email"] = body.customer_email
+    if body.plan_type is not None:
+        updates["plan_type"] = body.plan_type
+    if body.features is not None:
+        updates["features"] = body.features
+    if body.expiry_days is not None:
+        updates["expiry_date"] = time.time() + (body.expiry_days * 24 * 60 * 60)
+    if body.max_jobs is not None:
+        updates["max_jobs"] = body.max_jobs
+    if body.max_tokens is not None:
+        updates["max_tokens"] = body.max_tokens
+    if body.status is not None:
+        updates["status"] = body.status
+    if body.notes is not None:
+        updates["notes"] = body.notes
+    
+    if not updates:
+        raise HTTPException(400, "Không có field nào để cập nhật")
+    
+    if not store.update_license(license_id, updates):
+        raise HTTPException(404, "Không tìm thấy license")
+    
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM licenses WHERE id = ?", (license_id,)).fetchone()
+        return License.from_row(row).to_dict()
+
+
+@app.delete("/api/admin/licenses/{license_id}", status_code=204)
+def admin_delete_license(license_id: int, _admin_id: int = Depends(require_admin_user_id)):
+    """Delete a license (admin only)"""
+    if not store.delete_license(license_id):
+        raise HTTPException(404, "Không tìm thấy license")
+    return Response(status_code=204)
+
+
+@app.post("/api/licenses/validate")
+def validate_license(body: LicenseValidateBody):
+    """Validate a license key (public endpoint)"""
+    is_valid, license, error = store.validate_license(body.license_key)
+    if is_valid:
+        return {
+            "valid": True,
+            "license": license.to_dict() if license else None,
+        }
+    return {
+        "valid": False,
+        "error": error,
+    }
+
+
+@app.post("/api/licenses/activate")
+def activate_license(
+    body: LicenseActivateBody,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Activate a license key for the current user"""
+    is_valid, license, error = store.validate_license(body.license_key)
+    if not is_valid:
+        raise HTTPException(400, error or "License không hợp lệ")
+    
+    # Link license to user if not already linked
+    if license.user_id is None:
+        store.update_license(license.id, {"user_id": user_id})
+    elif license.user_id != user_id:
+        raise HTTPException(400, "License đã được kích hoạt bởi user khác")
+    
+    return {
+        "ok": True,
+        "license": license.to_dict(),
+    }
+
+
+@app.get("/api/me/license")
+def get_my_license(user_id: int = Depends(get_current_user_id)):
+    """Get the current user's active license"""
+    license = store.get_license_by_user(user_id)
+    if not license:
+        return {"license": None}
+    
+    # Get usage info
+    usage = store.get_license_usage(license.id, user_id)
+    result = license.to_dict()
+    result["usage"] = usage.to_dict() if usage else None
+    return {"license": result}
+
+
+@app.get("/api/me/free-trial")
+def get_my_free_trial(user_id: int = Depends(get_current_user_id)):
+    """Get the current user's free trial status"""
+    machine_id = store.get_machine_id()
+    trial = store.get_free_trial(user_id, machine_id)
+    if not trial:
+        return {"trial": None}
+    return {"trial": trial.to_dict()}
+
+
+@app.post("/api/me/free-trial/start")
+def start_free_trial(user_id: int = Depends(get_current_user_id)):
+    """Start a free trial for the current user"""
+    machine_id = store.get_machine_id()
+    
+    # Check if trial already exists
+    existing = store.get_free_trial(user_id, machine_id)
+    if existing:
+        if existing.expiry_date < time.time():
+            raise HTTPException(400, "Trial đã hết hạn")
+        raise HTTPException(400, "Đã có trial đang hoạt động")
+    
+    trial = store.create_free_trial(user_id, machine_id, tokens=10, days=7)
+    return {"trial": trial.to_dict()}
 
 
 # ---------------------------------------------------------------- Trend Scanner --

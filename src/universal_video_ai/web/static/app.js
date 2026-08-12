@@ -292,8 +292,79 @@ async function refreshMe() {
     const me = await api("/api/me");
     $("#userbar-credits").textContent = `💳 ${me.credits}`;
     $("#stat-credits").textContent = me.credits;
+    await loadLicenseInfo();
   } catch (e) { /* session likely expired; next job/history poll will surface it */ }
 }
+
+async function loadLicenseInfo() {
+  try {
+    const [licenseRes, trialRes] = await Promise.all([
+      api("/api/me/license"),
+      api("/api/me/free-trial"),
+    ]);
+    
+    const licenseInfo = $("#license-info");
+    const trialInfo = $("#trial-info");
+    
+    if (licenseRes.license) {
+      const l = licenseRes.license;
+      const usage = l.usage || { tokens_used: 0, jobs_completed: 0 };
+      licenseInfo.innerHTML = `
+        <div style="font-size:13px">
+          <strong>License:</strong> <span class="badge ${l.plan_type}">${l.plan_type}</span><br>
+          <strong>Khách hàng:</strong> ${l.customer_name || "-"}<br>
+          <strong>Features:</strong> ${l.features.length ? l.features.join(", ") : "Tất cả"}<br>
+          <strong>Hết hạn:</strong> ${l.expiry_date ? new Date(l.expiry_date * 1000).toLocaleDateString() : "Lifetime"}<br>
+          <strong>Sử dụng:</strong> ${usage.jobs_completed}/${l.max_jobs === -1 ? "∞" : l.max_jobs} jobs, ${usage.tokens_used}/${l.max_tokens === -1 ? "∞" : l.max_tokens} tokens
+        </div>
+      `;
+    } else {
+      licenseInfo.innerHTML = `<div style="font-size:13px;color:var(--text-dim)">Chưa có license nào được kích hoạt.</div>`;
+    }
+    
+    if (trialRes.trial) {
+      const t = trialRes.trial;
+      const daysLeft = Math.ceil((t.expiry_date - Date.now()/1000) / 86400);
+      trialInfo.innerHTML = `🎁 Trial: ${t.tokens_remaining} token còn lại, hết hạn sau ${daysLeft} ngày`;
+    } else {
+      trialInfo.innerHTML = "";
+    }
+  } catch (e) {
+    console.error("Failed to load license info:", e);
+  }
+}
+
+// License activation
+$("#activate-license-btn").onclick = async () => {
+  const licenseKey = $("#license-input").value.trim();
+  if (!licenseKey) {
+    alert("Vui lòng nhập license key");
+    return;
+  }
+  
+  try {
+    await api("/api/licenses/activate", {
+      method: "POST",
+      body: JSON.stringify({ license_key: licenseKey }),
+    });
+    $("#license-input").value = "";
+    alert("License đã được kích hoạt thành công!");
+    await loadLicenseInfo();
+  } catch (e) {
+    alert("Lỗi kích hoạt license: " + (e.message || "License không hợp lệ"));
+  }
+};
+
+// Start free trial
+$("#start-trial-btn").onclick = async () => {
+  try {
+    const res = await api("/api/me/free-trial/start", { method: "POST" });
+    alert("Đã bắt đầu dùng thử miễn phí! Bạn có " + res.trial.tokens_remaining + " token.");
+    await loadLicenseInfo();
+  } catch (e) {
+    alert("Lỗi: " + (e.message || "Không thể bắt đầu trial"));
+  }
+};
 
 window.addEventListener("message", (ev) => {
   if (ev.data === "social-connected") {
@@ -4086,8 +4157,8 @@ $("#admin-back-btn").onclick = () => {
 };
 
 async function loadAdmin() {
-  const [stats, users, feedback, topups] = await Promise.all([
-    api("/api/admin/stats"), api("/api/admin/users"), api("/api/admin/feedback"), api("/api/admin/top-up-requests"),
+  const [stats, users, feedback, topups, licenses] = await Promise.all([
+    api("/api/admin/stats"), api("/api/admin/users"), api("/api/admin/feedback"), api("/api/admin/top-up-requests"), api("/api/admin/licenses"),
   ]);
 
   $("#admin-stats").innerHTML = `
@@ -4167,7 +4238,134 @@ async function loadAdmin() {
       <td>${new Date(f.created_at * 1000).toLocaleString(uiLocale())}</td>
     </tr>
   `).join("");
+
+  // Load licenses
+  loadLicenses(licenses);
 }
+
+function loadLicenses(licenses) {
+  $("#admin-licenses-empty").classList.toggle("hidden", licenses.length > 0);
+  $("#admin-licenses-body").innerHTML = licenses.map(l => `
+    <tr>
+      <td><code style="font-size:12px">${_escapeHtml(l.license_key.substring(0, 20))}...</code></td>
+      <td>${_escapeHtml(l.customer_name || "-")}<br><span style="color:var(--text-dim);font-size:11px">${_escapeHtml(l.customer_email || "")}</span></td>
+      <td><span class="badge ${l.plan_type}">${l.plan_type}</span></td>
+      <td style="max-width:150px;font-size:12px">${l.features.length ? l.features.join(", ") : "-"}</td>
+      <td>${l.expiry_date ? new Date(l.expiry_date * 1000).toLocaleDateString() : "Lifetime"}</td>
+      <td style="font-size:12px">Jobs: ${l.max_jobs === -1 ? "∞" : l.max_jobs}<br>Tokens: ${l.max_tokens === -1 ? "∞" : l.max_tokens}</td>
+      <td class="status-${l.status}">${l.status}</td>
+      <td>
+        <button class="btn secondary small" data-license-edit="${l.id}">Sửa</button>
+        <button class="btn secondary small" data-license-delete="${l.id}">Xóa</button>
+      </td>
+    </tr>
+  `).join("");
+
+  $("#admin-licenses-body").querySelectorAll("[data-license-edit]").forEach(btn => {
+    btn.onclick = () => openLicenseModal(btn.dataset.licenseEdit);
+  });
+  $("#admin-licenses-body").querySelectorAll("[data-license-delete]").forEach(btn => {
+    btn.onclick = async () => {
+      if (confirm("Bạn có chắc muốn xóa license này?")) {
+        await api(`/api/admin/licenses/${btn.dataset.licenseDelete}`, { method: "DELETE" });
+        loadAdmin();
+      }
+    };
+  });
+}
+
+let currentEditingLicenseId = null;
+
+function openLicenseModal(licenseId = null) {
+  currentEditingLicenseId = licenseId;
+  const modal = $("#license-modal");
+  const title = $("#license-modal-title");
+  
+  if (licenseId) {
+    title.textContent = "Chỉnh sửa License";
+    // Load license data
+    api(`/api/admin/licenses/${licenseId}`).then(l => {
+      $("#license-key").value = l.license_key;
+      $("#license-plan").value = l.plan_type;
+      $("#license-customer-name").value = l.customer_name || "";
+      $("#license-customer-email").value = l.customer_email || "";
+      $("#license-max-jobs").value = l.max_jobs;
+      $("#license-max-tokens").value = l.max_tokens;
+      $("#license-expiry-days").value = l.expiry_date ? Math.ceil((l.expiry_date - Date.now()/1000) / 86400) : "";
+      $("#license-status").value = l.status;
+      $("#license-features").value = l.features.join(", ");
+      $("#license-notes").value = l.notes || "";
+    });
+  } else {
+    title.textContent = "Tạo License mới";
+    // Generate random license key
+    $("#license-key").value = "LICENSE-" + Math.random().toString(36).substring(2, 12).toUpperCase();
+    $("#license-plan").value = "basic";
+    $("#license-customer-name").value = "";
+    $("#license-customer-email").value = "";
+    $("#license-max-jobs").value = "-1";
+    $("#license-max-tokens").value = "-1";
+    $("#license-expiry-days").value = "";
+    $("#license-status").value = "active";
+    $("#license-features").value = "";
+    $("#license-notes").value = "";
+  }
+  
+  modal.classList.remove("hidden");
+}
+
+function closeLicenseModal() {
+  $("#license-modal").classList.add("hidden");
+  currentEditingLicenseId = null;
+}
+
+async function saveLicense() {
+  const data = {
+    license_key: $("#license-key").value.trim(),
+    plan_type: $("#license-plan").value,
+    customer_name: $("#license-customer-name").value.trim() || null,
+    customer_email: $("#license-customer-email").value.trim() || null,
+    max_jobs: parseInt($("#license-max-jobs").value, 10) || -1,
+    max_tokens: parseInt($("#license-max-tokens").value, 10) || -1,
+    expiry_days: $("#license-expiry-days").value ? parseInt($("#license-expiry-days").value, 10) : null,
+    status: $("#license-status").value,
+    features: $("#license-features").value.split(",").map(f => f.trim()).filter(f => f),
+    notes: $("#license-notes").value.trim() || null,
+  };
+
+  if (!data.license_key) {
+    alert("License key không được để trống");
+    return;
+  }
+
+  try {
+    if (currentEditingLicenseId) {
+      await api(`/api/admin/licenses/${currentEditingLicenseId}`, {
+        method: "PUT",
+        body: JSON.stringify(data),
+      });
+    } else {
+      await api("/api/admin/licenses", {
+        method: "POST",
+        body: JSON.stringify(data),
+      });
+    }
+    closeLicenseModal();
+    loadAdmin();
+  } catch (e) {
+    alert("Lỗi: " + (e.message || "Không thể lưu license"));
+  }
+}
+
+// License modal event listeners
+$("#create-license-btn").onclick = () => openLicenseModal();
+$("#license-modal-cancel").onclick = closeLicenseModal;
+$("#license-modal-save").onclick = saveLicense;
+$("#license-status-filter").onchange = async () => {
+  const status = $("#license-status-filter").value;
+  const licenses = await api(`/api/admin/licenses${status ? `?status=${status}` : ""}`);
+  loadLicenses(licenses);
+};
 
 function _escapeHtml(s) {
   const div = document.createElement("div");

@@ -230,6 +230,19 @@
     </div>
   </div>
 
+  <div class="card" id="license-card">
+    <h3 style="margin-top:0">License & Trial</h3>
+    <div id="license-info" style="margin-bottom:12px">
+      <div style="font-size:13px;color:var(--text-dim)">Chưa có license nào được kích hoạt.</div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="license-input" placeholder="Nhập license key..." style="flex:1;min-width:200px;padding:8px">
+      <button class="btn gradient" id="activate-license-btn">Kích hoạt License</button>
+      <button class="btn secondary" id="start-trial-btn">🎁 Dùng thử miễn phí</button>
+    </div>
+    <div id="trial-info" style="margin-top:12px;font-size:13px;color:var(--text-dim)"></div>
+  </div>
+
   <div class="card" id="job-queue-card">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
       <div>
@@ -1834,6 +1847,93 @@
       <tbody id="admin-feedback-body"></tbody>
     </table>
     <div id="admin-feedback-empty" class="hidden" style="color:var(--text-dim);font-size:13px">Chưa có góp ý nào.</div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Quản lý License</h3>
+    <div style="margin-bottom:16px">
+      <button class="btn gradient" id="create-license-btn">+ Tạo License mới</button>
+      <select id="license-status-filter" style="padding:8px;margin-left:8px">
+        <option value="">Tất cả</option>
+        <option value="active">Active</option>
+        <option value="suspended">Suspended</option>
+        <option value="expired">Expired</option>
+        <option value="revoked">Revoked</option>
+      </select>
+    </div>
+    <table class="admin-table" id="admin-licenses-table">
+      <thead><tr><th>License Key</th><th>Khách hàng</th><th>Plan</th><th>Features</th><th>Hết hạn</th><th>Giới hạn</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
+      <tbody id="admin-licenses-body"></tbody>
+    </table>
+    <div id="admin-licenses-empty" class="hidden" style="color:var(--text-dim);font-size:13px">Chưa có license nào.</div>
+  </div>
+</div>
+
+<!-- License Create/Edit Modal -->
+<div id="license-modal" class="modal hidden">
+  <div class="modal-content" style="max-width:600px">
+    <h3 id="license-modal-title">Tạo License mới</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">License Key</label>
+        <input type="text" id="license-key" placeholder="Nhập hoặc để trống để tự động tạo" style="width:100%;padding:8px">
+      </div>
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Plan Type</label>
+        <select id="license-plan" style="width:100%;padding:8px">
+          <option value="basic">Basic</option>
+          <option value="pro">Pro</option>
+          <option value="enterprise">Enterprise</option>
+        </select>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Customer Name</label>
+        <input type="text" id="license-customer-name" placeholder="Tên khách hàng" style="width:100%;padding:8px">
+      </div>
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Customer Email</label>
+        <input type="email" id="license-customer-email" placeholder="Email khách hàng" style="width:100%;padding:8px">
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Max Jobs (-1 = unlimited)</label>
+        <input type="number" id="license-max-jobs" value="-1" style="width:100%;padding:8px">
+      </div>
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Max Tokens (-1 = unlimited)</label>
+        <input type="number" id="license-max-tokens" value="-1" style="width:100%;padding:8px">
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Expiry Days (null = lifetime)</label>
+        <input type="number" id="license-expiry-days" placeholder="Số ngày" style="width:100%;padding:8px">
+      </div>
+      <div>
+        <label style="display:block;font-size:13px;margin-bottom:4px">Status</label>
+        <select id="license-status" style="width:100%;padding:8px">
+          <option value="active">Active</option>
+          <option value="suspended">Suspended</option>
+          <option value="expired">Expired</option>
+          <option value="revoked">Revoked</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:13px;margin-bottom:4px">Features (comma separated)</label>
+      <input type="text" id="license-features" placeholder="e.g. ai_script, animated_subtitles, video_templates" style="width:100%;padding:8px">
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:13px;margin-bottom:4px">Notes</label>
+      <textarea id="license-notes" rows="2" style="width:100%;padding:8px"></textarea>
+    </div>
+    <div style="text-align:right">
+      <button class="btn secondary" id="license-modal-cancel">Hủy</button>
+      <button class="btn gradient" id="license-modal-save">Lưu</button>
+    </div>
   </div>
 </div>
 
