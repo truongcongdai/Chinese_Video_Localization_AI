@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+import winreg
 import urllib.parse
 import uuid
 import time
@@ -27,6 +28,9 @@ import threading
 import gc
 import tempfile
 import zipfile
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -178,8 +182,69 @@ DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 # License Server Configuration
-LICENSE_SERVER_URL = os.environ.get("LICENSE_SERVER_URL", "").strip()
+def get_license_server_url() -> str:
+    """Get LICENSE_SERVER_URL from Windows Registry or system env var only"""
+    # Priority: Windows Registry > System Environment Variable > Default
+    # .env file is NOT checked to prevent user modification
+    url = ""
+    
+    # 1. Check Windows Registry (Windows only)
+    if sys.platform == "win32":
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ChineseVideoLocalizationAI", 0, winreg.KEY_READ)
+            url, _ = winreg.QueryValueEx(key, "LICENSE_SERVER_URL")
+            winreg.CloseKey(key)
+            if url:
+                logger.info(f"LICENSE_SERVER_URL loaded from Windows Registry")
+                return url.strip()
+        except (WindowsError, FileNotFoundError):
+            pass
+    
+    # 2. Check system environment variable
+    url = os.environ.get("LICENSE_SERVER_URL", "").strip()
+    if url:
+        logger.info(f"LICENSE_SERVER_URL loaded from system environment variable")
+        return url
+    
+    # 3. Default license server URL
+    default_url = "http://113.160.14.1:8000"
+    logger.info(f"Using default LICENSE_SERVER_URL: {default_url}")
+    return default_url
+
+LICENSE_SERVER_URL = get_license_server_url()
 USE_LICENSE_SERVER = bool(LICENSE_SERVER_URL)
+
+# User Management Server Configuration
+def get_user_management_server_url() -> str:
+    """Get USER_MANAGEMENT_SERVER_URL from Windows Registry or system env var"""
+    url = ""
+    
+    if sys.platform == "win32":
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ChineseVideoLocalizationAI", 0, winreg.KEY_READ)
+            url, _ = winreg.QueryValueEx(key, "USER_MANAGEMENT_SERVER_URL")
+            winreg.CloseKey(key)
+            if url:
+                logger.info(f"USER_MANAGEMENT_SERVER_URL loaded from Windows Registry")
+                return url.strip()
+        except (WindowsError, FileNotFoundError):
+            pass
+    
+    url = os.environ.get("USER_MANAGEMENT_SERVER_URL", "").strip()
+    if url:
+        logger.info(f"USER_MANAGEMENT_SERVER_URL loaded from system environment variable")
+        return url
+    
+    # Default to license server URL with port 8001
+    if LICENSE_SERVER_URL:
+        default_url = LICENSE_SERVER_URL.rsplit(":", 1)[0] + ":8001"
+    else:
+        default_url = "http://113.160.14.1:8001"
+    logger.info(f"Using default USER_MANAGEMENT_SERVER_URL: {default_url}")
+    return default_url
+
+USER_MANAGEMENT_SERVER_URL = get_user_management_server_url()
+USE_USER_MANAGEMENT_SERVER = bool(USER_MANAGEMENT_SERVER_URL)
 
 store = Store(_DB_PATH)
 
@@ -503,7 +568,12 @@ class RegisterBody(BaseModel):
     username: str
     contact_identifier: str  # email address or phone number
     password: str
+    verification_code: str  # 6-digit OTP sent to email/phone
     referral_code: Optional[str] = None  # whoever invited this person, if anyone
+
+
+class SendVerificationCodeBody(BaseModel):
+    contact_identifier: str  # email address, phone number, or Telegram username (@username)
 
 
 class NewJobBody(BaseModel):
@@ -892,10 +962,11 @@ def index() -> HTMLResponse:
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?\d[\d\s.-]{7,14}\d$")
+_TELEGRAM_RE = re.compile(r"^@?[a-zA-Z0-9_]{5,32}$")
 
 
 def _classify_identifier(identifier: str) -> tuple[str, str]:
-    """Return (kind, normalized_value) where kind is 'email', 'phone', or
+    """Return (kind, normalized_value) where kind is 'email', 'phone', 'telegram', or
     'username' — lets one input box on the login/register form accept any
     of the three, and tells the register endpoint which DB column to use."""
     value = identifier.strip()
@@ -904,6 +975,10 @@ def _classify_identifier(identifier: str) -> tuple[str, str]:
     digits_only = re.sub(r"[\s.-]", "", value)
     if _PHONE_RE.match(value):
         return "phone", digits_only
+    if _TELEGRAM_RE.match(value):
+        # Normalize Telegram username (ensure it starts with @)
+        telegram_username = value if value.startswith("@") else f"@{value}"
+        return "telegram", telegram_username.lower()
     return "username", value
 
 
@@ -933,20 +1008,184 @@ def _login_response(user_id: int) -> JSONResponse:
     return resp
 
 
+def _send_email_via_smtp(to_email: str, subject: str, body: str) -> bool:
+    """Send email using SMTP Gmail"""
+    smtp_enabled = os.environ.get("SMTP_ENABLED", "false").lower() == "true"
+    if not smtp_enabled:
+        logging.warning("SMTP is disabled in configuration")
+        return False
+    
+    try:
+        smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_email = os.environ.get("SMTP_EMAIL")
+        smtp_password = os.environ.get("SMTP_PASSWORD")
+        from_name = os.environ.get("SMTP_FROM_NAME", "Video Localization AI")
+        
+        if not smtp_email or not smtp_password:
+            logging.error("SMTP_EMAIL or SMTP_PASSWORD not configured")
+            return False
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = f"{from_name} <{smtp_email}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        # Send email
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+        
+        logging.info(f"Email sent successfully to {to_email}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send email to {to_email}: {e}")
+        return False
+
+
+def _send_telegram_message(chat_id: str, message: str) -> bool:
+    """Send message via Telegram Bot"""
+    telegram_enabled = os.environ.get("TELEGRAM_BOT_ENABLED", "false").lower() == "true"
+    if not telegram_enabled:
+        logging.warning("Telegram Bot is disabled in configuration")
+        return False
+    
+    try:
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        
+        if not bot_token:
+            logging.error("TELEGRAM_BOT_TOKEN not configured")
+            return False
+        
+        # Telegram Bot API endpoint
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        
+        data = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, json=data, timeout=10)
+        
+        if response.status_code == 200:
+            logging.info(f"Telegram message sent successfully to {chat_id}")
+            return True
+        else:
+            logging.error(f"Failed to send Telegram message: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Failed to send Telegram message to {chat_id}: {e}")
+        return False
+
+
+@app.post("/api/send-verification-code")
+def send_verification_code(body: SendVerificationCodeBody):
+    """Send a 6-digit verification code to email"""
+    kind, value = _classify_identifier(body.contact_identifier)
+    if kind != "email":
+        raise HTTPException(400, "Hiện tại chỉ hỗ trợ đăng ký qua Email. Vui lòng nhập email.")
+    
+    # Check if email is already registered
+    if store.get_user_by_identifier(value):
+        raise HTTPException(409, "Email này đã được đăng ký")
+    
+    # Generate and store verification code
+    code = store.create_verification_code(value, "register")
+    
+    # Send verification code via email
+    subject = "Mã xác minh đăng ký tài khoản"
+    body = f"""Chào bạn,
+
+Mã xác minh đăng ký tài khoản của bạn là: {code}
+
+Mã này có hiệu lực trong 5 phút.
+Vui lòng không chia sẻ mã này với bất kỳ ai.
+
+Nếu bạn không yêu cầu mã này, vui lòng bỏ qua email này.
+
+Trân trọng,
+Video Localization AI"""
+    sent = _send_email_via_smtp(value, subject, body)
+    
+    if not sent:
+        # Fallback: return code in response if sending failed
+        logging.warning("Failed to send verification code via email, returning in response instead")
+        return {
+            "ok": True,
+            "message": "Không thể gửi email. Mã hiển thị bên dưới để test.",
+            "code": code,
+            "expires_in": 300,
+            "sent_via": "fallback"
+        }
+    
+    return {
+        "ok": True,
+        "message": "Mã xác minh đã được gửi qua email",
+        "expires_in": 300,
+        "sent_via": "email"
+    }
+
+
 @app.post("/api/register")
 def register(body: RegisterBody):
     """
-    Self-service registration via email or phone number + password.
+    Self-service registration via email + password.
 
-    The very FIRST account ever created on this server (by any method —
-    this form, or a "Sign in with ..." button) becomes the admin. After
-    that, further self-registration is allowed by default (see
-    OPEN_REGISTRATION) so multiple people can sign up on their own;
-    set OPEN_REGISTRATION=false in .env to go back to "admin creates every
-    account by hand" instead.
+    All users registered via this form are regular users (not admin).
+    Admin accounts must be created from the admin panel.
+    
+    When USE_LICENSE_SERVER is true, users can register and get
+    a free trial with 25 tokens. They can activate a license key later
+    for unlimited access.
+    
+    When USE_USER_MANAGEMENT_SERVER is true, registration is proxied to
+    the centralized user management server.
     """
-    is_first_user = not store.any_users_exist()
-    if not is_first_user and not OPEN_REGISTRATION:
+    
+    if USE_USER_MANAGEMENT_SERVER:
+        # Proxy to User Management Server
+        try:
+            kind, value = _classify_identifier(body.contact_identifier)
+            if kind != "email":
+                raise HTTPException(400, "Vui lòng nhập đúng email")
+            
+            response = requests.post(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/register",
+                json={
+                    "username": body.username.strip(),
+                    "email": value,
+                    "password": body.password
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("success"):
+                # Create local user record for caching
+                user_id = store.create_user(
+                    body.username.strip(),
+                    hash_password(body.password),
+                    is_admin=False,
+                    credits=data.get("credits", 25),
+                    email=value,
+                    phone=None,
+                    referred_by_user_id=None,
+                )
+                return _login_response(user_id)
+            else:
+                raise HTTPException(400, data.get("message", "Registration failed"))
+        except requests.RequestException as e:
+            logger.error(f"Failed to register with user management server: {e}")
+            raise HTTPException(503, "Không thể kết nối đến server quản lý user")
+    
+    # Local registration (fallback)
+    if not OPEN_REGISTRATION:
         raise HTTPException(
             403,
             "Đăng ký đang bị khoá bởi quản trị viên. Liên hệ admin để được cấp tài khoản.",
@@ -963,10 +1202,16 @@ def register(body: RegisterBody):
         raise HTTPException(409, "Tên đăng nhập này đã được sử dụng")
 
     kind, value = _classify_identifier(body.contact_identifier)
-    if kind not in ("email", "phone"):
-        raise HTTPException(400, "Vui lòng nhập đúng email hoặc số điện thoại")
+    if kind != "email":
+        raise HTTPException(400, "Vui lòng nhập đúng email")
     if store.get_user_by_identifier(value):
-        raise HTTPException(409, "Email/số điện thoại này đã được đăng ký")
+        raise HTTPException(409, "Email này đã được đăng ký")
+    
+    # Verify the OTP code
+    success, error = store.verify_code(value, body.verification_code, "register")
+    if not success:
+        raise HTTPException(400, error or "Mã xác minh không hợp lệ")
+    
     email = value if kind == "email" else None
     phone = value if kind == "phone" else None
 
@@ -978,7 +1223,7 @@ def register(body: RegisterBody):
 
     user_id = store.create_user(
         username, hash_password(body.password),
-        is_admin=is_first_user, credits=10_000 if is_first_user else 10,
+        is_admin=False, credits=10,
         email=email, phone=phone,
         referred_by_user_id=referrer["id"] if referrer else None,
     )
@@ -989,6 +1234,12 @@ def register(body: RegisterBody):
         # requiring the friend to do anything further first).
         store.adjust_credits(user_id, REFERRAL_BONUS_CREDITS)
         store.adjust_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
+    
+    # Create free trial with 25 tokens when using license server
+    if USE_LICENSE_SERVER:
+        machine_id = store.get_machine_id()
+        store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+    
     return _login_response(user_id)
 
 
@@ -1003,6 +1254,8 @@ def bootstrap():
         "job_cost_credits": JOB_COST_CREDITS,
         "use_license_server": USE_LICENSE_SERVER,
         "license_server_url": LICENSE_SERVER_URL if USE_LICENSE_SERVER else None,
+        "use_user_management_server": USE_USER_MANAGEMENT_SERVER,
+        "user_management_server_url": USER_MANAGEMENT_SERVER_URL if USE_USER_MANAGEMENT_SERVER else None,
         "top_up_packages": [
             {"credits": credits, "amount_vnd": amount}
             for credits, amount in sorted(TOP_UP_PACKAGES.items())
@@ -1016,6 +1269,47 @@ def bootstrap():
 
 @app.post("/api/login")
 def login(body: LoginBody):
+    if USE_USER_MANAGEMENT_SERVER:
+        # Proxy to User Management Server
+        try:
+            response = requests.post(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/login",
+                json={
+                    "username": body.identifier,
+                    "password": body.password
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("success"):
+                # Check if local user exists, create if not
+                _kind, identifier = _classify_identifier(body.identifier)
+                local_user = store.get_user_by_identifier(identifier)
+                
+                if not local_user:
+                    # Create local cache record
+                    user_id = store.create_user(
+                        data.get("username", body.identifier),
+                        hash_password(body.password),
+                        is_admin=data.get("is_admin", False),
+                        credits=data.get("credits", 25),
+                        email=data.get("email"),
+                        phone=None,
+                        referred_by_user_id=None,
+                    )
+                else:
+                    user_id = local_user["id"]
+                
+                return _login_response(user_id)
+            else:
+                raise HTTPException(401, data.get("message", "Invalid username or password"))
+        except requests.RequestException as e:
+            logger.error(f"Failed to login with user management server: {e}")
+            raise HTTPException(503, "Không thể kết nối đến server quản lý user")
+    
+    # Local login (fallback)
     _kind, identifier = _classify_identifier(body.identifier)
     user = store.get_user_by_identifier(identifier)
     if not user or not user["password_hash"] or not verify_password(body.password, user["password_hash"]):
@@ -7537,6 +7831,49 @@ def admin_adjust_credits(target_user_id: int, body: CreditsAdjustBody,
     return {"ok": True, "credits": user["credits"]}
 
 
+@app.put("/api/admin/users/{target_user_id}/role")
+def admin_change_user_role(target_user_id: int, body: dict, _admin_id: int = Depends(require_admin_user_id)):
+    """Change user role (admin <-> regular user)"""
+    if not store.get_user_by_id(target_user_id):
+        raise HTTPException(404, "Không tìm thấy user")
+    
+    is_admin = body.get("is_admin", False)
+    store.set_admin(target_user_id, is_admin)
+    
+    return {"ok": True, "is_admin": is_admin}
+
+
+@app.post("/api/admin/create-first-admin")
+def create_first_admin(body: dict):
+    """Create the first admin account (only works if no users exist)"""
+    if store.any_users_exist():
+        raise HTTPException(403, "Đã có user trong hệ thống. Không thể tạo admin đầu tiên.")
+    
+    username = body.get("username")
+    password = body.get("password")
+    email = body.get("email")
+    
+    if not username or not password:
+        raise HTTPException(400, "Thiếu username hoặc password")
+    
+    if len(password) < 8:
+        raise HTTPException(400, "Mật khẩu cần tối thiểu 8 ký tự")
+    
+    if store.get_user_by_username(username):
+        raise HTTPException(409, "Tên đăng nhập đã tồn tại")
+    
+    if email and store.get_user_by_identifier(email):
+        raise HTTPException(409, "Email đã tồn tại")
+    
+    user_id = store.create_user(
+        username, hash_password(password),
+        is_admin=True, credits=10_000,
+        email=email, phone=None
+    )
+    
+    return {"ok": True, "user_id": user_id, "message": "Admin đầu tiên đã được tạo"}
+
+
 @app.get("/api/admin/stats")
 def admin_stats(_admin_id: int = Depends(require_admin_user_id)):
     return store.admin_stats()
@@ -7749,17 +8086,27 @@ def get_my_free_trial(user_id: int = Depends(get_current_user_id)):
 
 @app.post("/api/me/free-trial/start")
 def start_free_trial(user_id: int = Depends(get_current_user_id)):
-    """Start a free trial for the current user"""
+    """Start or restart a free trial for the current user"""
     machine_id = store.get_machine_id()
     
     # Check if trial already exists
     existing = store.get_free_trial(user_id, machine_id)
     if existing:
+        # Allow restart if trial expired or out of tokens
         if existing.expiry_date < time.time():
-            raise HTTPException(400, "Trial đã hết hạn")
-        raise HTTPException(400, "Đã có trial đang hoạt động")
+            # Trial expired - create new one
+            trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+            return {"trial": trial.to_dict(), "message": "Trial đã được làm mới"}
+        elif existing.tokens_remaining <= 0:
+            # Out of tokens - create new one
+            trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+            return {"trial": trial.to_dict(), "message": "Token đã được nạp lại"}
+        else:
+            # Active trial with remaining tokens
+            raise HTTPException(400, "Đang có trial hoạt động, còn lại {} token".format(existing.tokens_remaining))
     
-    trial = store.create_free_trial(user_id, machine_id, tokens=10, days=7)
+    # No existing trial - create new one
+    trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
     return {"trial": trial.to_dict()}
 
 

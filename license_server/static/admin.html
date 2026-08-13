@@ -72,6 +72,14 @@
                 <h3>Expired Licenses</h3>
                 <div class="value" id="expiredLicenses">0</div>
             </div>
+            <div class="stat-card">
+                <h3>Total Users</h3>
+                <div class="value" id="totalUsers">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Admin Users</h3>
+                <div class="value" id="adminUsers">0</div>
+            </div>
         </div>
 
         <div class="card">
@@ -119,6 +127,25 @@
                 </div>
                 <button type="submit" class="btn btn-primary">Create License</button>
             </form>
+        </div>
+
+        <div class="card">
+            <h2>Users</h2>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Username</th>
+                        <th>Email</th>
+                        <th>Role</th>
+                        <th>Credits</th>
+                        <th>License Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="usersTable">
+                </tbody>
+            </table>
         </div>
 
         <div class="card">
@@ -181,7 +208,9 @@
     </div>
 
     <script>
-        const API_BASE = 'http://localhost:8000/api';
+        const API_BASE = window.location.origin + '/api';
+        const WEB_API_BASE = 'http://192.168.6.10:8080/api'; // Web app API
+        const USER_MANAGEMENT_API_BASE = window.location.protocol + '//' + window.location.hostname + ':8001/api/users'; // User Management Server
 
         async function fetchLicenses() {
             const response = await fetch(`${API_BASE}/licenses`);
@@ -189,13 +218,65 @@
             return licenses;
         }
 
+        async function fetchUsers() {
+            // Try to fetch from User Management Server first
+            try {
+                const response = await fetch(`${USER_MANAGEMENT_API_BASE}`);
+                const users = await response.json();
+                return users;
+            } catch (error) {
+                console.error('Failed to fetch from User Management Server, falling back to Web API:', error);
+                // Fallback to web app API
+                const response = await fetch(`${WEB_API_BASE}/admin/users`);
+                const users = await response.json();
+                return users;
+            }
+        }
+
         async function updateStats() {
             const licenses = await fetchLicenses();
+            const users = await fetchUsers();
             
             document.getElementById('totalLicenses').textContent = licenses.length;
             document.getElementById('activeLicenses').textContent = licenses.filter(l => l.status === 'active').length;
             document.getElementById('revokedLicenses').textContent = licenses.filter(l => l.status === 'revoked').length;
             document.getElementById('expiredLicenses').textContent = licenses.filter(l => l.status === 'expired').length;
+            document.getElementById('totalUsers').textContent = users.length;
+            document.getElementById('adminUsers').textContent = users.filter(u => u.is_admin).length;
+        }
+
+        async function renderUsers() {
+            const users = await fetchUsers();
+            const licenses = await fetchLicenses();
+            const tbody = document.getElementById('usersTable');
+            
+            tbody.innerHTML = users.map(user => {
+                // Check if user has active license
+                const userLicense = licenses.find(l => l.customer_email === user.email);
+                const licenseStatus = userLicense ? 
+                    `<span class="badge badge-${userLicense.status}">${userLicense.status}</span>` : 
+                    '<span class="badge" style="background: #95a5a6; color: white;">No License</span>';
+                
+                return `
+                <tr>
+                    <td>${user.id}</td>
+                    <td>${user.username}</td>
+                    <td>${user.email || '-'}</td>
+                    <td>
+                        <span class="badge ${user.is_admin ? 'badge-active' : 'badge-revoked'}">
+                            ${user.is_admin ? 'Admin' : 'User'}
+                        </span>
+                    </td>
+                    <td>${user.credits}</td>
+                    <td>${licenseStatus}</td>
+                    <td>
+                        ${!userLicense ? `<button class="btn btn-success" onclick="createLicenseForUser(${user.id}, '${user.email || ''}')" style="padding: 4px 8px; font-size: 12px;">Add License</button>` : ''}
+                        <button class="btn btn-primary" onclick="toggleUserRole(${user.id}, ${user.is_admin})" style="padding: 4px 8px; font-size: 12px;">
+                            ${user.is_admin ? 'Make User' : 'Make Admin'}
+                        </button>
+                    </td>
+                </tr>
+            `}).join('');
         }
 
         async function renderLicenses() {
@@ -204,7 +285,12 @@
             
             tbody.innerHTML = licenses.map(license => `
                 <tr>
-                    <td><code>${license.license_key.substring(0, 20)}...</code></td>
+                    <td>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <code style="flex: 1;">${license.license_key.substring(0, 20)}...</code>
+                            <button onclick="copyToClipboard('${license.license_key}')" style="padding: 4px 8px; background: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">Copy</button>
+                        </div>
+                    </td>
                     <td>${license.customer_name}<br><small>${license.customer_email}</small></td>
                     <td>${license.plan_type}</td>
                     <td><span class="badge badge-${license.status}">${license.status}</span></td>
@@ -241,7 +327,23 @@
             const result = await response.json();
             
             if (result.success) {
-                alert(`License created successfully!\n\nLicense Key: ${result.license_key}\n\nPlease save this key securely.`);
+                // Show modal with copy button
+                const modal = document.createElement('div');
+                modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;';
+                modal.innerHTML = `
+                    <div style="background: white; padding: 30px; border-radius: 8px; max-width: 500px; width: 90%;">
+                        <h3 style="margin: 0 0 20px 0;">License Created Successfully!</h3>
+                        <p style="margin: 10px 0;"><strong>License Key:</strong></p>
+                        <div style="display: flex; gap: 10px; margin: 10px 0;">
+                            <input type="text" value="${result.license_key}" readonly style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-family: monospace;">
+                            <button onclick="copyToClipboard('${result.license_key}')" style="padding: 10px 20px; background: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer;">Copy</button>
+                        </div>
+                        <p style="margin: 10px 0; color: #7f8c8d; font-size: 14px;">Please save this key securely.</p>
+                        <button onclick="this.closest('div').parentElement.remove()" style="margin-top: 20px; padding: 10px 20px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; width: 100%;">Close</button>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+                
                 document.getElementById('createLicenseForm').reset();
                 renderLicenses();
                 updateStats();
@@ -314,15 +416,108 @@
             document.getElementById('editModal').classList.remove('active');
         }
 
+        function copyToClipboard(text) {
+            // Try modern clipboard API first
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(() => {
+                    alert('Copied to clipboard!');
+                }).catch(err => {
+                    // Fallback to older method
+                    fallbackCopyToClipboard(text);
+                });
+            } else {
+                // Fallback for older browsers
+                fallbackCopyToClipboard(text);
+            }
+        }
+
+        function fallbackCopyToClipboard(text) {
+            const textArea = document.createElement("textarea");
+            textArea.value = text;
+            textArea.style.position = "fixed";
+            textArea.style.left = "-9999px";
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            
+            try {
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    alert('Copied to clipboard!');
+                } else {
+                    alert('Failed to copy');
+                }
+            } catch (err) {
+                alert('Failed to copy');
+            }
+            
+            document.body.removeChild(textArea);
+        }
+
+        async function createLicenseForUser(userId, userEmail) {
+            const customerName = prompt('Enter customer name:');
+            if (!customerName) return;
+            
+            const data = {
+                customer_name: customerName,
+                customer_email: userEmail,
+                plan_type: 'basic',
+                features: 'video_localization,transcription,translation',
+                expiry_days: 365,
+                max_jobs: 100,
+                max_tokens: 1000,
+                machine_id: null,
+                notes: `Created for user ${userId}`
+            };
+            
+            const response = await fetch(`${API_BASE}/licenses`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                alert('License created successfully!');
+                renderUsers();
+                renderLicenses();
+                updateStats();
+            } else {
+                alert('Failed to create license');
+            }
+        }
+
+        async function toggleUserRole(userId, currentIsAdmin) {
+            if (!confirm(`Are you sure you want to change this user to ${currentIsAdmin ? 'regular user' : 'admin'}?`)) return;
+            
+            const response = await fetch(`${WEB_API_BASE}/admin/users/${userId}/role`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ is_admin: !currentIsAdmin })
+            });
+            
+            const result = await response.json();
+            
+            if (result.ok) {
+                renderUsers();
+                updateStats();
+            } else {
+                alert('Failed to change user role');
+            }
+        }
+
         document.getElementById('createLicenseForm').addEventListener('submit', createLicense);
         document.getElementById('editLicenseForm').addEventListener('submit', saveLicense);
 
         // Initial load
+        renderUsers();
         renderLicenses();
         updateStats();
         
         // Auto-refresh every 30 seconds
         setInterval(() => {
+            renderUsers();
             renderLicenses();
             updateStats();
         }, 30000);
