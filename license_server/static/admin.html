@@ -209,8 +209,9 @@
 
     <script>
         const API_BASE = window.location.origin + '/api';
-        const WEB_API_BASE = 'http://192.168.6.10:8080/api'; // Web app API
+        const WEB_API_BASE = window.location.protocol + '//' + window.location.hostname + ':8080/api'; // Web app API
         const USER_MANAGEMENT_API_BASE = window.location.protocol + '//' + window.location.hostname + ':8001/api/users'; // User Management Server
+        let usersApiSource = 'user-management';
 
         async function fetchLicenses() {
             const response = await fetch(`${API_BASE}/licenses`);
@@ -222,15 +223,28 @@
             // Try to fetch from User Management Server first
             try {
                 const response = await fetch(`${USER_MANAGEMENT_API_BASE}`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const users = await response.json();
+                usersApiSource = 'user-management';
                 return users;
             } catch (error) {
                 console.error('Failed to fetch from User Management Server, falling back to Web API:', error);
                 // Fallback to web app API
-                const response = await fetch(`${WEB_API_BASE}/admin/users`);
+                const response = await fetch(`${WEB_API_BASE}/admin/users`, { credentials: 'include' });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const users = await response.json();
+                usersApiSource = 'web-app';
                 return users;
             }
+        }
+
+        function apiErrorMessage(result, fallback) {
+            if (!result) return fallback;
+            if (typeof result.detail === 'string') return result.detail;
+            if (Array.isArray(result.detail)) {
+                return result.detail.map(item => item.msg || JSON.stringify(item)).join('\n');
+            }
+            return result.message || result.error || fallback;
         }
 
         async function updateStats() {
@@ -310,7 +324,7 @@
                 customer_name: document.getElementById('customerName').value,
                 customer_email: document.getElementById('customerEmail').value,
                 plan_type: document.getElementById('planType').value,
-                features: document.getElementById('features').value.split(',').map(f => f.trim()),
+                features: document.getElementById('features').value.split(',').map(f => f.trim()).filter(Boolean),
                 expiry_days: document.getElementById('expiryDays').value ? parseInt(document.getElementById('expiryDays').value) : null,
                 max_jobs: parseInt(document.getElementById('maxJobs').value),
                 max_tokens: parseInt(document.getElementById('maxTokens').value),
@@ -318,13 +332,25 @@
                 notes: document.getElementById('notes').value || null
             };
             
-            const response = await fetch(`${API_BASE}/licenses`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
-            
-            const result = await response.json();
+            let response;
+            let result;
+            try {
+                response = await fetch(`${API_BASE}/licenses`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                result = await response.json().catch(() => null);
+            } catch (error) {
+                console.error('Failed to create license:', error);
+                alert(`Failed to create license: ${error.message}`);
+                return;
+            }
+
+            if (!response.ok) {
+                alert(`Failed to create license: ${apiErrorMessage(result, `HTTP ${response.status}`)}`);
+                return;
+            }
             
             if (result.success) {
                 // Show modal with copy button
@@ -348,7 +374,7 @@
                 renderLicenses();
                 updateStats();
             } else {
-                alert('Failed to create license');
+                alert(`Failed to create license: ${apiErrorMessage(result, 'Unknown server response')}`);
             }
         }
 
@@ -462,7 +488,7 @@
                 customer_name: customerName,
                 customer_email: userEmail,
                 plan_type: 'basic',
-                features: 'video_localization,transcription,translation',
+                features: ['video_localization', 'transcription', 'translation'],
                 expiry_days: 365,
                 max_jobs: 100,
                 max_tokens: 1000,
@@ -470,40 +496,54 @@
                 notes: `Created for user ${userId}`
             };
             
-            const response = await fetch(`${API_BASE}/licenses`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
-            
-            const result = await response.json();
-            
-            if (result.success) {
+            try {
+                const response = await fetch(`${API_BASE}/licenses`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                const result = await response.json().catch(() => null);
+
+                if (!response.ok || !result?.success) {
+                    throw new Error(apiErrorMessage(result, `HTTP ${response.status}`));
+                }
+
                 alert('License created successfully!');
-                renderUsers();
-                renderLicenses();
-                updateStats();
-            } else {
-                alert('Failed to create license');
+                const refreshResults = await Promise.allSettled([renderUsers(), renderLicenses(), updateStats()]);
+                refreshResults
+                    .filter(result => result.status === 'rejected')
+                    .forEach(result => console.error('License created, but refreshing the page failed:', result.reason));
+            } catch (error) {
+                console.error('Failed to create license for user:', error);
+                alert(`Failed to create license: ${error.message}`);
             }
         }
 
         async function toggleUserRole(userId, currentIsAdmin) {
             if (!confirm(`Are you sure you want to change this user to ${currentIsAdmin ? 'regular user' : 'admin'}?`)) return;
-            
-            const response = await fetch(`${WEB_API_BASE}/admin/users/${userId}/role`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ is_admin: !currentIsAdmin })
-            });
-            
-            const result = await response.json();
-            
-            if (result.ok) {
-                renderUsers();
-                updateStats();
-            } else {
-                alert('Failed to change user role');
+
+            const useCentralUsers = usersApiSource === 'user-management';
+            const url = useCentralUsers
+                ? `${USER_MANAGEMENT_API_BASE}/${userId}`
+                : `${WEB_API_BASE}/admin/users/${userId}/role`;
+
+            try {
+                const response = await fetch(url, {
+                    method: 'PUT',
+                    credentials: useCentralUsers ? 'omit' : 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ is_admin: !currentIsAdmin })
+                });
+                const result = await response.json().catch(() => null);
+                if (!response.ok || result?.success === false || result?.ok === false) {
+                    throw new Error(apiErrorMessage(result, `HTTP ${response.status}`));
+                }
+
+                await Promise.all([renderUsers(), updateStats()]);
+            } catch (error) {
+                console.error('Failed to change user role:', error);
+                alert(`Failed to change user role: ${error.message}`);
             }
         }
 

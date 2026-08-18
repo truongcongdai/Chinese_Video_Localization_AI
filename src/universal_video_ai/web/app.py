@@ -18,7 +18,6 @@ import shutil
 import subprocess
 import sys
 import traceback
-import winreg
 import urllib.parse
 import uuid
 import time
@@ -33,6 +32,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None  # type: ignore[assignment]
 
 try:
     import openai as _openai
@@ -291,6 +295,74 @@ def update_license_usage_on_server(license_id: int, machine_id: str, jobs_delta:
     except Exception as e:
         logger.error(f"Failed to update license usage on server: {e}")
         return False
+
+
+def _require_license_or_trial(user_id: int) -> str:
+    """Authorize a job using an active license or a usable local trial.
+
+    Trials are stored locally because they belong to the web account/session,
+    even when paid licenses are validated by the centralized license server.
+    Keeping this decision in one place prevents the remote-license branch from
+    accidentally bypassing a trial that the UI just activated.
+    """
+    machine_id = store.get_machine_id()
+    user_license = store.get_license_by_user(user_id)
+    license_error: Optional[str] = None
+
+    if user_license and USE_LICENSE_SERVER:
+        validation_result = validate_license_with_server(user_license.license_key, machine_id)
+        if validation_result and validation_result.get("valid"):
+            license_data = validation_result.get("license", {})
+            jobs_used = int(license_data.get("jobs_used", 0) or 0)
+            tokens_used = int(license_data.get("tokens_used", 0) or 0)
+            max_jobs = int(license_data.get("max_jobs", 100) or 0)
+            max_tokens = int(license_data.get("max_tokens", 1000) or 0)
+            if max_jobs > 0 and jobs_used >= max_jobs:
+                license_error = f"Đã đạt giới hạn số jobs ({max_jobs})."
+            elif max_tokens > 0 and tokens_used >= max_tokens:
+                license_error = f"Đã đạt giới hạn số tokens ({max_tokens})."
+            else:
+                return "license"
+        else:
+            remote_error = (
+                validation_result.get("error", "License không hợp lệ")
+                if validation_result else "Không thể kết nối đến license server"
+            )
+            license_error = f"License validation failed: {remote_error}"
+    elif user_license:
+        can_proceed, limit_error = store.check_license_limits(user_license, user_id)
+        if can_proceed:
+            return "license"
+        license_error = f"License limit: {limit_error}"
+
+    trial = store.get_free_trial(user_id, machine_id)
+    if trial:
+        if trial.expiry_date < time.time():
+            raise HTTPException(403, "Trial đã hết hạn. Vui lòng kích hoạt license để tiếp tục.")
+        if trial.tokens_remaining <= 0:
+            raise HTTPException(403, "Đã hết token trial. Vui lòng kích hoạt license để tiếp tục.")
+        return "trial"
+
+    if license_error:
+        raise HTTPException(403, license_error)
+    if USE_LICENSE_SERVER:
+        raise HTTPException(
+            403,
+            "Vui lòng bắt đầu dùng thử miễn phí hoặc nhập license key để sử dụng.",
+        )
+
+    # Backward-compatible self-hosted mode: licenses remain optional when no
+    # centralized license server is configured.
+    return "unrestricted"
+
+
+def _ensure_registration_trial(user_id: int) -> None:
+    """Give newly cached/registered centralized users their promised trial once."""
+    if not USE_LICENSE_SERVER:
+        return
+    machine_id = store.get_machine_id()
+    if store.get_free_trial(user_id, machine_id) is None:
+        store.create_free_trial(user_id, machine_id, tokens=25, days=30)
 
 
 def _resolve_publishing_config_for_user(
@@ -1177,6 +1249,7 @@ def register(body: RegisterBody):
                     phone=None,
                     referred_by_user_id=None,
                 )
+                _ensure_registration_trial(user_id)
                 return _login_response(user_id)
             else:
                 raise HTTPException(400, data.get("message", "Registration failed"))
@@ -1236,9 +1309,7 @@ def register(body: RegisterBody):
         store.adjust_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
     
     # Create free trial with 25 tokens when using license server
-    if USE_LICENSE_SERVER:
-        machine_id = store.get_machine_id()
-        store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+    _ensure_registration_trial(user_id)
     
     return _login_response(user_id)
 
@@ -1301,6 +1372,15 @@ def login(body: LoginBody):
                     )
                 else:
                     user_id = local_user["id"]
+
+                # The central user server is the source of truth. Refresh the
+                # local cache on every login so a Make Admin/Make User change
+                # takes effect after the next sign-in instead of remaining
+                # stuck at the value from the account's first login.
+                store.set_admin(user_id, bool(data.get("is_admin", False)))
+                if data.get("credits") is not None:
+                    store.set_credits(user_id, int(data["credits"]))
+                _ensure_registration_trial(user_id)
                 
                 return _login_response(user_id)
             else:
@@ -2066,6 +2146,19 @@ def _update_license_usage(user_id: int, job_id: str) -> None:
         license = store.get_license_by_user(user_id)
         if license:
             store.update_license_usage(license.id, user_id, tokens_delta=1, jobs_delta=1)
+            if USE_LICENSE_SERVER and license.remote_license_id is not None:
+                machine_id = store.get_machine_id()
+                if not update_license_usage_on_server(
+                    license.remote_license_id,
+                    machine_id,
+                    tokens_delta=1,
+                    jobs_delta=1,
+                ):
+                    logger.warning(
+                        "Failed to update centralized usage for license %s (job %s)",
+                        license.remote_license_id,
+                        job_id,
+                    )
         else:
             # Consume trial token
             machine_id = store.get_machine_id()
@@ -4910,54 +5003,7 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
             "Liên hệ admin để được cấp thêm.",
         )
 
-    # Check license limits
-    if USE_LICENSE_SERVER:
-        # Use centralized license server
-        machine_id = store.get_machine_id()
-        user_license = store.get_license_by_user(user_id)
-        
-        if user_license:
-            # Validate with centralized server
-            validation_result = validate_license_with_server(user_license.license_key, machine_id)
-            
-            if validation_result and validation_result.get("valid"):
-                license_data = validation_result.get("license", {})
-                
-                # Check limits from server response
-                jobs_used = license_data.get("jobs_used", 0)
-                tokens_used = license_data.get("tokens_used", 0)
-                max_jobs = license_data.get("max_jobs", 100)
-                max_tokens = license_data.get("max_tokens", 1000)
-                
-                if jobs_used >= max_jobs:
-                    raise HTTPException(403, f"Đã đạt giới hạn số jobs ({max_jobs}).")
-                if tokens_used >= max_tokens:
-                    raise HTTPException(403, f"Đã đạt giới hạn số tokens ({max_tokens}).")
-            else:
-                error = validation_result.get("error", "License không hợp lệ") if validation_result else "Không thể kết nối đến license server"
-                raise HTTPException(403, f"License validation failed: {error}")
-        else:
-            # No license - check if free trial is allowed
-            raise HTTPException(403, "Vui lòng nhập license key để sử dụng. Liên hệ admin để được cấp license.")
-    else:
-        # Use local database (backward compatibility)
-        license = store.get_license_by_user(user_id)
-        if license:
-            can_proceed, limit_error = store.check_license_limits(license, user_id)
-            if not can_proceed:
-                raise HTTPException(403, f"License limit: {limit_error}")
-        else:
-            # Check free trial
-            machine_id = store.get_machine_id()
-            trial = store.get_free_trial(user_id, machine_id)
-            if trial:
-                if trial.expiry_date < time.time():
-                    raise HTTPException(403, "Trial đã hết hạn. Vui lòng kích hoạt license để tiếp tục.")
-                if trial.tokens_remaining <= 0:
-                    raise HTTPException(403, "Đã hết token trial. Vui lòng kích hoạt license để tiếp tục.")
-            else:
-                # No license and no trial - allow for now (backward compatibility)
-                pass
+    _require_license_or_trial(user_id)
 
     logo_path = None
     if body.logo_path:
@@ -8026,7 +8072,14 @@ def admin_delete_license(license_id: int, _admin_id: int = Depends(require_admin
 @app.post("/api/licenses/validate")
 def validate_license(body: LicenseValidateBody):
     """Validate a license key (public endpoint)"""
-    is_valid, license, error = store.validate_license(body.license_key)
+    license_key = body.license_key.strip()
+    if USE_LICENSE_SERVER:
+        result = validate_license_with_server(license_key, store.get_machine_id())
+        if result is None:
+            return {"valid": False, "error": "Không thể kết nối đến license server"}
+        return result
+
+    is_valid, license, error = store.validate_license(license_key)
     if is_valid:
         return {
             "valid": True,
@@ -8044,7 +8097,26 @@ def activate_license(
     user_id: int = Depends(get_current_user_id),
 ):
     """Activate a license key for the current user"""
-    is_valid, license, error = store.validate_license(body.license_key)
+    license_key = body.license_key.strip()
+    if not license_key:
+        raise HTTPException(400, "Vui lòng nhập license key")
+
+    if USE_LICENSE_SERVER:
+        validation = validate_license_with_server(license_key, store.get_machine_id())
+        if validation is None:
+            raise HTTPException(503, "Không thể kết nối đến license server")
+        if not validation.get("valid"):
+            raise HTTPException(400, validation.get("error") or "License không hợp lệ")
+        remote_license = validation.get("license")
+        if not isinstance(remote_license, dict):
+            raise HTTPException(502, "License server trả về dữ liệu không hợp lệ")
+        try:
+            license = store.link_remote_license(remote_license, user_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"ok": True, "license": license.to_dict()}
+
+    is_valid, license, error = store.validate_license(license_key)
     if not is_valid:
         raise HTTPException(400, error or "License không hợp lệ")
     
@@ -8067,10 +8139,26 @@ def get_my_license(user_id: int = Depends(get_current_user_id)):
     if not license:
         return {"license": None}
     
-    # Get usage info
-    usage = store.get_license_usage(license.id, user_id)
     result = license.to_dict()
+    usage = store.get_license_usage(license.id, user_id)
     result["usage"] = usage.to_dict() if usage else None
+
+    if USE_LICENSE_SERVER:
+        validation = validate_license_with_server(license.license_key, store.get_machine_id())
+        if validation and validation.get("valid") and isinstance(validation.get("license"), dict):
+            remote = validation["license"]
+            for field in (
+                "customer_name", "customer_email", "plan_type", "features",
+                "expiry_date", "max_jobs", "max_tokens", "status",
+            ):
+                if field in remote:
+                    result[field] = remote[field]
+            result["usage"] = {
+                "tokens_used": int(remote.get("tokens_used", 0) or 0),
+                "jobs_completed": int(remote.get("jobs_used", 0) or 0),
+            }
+        elif validation:
+            result["validation_error"] = validation.get("error") or "License không hợp lệ"
     return {"license": result}
 
 

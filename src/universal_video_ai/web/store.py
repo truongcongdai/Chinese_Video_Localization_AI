@@ -484,6 +484,7 @@ CREATE INDEX IF NOT EXISTS idx_content_os_memories_active ON content_os_memories
 -- License management system
 CREATE TABLE IF NOT EXISTS licenses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    remote_license_id INTEGER,
     license_key TEXT UNIQUE NOT NULL,
     user_id INTEGER,
     customer_name TEXT,
@@ -560,6 +561,8 @@ _MIGRATIONS = [
     # time, in the /api/register handler — this table just tracks the link.
     ("users", "referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
     ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
+    # Local ids are unrelated to ids on the centralized license server.
+    ("licenses", "remote_license_id", "ALTER TABLE licenses ADD COLUMN remote_license_id INTEGER"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -790,6 +793,7 @@ class Job:
 @dataclass
 class License:
     id: Optional[int]
+    remote_license_id: Optional[int]
     license_key: str
     user_id: Optional[int]
     customer_name: Optional[str]
@@ -805,14 +809,13 @@ class License:
     updated_at: float
 
     def to_dict(self) -> Dict[str, Any]:
-        d = self.__dict__.copy()
-        d["features_json"] = json.dumps(d.pop("features", []))
-        return d
+        return self.__dict__.copy()
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "License":
         return cls(
             id=row["id"],
+            remote_license_id=row["remote_license_id"],
             license_key=row["license_key"],
             user_id=row["user_id"],
             customer_name=row["customer_name"],
@@ -902,7 +905,7 @@ class Store:
                 for table in
                 ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
                  "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
-                 "content_os_memories", "channel_scan_states", "channel_scan_videos")
+                 "content_os_memories", "channel_scan_states", "channel_scan_videos", "licenses")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -2046,10 +2049,11 @@ class Store:
         now = time.time()
         with self._connect() as conn:
             cur = conn.execute(
-                """INSERT INTO licenses (license_key, user_id, customer_name, customer_email, 
+                """INSERT INTO licenses (remote_license_id, license_key, user_id, customer_name, customer_email,
                    plan_type, features_json, expiry_date, max_jobs, max_tokens, status, notes, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    license_data.get("remote_license_id"),
                     license_data["license_key"],
                     license_data.get("user_id"),
                     license_data.get("customer_name"),
@@ -2066,6 +2070,60 @@ class Store:
                 ),
             )
             row = conn.execute("SELECT * FROM licenses WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return License.from_row(row)
+
+    def link_remote_license(self, remote_data: Dict[str, Any], user_id: int) -> License:
+        """Cache a validated central license and bind it to one local user."""
+        license_key = str(remote_data.get("license_key") or "").strip()
+        if not license_key:
+            raise ValueError("License server không trả về license key")
+
+        features = remote_data.get("features") or []
+        if not isinstance(features, list):
+            features = []
+        now = time.time()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM licenses WHERE license_key = ?", (license_key,)
+            ).fetchone()
+            if existing and existing["user_id"] not in (None, user_id):
+                raise ValueError("License đã được kích hoạt bởi user khác")
+
+            values = (
+                int(remote_data["id"]) if remote_data.get("id") is not None else None,
+                user_id,
+                remote_data.get("customer_name"),
+                remote_data.get("customer_email"),
+                remote_data.get("plan_type") or "basic",
+                json.dumps(features),
+                remote_data.get("expiry_date"),
+                int(remote_data.get("max_jobs", -1)),
+                int(remote_data.get("max_tokens", -1)),
+                remote_data.get("status") or "active",
+                remote_data.get("notes"),
+                now,
+            )
+            if existing:
+                conn.execute(
+                    """UPDATE licenses SET remote_license_id = ?, user_id = ?, customer_name = ?,
+                       customer_email = ?, plan_type = ?, features_json = ?, expiry_date = ?,
+                       max_jobs = ?, max_tokens = ?, status = ?, notes = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (*values, existing["id"]),
+                )
+                local_id = existing["id"]
+            else:
+                cur = conn.execute(
+                    """INSERT INTO licenses (
+                       remote_license_id, license_key, user_id, customer_name, customer_email,
+                       plan_type, features_json, expiry_date, max_jobs, max_tokens, status,
+                       notes, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (values[0], license_key, *values[1:-1], now, now),
+                )
+                local_id = cur.lastrowid
+
+            row = conn.execute("SELECT * FROM licenses WHERE id = ?", (local_id,)).fetchone()
             return License.from_row(row)
 
     def get_license_by_key(self, license_key: str) -> Optional[License]:
@@ -2098,7 +2156,7 @@ class Store:
     def update_license(self, license_id: int, updates: Dict[str, Any]) -> bool:
         now = time.time()
         allowed_fields = {
-            "user_id", "customer_name", "customer_email", "plan_type",
+            "remote_license_id", "user_id", "customer_name", "customer_email", "plan_type",
             "features", "expiry_date", "max_jobs", "max_tokens", "status", "notes"
         }
         set_clauses = []
