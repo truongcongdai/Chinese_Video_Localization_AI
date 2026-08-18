@@ -17,6 +17,7 @@ tests/test_translation_adaptation_resilience.py
 dist/ChineseVideoLocalizationAI.zip
 dist/ChineseVideoLocalizationAI/
 dist.rar
+build/
 
 
 logs/*
