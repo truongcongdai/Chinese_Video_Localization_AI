@@ -113,6 +113,105 @@ def test_license_admin_updates_role_at_the_user_source():
     assert "usersApiSource === 'user-management'" in html
 
 
+def test_failed_registration_email_never_exposes_otp(monkeypatch):
+    invalidated = {}
+    monkeypatch.setattr(web_app.store, "get_user_by_identifier", lambda identifier: None)
+    monkeypatch.setattr(web_app.store, "create_verification_code", lambda *args: "123456")
+    monkeypatch.setattr(
+        web_app.store,
+        "invalidate_verification_code",
+        lambda identifier, purpose: invalidated.update(identifier=identifier, purpose=purpose),
+    )
+    monkeypatch.setattr(web_app, "_send_email_via_smtp", lambda *args: False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        web_app.send_verification_code(
+            web_app.SendVerificationCodeBody(contact_identifier="member@example.com")
+        )
+
+    assert exc_info.value.status_code == 503
+    assert "123456" not in str(exc_info.value.detail)
+    assert invalidated == {"identifier": "member@example.com", "purpose": "register"}
+
+
+def test_registration_and_studio_defaults_are_safe_and_consolidated():
+    html = (web_app._REPO_ROOT / "src" / "universal_video_ai" / "web" / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="publishing-enable-checkbox" checked' not in html
+    assert 'id="publishing-panel" class="hidden"' in html
+    assert 'data-feature="studio"' in html
+    assert html.count('class="feature-tab"') == 1
+    assert 'data-studio-feature="content-os"' in html
+    assert 'data-studio-feature="trend"' in html
+    assert 'data-studio-feature="ai-video"' in html
+    assert 'data-studio-feature="affiliate"' in html
+    assert "Mã chỉ được gửi qua email và không hiển thị trên trang." in html
+
+
+def test_active_license_hides_activation_and_trial_actions():
+    html = (web_app._REPO_ROOT / "src" / "universal_video_ai" / "web" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (web_app._REPO_ROOT / "src" / "universal_video_ai" / "web" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="license-actions"' in html
+    assert 'licenseActions.classList.toggle("hidden", licenseIsActive);' in app_js
+    assert 'licenseActions.classList.remove("hidden");' in app_js
+
+
+def test_windows_build_embeds_public_license_server_default():
+    build_script = (web_app._REPO_ROOT / "build_exe.bat").read_text(encoding="utf-8")
+    wrapper = (web_app._REPO_ROOT / "scripts" / "run_web_wrapper.py").read_text(encoding="utf-8")
+    app_source = (web_app._REPO_ROOT / "src" / "universal_video_ai" / "web" / "app.py").read_text(encoding="utf-8")
+
+    assert "LICENSE_SERVER_URL=http://113.160.14.1:8000" in build_script
+    assert "USER_MANAGEMENT_SERVER_URL=http://113.160.14.1:8001" in build_script
+    assert "server_defaults.env" in wrapper
+    assert 'default_url = "http://113.160.14.1:8000"' in app_source
+
+
+def test_fresh_douyin_cookie_error_is_non_retryable_and_user_friendly():
+    error = RuntimeError(
+        "ERROR: [Douyin] 123: Fresh cookies (not necessarily logged in) are needed"
+    )
+
+    assert web_app._is_non_retryable_job_error(error) is True
+    friendly = web_app._job_error_for_user(error)
+    assert "Douyin yêu cầu cookie mới" in friendly
+    assert "Traceback" not in friendly
+
+
+def test_first_admin_uses_verified_registration_and_device_guard(monkeypatch, tmp_path):
+    isolated_store = Store(tmp_path / "registration.sqlite3")
+    first_code = isolated_store.create_verification_code("owner@example.com", "register")
+    monkeypatch.setattr(web_app, "store", isolated_store)
+    monkeypatch.setattr(web_app, "OPEN_REGISTRATION", False)
+    monkeypatch.setattr(web_app, "USE_USER_MANAGEMENT_SERVER", False)
+    monkeypatch.setattr(web_app, "USE_LICENSE_SERVER", False)
+    monkeypatch.setattr(web_app, "_login_response", lambda user_id: {"user_id": user_id})
+
+    result = web_app.register(web_app.RegisterBody(
+        username="owner",
+        contact_identifier="owner@example.com",
+        password="password123",
+        verification_code=first_code,
+        device_id="browser-device-token-0001",
+    ))
+
+    owner = isolated_store.get_user_by_id(result["user_id"])
+    assert owner["is_admin"] == 1
+    assert owner["credits"] == 10_000
+
+    second_code = isolated_store.create_verification_code("second@example.com", "register")
+    monkeypatch.setattr(web_app, "OPEN_REGISTRATION", True)
+    with pytest.raises(HTTPException, match="Thiết bị này đã nhận tài khoản"):
+        web_app.register(web_app.RegisterBody(
+            username="second",
+            contact_identifier="second@example.com",
+            password="password123",
+            verification_code=second_code,
+            device_id="browser-device-token-0001",
+        ))
+
+
 def test_store_links_central_license_id_to_one_local_user(tmp_path):
     store = Store(tmp_path / "web.sqlite3")
     first_user = store.create_user("first", "hash")

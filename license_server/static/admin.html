@@ -1,566 +1,117 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="vi">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>License Server Admin</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .header { background: #2c3e50; color: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
-        .header h1 { font-size: 24px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 20px; }
-        .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .stat-card h3 { color: #7f8c8d; font-size: 14px; margin-bottom: 10px; }
-        .stat-card .value { font-size: 32px; font-weight: bold; color: #2c3e50; }
-        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        .card h2 { margin-bottom: 15px; color: #2c3e50; }
-        .form-group { margin-bottom: 15px; }
-        .form-group label { display: block; margin-bottom: 5px; color: #34495e; font-weight: 500; }
-        .form-group input, .form-group select, .form-group textarea {
-            width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
-        }
-        .form-group textarea { min-height: 80px; resize: vertical; }
-        .btn { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
-        .btn-primary { background: #3498db; color: white; }
-        .btn-primary:hover { background: #2980b9; }
-        .btn-danger { background: #e74c3c; color: white; }
-        .btn-danger:hover { background: #c0392b; }
-        .btn-success { background: #27ae60; color: white; }
-        .btn-success:hover { background: #1e8449; }
-        .table { width: 100%; border-collapse: collapse; }
-        .table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #ecf0f1; }
-        .table th { background: #f8f9fa; font-weight: 600; color: #2c3e50; }
-        .table tr:hover { background: #f8f9fa; }
-        .badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
-        .badge-active { background: #27ae60; color: white; }
-        .badge-revoked { background: #e74c3c; color: white; }
-        .badge-expired { background: #f39c12; color: white; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
-        .modal.active { display: flex; align-items: center; justify-content: center; }
-        .modal-content { background: white; padding: 30px; border-radius: 8px; max-width: 500px; width: 90%; }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .modal-header h3 { margin: 0; }
-        .close { background: none; border: none; font-size: 24px; cursor: pointer; }
-        .actions { display: flex; gap: 10px; }
-        .actions .btn { flex: 1; }
-        .hidden { display: none; }
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Video Localization · Admin</title>
+  <style>
+    :root{--bg:#f4f7fb;--panel:#fff;--text:#172033;--muted:#68738a;--line:#e4e9f2;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--amber:#d97706;--navy:#111a2e}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+    .shell{max-width:1500px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.top h1{font-size:25px;margin:0}.top p{margin:5px 0 0;color:var(--muted)}
+    .sync{padding:9px 13px;border-radius:9px;background:#e8f7ed;color:#147333}.error-banner{background:#fff1f2;color:#9f1239;border:1px solid #fecdd3;padding:12px 14px;border-radius:10px;margin-bottom:16px}.hidden{display:none!important}
+    .stats{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:12px;margin-bottom:18px}.stat,.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 4px 14px #12213a0a}.stat{padding:16px}.stat small{display:block;color:var(--muted);margin-bottom:7px}.stat strong{font-size:27px}.stat .danger{color:var(--red)}
+    .panel{padding:18px;margin-bottom:18px}.panel-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.panel h2,.panel h3{margin:0}.tools{display:flex;gap:8px;flex-wrap:wrap}.search,input,select,textarea{border:1px solid #cfd7e6;border-radius:8px;padding:9px 10px;background:#fff;font:inherit}.search{min-width:280px}
+    button{border:0;border-radius:8px;padding:8px 11px;cursor:pointer;font:inherit;font-weight:600}.primary{background:var(--blue);color:#fff}.secondary{background:#eef2f7;color:#26324a}.success{background:#dcfce7;color:#166534}.danger-btn{background:#fee2e2;color:#991b1b}.small{padding:6px 9px;font-size:12px}
+    .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1120px}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:middle}th{color:#526078;font-size:12px;text-transform:uppercase;letter-spacing:.03em;background:#f8fafc}tbody tr:hover{background:#f8faff}.clickable{cursor:pointer}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:700}.active,.admin{background:#dcfce7;color:#166534}.expired,.error,.revoked{background:#fee2e2;color:#991b1b}.user,.queued,.review{background:#e8eef8;color:#41506a}.running{background:#fef3c7;color:#92400e}.done{background:#dcfce7;color:#166534}.time{background:#ede9fe;color:#6d28d9}.credit{background:#dbeafe;color:#1d4ed8}
+    .quota{font-weight:700}.sub{display:block;color:var(--muted);font-size:12px;margin-top:3px}.row-actions{display:flex;gap:6px;flex-wrap:wrap}.detail-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}.detail-card{background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:10px}.detail-card small{color:var(--muted);display:block}.detail-card strong{font-size:20px}
+    .job-title{max-width:270px}.job-title a{color:var(--blue);text-decoration:none}.job-error{max-width:330px;color:var(--red);white-space:normal}.empty{text-align:center;color:var(--muted);padding:30px}
+    .modal{position:fixed;inset:0;background:#11182799;display:flex;align-items:center;justify-content:center;padding:18px;z-index:20}.modal-box{background:#fff;border-radius:15px;width:min(580px,100%);max-height:92vh;overflow:auto;padding:22px}.modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:17px}.modal-head h3{font-size:19px}.close{background:transparent;font-size:22px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px}.field{display:flex;flex-direction:column;gap:6px}.field.full{grid-column:1/-1}.field label{font-weight:600;color:#39455d}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.key{font-family:ui-monospace,monospace;word-break:break-all;background:#f5f7fa;border:1px solid var(--line);padding:10px;border-radius:8px}
+    @media(max-width:1000px){.stats{grid-template-columns:repeat(3,1fr)}.detail-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:620px){.shell{padding:12px}.top,.panel-head{align-items:flex-start;flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}.search{min-width:100%;width:100%}.form-grid{grid-template-columns:1fr}.field.full{grid-column:auto}}
+  </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🔐 License Server Admin</h1>
-            <p>Centralized License Management System</p>
-        </div>
+<main class="shell">
+  <header class="top"><div><h1>Trung tâm quản trị</h1><p>User, license, hạn mức và hoạt động xử lý trong cùng một nơi</p></div><div id="syncState" class="sync">Đang đồng bộ…</div></header>
+  <div id="errorBanner" class="error-banner hidden"></div>
+  <section class="stats">
+    <div class="stat"><small>Người dùng</small><strong id="sUsers">0</strong></div>
+    <div class="stat"><small>License active</small><strong id="sLicenses">0</strong></div>
+    <div class="stat"><small>Tổng video</small><strong id="sJobs">0</strong></div>
+    <div class="stat"><small>Trong queue</small><strong id="sQueue">0</strong></div>
+    <div class="stat"><small>Hoàn tất</small><strong id="sDone">0</strong></div>
+    <div class="stat"><small>Lỗi</small><strong id="sErrors" class="danger">0</strong></div>
+  </section>
 
-        <div class="stats">
-            <div class="stat-card">
-                <h3>Total Licenses</h3>
-                <div class="value" id="totalLicenses">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Active Licenses</h3>
-                <div class="value" id="activeLicenses">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Revoked Licenses</h3>
-                <div class="value" id="revokedLicenses">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Expired Licenses</h3>
-                <div class="value" id="expiredLicenses">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Total Users</h3>
-                <div class="value" id="totalUsers">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Admin Users</h3>
-                <div class="value" id="adminUsers">0</div>
-            </div>
-        </div>
+  <section class="panel">
+    <div class="panel-head"><div><h2>Người dùng &amp; License</h2><span class="sub">Click vào một user để xem video, queue và lỗi</span></div><div class="tools"><input id="search" class="search" placeholder="Tìm username, email, key…"><button id="refresh" class="primary">Làm mới</button></div></div>
+    <div class="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Loại gói</th><th>Hạn mức còn lại</th><th>License</th><th>Thiết bị</th><th>Queue</th><th>Jobs / lỗi</th><th>Thao tác</th></tr></thead><tbody id="usersBody"></tbody></table></div>
+  </section>
 
-        <div class="card">
-            <h2>Create New License</h2>
-            <form id="createLicenseForm">
-                <div class="form-group">
-                    <label>Customer Name</label>
-                    <input type="text" id="customerName" required>
-                </div>
-                <div class="form-group">
-                    <label>Customer Email</label>
-                    <input type="email" id="customerEmail" required>
-                </div>
-                <div class="form-group">
-                    <label>Plan Type</label>
-                    <select id="planType" required>
-                        <option value="basic">Basic</option>
-                        <option value="pro">Pro</option>
-                        <option value="enterprise">Enterprise</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Features (comma-separated)</label>
-                    <input type="text" id="features" value="video_localization,transcription,translation" required>
-                </div>
-                <div class="form-group">
-                    <label>Expiry Days (empty for lifetime)</label>
-                    <input type="number" id="expiryDays" placeholder="e.g., 365">
-                </div>
-                <div class="form-group">
-                    <label>Max Jobs</label>
-                    <input type="number" id="maxJobs" value="100" required>
-                </div>
-                <div class="form-group">
-                    <label>Max Tokens</label>
-                    <input type="number" id="maxTokens" value="1000" required>
-                </div>
-                <div class="form-group">
-                    <label>Machine ID (optional - for machine binding)</label>
-                    <input type="text" id="machineId" placeholder="Leave empty for no binding">
-                </div>
-                <div class="form-group">
-                    <label>Notes</label>
-                    <textarea id="notes"></textarea>
-                </div>
-                <button type="submit" class="btn btn-primary">Create License</button>
-            </form>
-        </div>
+  <section id="activityPanel" class="panel hidden">
+    <div class="panel-head"><div><h2 id="activityTitle">Hoạt động user</h2><span id="activityEmail" class="sub"></span></div><button id="closeActivity" class="secondary">Đóng</button></div>
+    <div id="activityStats" class="detail-grid"></div>
+    <div class="table-wrap"><table><thead><tr><th>Thời gian</th><th>Video / nguồn tải</th><th>Trạng thái</th><th>Tiến trình</th><th>Lỗi</th></tr></thead><tbody id="jobsBody"></tbody></table></div>
+  </section>
+</main>
 
-        <div class="card">
-            <h2>Users</h2>
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Username</th>
-                        <th>Email</th>
-                        <th>Role</th>
-                        <th>Credits</th>
-                        <th>License Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="usersTable">
-                </tbody>
-            </table>
-        </div>
+<div id="licenseModal" class="modal hidden"><div class="modal-box"><div class="modal-head"><h3 id="licenseTitle">Tạo license</h3><button class="close" data-close>&times;</button></div>
+  <div class="form-grid">
+    <div class="field full"><label>User</label><input id="licenseUser" readonly></div>
+    <div class="field"><label>Loại sử dụng</label><select id="quotaType"><option value="credit">Theo credit</option><option value="time">Theo thời gian</option></select></div>
+    <div class="field"><label>Gói</label><select id="planType"><option value="basic">Basic</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></div>
+    <div class="field" id="creditField"><label>Credit còn lại</label><input id="creditValue" type="number" min="0" value="100"></div>
+    <div class="field hidden" id="daysField"><label>Số ngày còn lại</label><input id="daysValue" type="number" min="1" value="30"></div>
+    <div class="field"><label>Trạng thái</label><select id="licenseStatus"><option value="active">Active</option><option value="revoked">Revoked</option><option value="expired">Expired</option></select></div>
+    <div class="field"><label>Giới hạn jobs (-1 = không giới hạn)</label><input id="maxJobs" type="number" value="-1"></div>
+    <div class="field full"><label>Ghi chú</label><textarea id="notes" rows="2"></textarea></div>
+    <div id="keyBlock" class="field full hidden"><label>License key</label><div id="licenseKey" class="key"></div><button id="copyKey" class="success" type="button">Copy key</button></div>
+  </div><div class="modal-actions"><button class="secondary" data-close>Hủy</button><button id="saveLicense" class="primary">Lưu &amp; đồng bộ</button></div>
+</div></div>
 
-        <div class="card">
-            <h2>Licenses</h2>
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>License Key</th>
-                        <th>Customer</th>
-                        <th>Plan</th>
-                        <th>Status</th>
-                        <th>Expiry</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="licensesTable">
-                </tbody>
-            </table>
-        </div>
-    </div>
+<div id="devicesModal" class="modal hidden"><div class="modal-box"><div class="modal-head"><h3>Thiết bị đang kết nối</h3><button class="close" data-close-devices>&times;</button></div><div id="devicesBody"></div><div class="modal-actions"><button class="secondary" data-close-devices>Đóng</button></div></div></div>
 
-    <div class="modal" id="editModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Edit License</h3>
-                <button class="close" onclick="closeModal()">&times;</button>
-            </div>
-            <form id="editLicenseForm">
-                <input type="hidden" id="editLicenseId">
-                <div class="form-group">
-                    <label>Status</label>
-                    <select id="editStatus">
-                        <option value="active">Active</option>
-                        <option value="revoked">Revoked</option>
-                        <option value="expired">Expired</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Expiry Days (empty for lifetime)</label>
-                    <input type="number" id="editExpiryDays">
-                </div>
-                <div class="form-group">
-                    <label>Max Jobs</label>
-                    <input type="number" id="editMaxJobs">
-                </div>
-                <div class="form-group">
-                    <label>Max Tokens</label>
-                    <input type="number" id="editMaxTokens">
-                </div>
-                <div class="form-group">
-                    <label>Notes</label>
-                    <textarea id="editNotes"></textarea>
-                </div>
-                <div class="actions">
-                    <button type="submit" class="btn btn-primary">Save Changes</button>
-                    <button type="button" class="btn btn-danger" onclick="closeModal()">Cancel</button>
-                </div>
-            </form>
-        </div>
-    </div>
+<script>
+const API_BASE = `${location.origin}/api`;
+const WEB_API_BASE = `${location.protocol}//${location.hostname}:8080/api`;
+const USER_MANAGEMENT_API_BASE = `${location.protocol}//${location.hostname}:8001/api/users`;
+let usersApiSource = 'web-app';
+let users = [], licenses = [], activities = new Map(), editingUser = null, editingLicense = null;
+const $ = s => document.querySelector(s);
+const esc = v => String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function jsonFetch(url, options={}) { const r=await fetch(url,{credentials:'include',...options,headers:{'Content-Type':'application/json',...(options.headers||{})}}); const data=await r.json().catch(()=>null); if(!r.ok) throw new Error(data?.detail||data?.message||`HTTP ${r.status}`); return data; }
+function showError(message){ $('#errorBanner').textContent=message; $('#errorBanner').classList.toggle('hidden',!message); }
+function licenseFor(user){ return licenses.find(l=>l.user_id===user.id)||licenses.find(l=>user.email&&l.customer_email?.toLowerCase()===user.email.toLowerCase()); }
+function remainText(user,l){ if(!l)return 'Chưa cấp'; if(l.quota_type==='time')return l.remaining_days==null?'Không giới hạn':`${l.remaining_days} ngày`; return `${user.credits} credit`; }
+function statusCount(a,key){return a?.by_status?.[key]||0}
 
-    <script>
-        const API_BASE = window.location.origin + '/api';
-        const WEB_API_BASE = window.location.protocol + '//' + window.location.hostname + ':8080/api'; // Web app API
-        const USER_MANAGEMENT_API_BASE = window.location.protocol + '//' + window.location.hostname + ':8001/api/users'; // User Management Server
-        let usersApiSource = 'user-management';
-
-        async function fetchLicenses() {
-            const response = await fetch(`${API_BASE}/licenses`);
-            const licenses = await response.json();
-            return licenses;
-        }
-
-        async function fetchUsers() {
-            // Try to fetch from User Management Server first
-            try {
-                const response = await fetch(`${USER_MANAGEMENT_API_BASE}`);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const users = await response.json();
-                usersApiSource = 'user-management';
-                return users;
-            } catch (error) {
-                console.error('Failed to fetch from User Management Server, falling back to Web API:', error);
-                // Fallback to web app API
-                const response = await fetch(`${WEB_API_BASE}/admin/users`, { credentials: 'include' });
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const users = await response.json();
-                usersApiSource = 'web-app';
-                return users;
-            }
-        }
-
-        function apiErrorMessage(result, fallback) {
-            if (!result) return fallback;
-            if (typeof result.detail === 'string') return result.detail;
-            if (Array.isArray(result.detail)) {
-                return result.detail.map(item => item.msg || JSON.stringify(item)).join('\n');
-            }
-            return result.message || result.error || fallback;
-        }
-
-        async function updateStats() {
-            const licenses = await fetchLicenses();
-            const users = await fetchUsers();
-            
-            document.getElementById('totalLicenses').textContent = licenses.length;
-            document.getElementById('activeLicenses').textContent = licenses.filter(l => l.status === 'active').length;
-            document.getElementById('revokedLicenses').textContent = licenses.filter(l => l.status === 'revoked').length;
-            document.getElementById('expiredLicenses').textContent = licenses.filter(l => l.status === 'expired').length;
-            document.getElementById('totalUsers').textContent = users.length;
-            document.getElementById('adminUsers').textContent = users.filter(u => u.is_admin).length;
-        }
-
-        async function renderUsers() {
-            const users = await fetchUsers();
-            const licenses = await fetchLicenses();
-            const tbody = document.getElementById('usersTable');
-            
-            tbody.innerHTML = users.map(user => {
-                // Check if user has active license
-                const userLicense = licenses.find(l => l.customer_email === user.email);
-                const licenseStatus = userLicense ? 
-                    `<span class="badge badge-${userLicense.status}">${userLicense.status}</span>` : 
-                    '<span class="badge" style="background: #95a5a6; color: white;">No License</span>';
-                
-                return `
-                <tr>
-                    <td>${user.id}</td>
-                    <td>${user.username}</td>
-                    <td>${user.email || '-'}</td>
-                    <td>
-                        <span class="badge ${user.is_admin ? 'badge-active' : 'badge-revoked'}">
-                            ${user.is_admin ? 'Admin' : 'User'}
-                        </span>
-                    </td>
-                    <td>${user.credits}</td>
-                    <td>${licenseStatus}</td>
-                    <td>
-                        ${!userLicense ? `<button class="btn btn-success" onclick="createLicenseForUser(${user.id}, '${user.email || ''}')" style="padding: 4px 8px; font-size: 12px;">Add License</button>` : ''}
-                        <button class="btn btn-primary" onclick="toggleUserRole(${user.id}, ${user.is_admin})" style="padding: 4px 8px; font-size: 12px;">
-                            ${user.is_admin ? 'Make User' : 'Make Admin'}
-                        </button>
-                    </td>
-                </tr>
-            `}).join('');
-        }
-
-        async function renderLicenses() {
-            const licenses = await fetchLicenses();
-            const tbody = document.getElementById('licensesTable');
-            
-            tbody.innerHTML = licenses.map(license => `
-                <tr>
-                    <td>
-                        <div style="display: flex; align-items: center; gap: 5px;">
-                            <code style="flex: 1;">${license.license_key.substring(0, 20)}...</code>
-                            <button onclick="copyToClipboard('${license.license_key}')" style="padding: 4px 8px; background: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">Copy</button>
-                        </div>
-                    </td>
-                    <td>${license.customer_name}<br><small>${license.customer_email}</small></td>
-                    <td>${license.plan_type}</td>
-                    <td><span class="badge badge-${license.status}">${license.status}</span></td>
-                    <td>${license.expiry_date ? new Date(license.expiry_date * 1000).toLocaleDateString() : 'Lifetime'}</td>
-                    <td>
-                        <button class="btn btn-primary" onclick="editLicense(${license.id})">Edit</button>
-                        <button class="btn btn-danger" onclick="deleteLicense(${license.id})">Delete</button>
-                    </td>
-                </tr>
-            `).join('');
-        }
-
-        async function createLicense(e) {
-            e.preventDefault();
-            
-            const data = {
-                customer_name: document.getElementById('customerName').value,
-                customer_email: document.getElementById('customerEmail').value,
-                plan_type: document.getElementById('planType').value,
-                features: document.getElementById('features').value.split(',').map(f => f.trim()).filter(Boolean),
-                expiry_days: document.getElementById('expiryDays').value ? parseInt(document.getElementById('expiryDays').value) : null,
-                max_jobs: parseInt(document.getElementById('maxJobs').value),
-                max_tokens: parseInt(document.getElementById('maxTokens').value),
-                machine_id: document.getElementById('machineId').value || null,
-                notes: document.getElementById('notes').value || null
-            };
-            
-            let response;
-            let result;
-            try {
-                response = await fetch(`${API_BASE}/licenses`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-                result = await response.json().catch(() => null);
-            } catch (error) {
-                console.error('Failed to create license:', error);
-                alert(`Failed to create license: ${error.message}`);
-                return;
-            }
-
-            if (!response.ok) {
-                alert(`Failed to create license: ${apiErrorMessage(result, `HTTP ${response.status}`)}`);
-                return;
-            }
-            
-            if (result.success) {
-                // Show modal with copy button
-                const modal = document.createElement('div');
-                modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;';
-                modal.innerHTML = `
-                    <div style="background: white; padding: 30px; border-radius: 8px; max-width: 500px; width: 90%;">
-                        <h3 style="margin: 0 0 20px 0;">License Created Successfully!</h3>
-                        <p style="margin: 10px 0;"><strong>License Key:</strong></p>
-                        <div style="display: flex; gap: 10px; margin: 10px 0;">
-                            <input type="text" value="${result.license_key}" readonly style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-family: monospace;">
-                            <button onclick="copyToClipboard('${result.license_key}')" style="padding: 10px 20px; background: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer;">Copy</button>
-                        </div>
-                        <p style="margin: 10px 0; color: #7f8c8d; font-size: 14px;">Please save this key securely.</p>
-                        <button onclick="this.closest('div').parentElement.remove()" style="margin-top: 20px; padding: 10px 20px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; width: 100%;">Close</button>
-                    </div>
-                `;
-                document.body.appendChild(modal);
-                
-                document.getElementById('createLicenseForm').reset();
-                renderLicenses();
-                updateStats();
-            } else {
-                alert(`Failed to create license: ${apiErrorMessage(result, 'Unknown server response')}`);
-            }
-        }
-
-        async function editLicense(id) {
-            const response = await fetch(`${API_BASE}/licenses/${id}`);
-            const license = await response.json();
-            
-            document.getElementById('editLicenseId').value = license.id;
-            document.getElementById('editStatus').value = license.status;
-            document.getElementById('editExpiryDays').value = '';
-            document.getElementById('editMaxJobs').value = license.max_jobs;
-            document.getElementById('editMaxTokens').value = license.max_tokens;
-            document.getElementById('editNotes').value = license.notes || '';
-            
-            document.getElementById('editModal').classList.add('active');
-        }
-
-        async function saveLicense(e) {
-            e.preventDefault();
-            
-            const id = document.getElementById('editLicenseId').value;
-            const data = {
-                status: document.getElementById('editStatus').value,
-                expiry_days: document.getElementById('editExpiryDays').value ? parseInt(document.getElementById('editExpiryDays').value) : null,
-                max_jobs: parseInt(document.getElementById('editMaxJobs').value),
-                max_tokens: parseInt(document.getElementById('editMaxTokens').value),
-                notes: document.getElementById('editNotes').value || null
-            };
-            
-            const response = await fetch(`${API_BASE}/licenses/${id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
-            
-            const result = await response.json();
-            
-            if (result.success) {
-                closeModal();
-                renderLicenses();
-                updateStats();
-            } else {
-                alert('Failed to update license');
-            }
-        }
-
-        async function deleteLicense(id) {
-            if (!confirm('Are you sure you want to delete this license?')) return;
-            
-            const response = await fetch(`${API_BASE}/licenses/${id}`, {
-                method: 'DELETE'
-            });
-            
-            const result = await response.json();
-            
-            if (result.success) {
-                renderLicenses();
-                updateStats();
-            } else {
-                alert('Failed to delete license');
-            }
-        }
-
-        function closeModal() {
-            document.getElementById('editModal').classList.remove('active');
-        }
-
-        function copyToClipboard(text) {
-            // Try modern clipboard API first
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).then(() => {
-                    alert('Copied to clipboard!');
-                }).catch(err => {
-                    // Fallback to older method
-                    fallbackCopyToClipboard(text);
-                });
-            } else {
-                // Fallback for older browsers
-                fallbackCopyToClipboard(text);
-            }
-        }
-
-        function fallbackCopyToClipboard(text) {
-            const textArea = document.createElement("textarea");
-            textArea.value = text;
-            textArea.style.position = "fixed";
-            textArea.style.left = "-9999px";
-            document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
-            
-            try {
-                const successful = document.execCommand('copy');
-                if (successful) {
-                    alert('Copied to clipboard!');
-                } else {
-                    alert('Failed to copy');
-                }
-            } catch (err) {
-                alert('Failed to copy');
-            }
-            
-            document.body.removeChild(textArea);
-        }
-
-        async function createLicenseForUser(userId, userEmail) {
-            const customerName = prompt('Enter customer name:');
-            if (!customerName) return;
-            
-            const data = {
-                customer_name: customerName,
-                customer_email: userEmail,
-                plan_type: 'basic',
-                features: ['video_localization', 'transcription', 'translation'],
-                expiry_days: 365,
-                max_jobs: 100,
-                max_tokens: 1000,
-                machine_id: null,
-                notes: `Created for user ${userId}`
-            };
-            
-            try {
-                const response = await fetch(`${API_BASE}/licenses`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-
-                const result = await response.json().catch(() => null);
-
-                if (!response.ok || !result?.success) {
-                    throw new Error(apiErrorMessage(result, `HTTP ${response.status}`));
-                }
-
-                alert('License created successfully!');
-                const refreshResults = await Promise.allSettled([renderUsers(), renderLicenses(), updateStats()]);
-                refreshResults
-                    .filter(result => result.status === 'rejected')
-                    .forEach(result => console.error('License created, but refreshing the page failed:', result.reason));
-            } catch (error) {
-                console.error('Failed to create license for user:', error);
-                alert(`Failed to create license: ${error.message}`);
-            }
-        }
-
-        async function toggleUserRole(userId, currentIsAdmin) {
-            if (!confirm(`Are you sure you want to change this user to ${currentIsAdmin ? 'regular user' : 'admin'}?`)) return;
-
-            const useCentralUsers = usersApiSource === 'user-management';
-            const url = useCentralUsers
-                ? `${USER_MANAGEMENT_API_BASE}/${userId}`
-                : `${WEB_API_BASE}/admin/users/${userId}/role`;
-
-            try {
-                const response = await fetch(url, {
-                    method: 'PUT',
-                    credentials: useCentralUsers ? 'omit' : 'include',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ is_admin: !currentIsAdmin })
-                });
-                const result = await response.json().catch(() => null);
-                if (!response.ok || result?.success === false || result?.ok === false) {
-                    throw new Error(apiErrorMessage(result, `HTTP ${response.status}`));
-                }
-
-                await Promise.all([renderUsers(), updateStats()]);
-            } catch (error) {
-                console.error('Failed to change user role:', error);
-                alert(`Failed to change user role: ${error.message}`);
-            }
-        }
-
-        document.getElementById('createLicenseForm').addEventListener('submit', createLicense);
-        document.getElementById('editLicenseForm').addEventListener('submit', saveLicense);
-
-        // Initial load
-        renderUsers();
-        renderLicenses();
-        updateStats();
-        
-        // Auto-refresh every 30 seconds
-        setInterval(() => {
-            renderUsers();
-            renderLicenses();
-            updateStats();
-        }, 30000);
-    </script>
+async function loadAll(){
+  $('#syncState').textContent='Đang đồng bộ…'; showError('');
+  try {
+    const [u,l,s,summaries]=await Promise.all([jsonFetch(`${WEB_API_BASE}/admin/users`),jsonFetch(`${API_BASE}/licenses`),jsonFetch(`${WEB_API_BASE}/admin/stats`),jsonFetch(`${WEB_API_BASE}/admin/user-activity-summary`)]);
+    users=u; licenses=l; usersApiSource='web-app';
+    activities=new Map(Object.entries(summaries||{}).map(([id,value])=>[Number(id),value]));
+    renderUsers(); renderStats(s); $('#syncState').textContent=`Đã đồng bộ ${new Date().toLocaleTimeString('vi-VN')}`;
+  } catch(e){ showError(`Không thể đọc dữ liệu web app: ${e.message}. Hãy đăng nhập tài khoản admin tại cổng 8080 trước, sau đó mở lại trang này.`); $('#syncState').textContent='Mất đồng bộ'; }
+}
+function renderStats(s){const queue=(s.jobs_by_status?.queued||0)+(s.jobs_by_status?.running||0)+(s.jobs_by_status?.review||0);$('#sUsers').textContent=users.length;$('#sLicenses').textContent=licenses.filter(l=>l.status==='active').length;$('#sJobs').textContent=s.total_jobs||0;$('#sQueue').textContent=queue;$('#sDone').textContent=s.jobs_by_status?.done||0;$('#sErrors').textContent=s.jobs_by_status?.error||0}
+function renderUsers(){
+  const q=$('#search').value.trim().toLowerCase(); const filtered=users.filter(u=>{const l=licenseFor(u);return !q||[u.username,u.email,l?.license_key].some(v=>String(v||'').toLowerCase().includes(q))});
+  $('#usersBody').innerHTML=filtered.length?filtered.map(u=>{const l=licenseFor(u),a=activities.get(u.id);return `<tr class="clickable" data-user-row="${u.id}">
+    <td><b>${esc(u.username)}</b><span class="sub">${esc(u.email||'#'+u.id)}</span></td><td><span class="badge ${u.is_admin?'admin':'user'}">${u.is_admin?'Admin':'User'}</span></td>
+    <td>${l?`<span class="badge ${l.quota_type==='time'?'time':'credit'}">${l.quota_type==='time'?'Theo thời gian':'Theo credit'}</span><span class="sub">${esc(l.plan_type)}</span>`:'—'}</td>
+    <td class="quota">${remainText(u,l)}</td><td>${l?`<span class="badge ${esc(l.status)}">${esc(l.status)}</span><span class="sub">${esc(l.license_key.slice(0,10))}…</span>`:'<span class="badge user">Chưa có</span>'}</td>
+    <td>${l?`<button class="secondary small" data-devices="${l.id}">${l.device_count||0} máy</button>`:'—'}</td><td>${a?.queue_count||0}</td><td>${a?.total_jobs||0} / <span style="color:var(--red)">${statusCount(a,'error')}</span></td>
+    <td><div class="row-actions"><button class="secondary small" data-role="${u.id}">${u.is_admin?'Hạ User':'Make Admin'}</button><button class="${l?'primary':'success'} small" data-license-user="${u.id}">${l?'Quản lý':'Tạo license'}</button><button class="secondary small" data-reset-registration-device="${u.id}" title="Cho phép đăng ký lại sau khi đổi máy hợp lệ">Reset máy đăng ký</button></div></td></tr>`}).join(''):'<tr><td colspan="9" class="empty">Không có user phù hợp</td></tr>';
+  document.querySelectorAll('[data-user-row]').forEach(row=>row.onclick=e=>{if(!e.target.closest('button'))openActivity(+row.dataset.userRow)});
+  document.querySelectorAll('[data-role]').forEach(b=>b.onclick=()=>toggleRole(+b.dataset.role));
+  document.querySelectorAll('[data-license-user]').forEach(b=>b.onclick=()=>openLicense(+b.dataset.licenseUser));
+  document.querySelectorAll('[data-devices]').forEach(b=>b.onclick=()=>openDevices(+b.dataset.devices));
+  document.querySelectorAll('[data-reset-registration-device]').forEach(b=>b.onclick=()=>resetRegistrationDevice(+b.dataset.resetRegistrationDevice));
+}
+async function toggleRole(userId){const u=users.find(x=>x.id===userId),next=!u.is_admin;if(!confirm(`Đổi ${u.username} thành ${next?'Admin':'User'}?`))return;await jsonFetch(`${WEB_API_BASE}/admin/users/${userId}/role`,{method:'PUT',body:JSON.stringify({is_admin:next})});
+  if(usersApiSource === 'user-management') await jsonFetch(`${USER_MANAGEMENT_API_BASE}/${userId}`,{method:'PUT',credentials:'omit',body:JSON.stringify({is_admin:next})});
+  u.is_admin=next;renderUsers();}
+async function resetRegistrationDevice(userId){const u=users.find(x=>x.id===userId);if(!confirm(`Cho phép ${u?.username||'user này'} đăng ký lại trên thiết bị mới?`))return;const result=await jsonFetch(`${WEB_API_BASE}/admin/users/${userId}/registration-devices`,{method:'DELETE'});alert(`Đã gỡ ${result.released||0} ràng buộc thiết bị đăng ký.`)}
+async function openActivity(id){const u=users.find(x=>x.id===id);let a=activities.get(id);$('#activityTitle').textContent=`Hoạt động: ${u.username}`;$('#activityEmail').textContent=u.email||'';$('#activityPanel').classList.remove('hidden');$('#jobsBody').innerHTML='<tr><td colspan="5" class="empty">Đang tải log…</td></tr>';$('#activityPanel').scrollIntoView({behavior:'smooth'});try{a=await jsonFetch(`${WEB_API_BASE}/admin/users/${id}/activity?limit=100`);activities.set(id,a)}catch(e){showError(e.message)}$('#activityStats').innerHTML=[['Tổng jobs',a?.total_jobs||0],['Trong queue',a?.queue_count||0],['Hoàn tất',statusCount(a,'done')],['Lỗi',statusCount(a,'error')]].map(x=>`<div class="detail-card"><small>${x[0]}</small><strong>${x[1]}</strong></div>`).join('');$('#jobsBody').innerHTML=a?.jobs?.length?a.jobs.map(j=>`<tr><td>${new Date(j.created_at*1000).toLocaleString('vi-VN')}</td><td class="job-title"><b>${esc(j.title||j.source_channel_title||'Video')}</b><span class="sub"><a href="${esc(j.source_url)}" target="_blank" rel="noopener">${esc(j.source_url)}</a></span></td><td><span class="badge ${esc(j.status)}">${esc(j.status)}</span></td><td>${esc(j.progress_note||'—')}</td><td class="job-error">${esc(j.error||'—')}</td></tr>`).join(''):'<tr><td colspan="5" class="empty">User chưa có hoạt động</td></tr>'}
+function openLicense(id){editingUser=users.find(x=>x.id===id);editingLicense=licenseFor(editingUser);$('#licenseTitle').textContent=editingLicense?'Quản lý license':'Tạo license cho user';$('#licenseUser').value=`${editingUser.username} · ${editingUser.email||'#'+id}`;$('#quotaType').value=editingLicense?.quota_type||'credit';$('#planType').value=editingLicense?.plan_type||'basic';$('#creditValue').value=editingUser.credits;$('#daysValue').value=editingLicense?.remaining_days||30;$('#licenseStatus').value=editingLicense?.status||'active';$('#maxJobs').value=editingLicense?.max_jobs??-1;$('#notes').value=editingLicense?.notes||'';$('#keyBlock').classList.toggle('hidden',!editingLicense);$('#licenseKey').textContent=editingLicense?.license_key||'';toggleQuotaFields();$('#licenseModal').classList.remove('hidden')}
+function toggleQuotaFields(){const time=$('#quotaType').value==='time';$('#daysField').classList.toggle('hidden',!time);$('#creditField').classList.toggle('hidden',time)}
+async function saveLicense(){const quota=$('#quotaType').value,days=Math.max(1,parseInt($('#daysValue').value)||30),credits=Math.max(0,parseInt($('#creditValue').value)||0),common={quota_type:quota,plan_type:$('#planType').value,expiry_days:quota==='time'?days:null,clear_expiry:quota==='credit',max_jobs:parseInt($('#maxJobs').value)||-1,max_tokens:quota==='credit'?credits:-1,status:$('#licenseStatus').value,notes:$('#notes').value||null};
+  if(editingLicense){await jsonFetch(`${API_BASE}/licenses/${editingLicense.id}`,{method:'PUT',body:JSON.stringify(common)})}else{await jsonFetch(`${API_BASE}/licenses`,{method:'POST',body:JSON.stringify({...common,user_id:editingUser.id,customer_name:editingUser.username,customer_email:editingUser.email||`${editingUser.username}@local`,features:['video_localization','transcription','translation']})})}
+  if(quota==='credit')await jsonFetch(`${WEB_API_BASE}/admin/users/${editingUser.id}/credits`,{method:'POST',body:JSON.stringify({set_to:credits})});closeLicense();await loadAll()}
+async function openDevices(id){const data=await jsonFetch(`${API_BASE}/licenses/${id}/usage`);$('#devicesBody').innerHTML=data.usage.length?data.usage.map((d,i)=>`<div class="detail-card" style="margin-bottom:8px"><b>Máy ${i+1}</b><span class="sub">ID: ${esc(d.machine_id)}</span><span class="sub">Jobs: ${d.jobs_used} · Tokens: ${d.tokens_used} · Kiểm tra cuối: ${new Date(d.last_check*1000).toLocaleString('vi-VN')}</span></div>`).join(''):'<div class="empty">License chưa kết nối máy nào</div>';$('#devicesModal').classList.remove('hidden')}
+function closeLicense(){$('#licenseModal').classList.add('hidden');editingUser=null;editingLicense=null}
+$('#quotaType').onchange=toggleQuotaFields;$('#saveLicense').onclick=()=>saveLicense().catch(e=>alert(e.message));$('#copyKey').onclick=()=>navigator.clipboard.writeText($('#licenseKey').textContent).then(()=>$('#copyKey').textContent='Đã copy ✓');document.querySelectorAll('[data-close]').forEach(b=>b.onclick=closeLicense);document.querySelectorAll('[data-close-devices]').forEach(b=>b.onclick=()=>$('#devicesModal').classList.add('hidden'));$('#closeActivity').onclick=()=>$('#activityPanel').classList.add('hidden');$('#search').oninput=renderUsers;$('#refresh').onclick=loadAll;loadAll();setInterval(loadAll,30000);
+</script>
 </body>
 </html>

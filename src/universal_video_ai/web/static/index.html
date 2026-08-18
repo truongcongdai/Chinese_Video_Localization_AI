@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Video Localization AI</title>
+<title>Video Studio</title>
 <meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/assets/app.css?v=20260729">
+<link rel="stylesheet" href="/assets/app.css?v=20260818-product-ui">
 </head>
 <body>
 
@@ -22,15 +22,15 @@
     
     <!-- Step 1: Welcome -->
     <div class="onboarding-step active" data-step="1">
-      <h2 class="onboarding-title">🎉 Chào mừng đến với Video Localization AI!</h2>
+      <h2 class="onboarding-title">Chào mừng đến với Video Studio</h2>
       <div class="onboarding-content">
         <p>Hệ thống giúp bạn:</p>
         <ul>
           <li>🎥 Tự động dịch và lồng tiếng video</li>
-          <li>🤖 Tạo kịch bản bằng AI (Gemini, OpenAI, Ollama)</li>
+          <li>Tạo kịch bản với Gemini, OpenAI hoặc Ollama</li>
           <li>🎬 Thêm hiệu ứng phụ đề động</li>
-          <li>🎨 Áp dụng template video chuyên nghiệp</li>
-          <li>📦 Xử lý hàng loạt với queue management</li>
+          <li>Áp dụng mẫu video có sẵn</li>
+          <li>Xử lý hàng loạt bằng hàng đợi</li>
         </ul>
         <p>Hệ thống chạy hoàn toàn nội bộ, dữ liệu của bạn luôn an toàn.</p>
       </div>
@@ -42,7 +42,7 @@
     
     <!-- Step 2: Quick Start -->
     <div class="onboarding-step" data-step="2">
-      <h2 class="onboarding-title">🚀 Bắt đầu nhanh</h2>
+      <h2 class="onboarding-title">Bắt đầu nhanh</h2>
       <div class="onboarding-content">
         <p>Để tạo video đầu tiên:</p>
         <ol>
@@ -70,7 +70,7 @@
           <li><strong>Video Templates:</strong> Template với color grading và audio filters</li>
           <li><strong>Video Presets:</strong> Lưu và tải lại cấu hình video</li>
         </ul>
-        <p>🎨 Mở panel "Tùy chọn nâng cao" để truy cập các tính năng này.</p>
+        <p>Mở phần "Tùy chọn nâng cao" khi bạn cần tinh chỉnh sâu hơn.</p>
       </div>
       <div class="onboarding-buttons">
         <button class="onboarding-skip" onclick="prevOnboardingStep()">← Quay lại</button>
@@ -82,18 +82,18 @@
     <div class="onboarding-step" data-step="4">
       <h2 class="onboarding-title">✅ Sẵn sàng!</h2>
       <div class="onboarding-content">
-        <p>Bạn đã sẵn sàng sử dụng Video Localization AI!</p>
+        <p>Bạn đã sẵn sàng sử dụng Video Studio.</p>
         <p>Nếu cần hỗ trợ:</p>
         <ul>
           <li>📖 Xem README.md trong thư mục dự án</li>
-          <li>🔍 Kiểm tra API docs tại /api/version</li>
+          <li>Kiểm tra thông tin API tại /api/version</li>
           <li>📧 Liên hệ hỗ trợ nếu gặp lỗi</li>
         </ul>
         <p>🎊 Chúc bạn tạo ra những video tuyệt vời!</p>
       </div>
       <div class="onboarding-buttons">
         <button class="onboarding-skip" onclick="prevOnboardingStep()">← Quay lại</button>
-        <button class="btn gradient" onclick="finishOnboarding()">Bắt đầu sử dụng 🚀</button>
+        <button class="btn gradient" onclick="finishOnboarding()">Bắt đầu sử dụng</button>
       </div>
     </div>
   </div>
@@ -113,7 +113,7 @@
 
 <div id="landing-view">
   <nav class="landing-nav">
-    <div class="landing-brand">Video Localization AI</div>
+    <div class="landing-brand">Video Studio</div>
     <div class="landing-nav-actions">
       <a href="#landing-pricing">Bảng giá</a>
       <button class="btn secondary small" id="landing-login-btn" type="button">Đăng nhập</button>
@@ -123,7 +123,7 @@
   <main class="landing-main">
     <section class="landing-hero">
       <div>
-        <div class="landing-eyebrow">AI VIDEO LOCALIZATION WORKSPACE</div>
+        <div class="landing-eyebrow">QUY TRÌNH VIDEO ĐA NGÔN NGỮ</div>
         <h1>Biến một video thành nội dung phù hợp với mọi thị trường.</h1>
         <p>Dịch lời thoại, tạo giọng đọc tự nhiên, dựng phụ đề và xuất preset TikTok, Shorts hoặc Reels trong một quy trình rõ ràng.</p>
         <div class="landing-hero-actions">
@@ -166,12 +166,12 @@
       </div>
     </section>
   </main>
-  <footer class="landing-footer">Video Localization AI · Dữ liệu và video được xử lý trong workspace của bạn.</footer>
+  <footer class="landing-footer">Video Studio · Dữ liệu và video được xử lý trong workspace của bạn.</footer>
 </div>
 
 <div id="auth-view" class="wrap hidden">
   <h2 id="auth-title">Đăng nhập</h2>
-  <p class="sub" id="auth-sub">Video Localization AI</p>
+  <p class="sub" id="auth-sub">Video Studio</p>
   <div class="card">
     <div class="auth-tabs">
       <button class="auth-tab active" type="button" id="show-login-tab">Đăng nhập</button>
@@ -186,11 +186,12 @@
       <button class="btn gradient" type="submit" style="width:100%">🔐 Đăng nhập</button>
     </form>
     <form id="register-form" class="hidden">
-      <div class="field"><label>Email / Số điện thoại</label><input id="register-contact" autocomplete="email" required></div>
+      <div class="field"><label>Email</label><input id="register-contact" type="email" autocomplete="email" required></div>
+      <div class="field"><label>Mã xác minh</label><div style="display:flex;gap:8px"><input id="register-verification-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6 chữ số" required><button class="btn secondary" id="register-send-code" type="button">Gửi mã</button></div><div id="register-code-status" class="muted-help">Mã chỉ được gửi qua email và không hiển thị trên trang.</div></div>
       <div class="field"><label>Tên đăng nhập</label><input id="register-username" autocomplete="username" required></div>
       <div class="field"><label>Mật khẩu</label><input id="register-password" type="password" autocomplete="new-password" required></div>
       <div class="field"><label>Mã giới thiệu (nếu có)</label><input id="register-referral-code" placeholder="VD: 6QNRHSW"></div>
-      <button class="btn gradient" type="submit" style="width:100%">📝 Đăng ký</button>
+      <button class="btn gradient" type="submit" style="width:100%">Tạo tài khoản</button>
     </form>
     <div id="auth-error"></div>
 
@@ -206,8 +207,8 @@
 <div id="app-view" class="wrap hidden">
   <header>
     <div>
-      <h1>Video Localization AI</h1>
-      <div class="sub">Dịch &amp; lồng tiếng video, xem trước, tải xuống, đăng lên mạng xã hội</div>
+      <h1>Video Studio</h1>
+      <div class="sub">Dịch, dựng và chuẩn bị video để xuất bản trong một quy trình rõ ràng</div>
     </div>
     <div id="userbar">
       <span id="userbar-credits" class="credits-badge" title="Credit còn lại"></span>
@@ -235,7 +236,7 @@
     <div id="license-info" style="margin-bottom:12px">
       <div style="font-size:13px;color:var(--text-dim)">Chưa có license nào được kích hoạt.</div>
     </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <div id="license-actions" style="display:flex;gap:8px;flex-wrap:wrap">
       <input type="text" id="license-input" placeholder="Nhập license key..." style="flex:1;min-width:200px;padding:8px">
       <button class="btn gradient" id="activate-license-btn">Kích hoạt License</button>
       <button class="btn secondary" id="start-trial-btn">🎁 Dùng thử miễn phí</button>
@@ -265,25 +266,17 @@
   <!-- Feature Tabs Navigation -->
   <div class="feature-tabs">
     <button class="feature-tab active" data-feature="localization">
-      <span>🎬</span>
       <span>Dịch Video</span>
     </button>
-    <button class="feature-tab" data-feature="trend">
-      <span>🔍</span>
-      <span>Quét Trend</span>
+    <button class="feature-tab" data-feature="studio">
+      <span>Studio nội dung</span>
     </button>
-    <button class="feature-tab" data-feature="content-os">
-      <span>🚀</span>
-      <span>Content OS</span>
-    </button>
-    <button class="feature-tab" data-feature="ai-video">
-      <span>🤖</span>
-      <span>Tạo Video AI</span>
-    </button>
-    <button class="feature-tab" data-feature="affiliate">
-      <span>📦</span>
-      <span>Product Ad</span>
-    </button>
+  </div>
+  <div class="studio-tabs hidden" id="studio-tabs" aria-label="Công cụ Studio nội dung">
+    <button class="studio-tab active" type="button" data-studio-feature="content-os">Chiến dịch</button>
+    <button class="studio-tab" type="button" data-studio-feature="trend">Nghiên cứu chủ đề</button>
+    <button class="studio-tab" type="button" data-studio-feature="ai-video">Video từ ý tưởng</button>
+    <button class="studio-tab" type="button" data-studio-feature="affiliate">Video sản phẩm</button>
   </div>
 
   <!-- Localization Panel -->
@@ -765,7 +758,7 @@
         <input type="checkbox" id="branding-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
         Bảo vệ thương hiệu cho video đầu ra
       </label>
-      <div class="muted-help">Áp dụng cho link đơn, upload, xử lý cả kênh, Creator và Content OS khi được bật.</div>
+      <div class="muted-help">Hệ thống không tự thêm logo hoặc watermark. Chỉ bật mục này khi bạn chủ động muốn chèn thương hiệu mình sở hữu.</div>
     </div>
     <div id="branding-panel" class="hidden" style="margin-bottom:14px;padding:16px;background:var(--panel-2);border-radius:var(--radius-sm);border:1px solid var(--border);">
       <div class="row">
@@ -799,12 +792,12 @@
 
     <div class="field" style="margin-top:16px;">
       <label>
-        <input type="checkbox" id="publishing-enable-checkbox" checked style="width:auto;vertical-align:middle;margin-right:6px">
+        <input type="checkbox" id="publishing-enable-checkbox" style="width:auto;vertical-align:middle;margin-right:6px">
         AI Publishing Pack cho task Reup
       </label>
       <div class="muted-help">Sau render tự phân tích subtitle/nội dung, tạo title, mô tả, hashtag, thumbnail và bản publish-ready.</div>
     </div>
-    <div id="publishing-panel" style="margin-bottom:14px;padding:16px;background:var(--panel-2);border-radius:var(--radius-sm);border:1px solid var(--border);">
+    <div id="publishing-panel" class="hidden" style="margin-bottom:14px;padding:16px;background:var(--panel-2);border-radius:var(--radius-sm);border:1px solid var(--border);">
       <div class="row">
         <div class="field">
           <label>Hồ sơ kênh</label>
@@ -1104,7 +1097,7 @@
     </div>
     <div class="localization-step-actions">
       <button class="btn secondary" type="button" data-localization-back="2">← Quay lại</button>
-      <button class="btn gradient" id="submit-btn">🚀 Bắt đầu xử lý</button>
+      <button class="btn gradient" id="submit-btn">Bắt đầu xử lý</button>
     </div>
     </section>
     <div id="submit-error" role="alert" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
@@ -1114,7 +1107,8 @@
   <!-- Affiliate Panel -->
   <div class="feature-panel" data-feature="affiliate">
     <div class="card">
-    <h3 class="section-title">Product Ad Creative / Affiliate Mode</h3>
+    <h3 class="section-title">Video sản phẩm</h3>
+    <p class="section-intro">Tạo kịch bản, cảnh minh họa và nội dung đăng bán từ thông tin sản phẩm thật.</p>
     <div class="row">
       <div class="field" style="flex: 2">
         <label>Link san pham (tuy chon)</label>
@@ -1236,7 +1230,8 @@
   <!-- AI Video Panel -->
   <div class="feature-panel" data-feature="ai-video">
     <div class="card">
-    <h3 class="section-title">Tạo video AI từ ý tưởng/cảnh quay</h3>
+    <h3 class="section-title">Video từ ý tưởng</h3>
+    <p class="section-intro">Biến một chủ đề thành kịch bản, giọng đọc và chuỗi cảnh hoàn chỉnh.</p>
     <div class="row">
       <div class="field" style="flex: 2">
         <label>Chủ đề</label>
@@ -1297,7 +1292,7 @@
       <label>Video keyword</label>
       <textarea id="creator-keywords" rows="3" placeholder="Keyword sẽ được tự gen từ chủ đề, dùng cho tìm footage và đăng video."></textarea>
       <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn secondary small" id="creator-keywords-generate" type="button">✨ Gen keyword</button>
+        <button class="btn secondary small" id="creator-keywords-generate" type="button">Gợi ý keyword</button>
         <button class="btn secondary small" id="creator-keywords-copy" type="button">📋 Copy keyword</button>
       </div>
     </div>
@@ -1382,7 +1377,7 @@
         <div class="field" style="flex:.6"><label>Mức bảo vệ</label><select id="creator-branding-preset"><option value="subtle">Nhẹ</option><option value="balanced" selected>Cân bằng</option><option value="strong">Mạnh</option></select></div>
       </div>
     </div>
-    <button class="btn gradient" id="creator-submit-btn" disabled>🎨 Tạo video AI</button>
+    <button class="btn gradient" id="creator-submit-btn" disabled>Tạo video</button>
     <div class="creator-progress hidden" id="creator-progress" aria-live="polite">
       <div class="creator-progress-head"><span id="creator-progress-label">Đang chuẩn bị...</span><strong id="creator-progress-percent">0%</strong></div>
       <div class="progress-track"><div class="progress-fill" id="creator-progress-fill"></div></div>
@@ -1395,8 +1390,8 @@
   <div class="feature-panel" data-feature="trend">
     <div class="card">
     <div class="template-library-heading">
-      <h3 class="section-title">🔍 Quét Trend</h3>
-      <span id="trend-status" class="muted-help">Khám phá nội dung đang hot</span>
+      <h3 class="section-title">Nghiên cứu chủ đề</h3>
+      <span id="trend-status" class="muted-help">Tìm tín hiệu và ý tưởng đang được quan tâm</span>
     </div>
     <div class="field">
       <label>Chủ đề cần quét</label>
@@ -1439,7 +1434,7 @@
         <option value="50">50</option>
       </select>
     </div>
-    <button class="btn gradient" id="trend-scan-btn" type="button">🔍 Quét trend</button>
+    <button class="btn gradient" id="trend-scan-btn" type="button">Bắt đầu nghiên cứu</button>
     <div id="trend-warnings" style="font-size:12px;color:var(--warn);margin-top:8px;display:none"></div>
     <div id="trend-results" style="margin-top:16px;display:none">
       <div style="font-size:13px;font-weight:600;margin-bottom:8px">Kết quả quét:</div>
@@ -1457,12 +1452,12 @@
   <div class="feature-panel" data-feature="content-os">
     <div class="card">
     <div class="template-library-heading">
-      <h3 class="section-title">🚀 Content OS</h3>
-      <span id="content-os-status" class="muted-help">Workflow tạo nội dung AI</span>
+      <h3 class="section-title">Chiến dịch nội dung</h3>
+      <span id="content-os-status" class="muted-help">Quản lý dự án và quy trình sản xuất theo kênh</span>
     </div>
 
     <div id="content-os-feature-disabled" class="hidden" style="padding: 20px; text-align: center; color: var(--text-dim);">
-      <p>Content OS hiện đang bị tắt.</p>
+      <p>Chiến dịch nội dung hiện đang bị tắt.</p>
       <p style="font-size: 13px;">Để bật tính năng này, hãy đặt CONTENT_OS_ENABLED=true trong file .env</p>
     </div>
 
@@ -1517,7 +1512,7 @@
         </select>
       </div>
       <div class="field">
-        <label><input type="checkbox" id="content-os-branding-enable" style="width:auto;margin-right:6px">Bảo vệ thương hiệu cho video Content OS</label>
+        <label><input type="checkbox" id="content-os-branding-enable" style="width:auto;margin-right:6px">Chèn thương hiệu của kênh</label>
       </div>
       <div id="content-os-branding-panel" class="hidden" style="padding:12px;margin-bottom:12px;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);">
         <div class="row">
@@ -1606,7 +1601,7 @@
       </div>
       <div class="stat-box">
         <div class="num" id="stat-credits">0</div>
-        <div class="label">Credit còn lại</div>
+        <div class="label" id="stat-quota-label">Credit còn lại</div>
       </div>
     </div>
     <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
@@ -1742,10 +1737,11 @@
       </div>
     </div>
     <div id="before-video-note" class="muted-help hidden">Video nguồn cũ không còn được lưu; các job mới sẽ có Before/After đầy đủ.</div>
+    <div class="source-logo-notice">Ứng dụng không chèn logo hệ thống. Trước khi đăng, hãy xem hết bản After để xác nhận không còn logo nguồn ngoài ý muốn; chỉ crop/che nội dung mà bạn có quyền sử dụng.</div>
     <div id="prepublish-result" class="hidden" style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:8px"></div>
     <div style="margin-top: 14px; display:flex; gap:10px;">
       <a class="btn" id="preview-download">📥 Tải xuống</a>
-      <button class="btn secondary" id="prepublish-check-btn">🔍 Kiểm tra trước đăng</button>
+      <button class="btn secondary" id="prepublish-check-btn">Kiểm tra trước đăng</button>
       <button class="btn gradient" id="preview-improve-btn">Improve</button>
       <button class="btn gradient" id="preview-publish-btn">📱 Đăng lên mạng xã hội</button>
     </div>
@@ -1790,7 +1786,7 @@
     </div>
     <div class="field"><label>Hẹn giờ đăng (theo giờ trên thiết bị)</label><input type="datetime-local" id="publish-scheduled-at"></div>
     <div style="display:flex;gap:10px">
-      <button class="btn gradient" id="publish-submit">🚀 Đăng ngay</button>
+      <button class="btn gradient" id="publish-submit">Đăng ngay</button>
       <button class="btn secondary" id="publish-schedule">⏰ Hẹn giờ đăng</button>
     </div>
     <div id="scheduled-posts" style="margin-top:12px"></div>
@@ -1938,6 +1934,6 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260805-channel" defer></script>
+<script src="/assets/app.js?v=20260818-license-douyin" defer></script>
 </body>
 </html>

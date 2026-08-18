@@ -4,8 +4,8 @@ REM Run as Administrator
 
 if "%1"=="" (
     echo Usage: set_license_server.bat ^<LICENSE_SERVER_URL^>
-    echo Example: set_license_server.bat http://192.168.6.10:8000
-    echo Example: set_license_server.bat http://113.160.14.1:8000
+    echo Public: set_license_server.bat http://113.160.14.1:8000
+    echo Local only: set_license_server.bat http://192.168.6.10:8000
     echo.
     echo This will automatically set USER_MANAGEMENT_SERVER_URL to the same host with port 8001
     exit /b 1

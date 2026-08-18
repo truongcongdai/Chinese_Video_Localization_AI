@@ -10,6 +10,7 @@ Run with: python scripts/run_web.py
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ OPENAI_AVAILABLE = _openai is not None
 import requests
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -113,7 +115,14 @@ from .content_os_router import router as content_os_router
 
 logger = logging.getLogger("universal_video_ai.web")
 
-app = FastAPI(title="Video Localization AI")
+app = FastAPI(title="Video Studio")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https?://[^/]+:8000",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 
 def _redact_redis_url(url: str) -> str:
@@ -249,6 +258,7 @@ def get_user_management_server_url() -> str:
 
 USER_MANAGEMENT_SERVER_URL = get_user_management_server_url()
 USE_USER_MANAGEMENT_SERVER = bool(USER_MANAGEMENT_SERVER_URL)
+USER_MANAGEMENT_MIRROR_ENABLED = bool(os.environ.get("USER_MANAGEMENT_SERVER_URL", "").strip()) or sys.platform == "win32"
 
 store = Store(_DB_PATH)
 
@@ -297,6 +307,98 @@ def update_license_usage_on_server(license_id: int, machine_id: str, jobs_delta:
         return False
 
 
+def get_license_for_user_on_server(user_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch the active central license assigned to a web user."""
+    if not USE_LICENSE_SERVER:
+        return None
+    try:
+        response = requests.get(
+            f"{LICENSE_SERVER_URL}/api/licenses/by-user/{user_id}", timeout=10
+        )
+        if getattr(response, "status_code", 200) == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        license_data = payload.get("license") if isinstance(payload, dict) else None
+        return license_data if isinstance(license_data, dict) else None
+    except requests.RequestException as exc:
+        logger.warning("Could not sync license for user %s: %s", user_id, exc)
+        return None
+
+
+def _get_user_license(user_id: int) -> Optional[License]:
+    """Return the local license cache, auto-linking an admin-assigned remote license."""
+    license_record = store.get_license_by_user(user_id)
+    if not USE_LICENSE_SERVER:
+        return license_record
+    remote: Optional[Dict[str, Any]] = None
+    if license_record is not None:
+        validation = validate_license_with_server(license_record.license_key, store.get_machine_id())
+        if validation and validation.get("valid") and isinstance(validation.get("license"), dict):
+            remote = validation["license"]
+    if remote is None:
+        remote = get_license_for_user_on_server(user_id)
+    if not remote:
+        return license_record
+    if not str(remote.get("license_key") or "").strip() and license_record is not None:
+        return license_record
+    try:
+        return store.link_remote_license(remote, user_id)
+    except ValueError as exc:
+        logger.warning("Could not link remote license for user %s: %s", user_id, exc)
+        return None
+
+
+def _job_credit_cost(user_id: int) -> int:
+    """Time-based subscriptions do not consume the user's credit balance."""
+    license_record = store.get_license_by_user(user_id)
+    if license_record and license_record.status == "active" and license_record.quota_type == "time":
+        if license_record.expiry_date is None or license_record.expiry_date >= time.time():
+            return 0
+    return JOB_COST_CREDITS
+
+
+def _mirror_user_credit_delta(user_id: int, delta: int) -> None:
+    """Best-effort mirror so the account server cannot restore a stale balance."""
+    if not USER_MANAGEMENT_MIRROR_ENABLED or delta == 0:
+        return
+    try:
+        response = requests.post(
+            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{user_id}/credits",
+            json={"amount": delta}, timeout=3,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Could not mirror credit delta for user %s: %s", user_id, exc)
+
+
+def _mirror_user_role(user_id: int, is_admin: bool) -> None:
+    """Best-effort role mirror to the centralized account service."""
+    if not USER_MANAGEMENT_MIRROR_ENABLED:
+        return
+    try:
+        response = requests.put(
+            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{user_id}",
+            json={"is_admin": is_admin}, timeout=3,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Could not mirror role for user %s: %s", user_id, exc)
+
+
+def _adjust_user_credits(user_id: int, delta: int) -> int:
+    new_balance = store.adjust_credits(user_id, delta)
+    _mirror_user_credit_delta(user_id, delta)
+    return new_balance
+
+
+def _set_user_credits(user_id: int, value: int) -> None:
+    current = store.get_user_by_id(user_id)
+    old_value = int(current["credits"]) if current else 0
+    store.set_credits(user_id, value)
+    _mirror_user_credit_delta(user_id, value - old_value)
+
+
 def _require_license_or_trial(user_id: int) -> str:
     """Authorize a job using an active license or a usable local trial.
 
@@ -306,7 +408,7 @@ def _require_license_or_trial(user_id: int) -> str:
     accidentally bypassing a trial that the UI just activated.
     """
     machine_id = store.get_machine_id()
-    user_license = store.get_license_by_user(user_id)
+    user_license = _get_user_license(user_id)
     license_error: Optional[str] = None
 
     if user_license and USE_LICENSE_SERVER:
@@ -634,18 +736,20 @@ def require_admin_user_id(user_id: int = Depends(get_current_user_id)) -> int:
 class LoginBody(BaseModel):
     identifier: str  # username, email, or phone number — whichever the account was created with
     password: str
+    device_id: Optional[str] = None
 
 
 class RegisterBody(BaseModel):
     username: str
-    contact_identifier: str  # email address or phone number
+    contact_identifier: str  # verified email address
     password: str
-    verification_code: str  # 6-digit OTP sent to email/phone
+    verification_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    device_id: str = Field(min_length=16, max_length=200)
     referral_code: Optional[str] = None  # whoever invited this person, if anyone
 
 
 class SendVerificationCodeBody(BaseModel):
-    contact_identifier: str  # email address, phone number, or Telegram username (@username)
+    contact_identifier: str  # email address
 
 
 class NewJobBody(BaseModel):
@@ -990,6 +1094,7 @@ class LicenseBody(BaseModel):
     customer_name: Optional[str] = None
     customer_email: Optional[str] = None
     plan_type: str = "basic"  # basic | pro | enterprise
+    quota_type: str = "credit"  # credit | time
     features: List[str] = Field(default_factory=list)
     expiry_days: Optional[int] = None  # Days from now, None = lifetime
     max_jobs: int = -1  # -1 = unlimited
@@ -1002,6 +1107,7 @@ class LicenseUpdateBody(BaseModel):
     customer_name: Optional[str] = None
     customer_email: Optional[str] = None
     plan_type: Optional[str] = None
+    quota_type: Optional[str] = None
     features: Optional[List[str]] = None
     expiry_days: Optional[int] = None
     max_jobs: Optional[int] = None
@@ -1034,7 +1140,7 @@ def index() -> HTMLResponse:
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?\d[\d\s.-]{7,14}\d$")
-_TELEGRAM_RE = re.compile(r"^@?[a-zA-Z0-9_]{5,32}$")
+_TELEGRAM_RE = re.compile(r"^@[a-zA-Z0-9_]{5,32}$")
 
 
 def _classify_identifier(identifier: str) -> tuple[str, str]:
@@ -1048,9 +1154,7 @@ def _classify_identifier(identifier: str) -> tuple[str, str]:
     if _PHONE_RE.match(value):
         return "phone", digits_only
     if _TELEGRAM_RE.match(value):
-        # Normalize Telegram username (ensure it starts with @)
-        telegram_username = value if value.startswith("@") else f"@{value}"
-        return "telegram", telegram_username.lower()
+        return "telegram", value.lower()
     return "username", value
 
 
@@ -1080,6 +1184,44 @@ def _login_response(user_id: int) -> JSONResponse:
     return resp
 
 
+def _registration_device_hash(device_id: str) -> str:
+    clean_id = str(device_id or "").strip()
+    if len(clean_id) < 16 or len(clean_id) > 200:
+        raise HTTPException(400, "Không xác định được thiết bị đăng ký. Hãy bật local storage và thử lại.")
+    return hashlib.sha256(clean_id.encode("utf-8")).hexdigest()
+
+
+def _request_registration_fingerprint(request: Optional[Request]) -> str:
+    if request is None:
+        return hashlib.sha256(b"request-unavailable").hexdigest()
+    client_host = request.client.host if request.client else "unknown"
+    if os.environ.get("TRUST_PROXY_HEADERS", "false").lower() == "true":
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if forwarded:
+            client_host = forwarded
+    parts = (
+        client_host,
+        request.headers.get("user-agent", ""),
+        request.headers.get("accept-language", ""),
+        request.headers.get("sec-ch-ua-platform", ""),
+    )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _record_login_device(user_id: int, device_id: Optional[str], request: Optional[Request]) -> None:
+    """Backfill the device binding for accounts created before this guard existed."""
+    if not device_id:
+        return
+    try:
+        device_hash = _registration_device_hash(device_id)
+    except HTTPException:
+        return
+    fingerprint_hash = _request_registration_fingerprint(request)
+    owner = store.registration_device_owner(device_hash, fingerprint_hash)
+    if owner in (None, user_id):
+        store.claim_registration_device(user_id, device_hash, fingerprint_hash)
+
+
 def _send_email_via_smtp(to_email: str, subject: str, body: str) -> bool:
     """Send email using SMTP Gmail"""
     smtp_enabled = os.environ.get("SMTP_ENABLED", "false").lower() == "true"
@@ -1092,7 +1234,7 @@ def _send_email_via_smtp(to_email: str, subject: str, body: str) -> bool:
         smtp_port = int(os.environ.get("SMTP_PORT", "587"))
         smtp_email = os.environ.get("SMTP_EMAIL")
         smtp_password = os.environ.get("SMTP_PASSWORD")
-        from_name = os.environ.get("SMTP_FROM_NAME", "Video Localization AI")
+        from_name = os.environ.get("SMTP_FROM_NAME", "Video Studio")
         
         if not smtp_email or not smtp_password:
             logging.error("SMTP_EMAIL or SMTP_PASSWORD not configured")
@@ -1106,9 +1248,11 @@ def _send_email_via_smtp(to_email: str, subject: str, body: str) -> bool:
         
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
         
-        # Send email
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
+        # Send email. Gmail uses implicit TLS on 465 and STARTTLS on 587.
+        smtp_factory = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
+        with smtp_factory(smtp_host, smtp_port, timeout=15) as server:
+            if smtp_port != 465:
+                server.starttls()
             server.login(smtp_email, smtp_password)
             server.send_message(msg)
         
@@ -1167,7 +1311,10 @@ def send_verification_code(body: SendVerificationCodeBody):
         raise HTTPException(409, "Email này đã được đăng ký")
     
     # Generate and store verification code
-    code = store.create_verification_code(value, "register")
+    try:
+        code = store.create_verification_code(value, "register")
+    except ValueError as exc:
+        raise HTTPException(429, str(exc)) from exc
     
     # Send verification code via email
     subject = "Mã xác minh đăng ký tài khoản"
@@ -1181,19 +1328,16 @@ Vui lòng không chia sẻ mã này với bất kỳ ai.
 Nếu bạn không yêu cầu mã này, vui lòng bỏ qua email này.
 
 Trân trọng,
-Video Localization AI"""
+Video Studio"""
     sent = _send_email_via_smtp(value, subject, body)
     
     if not sent:
-        # Fallback: return code in response if sending failed
-        logging.warning("Failed to send verification code via email, returning in response instead")
-        return {
-            "ok": True,
-            "message": "Không thể gửi email. Mã hiển thị bên dưới để test.",
-            "code": code,
-            "expires_in": 300,
-            "sent_via": "fallback"
-        }
+        store.invalidate_verification_code(value, "register")
+        logging.warning("Failed to deliver registration verification code")
+        raise HTTPException(
+            503,
+            "Không gửi được email xác minh. Vui lòng kiểm tra cấu hình Gmail SMTP hoặc thử lại sau.",
+        )
     
     return {
         "ok": True,
@@ -1204,12 +1348,12 @@ Video Localization AI"""
 
 
 @app.post("/api/register")
-def register(body: RegisterBody):
+def register(body: RegisterBody, request: Request = None):
     """
     Self-service registration via email + password.
 
-    All users registered via this form are regular users (not admin).
-    Admin accounts must be created from the admin panel.
+    The first verified account becomes the bootstrap admin. Later accounts are
+    regular users unless an admin promotes them.
     
     When USE_LICENSE_SERVER is true, users can register and get
     a free trial with 25 tokens. They can activate a license key later
@@ -1219,46 +1363,8 @@ def register(body: RegisterBody):
     the centralized user management server.
     """
     
-    if USE_USER_MANAGEMENT_SERVER:
-        # Proxy to User Management Server
-        try:
-            kind, value = _classify_identifier(body.contact_identifier)
-            if kind != "email":
-                raise HTTPException(400, "Vui lòng nhập đúng email")
-            
-            response = requests.post(
-                f"{USER_MANAGEMENT_SERVER_URL}/api/users/register",
-                json={
-                    "username": body.username.strip(),
-                    "email": value,
-                    "password": body.password
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if data.get("success"):
-                # Create local user record for caching
-                user_id = store.create_user(
-                    body.username.strip(),
-                    hash_password(body.password),
-                    is_admin=False,
-                    credits=data.get("credits", 25),
-                    email=value,
-                    phone=None,
-                    referred_by_user_id=None,
-                )
-                _ensure_registration_trial(user_id)
-                return _login_response(user_id)
-            else:
-                raise HTTPException(400, data.get("message", "Registration failed"))
-        except requests.RequestException as e:
-            logger.error(f"Failed to register with user management server: {e}")
-            raise HTTPException(503, "Không thể kết nối đến server quản lý user")
-    
-    # Local registration (fallback)
-    if not OPEN_REGISTRATION:
+    is_first_user = not store.any_users_exist()
+    if not OPEN_REGISTRATION and not is_first_user:
         raise HTTPException(
             403,
             "Đăng ký đang bị khoá bởi quản trị viên. Liên hệ admin để được cấp tài khoản.",
@@ -1276,15 +1382,59 @@ def register(body: RegisterBody):
 
     kind, value = _classify_identifier(body.contact_identifier)
     if kind != "email":
-        raise HTTPException(400, "Vui lòng nhập đúng email")
+        raise HTTPException(400, "Hiện tại chỉ hỗ trợ đăng ký qua email đã xác minh")
     if store.get_user_by_identifier(value):
         raise HTTPException(409, "Email này đã được đăng ký")
-    
-    # Verify the OTP code
+
+    device_hash = _registration_device_hash(body.device_id)
+    fingerprint_hash = _request_registration_fingerprint(request)
+    if store.registration_device_owner(device_hash, fingerprint_hash) is not None:
+        raise HTTPException(
+            409,
+            "Thiết bị này đã nhận tài khoản dùng thử. Hãy đăng nhập tài khoản cũ hoặc liên hệ admin.",
+        )
+
     success, error = store.verify_code(value, body.verification_code, "register")
     if not success:
         raise HTTPException(400, error or "Mã xác minh không hợp lệ")
+
+    if USE_USER_MANAGEMENT_SERVER:
+        # Proxy to User Management Server
+        try:
+            response = requests.post(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/register",
+                json={
+                    "username": body.username.strip(),
+                    "email": value,
+                    "password": body.password
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("success"):
+                # Create local user record for caching
+                user_id = store.create_user(
+                    username,
+                    hash_password(body.password),
+                    is_admin=is_first_user or bool(data.get("is_admin", False)),
+                    credits=10_000 if is_first_user else data.get("credits", 25),
+                    email=value,
+                    phone=None,
+                    referred_by_user_id=None,
+                )
+                if not store.claim_registration_device(user_id, device_hash, fingerprint_hash):
+                    raise HTTPException(409, "Thiết bị này đã được dùng để đăng ký tài khoản khác")
+                _ensure_registration_trial(user_id)
+                return _login_response(user_id)
+            else:
+                raise HTTPException(400, data.get("message", "Registration failed"))
+        except requests.RequestException as e:
+            logger.error(f"Failed to register with user management server: {e}")
+            raise HTTPException(503, "Không thể kết nối đến server quản lý user")
     
+    # Local registration (fallback)
     email = value if kind == "email" else None
     phone = value if kind == "phone" else None
 
@@ -1296,17 +1446,19 @@ def register(body: RegisterBody):
 
     user_id = store.create_user(
         username, hash_password(body.password),
-        is_admin=False, credits=10,
+        is_admin=is_first_user, credits=10_000 if is_first_user else 10,
         email=email, phone=phone,
         referred_by_user_id=referrer["id"] if referrer else None,
     )
+    if not store.claim_registration_device(user_id, device_hash, fingerprint_hash):
+        raise HTTPException(409, "Thiết bị này đã được dùng để đăng ký tài khoản khác")
     if referrer is not None:
         # Both sides get a bonus — the invitee starts with extra credit
         # instead of the usual 10, and the person who invited them gets
         # rewarded too, same moment their friend actually signs up (not
         # requiring the friend to do anything further first).
-        store.adjust_credits(user_id, REFERRAL_BONUS_CREDITS)
-        store.adjust_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
+        _adjust_user_credits(user_id, REFERRAL_BONUS_CREDITS)
+        _adjust_user_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
     
     # Create free trial with 25 tokens when using license server
     _ensure_registration_trial(user_id)
@@ -1339,7 +1491,7 @@ def bootstrap():
 
 
 @app.post("/api/login")
-def login(body: LoginBody):
+def login(body: LoginBody, request: Request = None):
     if USE_USER_MANAGEMENT_SERVER:
         # Proxy to User Management Server
         try:
@@ -1373,14 +1525,13 @@ def login(body: LoginBody):
                 else:
                     user_id = local_user["id"]
 
-                # The central user server is the source of truth. Refresh the
-                # local cache on every login so a Make Admin/Make User change
-                # takes effect after the next sign-in instead of remaining
-                # stuck at the value from the account's first login.
+                # Refresh the cache from the centralized account source. The
+                # admin dashboard writes both sources so this remains current.
                 store.set_admin(user_id, bool(data.get("is_admin", False)))
                 if data.get("credits") is not None:
                     store.set_credits(user_id, int(data["credits"]))
                 _ensure_registration_trial(user_id)
+                _record_login_device(user_id, body.device_id, request)
                 
                 return _login_response(user_id)
             else:
@@ -1394,6 +1545,7 @@ def login(body: LoginBody):
     user = store.get_user_by_identifier(identifier)
     if not user or not user["password_hash"] or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(401, "Sai thông tin đăng nhập hoặc mật khẩu")
+    _record_login_device(int(user["id"]), body.device_id, request)
     return _login_response(user["id"])
 
 
@@ -1833,8 +1985,21 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             "DefaultCPUAllocator: not enough memory",
             "No space left on device",
             "not enough disk space",
+            "Douyin yêu cầu cookie mới",
+            "Fresh cookies (not necessarily logged in) are needed",
         )
     )
+
+
+def _job_error_for_user(exc: Exception) -> str:
+    """Hide implementation traceback for errors that need user action."""
+    message = str(exc).strip()
+    if "fresh cookies" in message.lower() and "douyin yêu cầu" not in message.lower():
+        return (
+            "Douyin yêu cầu cookie mới. Hãy mở Douyin bằng Edge, Chrome hoặc Firefox "
+            "trên máy chạy ứng dụng, tải lại trang một lần rồi bấm Thử lại."
+        )
+    return message
 
 
 MAX_JOB_RETRIES = 2
@@ -1924,7 +2089,10 @@ async def _run_job_unlocked(job_id: str) -> None:
             logger.exception("Job %s failed (attempt %d/%d)", job_id, retry_count + 1, MAX_JOB_RETRIES + 1)
 
             if _is_non_retryable_job_error(exc):
-                store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
+                user_error = _job_error_for_user(exc)
+                store.update_job(
+                    job_id, status="error", progress_note=user_error, error=user_error,
+                )
                 _refund_job_credits(job)
                 return
 
@@ -2218,9 +2386,10 @@ async def _run_render_from_review(job_id: str) -> None:
 
 def _refund_job_credits(job) -> None:
     """A job that errors out shouldn't cost the user credit — refund it."""
-    if JOB_COST_CREDITS > 0:
+    credit_cost = _job_credit_cost(job.user_id)
+    if credit_cost > 0:
         try:
-            store.adjust_credits(job.user_id, JOB_COST_CREDITS)
+            _adjust_user_credits(job.user_id, credit_cost)
         except Exception:
             logger.exception("Failed to refund credits for job %s", job.id)
 
@@ -4995,15 +5164,15 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
     processing_mode = (body.processing_mode or "fast").strip().lower()
     tts_provider = (body.tts_provider or "edge").strip().lower()
 
+    _require_license_or_trial(user_id)
     user = store.get_user_by_id(user_id)
-    if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
+    credit_cost = _job_credit_cost(user_id)
+    if credit_cost > 0 and user["credits"] < credit_cost:
         raise HTTPException(
             402,
-            f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS}). "
+            f"Không đủ credit (còn {user['credits']}, cần {credit_cost}). "
             "Liên hệ admin để được cấp thêm.",
         )
-
-    _require_license_or_trial(user_id)
 
     logo_path = None
     if body.logo_path:
@@ -5049,8 +5218,8 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         keep_original_audio=body.keep_original_audio,
         background_music_strategy=body.background_music_strategy,
     )
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    if credit_cost > 0:
+        _adjust_user_credits(user_id, -credit_cost)
     await _configure_job_run_limit(body.max_concurrent)
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
@@ -5268,8 +5437,9 @@ async def process_channel_download(
         candidates = [candidate for candidate in candidates if candidate.source_url not in existing]
 
     user = store.get_user_by_id(user_id)
-    total_cost = JOB_COST_CREDITS * len(candidates)
-    if JOB_COST_CREDITS > 0 and user["credits"] < total_cost:
+    credit_cost = _job_credit_cost(user_id)
+    total_cost = credit_cost * len(candidates)
+    if credit_cost > 0 and user["credits"] < total_cost:
         raise HTTPException(
             402,
             f"Kênh có {len(candidates)} video mới, cần {total_cost} credit nhưng tài khoản chỉ còn "
@@ -5427,8 +5597,9 @@ async def upload_video(
     )
 
     # Deduct credits if needed
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    credit_cost = _job_credit_cost(user_id)
+    if credit_cost > 0:
+        _adjust_user_credits(user_id, -credit_cost)
 
     # Start job processing
     task = asyncio.create_task(_run_job(job.id))
@@ -5567,8 +5738,9 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
                     })
 
     user = store.get_user_by_id(user_id)
-    required_credits = JOB_COST_CREDITS * max(1, url_count)
-    if JOB_COST_CREDITS > 0 and user["credits"] < required_credits:
+    credit_cost = _job_credit_cost(user_id)
+    required_credits = credit_cost * max(1, url_count)
+    if credit_cost > 0 and user["credits"] < required_credits:
         issues.append({
             "severity": "error",
             "code": "insufficient_credits",
@@ -5650,8 +5822,9 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
             "Chưa cấu hình kho ảnh. Thêm PEXELS_API_KEY vào file .env rồi khởi động lại web.",
         )
     user = store.get_user_by_id(user_id)
-    if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
-        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
+    credit_cost = _job_credit_cost(user_id)
+    if credit_cost > 0 and user["credits"] < credit_cost:
+        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {credit_cost})")
 
     job = _store_create_job(
         user_id,
@@ -5660,8 +5833,8 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
         source_language=f"creator:{'ai' if body.image_provider == 'cpu_ai' else body.image_provider}",
         branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
     )
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    if credit_cost > 0:
+        _adjust_user_credits(user_id, -credit_cost)
     task = asyncio.create_task(asyncio.to_thread(_run_creator_job, job.id, body))
     _running_tasks[job.id] = task
     return job.to_dict()
@@ -6651,8 +6824,8 @@ def estimate_jobs(body: JobEstimateBody, user_id: int = Depends(get_current_user
     estimated_seconds = per_job_seconds * body.url_count * overlap_factor
     return {
         "url_count": body.url_count,
-        "credits_per_job": JOB_COST_CREDITS,
-        "total_credits": JOB_COST_CREDITS * body.url_count,
+        "credits_per_job": _job_credit_cost(user_id),
+        "total_credits": _job_credit_cost(user_id) * body.url_count,
         "estimated_seconds_min": max(30, round(estimated_seconds * 0.70)),
         "estimated_seconds_max": max(60, round(estimated_seconds * 1.45)),
         "sample_size": len(completed),
@@ -7343,14 +7516,15 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
         )
 
     user = store.get_user_by_id(user_id)
-    if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
-        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
+    credit_cost = _job_credit_cost(user_id)
+    if credit_cost > 0 and user["credits"] < credit_cost:
+        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {credit_cost})")
 
     new_job = store.retry_job(job_id, user_id)
     if new_job is None:
         raise HTTPException(404, "Không tìm thấy job")
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    if credit_cost > 0:
+        _adjust_user_credits(user_id, -credit_cost)
     if old_job.source_language.startswith("creator"):
         topic = old_job.source_url.removeprefix("creator:").strip()
         image_provider = old_job.source_language.partition(":")[2] or "stock"
@@ -7847,9 +8021,27 @@ def get_youtube_metadata(body: YouTubeDownloadBody):
 def admin_list_users(_admin_id: int = Depends(require_admin_user_id)):
     return [
         {"id": u["id"], "username": u["username"], "credits": u["credits"],
-         "is_admin": bool(u["is_admin"]), "created_at": u["created_at"]}
+         "email": u["email"], "is_admin": bool(u["is_admin"]),
+         "created_at": u["created_at"]}
         for u in store.list_users()
     ]
+
+
+@app.get("/api/admin/users/{target_user_id}/activity")
+def admin_user_activity(
+    target_user_id: int,
+    limit: int = 100,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    """Show downloads, processing state, errors and queue counts for a user."""
+    if not store.get_user_by_id(target_user_id):
+        raise HTTPException(404, "Không tìm thấy user")
+    return store.admin_user_activity(target_user_id, limit=limit)
+
+
+@app.get("/api/admin/user-activity-summary")
+def admin_user_activity_summary(_admin_id: int = Depends(require_admin_user_id)):
+    return store.admin_user_activity_summaries()
 
 
 @app.post("/api/admin/users")
@@ -7868,9 +8060,9 @@ def admin_adjust_credits(target_user_id: int, body: CreditsAdjustBody,
     if not store.get_user_by_id(target_user_id):
         raise HTTPException(404, "Không tìm thấy user")
     if body.set_to is not None:
-        store.set_credits(target_user_id, body.set_to)
+        _set_user_credits(target_user_id, body.set_to)
     elif body.delta is not None:
-        store.adjust_credits(target_user_id, body.delta)
+        _adjust_user_credits(target_user_id, body.delta)
     else:
         raise HTTPException(400, "Cần truyền delta hoặc set_to")
     user = store.get_user_by_id(target_user_id)
@@ -7885,39 +8077,28 @@ def admin_change_user_role(target_user_id: int, body: dict, _admin_id: int = Dep
     
     is_admin = body.get("is_admin", False)
     store.set_admin(target_user_id, is_admin)
+    _mirror_user_role(target_user_id, bool(is_admin))
     
     return {"ok": True, "is_admin": is_admin}
 
 
+@app.delete("/api/admin/users/{target_user_id}/registration-devices")
+def admin_release_registration_devices(
+    target_user_id: int,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    """Allow support staff to recover a legitimate user after a device change."""
+    if not store.get_user_by_id(target_user_id):
+        raise HTTPException(404, "Không tìm thấy user")
+    return {"ok": True, "released": store.release_registration_devices(target_user_id)}
+
+
 @app.post("/api/admin/create-first-admin")
-def create_first_admin(body: dict):
-    """Create the first admin account (only works if no users exist)"""
+def create_first_admin(body: RegisterBody, request: Request = None):
+    """Compatibility route: first admin now uses the verified registration flow."""
     if store.any_users_exist():
         raise HTTPException(403, "Đã có user trong hệ thống. Không thể tạo admin đầu tiên.")
-    
-    username = body.get("username")
-    password = body.get("password")
-    email = body.get("email")
-    
-    if not username or not password:
-        raise HTTPException(400, "Thiếu username hoặc password")
-    
-    if len(password) < 8:
-        raise HTTPException(400, "Mật khẩu cần tối thiểu 8 ký tự")
-    
-    if store.get_user_by_username(username):
-        raise HTTPException(409, "Tên đăng nhập đã tồn tại")
-    
-    if email and store.get_user_by_identifier(email):
-        raise HTTPException(409, "Email đã tồn tại")
-    
-    user_id = store.create_user(
-        username, hash_password(password),
-        is_admin=True, credits=10_000,
-        email=email, phone=None
-    )
-    
-    return {"ok": True, "user_id": user_id, "message": "Admin đầu tiên đã được tạo"}
+    return register(body, request)
 
 
 @app.get("/api/admin/stats")
@@ -7957,6 +8138,7 @@ def admin_approve_top_up_request(
     row = store.approve_top_up_request(request_id, admin_note=(body.admin_note or "").strip() or None)
     if row is None:
         raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
+    _mirror_user_credit_delta(int(row["user_id"]), int(row["credits"]))
     return {"ok": True, "status": row["status"]}
 
 
@@ -7988,6 +8170,7 @@ def admin_create_license(body: LicenseBody, _admin_id: int = Depends(require_adm
         "customer_name": body.customer_name,
         "customer_email": body.customer_email,
         "plan_type": body.plan_type,
+        "quota_type": body.quota_type,
         "features": body.features,
         "expiry_date": expiry_date,
         "max_jobs": body.max_jobs,
@@ -8037,6 +8220,8 @@ def admin_update_license(
         updates["customer_email"] = body.customer_email
     if body.plan_type is not None:
         updates["plan_type"] = body.plan_type
+    if body.quota_type is not None:
+        updates["quota_type"] = body.quota_type
     if body.features is not None:
         updates["features"] = body.features
     if body.expiry_days is not None:
@@ -8135,7 +8320,7 @@ def activate_license(
 @app.get("/api/me/license")
 def get_my_license(user_id: int = Depends(get_current_user_id)):
     """Get the current user's active license"""
-    license = store.get_license_by_user(user_id)
+    license = _get_user_license(user_id)
     if not license:
         return {"license": None}
     
@@ -8149,7 +8334,7 @@ def get_my_license(user_id: int = Depends(get_current_user_id)):
             remote = validation["license"]
             for field in (
                 "customer_name", "customer_email", "plan_type", "features",
-                "expiry_date", "max_jobs", "max_tokens", "status",
+                "quota_type", "expiry_date", "max_jobs", "max_tokens", "status",
             ):
                 if field in remote:
                     result[field] = remote[field]

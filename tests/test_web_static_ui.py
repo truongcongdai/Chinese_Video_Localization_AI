@@ -75,7 +75,7 @@ def test_history_bulk_download_and_status_filter_are_available() -> None:
     assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
     assert 'data-cancel="${job.id}"' in app_js
     assert '/cancel`' in app_js
-    assert 'app.js?v=20260731b' in html
+    assert 'app.js?v=20260818-license-douyin' in html
 
 
 def test_remix_panel_is_toggleable_and_cache_busted() -> None:
@@ -92,7 +92,7 @@ def test_remix_panel_is_toggleable_and_cache_busted() -> None:
     assert "function syncRemixPanel()" in app_js
     assert '$("#remix-panel").classList.toggle("hidden", !ev.target.checked);' not in app_js
     assert 'subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0' in app_js
-    assert 'app.js?v=20260731b' in html
+    assert 'app.js?v=20260818-license-douyin' in html
 
 
 def test_subtitle_time_display_keeps_tenths() -> None:

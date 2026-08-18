@@ -7,16 +7,22 @@ import sqlite3
 import hashlib
 import secrets
 import json
+import logging
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from dataclasses import dataclass, asdict
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
 # Database setup
-DB_PATH = "licenses.db"
+DB_PATH = Path("licenses.db")
+logger = logging.getLogger(__name__)
+VALID_QUOTA_TYPES = {"credit", "time"}
+VALID_LICENSE_STATUSES = {"active", "revoked", "expired"}
 
 @dataclass
 class License:
@@ -24,7 +30,9 @@ class License:
     license_key: str
     customer_name: str
     customer_email: str
+    user_id: Optional[int]
     plan_type: str  # basic, pro, enterprise
+    quota_type: str  # credit, time
     features: List[str]
     expiry_date: Optional[float]  # Unix timestamp
     max_jobs: int
@@ -38,7 +46,9 @@ class License:
 class LicenseCreate(BaseModel):
     customer_name: str
     customer_email: str
+    user_id: Optional[int] = None
     plan_type: str
+    quota_type: str = "credit"
     features: List[str]
     expiry_days: Optional[int] = None  # None = lifetime
     max_jobs: int = 100
@@ -48,7 +58,10 @@ class LicenseCreate(BaseModel):
 
 class LicenseUpdate(BaseModel):
     status: Optional[str] = None
+    plan_type: Optional[str] = None
+    quota_type: Optional[str] = None
     expiry_days: Optional[int] = None
+    clear_expiry: bool = False
     max_jobs: Optional[int] = None
     max_tokens: Optional[int] = None
     features: Optional[List[str]] = None
@@ -75,7 +88,7 @@ app.add_middleware(
 )
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -89,7 +102,9 @@ def init_db():
             license_key TEXT UNIQUE NOT NULL,
             customer_name TEXT NOT NULL,
             customer_email TEXT NOT NULL,
+            user_id INTEGER,
             plan_type TEXT NOT NULL,
+            quota_type TEXT NOT NULL DEFAULT 'credit',
             features TEXT NOT NULL,
             expiry_date REAL,
             max_jobs INTEGER NOT NULL,
@@ -113,6 +128,13 @@ def init_db():
             FOREIGN KEY (license_id) REFERENCES licenses(id)
         )
     """)
+
+    columns = {row["name"] for row in cursor.execute("PRAGMA table_info(licenses)")}
+    if "user_id" not in columns:
+        cursor.execute("ALTER TABLE licenses ADD COLUMN user_id INTEGER")
+    if "quota_type" not in columns:
+        cursor.execute("ALTER TABLE licenses ADD COLUMN quota_type TEXT NOT NULL DEFAULT 'credit'")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)")
     
     conn.commit()
     conn.close()
@@ -128,7 +150,9 @@ def license_from_row(row) -> License:
         license_key=row["license_key"],
         customer_name=row["customer_name"],
         customer_email=row["customer_email"],
+        user_id=row["user_id"] if "user_id" in row.keys() else None,
         plan_type=row["plan_type"],
+        quota_type=row["quota_type"] if "quota_type" in row.keys() else "credit",
         features=json.loads(row["features"]),
         expiry_date=row["expiry_date"],
         max_jobs=row["max_jobs"],
@@ -140,6 +164,32 @@ def license_from_row(row) -> License:
         notes=row["notes"]
     )
 
+
+def license_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> Dict:
+    """Serialize a license with aggregate usage and connected devices."""
+    license_record = license_from_row(row)
+    usage = conn.execute(
+        "SELECT COUNT(*) AS device_count, COALESCE(SUM(jobs_used), 0) AS jobs_used, "
+        "COALESCE(SUM(tokens_used), 0) AS tokens_used, MAX(last_check) AS last_check "
+        "FROM license_usage WHERE license_id = ?",
+        (license_record.id,),
+    ).fetchone()
+    payload = asdict(license_record)
+    payload.update({
+        "device_count": int(usage["device_count"] or 0),
+        "jobs_used": int(usage["jobs_used"] or 0),
+        "tokens_used": int(usage["tokens_used"] or 0),
+        "last_check": usage["last_check"],
+    })
+    if license_record.expiry_date is not None:
+        seconds_left = license_record.expiry_date - datetime.now().timestamp()
+        payload["remaining_days"] = max(0, int((seconds_left + 86399) // 86400))
+        if seconds_left < 0 and payload["status"] == "active":
+            payload["status"] = "expired"
+    else:
+        payload["remaining_days"] = None
+    return payload
+
 # API Endpoints
 
 @app.get("/")
@@ -149,6 +199,8 @@ async def root():
 @app.post("/api/licenses", response_model=Dict)
 async def create_license(license_data: LicenseCreate):
     """Create a new license"""
+    if license_data.quota_type not in VALID_QUOTA_TYPES:
+        raise HTTPException(status_code=400, detail="quota_type must be credit or time")
     conn = get_db()
     cursor = conn.cursor()
     
@@ -165,15 +217,17 @@ async def create_license(license_data: LicenseCreate):
     try:
         cursor.execute("""
             INSERT INTO licenses (
-                license_key, customer_name, customer_email, plan_type,
+                license_key, customer_name, customer_email, user_id, plan_type, quota_type,
                 features, expiry_date, max_jobs, max_tokens, status,
                 machine_id, created_at, updated_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             license_key,
             license_data.customer_name,
             license_data.customer_email,
+            license_data.user_id,
             license_data.plan_type,
+            license_data.quota_type,
             json.dumps(license_data.features),
             expiry_date,
             license_data.max_jobs,
@@ -222,12 +276,12 @@ async def validate_license(validation: LicenseValidation):
     license = license_from_row(row)
     
     # Check if license is revoked
-    if license.status == "revoked":
+    if license.status != "active":
         conn.close()
         return LicenseResponse(
             valid=False,
             license=None,
-            error="License has been revoked"
+            error=f"License is {license.status}"
         )
     
     # Check if license is expired
@@ -341,14 +395,28 @@ async def list_licenses():
     
     cursor.execute("SELECT * FROM licenses ORDER BY created_at DESC")
     rows = cursor.fetchall()
+    licenses = [license_payload(conn, row) for row in rows]
     conn.close()
-    
-    licenses = []
-    for row in rows:
-        license = license_from_row(row)
-        licenses.append(asdict(license))
-    
     return licenses
+
+
+@app.get("/api/licenses/by-user/{user_id}", response_model=Dict)
+async def get_license_by_user(user_id: int):
+    """Return the latest active license assigned by the admin to a web user."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM licenses WHERE user_id = ? AND status = 'active' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="License not found")
+    payload = license_payload(conn, row)
+    conn.close()
+    if payload["status"] == "expired":
+        raise HTTPException(status_code=404, detail="Active license has expired")
+    return {"license": payload}
 
 @app.get("/api/licenses/{license_id}", response_model=Dict)
 async def get_license(license_id: int):
@@ -358,13 +426,13 @@ async def get_license(license_id: int):
     
     cursor.execute("SELECT * FROM licenses WHERE id = ?", (license_id,))
     row = cursor.fetchone()
-    conn.close()
-    
     if not row:
+        conn.close()
         raise HTTPException(status_code=404, detail="License not found")
-    
-    license = license_from_row(row)
-    return asdict(license)
+
+    payload = license_payload(conn, row)
+    conn.close()
+    return payload
 
 @app.put("/api/licenses/{license_id}", response_model=Dict)
 async def update_license(license_id: int, update_data: LicenseUpdate):
@@ -378,6 +446,12 @@ async def update_license(license_id: int, update_data: LicenseUpdate):
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="License not found")
+    if update_data.quota_type is not None and update_data.quota_type not in VALID_QUOTA_TYPES:
+        conn.close()
+        raise HTTPException(status_code=400, detail="quota_type must be credit or time")
+    if update_data.status is not None and update_data.status not in VALID_LICENSE_STATUSES:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid license status")
     
     license = license_from_row(row)
     
@@ -388,8 +462,19 @@ async def update_license(license_id: int, update_data: LicenseUpdate):
     if update_data.status is not None:
         updates.append("status = ?")
         params.append(update_data.status)
+
+    if update_data.plan_type is not None:
+        updates.append("plan_type = ?")
+        params.append(update_data.plan_type)
+
+    if update_data.quota_type is not None:
+        updates.append("quota_type = ?")
+        params.append(update_data.quota_type)
     
-    if update_data.expiry_days is not None:
+    if update_data.clear_expiry:
+        updates.append("expiry_date = ?")
+        params.append(None)
+    elif update_data.expiry_days is not None:
         expiry_date = (datetime.now() + timedelta(days=update_data.expiry_days)).timestamp()
         updates.append("expiry_date = ?")
         params.append(expiry_date)
@@ -429,8 +514,8 @@ async def delete_license(license_id: int):
     conn = get_db()
     cursor = conn.cursor()
     
-    cursor.execute("DELETE FROM licenses WHERE id = ?", (license_id,))
     cursor.execute("DELETE FROM license_usage WHERE license_id = ?", (license_id,))
+    cursor.execute("DELETE FROM licenses WHERE id = ?", (license_id,))
     
     conn.commit()
     conn.close()
@@ -461,6 +546,14 @@ async def get_license_usage(license_id: int):
     
     return {"license_id": license_id, "usage": usage}
 
-if __name__ == "__main__":
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
+
+@app.on_event("startup")
+async def initialize_database() -> None:
+    """Apply idempotent schema migrations before serving requests."""
     init_db()
+
+
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

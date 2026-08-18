@@ -9,13 +9,19 @@ small tables and doesn't need one.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import secrets
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+VERIFICATION_TTL_SECONDS = 300
+VERIFICATION_RESEND_SECONDS = 60
+VERIFICATION_MAX_ATTEMPTS = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -32,6 +38,36 @@ CREATE TABLE IF NOT EXISTS users (
     referred_by_user_id INTEGER,
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS verification_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identifier TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    consumed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_identifier
+    ON verification_codes(identifier, purpose, created_at);
+
+CREATE TABLE IF NOT EXISTS registration_devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    device_hash TEXT UNIQUE NOT NULL,
+    fingerprint_hash TEXT,
+    created_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_registration_devices_user
+    ON registration_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_registration_devices_fingerprint
+    ON registration_devices(fingerprint_hash);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -490,6 +526,7 @@ CREATE TABLE IF NOT EXISTS licenses (
     customer_name TEXT,
     customer_email TEXT,
     plan_type TEXT NOT NULL DEFAULT 'basic',  -- basic | pro | enterprise
+    quota_type TEXT NOT NULL DEFAULT 'credit',  -- credit | time
     features_json TEXT NOT NULL DEFAULT '[]',  -- List of enabled features
     expiry_date REAL,
     max_jobs INTEGER NOT NULL DEFAULT -1,  -- -1 = unlimited
@@ -563,6 +600,7 @@ _MIGRATIONS = [
     ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
     # Local ids are unrelated to ids on the centralized license server.
     ("licenses", "remote_license_id", "ALTER TABLE licenses ADD COLUMN remote_license_id INTEGER"),
+    ("licenses", "quota_type", "ALTER TABLE licenses ADD COLUMN quota_type TEXT NOT NULL DEFAULT 'credit'"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -799,6 +837,7 @@ class License:
     customer_name: Optional[str]
     customer_email: Optional[str]
     plan_type: str
+    quota_type: str
     features: List[str]
     expiry_date: Optional[float]
     max_jobs: int
@@ -821,6 +860,7 @@ class License:
             customer_name=row["customer_name"],
             customer_email=row["customer_email"],
             plan_type=row["plan_type"],
+            quota_type=row["quota_type"] if "quota_type" in row.keys() else "credit",
             features=json.loads(row["features_json"]) if row["features_json"] else [],
             expiry_date=row["expiry_date"],
             max_jobs=row["max_jobs"],
@@ -1056,6 +1096,138 @@ class Store:
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM users ORDER BY created_at ASC")
             return cur.fetchall()
+
+    # ---- registration verification / device abuse prevention ----
+    @staticmethod
+    def _verification_hash(identifier: str, purpose: str, code: str, salt: str) -> str:
+        payload = f"{salt}:{identifier.strip().lower()}:{purpose}:{code}"
+        # A six-digit OTP has a small search space. PBKDF2 makes an offline
+        # database brute-force materially more expensive than a single SHA-256.
+        return hashlib.pbkdf2_hmac(
+            "sha256", payload.encode("utf-8"), salt.encode("utf-8"), 120_000,
+        ).hex()
+
+    def create_verification_code(self, identifier: str, purpose: str) -> str:
+        """Create a single-use OTP while enforcing a resend cooldown."""
+        identifier = identifier.strip().lower()
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                "SELECT created_at FROM verification_codes "
+                "WHERE identifier = ? AND purpose = ? AND consumed_at IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (identifier, purpose),
+            ).fetchone()
+            if latest and now - float(latest["created_at"]) < VERIFICATION_RESEND_SECONDS:
+                wait_seconds = int(VERIFICATION_RESEND_SECONDS - (now - float(latest["created_at"]))) + 1
+                raise ValueError(f"Vui lòng chờ {wait_seconds} giây trước khi gửi lại mã")
+            conn.execute(
+                "DELETE FROM verification_codes WHERE expires_at < ? OR consumed_at IS NOT NULL",
+                (now,),
+            )
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            salt = secrets.token_hex(16)
+            conn.execute(
+                "INSERT INTO verification_codes "
+                "(identifier, purpose, code_hash, salt, attempts, expires_at, created_at) "
+                "VALUES (?, ?, ?, ?, 0, ?, ?)",
+                (
+                    identifier,
+                    purpose,
+                    self._verification_hash(identifier, purpose, code, salt),
+                    salt,
+                    now + VERIFICATION_TTL_SECONDS,
+                    now,
+                ),
+            )
+        return code
+
+    def invalidate_verification_code(self, identifier: str, purpose: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE verification_codes SET consumed_at = ? "
+                "WHERE identifier = ? AND purpose = ? AND consumed_at IS NULL",
+                (time.time(), identifier.strip().lower(), purpose),
+            )
+
+    def verify_code(self, identifier: str, code: str, purpose: str) -> tuple[bool, Optional[str]]:
+        """Validate and consume the newest OTP, with a strict attempt limit."""
+        identifier = identifier.strip().lower()
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM verification_codes "
+                "WHERE identifier = ? AND purpose = ? AND consumed_at IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (identifier, purpose),
+            ).fetchone()
+            if not row:
+                return False, "Chưa yêu cầu mã xác minh hoặc mã đã được sử dụng"
+            if float(row["expires_at"]) < now:
+                conn.execute(
+                    "UPDATE verification_codes SET consumed_at = ? WHERE id = ?", (now, row["id"])
+                )
+                return False, "Mã xác minh đã hết hạn"
+            if int(row["attempts"]) >= VERIFICATION_MAX_ATTEMPTS:
+                return False, "Mã đã bị khóa do nhập sai quá nhiều lần"
+            expected = self._verification_hash(identifier, purpose, str(code).strip(), row["salt"])
+            if not secrets.compare_digest(expected, row["code_hash"]):
+                conn.execute(
+                    "UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (row["id"],)
+                )
+                return False, "Mã xác minh không đúng"
+            conn.execute(
+                "UPDATE verification_codes SET consumed_at = ? WHERE id = ?", (now, row["id"])
+            )
+            return True, None
+
+    def registration_device_owner(
+        self, device_hash: str, fingerprint_hash: Optional[str] = None,
+    ) -> Optional[int]:
+        # The browser-generated device token is the enforceable key. A network/
+        # browser fingerprint is deliberately audit-only: using it as an OR
+        # condition would lock unrelated people behind the same NAT, school or
+        # office network out of registration.
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT user_id FROM registration_devices WHERE device_hash = ? LIMIT 1",
+                (device_hash,),
+            ).fetchone()
+            return int(row["user_id"]) if row else None
+
+    def claim_registration_device(
+        self, user_id: int, device_hash: str, fingerprint_hash: Optional[str] = None,
+    ) -> bool:
+        """Bind a trial-registration device to its first account."""
+        now = time.time()
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT user_id FROM registration_devices WHERE device_hash = ? LIMIT 1",
+                (device_hash,),
+            ).fetchone()
+            if owner:
+                if int(owner["user_id"]) == user_id:
+                    conn.execute(
+                        "UPDATE registration_devices SET last_seen_at = ? WHERE user_id = ?",
+                        (now, user_id),
+                    )
+                    return True
+                return False
+            conn.execute(
+                "INSERT INTO registration_devices "
+                "(user_id, device_hash, fingerprint_hash, created_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, device_hash, fingerprint_hash, now, now),
+            )
+            return True
+
+    def release_registration_devices(self, user_id: int) -> int:
+        """Admin recovery hook for a legitimate device/account migration."""
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM registration_devices WHERE user_id = ?", (user_id,))
+            return int(cursor.rowcount)
 
     def adjust_credits(self, user_id: int, delta: int) -> int:
         """Add (or, with a negative delta, subtract) credits. Returns the new balance."""
@@ -2050,8 +2222,9 @@ class Store:
         with self._connect() as conn:
             cur = conn.execute(
                 """INSERT INTO licenses (remote_license_id, license_key, user_id, customer_name, customer_email,
-                   plan_type, features_json, expiry_date, max_jobs, max_tokens, status, notes, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   plan_type, quota_type, features_json, expiry_date, max_jobs, max_tokens, status, notes,
+                   created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     license_data.get("remote_license_id"),
                     license_data["license_key"],
@@ -2059,6 +2232,7 @@ class Store:
                     license_data.get("customer_name"),
                     license_data.get("customer_email"),
                     license_data.get("plan_type", "basic"),
+                    license_data.get("quota_type", "credit"),
                     json.dumps(license_data.get("features", [])),
                     license_data.get("expiry_date"),
                     license_data.get("max_jobs", -1),
@@ -2095,6 +2269,7 @@ class Store:
                 remote_data.get("customer_name"),
                 remote_data.get("customer_email"),
                 remote_data.get("plan_type") or "basic",
+                remote_data.get("quota_type") or "credit",
                 json.dumps(features),
                 remote_data.get("expiry_date"),
                 int(remote_data.get("max_jobs", -1)),
@@ -2106,7 +2281,7 @@ class Store:
             if existing:
                 conn.execute(
                     """UPDATE licenses SET remote_license_id = ?, user_id = ?, customer_name = ?,
-                       customer_email = ?, plan_type = ?, features_json = ?, expiry_date = ?,
+                       customer_email = ?, plan_type = ?, quota_type = ?, features_json = ?, expiry_date = ?,
                        max_jobs = ?, max_tokens = ?, status = ?, notes = ?, updated_at = ?
                        WHERE id = ?""",
                     (*values, existing["id"]),
@@ -2116,9 +2291,9 @@ class Store:
                 cur = conn.execute(
                     """INSERT INTO licenses (
                        remote_license_id, license_key, user_id, customer_name, customer_email,
-                       plan_type, features_json, expiry_date, max_jobs, max_tokens, status,
+                       plan_type, quota_type, features_json, expiry_date, max_jobs, max_tokens, status,
                        notes, created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (values[0], license_key, *values[1:-1], now, now),
                 )
                 local_id = cur.lastrowid
@@ -2156,7 +2331,7 @@ class Store:
     def update_license(self, license_id: int, updates: Dict[str, Any]) -> bool:
         now = time.time()
         allowed_fields = {
-            "remote_license_id", "user_id", "customer_name", "customer_email", "plan_type",
+            "remote_license_id", "user_id", "customer_name", "customer_email", "plan_type", "quota_type",
             "features", "expiry_date", "max_jobs", "max_tokens", "status", "notes"
         }
         set_clauses = []
@@ -2557,3 +2732,53 @@ class Store:
                 "publishes_by_platform": publishes_by_platform,
                 "total_credits_outstanding": total_credits_issued,
             }
+
+    def admin_user_activity(self, user_id: int, limit: int = 100) -> Dict[str, Any]:
+        """Return an admin-safe operational view of one user's jobs and queue."""
+        jobs = self.list_jobs_for_user(user_id, limit=max(1, min(limit, 500)))
+        by_status: Dict[str, int] = {}
+        for job in jobs:
+            by_status[job.status] = by_status.get(job.status, 0) + 1
+        active_statuses = {"queued", "running", "review"}
+        return {
+            "user_id": user_id,
+            "total_jobs": len(jobs),
+            "by_status": by_status,
+            "queue_count": sum(by_status.get(status, 0) for status in active_statuses),
+            "jobs": [
+                {
+                    "id": job.id,
+                    "title": job.title,
+                    "source_url": job.source_url,
+                    "source_channel_title": job.source_channel_title,
+                    "status": job.status,
+                    "progress_note": job.progress_note,
+                    "error": job.error,
+                    "target_language": job.target_language,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                    "has_video": bool(job.final_video_path),
+                }
+                for job in jobs
+            ],
+        }
+
+    def admin_user_activity_summaries(self) -> Dict[int, Dict[str, Any]]:
+        """Aggregate queue and job counts for all users in one query."""
+        summaries: Dict[int, Dict[str, Any]] = {}
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, status, COUNT(*) AS count FROM jobs GROUP BY user_id, status"
+            ).fetchall()
+        for row in rows:
+            user_id = int(row["user_id"])
+            summary = summaries.setdefault(
+                user_id, {"user_id": user_id, "total_jobs": 0, "queue_count": 0, "by_status": {}}
+            )
+            status_name = str(row["status"])
+            count = int(row["count"])
+            summary["by_status"][status_name] = count
+            summary["total_jobs"] += count
+            if status_name in {"queued", "running", "review"}:
+                summary["queue_count"] += count
+        return summaries

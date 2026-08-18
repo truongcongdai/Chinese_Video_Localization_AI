@@ -65,7 +65,20 @@ async function api(path, opts = {}) {
 let needsRegistrationGlobal = false;
 let bootstrapConfig = {};
 let currentUserId = null;
+let currentMe = null;
 let providerSettings = {};
+const REGISTRATION_DEVICE_KEY = "registration_device_id_v1";
+
+function registrationDeviceId() {
+  let value = localStorage.getItem(REGISTRATION_DEVICE_KEY);
+  if (!value) {
+    value = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(REGISTRATION_DEVICE_KEY, value);
+  }
+  return value;
+}
 
 async function initAuth() {
   const boot = await api("/api/bootstrap");
@@ -169,6 +182,7 @@ async function doLogin() {
   try {
     await api("/api/login", { method: "POST", body: JSON.stringify({
       identifier: $("#login-identifier").value.trim(), password: $("#login-password").value,
+      device_id: registrationDeviceId(),
     })});
     const me = await api("/api/me");
     showApp(me);
@@ -182,12 +196,45 @@ async function doRegister() {
       contact_identifier: $("#register-contact").value.trim(),
       username: $("#register-username").value.trim(),
       password: $("#register-password").value,
+      verification_code: $("#register-verification-code").value.trim(),
+      device_id: registrationDeviceId(),
       referral_code: $("#register-referral-code").value.trim() || null,
     })});
     const me = await api("/api/me");
     showApp(me);
   } catch (e) { $("#auth-error").textContent = e.message; }
 }
+
+$("#register-send-code").onclick = async () => {
+  const email = $("#register-contact").value.trim();
+  const button = $("#register-send-code");
+  const status = $("#register-code-status");
+  if (!email) {
+    status.textContent = "Nhập email trước khi yêu cầu mã.";
+    return;
+  }
+  button.disabled = true;
+  status.textContent = "Đang gửi mã xác minh…";
+  try {
+    const result = await api("/api/send-verification-code", {
+      method: "POST", body: JSON.stringify({ contact_identifier: email }),
+    });
+    status.textContent = result.message || "Đã gửi mã. Kiểm tra cả thư rác nếu chưa thấy email.";
+    let remaining = 60;
+    button.textContent = `Gửi lại (${remaining}s)`;
+    const timer = setInterval(() => {
+      remaining -= 1;
+      button.textContent = remaining > 0 ? `Gửi lại (${remaining}s)` : "Gửi lại mã";
+      if (remaining <= 0) {
+        clearInterval(timer);
+        button.disabled = false;
+      }
+    }, 1000);
+  } catch (error) {
+    status.textContent = error.message;
+    button.disabled = false;
+  }
+};
 
 async function startIdentityLogin(provider) {
   try {
@@ -197,6 +244,7 @@ async function startIdentityLogin(provider) {
 }
 
 function showApp(me) {
+  currentMe = me;
   currentUserId = me.id;
   $("#landing-view").classList.add("hidden");
   $("#auth-view").classList.add("hidden");
@@ -216,6 +264,7 @@ function showApp(me) {
   loadProviderSettings();
   loadPublishingProfiles();
   loadPersonalStats();
+  loadLicenseInfo();
   refreshJobQueueStatus();
   requestNotificationPermission();
   refreshJobs();
@@ -290,8 +339,10 @@ function _notifyJobStatusChange(job) {
 async function refreshMe() {
   try {
     const me = await api("/api/me");
+    currentMe = me;
     $("#userbar-credits").textContent = `💳 ${me.credits}`;
     $("#stat-credits").textContent = me.credits;
+    $("#admin-btn").classList.toggle("hidden", !me.is_admin);
     await loadLicenseInfo();
   } catch (e) { /* session likely expired; next job/history poll will surface it */ }
 }
@@ -305,20 +356,44 @@ async function loadLicenseInfo() {
     
     const licenseInfo = $("#license-info");
     const trialInfo = $("#trial-info");
+    const licenseActions = $("#license-actions");
     
     if (licenseRes.license) {
       const l = licenseRes.license;
+      const licenseIsActive = (
+        (l.status || "active") === "active" &&
+        !l.validation_error &&
+        (!l.expiry_date || l.expiry_date > Date.now() / 1000)
+      );
+      licenseActions.classList.toggle("hidden", licenseIsActive);
       const usage = l.usage || { tokens_used: 0, jobs_completed: 0 };
+      const isTimePlan = l.quota_type === "time";
+      const daysLeft = l.expiry_date ? Math.max(0, Math.ceil((l.expiry_date - Date.now()/1000) / 86400)) : null;
+      const quotaText = isTimePlan
+        ? (daysLeft == null ? "Không giới hạn ngày" : `${daysLeft} ngày còn lại`)
+        : `${currentMe?.credits ?? 0} credit còn lại`;
+      $("#userbar-credits").textContent = isTimePlan ? `📅 ${quotaText}` : `💳 ${currentMe?.credits ?? 0}`;
+      $("#userbar-credits").title = quotaText;
+      $("#stat-credits").textContent = isTimePlan ? (daysLeft ?? "∞") : (currentMe?.credits ?? 0);
+      $("#stat-quota-label").textContent = isTimePlan ? "Ngày sử dụng còn lại" : "Credit còn lại";
+      $("#topup-btn").classList.toggle("hidden", isTimePlan);
       licenseInfo.innerHTML = `
         <div style="font-size:13px">
           <strong>License:</strong> <span class="badge ${l.plan_type}">${l.plan_type}</span><br>
+          <strong>Loại hạn mức:</strong> ${isTimePlan ? "Theo thời gian" : "Theo credit"}<br>
           <strong>Khách hàng:</strong> ${l.customer_name || "-"}<br>
           <strong>Features:</strong> ${l.features.length ? l.features.join(", ") : "Tất cả"}<br>
           <strong>Hết hạn:</strong> ${l.expiry_date ? new Date(l.expiry_date * 1000).toLocaleDateString() : "Lifetime"}<br>
-          <strong>Sử dụng:</strong> ${usage.jobs_completed}/${l.max_jobs === -1 ? "∞" : l.max_jobs} jobs, ${usage.tokens_used}/${l.max_tokens === -1 ? "∞" : l.max_tokens} tokens
+          <strong>Còn lại:</strong> ${quotaText}<br>
+          <strong>Đã xử lý:</strong> ${usage.jobs_completed || 0} jobs
         </div>
       `;
     } else {
+      licenseActions.classList.remove("hidden");
+      $("#userbar-credits").textContent = `💳 ${currentMe?.credits ?? 0}`;
+      $("#stat-credits").textContent = currentMe?.credits ?? 0;
+      $("#stat-quota-label").textContent = "Credit còn lại";
+      $("#topup-btn").classList.remove("hidden");
       licenseInfo.innerHTML = `<div style="font-size:13px;color:var(--text-dim)">Chưa có license nào được kích hoạt.</div>`;
     }
     
@@ -330,6 +405,7 @@ async function loadLicenseInfo() {
       trialInfo.innerHTML = "";
     }
   } catch (e) {
+    $("#license-actions")?.classList.remove("hidden");
     console.error("Failed to load license info:", e);
   }
 }
@@ -1992,7 +2068,7 @@ const SUBTITLE_TEMPLATES = {
 };
 
 function applyRecommendedLocalizationDefaults() {
-  $("#output-aspect-ratio").value = "auto";
+  $("#output-aspect-ratio").value = "9:16";
   $("#video-template-checkbox").checked = true;
   $("#video-template-panel").classList.remove("hidden");
   $("#video-template-select").value = "social";
@@ -3548,32 +3624,34 @@ async function _prefillPublishSuggestions(jobId) {
   });
 }
 
-// Feature tab switching - ensure DOM is loaded
+// The four content tools share one top-level workspace. Their existing APIs
+// remain independent, while navigation presents them as stages of one product.
 document.addEventListener("DOMContentLoaded", () => {
+  const studioFeatures = new Set(["content-os", "trend", "ai-video", "affiliate"]);
+
+  function activateFeature(requestedFeature) {
+    const feature = requestedFeature === "studio" ? "content-os" : requestedFeature;
+    const inStudio = studioFeatures.has(feature);
+
+    document.querySelectorAll(".feature-tab").forEach(tab => {
+      tab.classList.toggle("active", tab.dataset.feature === (inStudio ? "studio" : feature));
+    });
+    $("#studio-tabs")?.classList.toggle("hidden", !inStudio);
+    document.querySelectorAll("[data-studio-feature]").forEach(tab => {
+      tab.classList.toggle("active", tab.dataset.studioFeature === feature);
+    });
+    document.querySelectorAll(".feature-panel").forEach(panel => {
+      panel.classList.toggle("active", panel.dataset.feature === feature);
+    });
+
+    if (feature === "content-os") initContentOS();
+  }
+
   document.querySelectorAll(".feature-tab").forEach(tab => {
-    tab.onclick = () => {
-      const feature = tab.dataset.feature;
-
-      console.log("Tab clicked:", feature);
-
-      // Update tab active state
-      document.querySelectorAll(".feature-tab").forEach(t => t.classList.remove("active"));
-      tab.classList.add("active");
-
-      // Update panel visibility
-      document.querySelectorAll(".feature-panel").forEach(panel => {
-        panel.classList.remove("active");
-        if (panel.dataset.feature === feature) {
-          panel.classList.add("active");
-          console.log("Panel shown:", feature);
-
-          // Initialize Content OS if switching to that tab
-          if (feature === "content-os") {
-            initContentOS();
-          }
-        }
-      });
-    };
+    tab.onclick = () => activateFeature(tab.dataset.feature);
+  });
+  document.querySelectorAll("[data-studio-feature]").forEach(tab => {
+    tab.onclick = () => activateFeature(tab.dataset.studioFeature);
   });
 });
 

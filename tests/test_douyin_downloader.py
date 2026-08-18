@@ -1,8 +1,14 @@
 import requests
+import pytest
+from yt_dlp.utils import DownloadError
 
 from universal_video_ai.downloader.douyin import DouyinDownloader, _safe_video_filename
 from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.downloader.platform_detector import PlatformDetector
+from universal_video_ai.downloader.ytdlp_downloader import (
+    DouyinCookiesRequiredError,
+    YTDLPDownloader,
+)
 from universal_video_ai.web.app import _extract_first_video_url
 
 
@@ -150,3 +156,65 @@ def test_direct_stream_retries_interruption_from_received_byte(tmp_path, monkeyp
     assert size == 6
     assert output_path.read_bytes() == b"abcdef"
     assert calls[1][1]["headers"]["Range"] == "bytes=3-"
+
+
+def test_ytdlp_douyin_automatically_tries_local_browser_cookies(tmp_path, monkeypatch):
+    attempts = []
+    monkeypatch.setenv("DOUYIN_COOKIES_FROM_BROWSER", "edge,chrome")
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+            attempts.append(options.get("cookiesfrombrowser"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def extract_info(self, url, download):
+            assert download is True
+            if self.options.get("cookiesfrombrowser") == ("edge",):
+                raise DownloadError("failed to load cookies")
+            return {"id": "123", "title": "clip", "webpage_url": url}
+
+        def prepare_filename(self, info):
+            return str(tmp_path / f"{info['title']}.webm")
+
+    monkeypatch.setattr(
+        "universal_video_ai.downloader.ytdlp_downloader.yt_dlp.YoutubeDL", FakeYDL,
+    )
+
+    result = YTDLPDownloader(Platform.DOUYIN).download(
+        "https://www.douyin.com/video/123", tmp_path,
+    )
+
+    assert attempts == [("edge",), ("chrome",)]
+    assert result.video_path == tmp_path / "clip.mp4"
+
+
+def test_ytdlp_douyin_returns_actionable_error_after_cookie_sources_fail(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOUYIN_COOKIES_FROM_BROWSER", "firefox")
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def extract_info(self, url, download):
+            raise DownloadError("Fresh cookies (not necessarily logged in) are needed")
+
+    monkeypatch.setattr(
+        "universal_video_ai.downloader.ytdlp_downloader.yt_dlp.YoutubeDL", FakeYDL,
+    )
+
+    with pytest.raises(DouyinCookiesRequiredError, match="mở Douyin bằng Edge"):
+        YTDLPDownloader(Platform.DOUYIN).download(
+            "https://www.douyin.com/video/123", tmp_path,
+        )

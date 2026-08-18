@@ -46,6 +46,20 @@ if not env_loaded:
         print(f"  - {loc}")
     print("WEB_SESSION_SECRET may not be set!")
 
+# The Windows build writes this non-secret file next to the executable. It
+# provides a ready-to-run public server default while allowing a real environment
+# variable or .env entry loaded above to override it.
+server_defaults_locations = [
+    Path.cwd() / "server_defaults.env",
+    Path.cwd() / "ChineseVideoLocalizationAI" / "server_defaults.env",
+    Path(__file__).parent.parent / "dist" / "ChineseVideoLocalizationAI" / "server_defaults.env",
+]
+for defaults_file in server_defaults_locations:
+    if defaults_file.exists():
+        print(f"Loading server defaults from: {defaults_file}")
+        load_dotenv(defaults_file, override=False)
+        break
+
 def main():
     # Import the app directly instead of using string
     try:

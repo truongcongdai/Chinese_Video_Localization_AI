@@ -83,3 +83,41 @@ def test_content_os_job_is_flagged_for_frontend(tmp_path: Path) -> None:
     loaded = store.get_job(job.id)
     assert loaded is not None
     assert loaded.to_dict()["is_content_os"] is True
+
+
+def test_registration_code_is_hashed_single_use_and_rate_limited(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    code = store.create_verification_code("Member@Example.com", "register")
+
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM verification_codes").fetchone()
+    assert row["code_hash"] != code
+    assert row["identifier"] == "member@example.com"
+
+    success, error = store.verify_code("member@example.com", code, "register")
+    assert success is True
+    assert error is None
+    assert store.verify_code("member@example.com", code, "register")[0] is False
+
+    store.create_verification_code("other@example.com", "register")
+    try:
+        store.create_verification_code("other@example.com", "register")
+    except ValueError as exc:
+        assert "Vui lòng chờ" in str(exc)
+    else:
+        raise AssertionError("OTP resend cooldown was not enforced")
+
+
+def test_registration_device_uses_device_token_not_shared_network_fingerprint(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    first_user = store.create_user("first-device", "hash")
+    second_user = store.create_user("second-device", "hash")
+    shared_fingerprint = "same-office-network"
+
+    assert store.claim_registration_device(first_user, "device-one", shared_fingerprint) is True
+    assert store.registration_device_owner("device-one", shared_fingerprint) == first_user
+    assert store.registration_device_owner("device-two", shared_fingerprint) is None
+    assert store.claim_registration_device(second_user, "device-two", shared_fingerprint) is True
+    assert store.claim_registration_device(second_user, "device-one", "different") is False
+    assert store.release_registration_devices(first_user) == 1
+    assert store.registration_device_owner("device-one") is None

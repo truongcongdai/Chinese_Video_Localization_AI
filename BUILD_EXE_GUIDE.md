@@ -116,6 +116,16 @@ Project này có thể đóng gói thành file .exe để chạy trên Windows m
    ```
 3. Cấu hình các API key cần thiết (OpenAI, Google, etc.) nếu có
 
+`build_exe.bat` tự tạo `server_defaults.env` với:
+
+```env
+LICENSE_SERVER_URL=http://113.160.14.1:8000
+USER_MANAGEMENT_SERVER_URL=http://113.160.14.1:8001
+```
+
+Vì vậy bản PyInstaller không cần chạy `set_license_server.bat`. Registry,
+biến môi trường hệ thống hoặc giá trị trong `.env` vẫn có thể ghi đè mặc định này.
+
 ## Cách chạy
 
 ### Chạy trực tiếp
@@ -189,7 +199,9 @@ ChineseVideoLocalizationAI.exe
 ### Để phân phối cho người khác
 1. Zip toàn bộ thư mục `dist\ChineseVideoLocalizationAI\`
 2. Gửi file zip cho người dùng
-3. Họ chỉ cần giải nén và chạy exe
+3. Họ chỉ cần giải nén và chạy exe; license server public đã được cấu hình mặc định
+
+Địa chỉ `http://192.168.6.10:8000` chỉ dùng khi chạy và kiểm thử trong mạng local.
 
 ### Không cần cài đặt Python
 - Người dùng không cần cài Python

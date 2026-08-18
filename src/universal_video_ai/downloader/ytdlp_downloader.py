@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import logging
 from pathlib import Path
 
 import yt_dlp
@@ -8,6 +10,41 @@ import yt_dlp
 from .base import BaseDownloader
 from .download_result import DownloadResult
 from .platform import Platform
+
+logger = logging.getLogger(__name__)
+
+
+class DouyinCookiesRequiredError(RuntimeError):
+    """Raised after every safe automatic Douyin cookie source was exhausted."""
+
+
+def _browser_cookie_candidates(platform: Platform) -> list[tuple[str, ...]]:
+    """Return browser profiles to try without exporting cookies to disk."""
+    configured = os.environ.get(f"{platform.name.upper()}_COOKIES_FROM_BROWSER")
+    if configured is None:
+        configured = os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
+    if configured is not None:
+        value = configured.strip()
+        if value.lower() in {"", "0", "false", "no", "off", "none"}:
+            return []
+        return [(name.strip().lower(),) for name in value.split(",") if name.strip()]
+
+    if platform != Platform.DOUYIN:
+        return []
+    # Most Windows builds are used with Edge or Chrome. Firefox is also
+    # included because yt-dlp documents it as the most reliable cookie source.
+    if os.name == "nt":
+        return [("edge",), ("chrome",), ("firefox",)]
+    if sys.platform == "darwin":
+        return [("chrome",), ("safari",), ("firefox",)]
+    return [("chrome",), ("chromium",), ("firefox",)]
+
+
+def _is_cookie_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "cookie", "failed to load cookies", "could not find", "decrypt",
+    ))
 
 # Optional cookies for yt-dlp, only used if actually configured/present.
 # Some platforms (Douyin in particular) intermittently require "fresh
@@ -98,63 +135,68 @@ class YTDLPDownloader(BaseDownloader):
 
         }
 
-        cookiefile = _cookiefile_for(self.platform)
-        if cookiefile:
-            options["cookiefile"] = cookiefile
-
         options.update(self.get_extra_options())
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-
-            info = ydl.extract_info(
-                url,
-                download=True,
+        cookiefile = _cookiefile_for(self.platform)
+        cookie_attempts: list[dict] = []
+        if cookiefile:
+            cookie_attempts.append({"cookiefile": cookiefile})
+        elif self.platform == Platform.DOUYIN:
+            cookie_attempts.extend(
+                {"cookiesfrombrowser": candidate}
+                for candidate in _browser_cookie_candidates(self.platform)
             )
+            # Preserve the previous cookie-less behavior as the last attempt.
+            cookie_attempts.append({})
+        else:
+            cookie_attempts.append({})
 
-            filepath = Path(
-                ydl.prepare_filename(info)
-            ).with_suffix(".mp4")
+        last_cookie_error: BaseException | None = None
+        for cookie_options in cookie_attempts:
+            attempt_options = {**options, **cookie_options}
+            browser = cookie_options.get("cookiesfrombrowser")
+            if browser:
+                logging_label = browser[0]
+                logger.info("Douyin: trying fresh cookies from %s", logging_label)
+            try:
+                with yt_dlp.YoutubeDL(attempt_options) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    filepath = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+                return DownloadResult(
+                    success=True,
+                    platform=self.platform,
+                    original_url=url,
+                    final_url=info.get("webpage_url", url),
+                    video_path=filepath,
+                    title=info.get("title", ""),
+                    uploader=info.get("uploader", ""),
+                    duration=info.get("duration", 0),
+                    width=info.get("width", 0),
+                    height=info.get("height", 0),
+                    filesize=info.get("filesize", 0),
+                    extension="mp4",
+                    description=info.get("description", "") or "",
+                    thumbnail_url=info.get("thumbnail", "") or "",
+                    tags=[str(item) for item in (info.get("tags") or []) if str(item).strip()],
+                    raw_metadata={
+                        "id": info.get("id"),
+                        "webpage_url": info.get("webpage_url"),
+                        "upload_date": info.get("upload_date"),
+                        "timestamp": info.get("timestamp"),
+                        "view_count": info.get("view_count"),
+                        "like_count": info.get("like_count"),
+                        "comment_count": info.get("comment_count"),
+                        "categories": info.get("categories") or [],
+                    },
+                )
+            except Exception as exc:
+                if self.platform != Platform.DOUYIN or not _is_cookie_error(exc):
+                    raise
+                last_cookie_error = exc
 
-        return DownloadResult(
-
-            success=True,
-
-            platform=self.platform,
-
-            original_url=url,
-
-            final_url=info.get("webpage_url", url),
-
-            video_path=filepath,
-
-            title=info.get("title", ""),
-
-            uploader=info.get("uploader", ""),
-
-            duration=info.get("duration", 0),
-
-            width=info.get("width", 0),
-
-            height=info.get("height", 0),
-
-            filesize=info.get("filesize", 0),
-
-            extension="mp4",
-
-            description=info.get("description", "") or "",
-
-            thumbnail_url=info.get("thumbnail", "") or "",
-
-            tags=[str(item) for item in (info.get("tags") or []) if str(item).strip()],
-
-            raw_metadata={
-                "id": info.get("id"),
-                "webpage_url": info.get("webpage_url"),
-                "upload_date": info.get("upload_date"),
-                "timestamp": info.get("timestamp"),
-                "view_count": info.get("view_count"),
-                "like_count": info.get("like_count"),
-                "comment_count": info.get("comment_count"),
-                "categories": info.get("categories") or [],
-            },
-        )
+        browsers = ", ".join(item[0] for item in _browser_cookie_candidates(self.platform))
+        detail = f" Đã tự thử: {browsers}." if browsers else ""
+        raise DouyinCookiesRequiredError(
+            "Douyin yêu cầu cookie mới. Hãy mở Douyin bằng Edge, Chrome hoặc Firefox "
+            "trên máy chạy ứng dụng, tải lại trang Douyin một lần rồi bấm Thử lại."
+            f"{detail} Nếu vẫn lỗi, cấu hình DOUYIN_COOKIES_FILE."
+        ) from last_cookie_error
