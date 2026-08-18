@@ -25,9 +25,9 @@ Lightweight centralized license management system for Chinese Video Localization
 
 1. Upload files to your Ubuntu server:
    ```bash
-   scp license_server/server.py root@your-server:/opt/license-server/
-   scp license_server/static/admin.html root@your-server:/opt/license-server/static/
-   scp license_server/deploy_ubuntu.sh root@your-server:/opt/license-server/
+   scp license_server/server.py jsvn@192.168.6.10:/opt/license-server/
+   scp license_server/static/admin.html jsvn@192.168.6.10:/opt/license-server/static/
+   scp license_server/deploy_ubuntu.sh jsvn@192.168.6.10:/opt/license-server/
    ```
 
 2. Run the deployment script:
