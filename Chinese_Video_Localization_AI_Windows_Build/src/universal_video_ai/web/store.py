@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,6 +37,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
     source_url TEXT NOT NULL,
+    source_channel_url TEXT,
+    source_channel_title TEXT,
+    source_channel_id TEXT,
+    source_uploader TEXT,
     target_language TEXT NOT NULL,
     source_language TEXT DEFAULT 'auto',
     status TEXT NOT NULL,           -- queued | running | review | done | error
@@ -49,6 +52,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     logo_path TEXT,
     logo_corner TEXT DEFAULT 'bottom_right',
     logo_size_px INTEGER DEFAULT 120,
+    branding_config TEXT,
+    publishing_config TEXT,
+    publishing_pack_path TEXT,
+    publish_ready_video_path TEXT,
+    publishing_pack_status TEXT DEFAULT 'disabled',
+    publishing_pack_error TEXT,
     tts_voice TEXT,
     review_mode INTEGER NOT NULL DEFAULT 0,
     review_state_json TEXT,
@@ -381,6 +390,68 @@ CREATE TABLE IF NOT EXISTS content_os_memories (
     FOREIGN KEY(source_run_id) REFERENCES content_os_runs(id)
 );
 
+
+-- Reusable AI Publishing Pack channel profiles. These are strictly scoped to
+-- one app user; no user's channel name/SEO rules become global defaults.
+CREATE TABLE IF NOT EXISTS publishing_channel_profiles (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_publishing_profiles_user
+    ON publishing_channel_profiles(user_id, updated_at);
+
+-- Persistent channel catalog used by deep/continued profile scans.
+CREATE TABLE IF NOT EXISTS channel_scan_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    channel_id TEXT,
+    channel_title TEXT,
+    cursor TEXT,
+    has_more INTEGER,
+    complete INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'incomplete',
+    stop_reason TEXT,
+    scan_source TEXT,
+    network_pages INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    total_discovered INTEGER NOT NULL DEFAULT 0,
+    scan_version INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, canonical_url)
+);
+
+CREATE TABLE IF NOT EXISTS channel_scan_videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    state_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    metadata_json TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    discovered_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    UNIQUE(state_id, video_id),
+    UNIQUE(state_id, source_url),
+    FOREIGN KEY(state_id) REFERENCES channel_scan_states(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_scan_states_user_url
+    ON channel_scan_states(user_id, canonical_url);
+CREATE INDEX IF NOT EXISTS idx_channel_scan_videos_state_position
+    ON channel_scan_videos(state_id, position);
+CREATE INDEX IF NOT EXISTS idx_channel_scan_videos_source_url
+    ON channel_scan_videos(source_url);
+
 -- Content OS indexes
 CREATE INDEX IF NOT EXISTS idx_content_os_projects_user_id ON content_os_projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_content_os_projects_status ON content_os_projects(status);
@@ -409,6 +480,63 @@ CREATE INDEX IF NOT EXISTS idx_content_os_approvals_user_id ON content_os_approv
 CREATE INDEX IF NOT EXISTS idx_content_os_memories_user_id ON content_os_memories(user_id);
 CREATE INDEX IF NOT EXISTS idx_content_os_memories_channel_key ON content_os_memories(channel_key);
 CREATE INDEX IF NOT EXISTS idx_content_os_memories_active ON content_os_memories(active);
+
+-- License management system
+CREATE TABLE IF NOT EXISTS licenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    remote_license_id INTEGER,
+    license_key TEXT UNIQUE NOT NULL,
+    user_id INTEGER,
+    customer_name TEXT,
+    customer_email TEXT,
+    plan_type TEXT NOT NULL DEFAULT 'basic',  -- basic | pro | enterprise
+    features_json TEXT NOT NULL DEFAULT '[]',  -- List of enabled features
+    expiry_date REAL,
+    max_jobs INTEGER NOT NULL DEFAULT -1,  -- -1 = unlimited
+    max_tokens INTEGER NOT NULL DEFAULT -1,  -- -1 = unlimited
+    status TEXT NOT NULL DEFAULT 'active',  -- active | suspended | expired | revoked
+    notes TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key);
+CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id);
+CREATE INDEX IF NOT EXISTS idx_licenses_status ON licenses(status);
+
+-- License usage tracking
+CREATE TABLE IF NOT EXISTS license_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    jobs_completed INTEGER NOT NULL DEFAULT 0,
+    last_used_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(license_id) REFERENCES licenses(id),
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    UNIQUE(license_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_license_usage_license_id ON license_usage(license_id);
+CREATE INDEX IF NOT EXISTS idx_license_usage_user_id ON license_usage(user_id);
+
+-- Free trial tracking (token-based)
+CREATE TABLE IF NOT EXISTS free_trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    machine_id TEXT,  -- Hardware fingerprint for offline tracking
+    tokens_remaining INTEGER NOT NULL DEFAULT 10,
+    expiry_date REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_free_trials_user_id ON free_trials(user_id);
+CREATE INDEX IF NOT EXISTS idx_free_trials_machine_id ON free_trials(machine_id);
 """
 
 _MIGRATIONS = [
@@ -433,12 +561,24 @@ _MIGRATIONS = [
     # time, in the /api/register handler — this table just tracks the link.
     ("users", "referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
     ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
+    # Local ids are unrelated to ids on the centralized license server.
+    ("licenses", "remote_license_id", "ALTER TABLE licenses ADD COLUMN remote_license_id INTEGER"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
+    ("jobs", "source_channel_url", "ALTER TABLE jobs ADD COLUMN source_channel_url TEXT"),
+    ("jobs", "source_channel_title", "ALTER TABLE jobs ADD COLUMN source_channel_title TEXT"),
+    ("jobs", "source_channel_id", "ALTER TABLE jobs ADD COLUMN source_channel_id TEXT"),
+    ("jobs", "source_uploader", "ALTER TABLE jobs ADD COLUMN source_uploader TEXT"),
     ("jobs", "logo_path", "ALTER TABLE jobs ADD COLUMN logo_path TEXT"),
     ("jobs", "logo_corner", "ALTER TABLE jobs ADD COLUMN logo_corner TEXT DEFAULT 'bottom_right'"),
     ("jobs", "logo_size_px", "ALTER TABLE jobs ADD COLUMN logo_size_px INTEGER DEFAULT 120"),
+    ("jobs", "branding_config", "ALTER TABLE jobs ADD COLUMN branding_config TEXT"),
+    ("jobs", "publishing_config", "ALTER TABLE jobs ADD COLUMN publishing_config TEXT"),
+    ("jobs", "publishing_pack_path", "ALTER TABLE jobs ADD COLUMN publishing_pack_path TEXT"),
+    ("jobs", "publish_ready_video_path", "ALTER TABLE jobs ADD COLUMN publish_ready_video_path TEXT"),
+    ("jobs", "publishing_pack_status", "ALTER TABLE jobs ADD COLUMN publishing_pack_status TEXT DEFAULT 'disabled'"),
+    ("jobs", "publishing_pack_error", "ALTER TABLE jobs ADD COLUMN publishing_pack_error TEXT"),
     # TTS voice override (None = pick the language's default voice, see
     # tts.voices.VOICE_OPTIONS).
     ("jobs", "tts_voice", "ALTER TABLE jobs ADD COLUMN tts_voice TEXT"),
@@ -484,24 +624,33 @@ _MIGRATIONS = [
     ("jobs", "translation_glossary", "ALTER TABLE jobs ADD COLUMN translation_glossary TEXT"),
     # Upload video audio configuration
     ("jobs", "keep_original_audio", "ALTER TABLE jobs ADD COLUMN keep_original_audio INTEGER NOT NULL DEFAULT 0"),
-    ("jobs", "background_music_strategy", "ALTER TABLE jobs ADD COLUMN background_music_strategy TEXT NOT NULL DEFAULT 'deterministic'"),
+    ("jobs", "background_music_strategy",
+     "ALTER TABLE jobs ADD COLUMN background_music_strategy TEXT NOT NULL DEFAULT 'deterministic'"),
+    ("channel_scan_states", "scan_version", "ALTER TABLE channel_scan_states ADD COLUMN scan_version INTEGER NOT NULL DEFAULT 1"),
     # Content OS migrations - add missing columns
     ("content_os_projects", "channel_id", "ALTER TABLE content_os_projects ADD COLUMN channel_id INTEGER"),
     ("content_os_projects", "mode", "ALTER TABLE content_os_projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'ai_video'"),
     ("content_os_projects", "objective", "ALTER TABLE content_os_projects ADD COLUMN objective TEXT"),
-    ("content_os_projects", "target_platform", "ALTER TABLE content_os_projects ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'youtube_shorts'"),
-    ("content_os_projects", "target_duration_seconds", "ALTER TABLE content_os_projects ADD COLUMN target_duration_seconds INTEGER NOT NULL DEFAULT 45"),
-    ("content_os_projects", "target_language", "ALTER TABLE content_os_projects ADD COLUMN target_language TEXT NOT NULL DEFAULT 'vi'"),
+    ("content_os_projects", "target_platform",
+     "ALTER TABLE content_os_projects ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'youtube_shorts'"),
+    ("content_os_projects", "target_duration_seconds",
+     "ALTER TABLE content_os_projects ADD COLUMN target_duration_seconds INTEGER NOT NULL DEFAULT 45"),
+    ("content_os_projects", "target_language",
+     "ALTER TABLE content_os_projects ADD COLUMN target_language TEXT NOT NULL DEFAULT 'vi'"),
     ("content_os_projects", "content_style", "ALTER TABLE content_os_projects ADD COLUMN content_style TEXT"),
     ("content_os_projects", "visual_style", "ALTER TABLE content_os_projects ADD COLUMN visual_style TEXT"),
     ("content_os_projects", "voice_id", "ALTER TABLE content_os_projects ADD COLUMN voice_id TEXT"),
     ("content_os_projects", "subtitle_style_id", "ALTER TABLE content_os_projects ADD COLUMN subtitle_style_id TEXT"),
-    ("content_os_projects", "background_music_enabled", "ALTER TABLE content_os_projects ADD COLUMN background_music_enabled INTEGER NOT NULL DEFAULT 0"),
+    ("content_os_projects", "background_music_enabled",
+     "ALTER TABLE content_os_projects ADD COLUMN background_music_enabled INTEGER NOT NULL DEFAULT 0"),
     ("content_os_projects", "user_instructions", "ALTER TABLE content_os_projects ADD COLUMN user_instructions TEXT"),
     ("content_os_projects", "settings_json", "ALTER TABLE content_os_projects ADD COLUMN settings_json TEXT"),
-    ("content_os_projects", "status", "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+    ("content_os_projects", "status",
+     "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
     # Trend Scanner tables (new feature, no migration needed for fresh installs)
+    # License system tables (new feature, no migration needed for fresh installs)
 ]
+
 
 @dataclass
 class TrendScan:
@@ -571,10 +720,20 @@ class Job:
     source_video_path: Optional[str]
     created_at: float
     updated_at: float
+    source_channel_url: Optional[str] = None
+    source_channel_title: Optional[str] = None
+    source_channel_id: Optional[str] = None
+    source_uploader: Optional[str] = None
     source_language: str = "auto"
     logo_path: Optional[str] = None
     logo_corner: str = "bottom_right"
     logo_size_px: int = 120
+    branding_config: Optional[Dict[str, Any]] = None
+    publishing_config: Optional[Dict[str, Any]] = None
+    publishing_pack_path: Optional[str] = None
+    publish_ready_video_path: Optional[str] = None
+    publishing_pack_status: str = "disabled"
+    publishing_pack_error: Optional[str] = None
     tts_voice: Optional[str] = None
     review_mode: int = 0
     review_state_json: Optional[str] = None
@@ -604,10 +763,16 @@ class Job:
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
         d["is_content_os"] = (
-            str(self.source_url or "").startswith("content_os://")
-            or str(self.source_language or "").startswith("content_os")
+                str(self.source_url or "").startswith("content_os://")
+                or str(self.source_language or "").startswith("content_os")
         )
         d["has_video"] = bool(self.final_video_path and Path(self.final_video_path).exists())
+        d["has_publishing_pack"] = bool(
+            self.publishing_pack_path and Path(self.publishing_pack_path).is_dir()
+        )
+        d["has_publish_ready_video"] = bool(
+            self.publish_ready_video_path and Path(self.publish_ready_video_path).is_file()
+        )
         # review_state_json is an internal implementation detail (a
         # serialized PreparedLocalization, can be sizeable) — not useful to
         # the frontend and not something to leak. segments_json IS useful
@@ -623,6 +788,102 @@ class Job:
         remix_platforms_json = d.pop("remix_platforms_json", None)
         d["remix_platforms"] = json.loads(remix_platforms_json) if remix_platforms_json else []
         return d
+
+
+@dataclass
+class License:
+    id: Optional[int]
+    remote_license_id: Optional[int]
+    license_key: str
+    user_id: Optional[int]
+    customer_name: Optional[str]
+    customer_email: Optional[str]
+    plan_type: str
+    features: List[str]
+    expiry_date: Optional[float]
+    max_jobs: int
+    max_tokens: int
+    status: str
+    notes: Optional[str]
+    created_at: float
+    updated_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "License":
+        return cls(
+            id=row["id"],
+            remote_license_id=row["remote_license_id"],
+            license_key=row["license_key"],
+            user_id=row["user_id"],
+            customer_name=row["customer_name"],
+            customer_email=row["customer_email"],
+            plan_type=row["plan_type"],
+            features=json.loads(row["features_json"]) if row["features_json"] else [],
+            expiry_date=row["expiry_date"],
+            max_jobs=row["max_jobs"],
+            max_tokens=row["max_tokens"],
+            status=row["status"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class LicenseUsage:
+    id: Optional[int]
+    license_id: int
+    user_id: int
+    tokens_used: int
+    jobs_completed: int
+    last_used_at: Optional[float]
+    created_at: float
+    updated_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "LicenseUsage":
+        return cls(
+            id=row["id"],
+            license_id=row["license_id"],
+            user_id=row["user_id"],
+            tokens_used=row["tokens_used"],
+            jobs_completed=row["jobs_completed"],
+            last_used_at=row["last_used_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class FreeTrial:
+    id: Optional[int]
+    user_id: int
+    machine_id: Optional[str]
+    tokens_remaining: int
+    expiry_date: float
+    created_at: float
+    updated_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "FreeTrial":
+        return cls(
+            id=row["id"],
+            user_id=row["user_id"],
+            machine_id=row["machine_id"],
+            tokens_remaining=row["tokens_remaining"],
+            expiry_date=row["expiry_date"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
 
 class Store:
@@ -641,11 +902,14 @@ class Store:
             conn.executescript(SCHEMA)
             existing_cols = {
                 table: {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-                for table in ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps", "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals", "content_os_memories")
+                for table in
+                ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
+                 "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
+                 "content_os_memories", "channel_scan_states", "channel_scan_videos", "licenses")
             }
             migrated_legacy_projects = (
-                "target_platforms_json" in existing_cols.get("content_os_projects", set())
-                and "target_platform" not in existing_cols.get("content_os_projects", set())
+                    "target_platforms_json" in existing_cols.get("content_os_projects", set())
+                    and "target_platform" not in existing_cols.get("content_os_projects", set())
             )
             ran_is_admin_migration = False
             for table, column, ddl in _MIGRATIONS:
@@ -690,9 +954,9 @@ class Store:
 
     # ---- users ----
     def create_user(
-        self, username: str, password_hash: str, is_admin: bool = False,
-        credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
-        referred_by_user_id: Optional[int] = None,
+            self, username: str, password_hash: str, is_admin: bool = False,
+            credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
+            referred_by_user_id: Optional[int] = None,
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
@@ -720,8 +984,8 @@ class Store:
             return cur.fetchone()
 
     def create_user_oauth(
-        self, username: str, oauth_provider: str, oauth_id: str,
-        email: Optional[str] = None, is_admin: bool = False, credits: int = 10,
+            self, username: str, oauth_provider: str, oauth_id: str,
+            email: Optional[str] = None, is_admin: bool = False, credits: int = 10,
     ) -> int:
         """
         Create an account for someone who signed up/in via "Sign in with
@@ -813,29 +1077,31 @@ class Store:
 
     # ---- jobs ----
     def create_job(
-        self, user_id: int, source_url: str, target_language: str,
-        source_language: str = "auto", logo_path: Optional[str] = None,
-        logo_corner: str = "bottom_right", logo_size_px: int = 120,
-        tts_voice: Optional[str] = None, review_mode: bool = False,
-        animated_subtitle_config: Optional[Dict[str, Any]] = None,
-        video_template_config: Optional[Dict[str, Any]] = None,
-        transform_config: Optional[Dict[str, Any]] = None,
-        processing_mode: str = "fast",
-        tts_provider: str = "edge",
-        tts_style: str = "natural",
-        tts_model: Optional[str] = None,
-        translation_mode: str = "faithful",
-        translation_model: Optional[str] = None,
-        translation_tone: str = "natural",
-        translation_audience: Optional[str] = None,
-        translation_glossary: Optional[str] = None,
-        remix_enabled: bool = False,
-        remix_platforms: Optional[List[str]] = None,
-        remix_goal: str = "viral",
-        remix_strength: str = "balanced",
-        subtitle_offset_seconds: float = 0.0,
-        keep_original_audio: int = 0,
-        background_music_strategy: str = "deterministic",
+            self, user_id: int, source_url: str, target_language: str,
+            source_language: str = "auto", logo_path: Optional[str] = None,
+            logo_corner: str = "bottom_right", logo_size_px: int = 120,
+            branding_config: Optional[Dict[str, Any]] = None,
+            publishing_config: Optional[Dict[str, Any]] = None,
+            tts_voice: Optional[str] = None, review_mode: bool = False,
+            animated_subtitle_config: Optional[Dict[str, Any]] = None,
+            video_template_config: Optional[Dict[str, Any]] = None,
+            transform_config: Optional[Dict[str, Any]] = None,
+            processing_mode: str = "fast",
+            tts_provider: str = "edge",
+            tts_style: str = "natural",
+            tts_model: Optional[str] = None,
+            translation_mode: str = "faithful",
+            translation_model: Optional[str] = None,
+            translation_tone: str = "natural",
+            translation_audience: Optional[str] = None,
+            translation_glossary: Optional[str] = None,
+            remix_enabled: bool = False,
+            remix_platforms: Optional[List[str]] = None,
+            remix_goal: str = "viral",
+            remix_strength: str = "balanced",
+            subtitle_offset_seconds: float = 0.0,
+            keep_original_audio: int = 0,
+            background_music_strategy: str = "deterministic",
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -846,6 +1112,9 @@ class Store:
             final_video_path=None, source_video_path=None, created_at=now, updated_at=now,
             source_language=source_language, logo_path=logo_path,
             logo_corner=logo_corner, logo_size_px=logo_size_px,
+            branding_config=branding_config,
+            publishing_config=publishing_config,
+            publishing_pack_status=("pending" if (publishing_config or {}).get("enabled") else "disabled"),
             tts_voice=tts_voice, review_mode=int(review_mode),
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
@@ -870,7 +1139,9 @@ class Store:
         columns = (
             "id", "user_id", "source_url", "target_language", "source_language", "status",
             "progress_note", "error", "title", "final_video_path", "logo_path", "logo_corner",
-            "logo_size_px", "tts_voice", "review_mode", "review_state_json", "segments_json",
+            "logo_size_px", "branding_config", "publishing_config", "publishing_pack_path",
+            "publish_ready_video_path", "publishing_pack_status", "publishing_pack_error",
+            "tts_voice", "review_mode", "review_state_json", "segments_json",
             "qc_warnings_json", "created_at", "updated_at", "animated_subtitle_config",
             "video_template_config", "transform_config", "source_video_path", "source_segments_json",
             "processing_mode", "tts_provider", "tts_style", "translation_mode", "translation_tone",
@@ -881,8 +1152,12 @@ class Store:
         values = (
             job.id, job.user_id, job.source_url, job.target_language, job.source_language,
             job.status, job.progress_note, job.error, job.title, job.final_video_path,
-            job.logo_path, job.logo_corner, job.logo_size_px, job.tts_voice, job.review_mode,
-            job.review_state_json, job.segments_json, job.qc_warnings_json,
+            job.logo_path, job.logo_corner, job.logo_size_px,
+            json.dumps(job.branding_config, ensure_ascii=False) if job.branding_config else None,
+            json.dumps(job.publishing_config, ensure_ascii=False) if job.publishing_config else None,
+            job.publishing_pack_path, job.publish_ready_video_path, job.publishing_pack_status,
+            job.publishing_pack_error, job.tts_voice, job.review_mode, job.review_state_json,
+            job.segments_json, job.qc_warnings_json,
             job.created_at, job.updated_at,
             json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
             json.dumps(job.video_template_config) if job.video_template_config else None,
@@ -911,10 +1186,12 @@ class Store:
         old = self.get_job(job_id)
         if old is None or old.user_id != user_id:
             return None
-        return self.create_job(
+        retried = self.create_job(
             user_id, old.source_url, old.target_language,
             source_language=old.source_language, logo_path=old.logo_path,
             logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
+            branding_config=old.branding_config,
+            publishing_config=old.publishing_config,
             tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
             animated_subtitle_config=old.animated_subtitle_config,
             video_template_config=old.video_template_config,
@@ -936,17 +1213,139 @@ class Store:
             keep_original_audio=old.keep_original_audio,
             background_music_strategy=old.background_music_strategy,
         )
+        if any((old.source_channel_url, old.source_channel_title, old.source_channel_id, old.source_uploader)):
+            self.set_job_source_channel(
+                retried.id, user_id,
+                channel_url=old.source_channel_url or "",
+                channel_title=old.source_channel_title or "",
+                channel_id=old.source_channel_id or "",
+                uploader=old.source_uploader or "",
+            )
+            retried = self.get_job(retried.id) or retried
+        return retried
+
+    # ---- publishing channel profiles ----
+    def list_publishing_profiles(self, user_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM publishing_channel_profiles WHERE user_id = ? "
+                "ORDER BY is_default DESC, updated_at DESC, name ASC",
+                (user_id,),
+            ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                profile = json.loads(row["profile_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                profile = {}
+            result.append({
+                "id": row["id"],
+                "name": row["name"],
+                "is_default": bool(row["is_default"]),
+                "profile": profile if isinstance(profile, dict) else {},
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            })
+        return result
+
+    def get_publishing_profile(self, user_id: int, profile_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM publishing_channel_profiles WHERE user_id = ? AND id = ?",
+                (user_id, str(profile_id)),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            profile = json.loads(row["profile_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            profile = {}
+        return {
+            "id": row["id"], "name": row["name"], "is_default": bool(row["is_default"]),
+            "profile": profile if isinstance(profile, dict) else {},
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
+    def save_publishing_profile(
+            self, user_id: int, *, name: str, profile: Dict[str, Any],
+            profile_id: Optional[str] = None, is_default: bool = False,
+    ) -> Dict[str, Any]:
+        profile_id = str(profile_id or uuid.uuid4().hex)
+        clean_name = " ".join(str(name or "Hồ sơ kênh").split())[:100] or "Hồ sơ kênh"
+        now = time.time()
+        payload = json.dumps(profile or {}, ensure_ascii=False)
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM publishing_channel_profiles WHERE user_id = ? AND id = ?",
+                (user_id, profile_id),
+            ).fetchone()
+            if is_default:
+                conn.execute(
+                    "UPDATE publishing_channel_profiles SET is_default = 0 WHERE user_id = ?",
+                    (user_id,),
+                )
+            if existing:
+                conn.execute(
+                    "UPDATE publishing_channel_profiles SET name = ?, profile_json = ?, "
+                    "is_default = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+                    (clean_name, payload, int(is_default), now, user_id, profile_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO publishing_channel_profiles "
+                    "(id, user_id, name, profile_json, is_default, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (profile_id, user_id, clean_name, payload, int(is_default), now, now),
+                )
+        saved = self.get_publishing_profile(user_id, profile_id)
+        assert saved is not None
+        return saved
+
+    def delete_publishing_profile(self, user_id: int, profile_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM publishing_channel_profiles WHERE user_id = ? AND id = ?",
+                (user_id, str(profile_id)),
+            )
+            return cur.rowcount > 0
+
+    def set_default_publishing_profile(self, user_id: int, profile_id: Optional[str]) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE publishing_channel_profiles SET is_default = 0 WHERE user_id = ?", (user_id,))
+            if profile_id:
+                cur = conn.execute(
+                    "UPDATE publishing_channel_profiles SET is_default = 1, updated_at = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (time.time(), user_id, str(profile_id)),
+                )
+                if cur.rowcount <= 0:
+                    raise ValueError("Publishing profile not found")
+
+    def latest_job_publishing_config(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT publishing_config FROM jobs WHERE user_id = ? AND publishing_config IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        if not row or not row["publishing_config"]:
+            return None
+        try:
+            data = json.loads(row["publishing_config"])
+            return data if isinstance(data, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     # ---- provider settings ----
     def upsert_provider_settings(
-        self,
-        user_id: int,
-        provider: str,
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
-        default_model: Optional[str] = None,
-        default_voice: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None,
+            self,
+            user_id: int,
+            provider: str,
+            api_key: Optional[str] = None,
+            api_secret: Optional[str] = None,
+            default_model: Optional[str] = None,
+            default_voice: Optional[str] = None,
+            extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         now = time.time()
         provider = provider.strip().lower()
@@ -1097,8 +1496,8 @@ class Store:
 
     # ---- top-up requests ----
     def create_top_up_request(
-        self, user_id: int, credits: int, amount_vnd: int,
-        payment_method: str, note: Optional[str] = None,
+            self, user_id: int, credits: int, amount_vnd: int,
+            payment_method: str, note: Optional[str] = None,
     ) -> int:
         now = time.time()
         with self._connect() as conn:
@@ -1150,6 +1549,35 @@ class Store:
                 (admin_note, time.time(), request_id),
             )
             return conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
+
+    def set_job_publishing_config(
+            self, job_id: str, publishing_config: Optional[Dict[str, Any]],
+    ) -> None:
+        payload = json.dumps(publishing_config, ensure_ascii=False) if publishing_config else None
+        status = "pending" if (publishing_config or {}).get("enabled") else "disabled"
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET publishing_config = ?, publishing_pack_status = ?, updated_at = ? WHERE id = ?",
+                (payload, status, time.time(), job_id),
+            )
+
+    def set_job_branding_config(
+            self, job_id: str, branding_config: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist normalized branding config for an existing job.
+
+        This is also used as a compatibility fallback when app.py is reloaded
+        before a newer create_job signature is visible to the running process.
+        """
+        payload = (
+            json.dumps(branding_config, ensure_ascii=False)
+            if branding_config else None
+        )
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET branding_config = ?, updated_at = ? WHERE id = ?",
+                (payload, time.time(), job_id),
+            )
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -1211,6 +1639,10 @@ class Store:
             row_dict["video_template_config"] = json.loads(row_dict["video_template_config"])
         if row_dict.get("transform_config"):
             row_dict["transform_config"] = json.loads(row_dict["transform_config"])
+        if row_dict.get("branding_config"):
+            row_dict["branding_config"] = json.loads(row_dict["branding_config"])
+        if row_dict.get("publishing_config"):
+            row_dict["publishing_config"] = json.loads(row_dict["publishing_config"])
         return Job(**row_dict)
 
     def get_job(self, job_id: str) -> Optional[Job]:
@@ -1218,6 +1650,255 @@ class Store:
             cur = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             row = cur.fetchone()
             return self._row_to_job(row) if row else None
+
+    def existing_source_urls_for_user(self, user_id: int, urls: List[str]) -> set[str]:
+        """Return exact source URLs already present in this user's history.
+
+        Used by channel mode to avoid re-downloading/re-processing videos that
+        have already been submitted. Queries are chunked to stay below
+        SQLite's bound-parameter limit.
+        """
+        cleaned = [str(url).strip() for url in urls if str(url).strip()]
+        if not cleaned:
+            return set()
+        found: set[str] = set()
+        with self._connect() as conn:
+            for offset in range(0, len(cleaned), 800):
+                chunk = cleaned[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT source_url FROM jobs WHERE user_id = ? "
+                    f"AND source_url IN ({placeholders})",
+                    [user_id, *chunk],
+                ).fetchall()
+                found.update(str(row["source_url"]) for row in rows)
+        return found
+
+    def set_job_source_channel(
+            self,
+            job_id: str,
+            user_id: int,
+            *,
+            channel_url: str = "",
+            channel_title: str = "",
+            channel_id: str = "",
+            uploader: str = "",
+    ) -> bool:
+        """Attach source-channel provenance to a job created from channel mode."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET source_channel_url = ?, source_channel_title = ?, "
+                "source_channel_id = ?, source_uploader = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ?",
+                (
+                    str(channel_url or "").strip() or None,
+                    str(channel_title or "").strip() or None,
+                    str(channel_id or "").strip() or None,
+                    str(uploader or "").strip() or None,
+                    time.time(), job_id, user_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def get_channel_scan_state(self, user_id: int, canonical_url: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM channel_scan_states WHERE user_id = ? AND canonical_url = ?",
+                (user_id, str(canonical_url).strip()),
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        if data.get("has_more") is not None:
+            data["has_more"] = bool(data["has_more"])
+        data["complete"] = bool(data.get("complete"))
+        return data
+
+    def get_channel_scan_video_ids(self, user_id: int, canonical_url: str) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT v.video_id FROM channel_scan_videos v "
+                "JOIN channel_scan_states s ON s.id = v.state_id "
+                "WHERE s.user_id = ? AND s.canonical_url = ?",
+                (user_id, str(canonical_url).strip()),
+            ).fetchall()
+        return {str(row["video_id"]) for row in rows if row["video_id"]}
+
+    def reset_channel_scan(self, user_id: int, canonical_url: str) -> bool:
+        canonical_url = str(canonical_url).strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM channel_scan_states WHERE user_id = ? AND canonical_url = ?",
+                (user_id, canonical_url),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM channel_scan_videos WHERE state_id = ?", (row["id"],))
+            conn.execute("DELETE FROM channel_scan_states WHERE id = ?", (row["id"],))
+            return True
+
+    def merge_channel_scan_result(
+            self,
+            user_id: int,
+            *,
+            original_url: str,
+            canonical_url: str,
+            platform: str,
+            channel_id: str = "",
+            channel_title: str = "",
+            videos: List[Dict[str, Any]],
+            cursor: str = "",
+            has_more: Optional[bool] = None,
+            complete: bool = False,
+            stop_reason: str = "",
+            scan_source: str = "",
+            network_pages: int = 0,
+            last_error: str = "",
+            scan_version: int = 2,
+    ) -> Dict[str, Any]:
+        """Merge one scan into the user's persistent channel catalog.
+
+        Video identity is primarily `video_id`/aweme_id and falls back to the
+        canonical source URL. Existing rows are refreshed without changing
+        their original catalog position, so repeated scans never create nine
+        duplicate entries at the top.
+        """
+        now = time.time()
+        canonical_url = str(canonical_url).strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM channel_scan_states WHERE user_id = ? AND canonical_url = ?",
+                (user_id, canonical_url),
+            ).fetchone()
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO channel_scan_states ("
+                    "user_id, platform, original_url, canonical_url, channel_id, channel_title, "
+                    "cursor, has_more, complete, status, stop_reason, scan_source, network_pages, "
+                    "last_error, total_discovered, scan_version, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                    (
+                        user_id, platform, original_url, canonical_url, channel_id, channel_title,
+                        cursor or None, None if has_more is None else int(bool(has_more)),
+                        int(bool(complete)), "complete" if complete else "incomplete",
+                        stop_reason or None, scan_source or None, int(network_pages or 0),
+                        last_error or None, int(scan_version or 2), now, now,
+                    ),
+                )
+                state_id = int(cur.lastrowid)
+                next_position = 0
+            else:
+                state_id = int(row["id"])
+                next_position_row = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 AS next_position "
+                    "FROM channel_scan_videos WHERE state_id = ?",
+                    (state_id,),
+                ).fetchone()
+                next_position = int(next_position_row["next_position"] or 0)
+
+            new_count = 0
+            seen_in_request: set[tuple[str, str]] = set()
+            for raw_video in videos or []:
+                source_url = str(raw_video.get("source_url") or "").strip()
+                video_id = str(raw_video.get("video_id") or raw_video.get("aweme_id") or "").strip()
+                if not video_id and source_url:
+                    video_id = source_url.rstrip("/").rsplit("/", 1)[-1]
+                if not source_url or not video_id:
+                    continue
+                identity = (video_id, source_url)
+                if identity in seen_in_request:
+                    continue
+                seen_in_request.add(identity)
+                metadata_json = json.dumps(raw_video, ensure_ascii=False)
+                existing = conn.execute(
+                    "SELECT id FROM channel_scan_videos "
+                    "WHERE state_id = ? AND (video_id = ? OR source_url = ?) LIMIT 1",
+                    (state_id, video_id, source_url),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO channel_scan_videos ("
+                        "state_id, video_id, source_url, metadata_json, position, discovered_at, last_seen_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (state_id, video_id, source_url, metadata_json, next_position, now, now),
+                    )
+                    next_position += 1
+                    new_count += 1
+                else:
+                    conn.execute(
+                        "UPDATE channel_scan_videos SET source_url = ?, metadata_json = ?, last_seen_at = ? "
+                        "WHERE id = ?",
+                        (source_url, metadata_json, now, existing["id"]),
+                    )
+
+                # Backfill provenance for older channel jobs when a newly
+                # owner-verified catalog sees the same source URL again.
+                conn.execute(
+                    "UPDATE jobs SET source_channel_url = COALESCE(source_channel_url, ?), "
+                    "source_channel_title = COALESCE(source_channel_title, ?), "
+                    "source_channel_id = COALESCE(source_channel_id, ?), "
+                    "source_uploader = COALESCE(source_uploader, ?), updated_at = updated_at "
+                    "WHERE user_id = ? AND source_url = ?",
+                    (
+                        canonical_url or None,
+                        channel_title or None,
+                        channel_id or None,
+                        str(raw_video.get("uploader") or "").strip() or None,
+                        user_id,
+                        source_url,
+                    ),
+                )
+
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS total FROM channel_scan_videos WHERE state_id = ?",
+                (state_id,),
+            ).fetchone()
+            total = int(total_row["total"] or 0)
+            conn.execute(
+                "UPDATE channel_scan_states SET platform = ?, original_url = ?, channel_id = ?, "
+                "channel_title = ?, cursor = ?, has_more = ?, complete = ?, status = ?, "
+                "stop_reason = ?, scan_source = ?, network_pages = ?, last_error = ?, "
+                "total_discovered = ?, scan_version = ?, updated_at = ? WHERE id = ?",
+                (
+                    platform, original_url, channel_id or None, channel_title or None,
+                    cursor or None, None if has_more is None else int(bool(has_more)),
+                    int(bool(complete)), "complete" if complete else ("error" if last_error else "incomplete"),
+                    stop_reason or None, scan_source or None, int(network_pages or 0),
+                    last_error or None, total, int(scan_version or 2), now, state_id,
+                ),
+            )
+
+        state = self.get_channel_scan_state(user_id, canonical_url) or {}
+        state["new_count"] = new_count
+        state["total_discovered"] = total
+        return state
+
+    def list_channel_scan_videos(
+            self, user_id: int, canonical_url: str, limit: int = 0,
+    ) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT v.video_id, v.source_url, v.metadata_json, v.position, "
+            "v.discovered_at, v.last_seen_at FROM channel_scan_videos v "
+            "JOIN channel_scan_states s ON s.id = v.state_id "
+            "WHERE s.user_id = ? AND s.canonical_url = ? ORDER BY v.position ASC"
+        )
+        params: List[Any] = [user_id, str(canonical_url).strip()]
+        if int(limit or 0) > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        output: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            metadata["video_id"] = str(metadata.get("video_id") or row["video_id"] or "")
+            metadata["source_url"] = str(metadata.get("source_url") or row["source_url"] or "")
+            metadata["catalog_position"] = int(row["position"] or 0)
+            output.append(metadata)
+        return output
 
     def list_jobs_for_user(self, user_id: int, limit: int = 100) -> List[Job]:
         with self._connect() as conn:
@@ -1228,13 +1909,13 @@ class Store:
             return [self._row_to_job(row) for row in cur.fetchall()]
 
     def search_jobs_for_user(
-        self,
-        user_id: int,
-        query: Optional[str] = None,
-        status: Optional[str] = None,
-        date_from: Optional[float] = None,
-        date_to: Optional[float] = None,
-        limit: int = 200,
+            self,
+            user_id: int,
+            query: Optional[str] = None,
+            status: Optional[str] = None,
+            date_from: Optional[float] = None,
+            date_to: Optional[float] = None,
+            limit: int = 200,
     ) -> List[Job]:
         """
         Same as `list_jobs_for_user` but filterable — used by the history
@@ -1247,9 +1928,9 @@ class Store:
         params: List[Any] = [user_id]
 
         if query:
-            clauses.append("(title LIKE ? OR source_url LIKE ?)")
+            clauses.append("(title LIKE ? OR source_url LIKE ? OR source_channel_title LIKE ? OR source_channel_url LIKE ?)")
             like = f"%{query}%"
-            params.extend([like, like])
+            params.extend([like, like, like, like])
         if status:
             clauses.append("status = ?")
             params.append(status)
@@ -1343,7 +2024,8 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE scheduled_posts SET status='error', result_json=?, updated_at=? WHERE status='processing'",
-                (json.dumps({"message": "Server khởi động lại khi đang đăng; không tự thử lại để tránh đăng trùng."}, ensure_ascii=False), time.time()),
+                (json.dumps({"message": "Server khởi động lại khi đang đăng; không tự thử lại để tránh đăng trùng."},
+                            ensure_ascii=False), time.time()),
             )
 
     def finish_scheduled_post(self, post_id: int, status: str, result: Any) -> None:
@@ -1362,9 +2044,275 @@ class Store:
             )
             return cur.rowcount > 0
 
+    # ---- License management ----
+    def create_license(self, license_data: Dict[str, Any]) -> License:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO licenses (remote_license_id, license_key, user_id, customer_name, customer_email,
+                   plan_type, features_json, expiry_date, max_jobs, max_tokens, status, notes, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    license_data.get("remote_license_id"),
+                    license_data["license_key"],
+                    license_data.get("user_id"),
+                    license_data.get("customer_name"),
+                    license_data.get("customer_email"),
+                    license_data.get("plan_type", "basic"),
+                    json.dumps(license_data.get("features", [])),
+                    license_data.get("expiry_date"),
+                    license_data.get("max_jobs", -1),
+                    license_data.get("max_tokens", -1),
+                    license_data.get("status", "active"),
+                    license_data.get("notes"),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM licenses WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return License.from_row(row)
+
+    def link_remote_license(self, remote_data: Dict[str, Any], user_id: int) -> License:
+        """Cache a validated central license and bind it to one local user."""
+        license_key = str(remote_data.get("license_key") or "").strip()
+        if not license_key:
+            raise ValueError("License server không trả về license key")
+
+        features = remote_data.get("features") or []
+        if not isinstance(features, list):
+            features = []
+        now = time.time()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM licenses WHERE license_key = ?", (license_key,)
+            ).fetchone()
+            if existing and existing["user_id"] not in (None, user_id):
+                raise ValueError("License đã được kích hoạt bởi user khác")
+
+            values = (
+                int(remote_data["id"]) if remote_data.get("id") is not None else None,
+                user_id,
+                remote_data.get("customer_name"),
+                remote_data.get("customer_email"),
+                remote_data.get("plan_type") or "basic",
+                json.dumps(features),
+                remote_data.get("expiry_date"),
+                int(remote_data.get("max_jobs", -1)),
+                int(remote_data.get("max_tokens", -1)),
+                remote_data.get("status") or "active",
+                remote_data.get("notes"),
+                now,
+            )
+            if existing:
+                conn.execute(
+                    """UPDATE licenses SET remote_license_id = ?, user_id = ?, customer_name = ?,
+                       customer_email = ?, plan_type = ?, features_json = ?, expiry_date = ?,
+                       max_jobs = ?, max_tokens = ?, status = ?, notes = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (*values, existing["id"]),
+                )
+                local_id = existing["id"]
+            else:
+                cur = conn.execute(
+                    """INSERT INTO licenses (
+                       remote_license_id, license_key, user_id, customer_name, customer_email,
+                       plan_type, features_json, expiry_date, max_jobs, max_tokens, status,
+                       notes, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (values[0], license_key, *values[1:-1], now, now),
+                )
+                local_id = cur.lastrowid
+
+            row = conn.execute("SELECT * FROM licenses WHERE id = ?", (local_id,)).fetchone()
+            return License.from_row(row)
+
+    def get_license_by_key(self, license_key: str) -> Optional[License]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,)).fetchone()
+            return License.from_row(row) if row else None
+
+    def get_license_by_user(self, user_id: int) -> Optional[License]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM licenses WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            return License.from_row(row) if row else None
+
+    def list_licenses(self, status: Optional[str] = None, limit: int = 100) -> List[License]:
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM licenses WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM licenses ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [License.from_row(row) for row in rows]
+
+    def update_license(self, license_id: int, updates: Dict[str, Any]) -> bool:
+        now = time.time()
+        allowed_fields = {
+            "remote_license_id", "user_id", "customer_name", "customer_email", "plan_type",
+            "features", "expiry_date", "max_jobs", "max_tokens", "status", "notes"
+        }
+        set_clauses = []
+        values = []
+        
+        for field, value in updates.items():
+            if field in allowed_fields:
+                if field == "features":
+                    set_clauses.append("features_json = ?")
+                    values.append(json.dumps(value))
+                else:
+                    set_clauses.append(f"{field} = ?")
+                    values.append(value)
+        
+        if not set_clauses:
+            return False
+        
+        set_clauses.append("updated_at = ?")
+        values.append(now)
+        values.append(license_id)
+        
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE licenses SET {', '.join(set_clauses)} WHERE id = ?",
+                values,
+            )
+            return cur.rowcount > 0
+
+    def delete_license(self, license_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM licenses WHERE id = ?", (license_id,))
+            return cur.rowcount > 0
+
+    def validate_license(self, license_key: str) -> Tuple[bool, Optional[License], Optional[str]]:
+        """Validate license key and return (is_valid, license, error_message)"""
+        license = self.get_license_by_key(license_key)
+        if not license:
+            return False, None, "License key không tồn tại"
+        
+        if license.status != "active":
+            return False, license, f"License đã bị {license.status}"
+        
+        if license.expiry_date and license.expiry_date < time.time():
+            self.update_license(license.id, {"status": "expired"})
+            return False, license, "License đã hết hạn"
+        
+        return True, license, None
+
+    def get_license_usage(self, license_id: int, user_id: int) -> Optional[LicenseUsage]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM license_usage WHERE license_id = ? AND user_id = ?",
+                (license_id, user_id),
+            ).fetchone()
+            return LicenseUsage.from_row(row) if row else None
+
+    def update_license_usage(self, license_id: int, user_id: int, tokens_delta: int = 0, jobs_delta: int = 0) -> LicenseUsage:
+        now = time.time()
+        with self._connect() as conn:
+            # Try to update existing record
+            cur = conn.execute(
+                """UPDATE license_usage 
+                   SET tokens_used = tokens_used + ?, jobs_completed = jobs_completed + ?, 
+                       last_used_at = ?, updated_at = ?
+                   WHERE license_id = ? AND user_id = ?""",
+                (tokens_delta, jobs_delta, now, now, license_id, user_id),
+            )
+            
+            if cur.rowcount == 0:
+                # Create new record
+                cur = conn.execute(
+                    """INSERT INTO license_usage (license_id, user_id, tokens_used, jobs_completed, last_used_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (license_id, user_id, tokens_delta, jobs_delta, now, now, now),
+                )
+            
+            row = conn.execute(
+                "SELECT * FROM license_usage WHERE license_id = ? AND user_id = ?",
+                (license_id, user_id),
+            ).fetchone()
+            return LicenseUsage.from_row(row)
+
+    def check_license_limits(self, license: License, user_id: int) -> Tuple[bool, Optional[str]]:
+        """Check if user has reached license limits"""
+        usage = self.get_license_usage(license.id, user_id)
+        if not usage:
+            return True, None
+        
+        if license.max_jobs > 0 and usage.jobs_completed >= license.max_jobs:
+            return False, f"Đã đạt giới hạn số job ({license.max_jobs})"
+        
+        if license.max_tokens > 0 and usage.tokens_used >= license.max_tokens:
+            return False, f"Đã đạt giới hạn số token ({license.max_tokens})"
+        
+        return True, None
+
+    # ---- Free trial management ----
+    def create_free_trial(self, user_id: int, machine_id: Optional[str], tokens: int = 10, days: int = 7) -> FreeTrial:
+        now = time.time()
+        expiry = now + (days * 24 * 60 * 60)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO free_trials (user_id, machine_id, tokens_remaining, expiry_date, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, machine_id, tokens, expiry, now, now),
+            )
+            row = conn.execute("SELECT * FROM free_trials WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return FreeTrial.from_row(row)
+
+    def get_free_trial(self, user_id: int, machine_id: Optional[str] = None) -> Optional[FreeTrial]:
+        with self._connect() as conn:
+            if machine_id:
+                row = conn.execute(
+                    "SELECT * FROM free_trials WHERE user_id = ? AND machine_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (user_id, machine_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM free_trials WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+            return FreeTrial.from_row(row) if row else None
+
+    def consume_trial_token(self, user_id: int, machine_id: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """Consume one trial token, return (success, error_message)"""
+        trial = self.get_free_trial(user_id, machine_id)
+        if not trial:
+            return False, "Không tìm thấy trial"
+        
+        if trial.expiry_date < time.time():
+            return False, "Trial đã hết hạn"
+        
+        if trial.tokens_remaining <= 0:
+            return False, "Đã hết token trial"
+        
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE free_trials SET tokens_remaining = tokens_remaining - 1, updated_at = ? WHERE id = ?",
+                (time.time(), trial.id),
+            )
+            if cur.rowcount > 0:
+                return True, None
+            return False, "Không thể cập nhật trial"
+
+    def get_machine_id(self) -> str:
+        """Generate a machine ID based on hardware fingerprint"""
+        import platform
+        import hashlib
+        
+        # Create a fingerprint from machine info
+        machine_info = f"{platform.node()}-{platform.system()}-{platform.machine()}"
+        return hashlib.sha256(machine_info.encode()).hexdigest()[:32]
+
     # ---- publish log ----
     def log_publish(self, job_id: str, platform: str, success: bool, message: str,
-                     remote_url: Optional[str] = None) -> None:
+                    remote_url: Optional[str] = None) -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO publish_log (job_id, platform, success, message, remote_url, created_at) "
@@ -1374,21 +2322,21 @@ class Store:
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(
-        self, user_id: int, platform: str, access_token: Optional[str],
-        refresh_token: Optional[str] = None, expires_at: Optional[float] = None,
-        account_name: Optional[str] = None, account_ref: Optional[str] = None,
+            self, user_id: int, platform: str, access_token: Optional[str],
+            refresh_token: Optional[str] = None, expires_at: Optional[float] = None,
+            account_name: Optional[str] = None, account_ref: Optional[str] = None,
     ) -> None:
         now = time.time()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO social_accounts
-                    (user_id, platform, access_token, refresh_token, expires_at,
-                     account_name, account_ref, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(user_id, platform) DO UPDATE SET
+                (user_id, platform, access_token, refresh_token, expires_at,
+                 account_name, account_ref, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform) DO
+                UPDATE SET
                     access_token=excluded.access_token,
-                    refresh_token=COALESCE(excluded.refresh_token, social_accounts.refresh_token),
+                    refresh_token= COALESCE (excluded.refresh_token, social_accounts.refresh_token),
                     expires_at=excluded.expires_at,
                     account_name=excluded.account_name,
                     account_ref=excluded.account_ref,
@@ -1459,15 +2407,15 @@ class Store:
 
     # ---- video presets ----
     def create_video_preset(
-        self,
-        user_id: int,
-        name: str,
-        template: str,
-        transition: str,
-        color_effect: str,
-        audio_filters: Optional[Dict[str, Any]] = None,
-        video_quality: Optional[str] = None,
-        is_default: bool = False,
+            self,
+            user_id: int,
+            name: str,
+            template: str,
+            transition: str,
+            color_effect: str,
+            audio_filters: Optional[Dict[str, Any]] = None,
+            video_quality: Optional[str] = None,
+            is_default: bool = False,
     ) -> int:
         now = time.time()
         with self._connect() as conn:
@@ -1475,10 +2423,12 @@ class Store:
             if is_default:
                 conn.execute("UPDATE video_presets SET is_default = 0 WHERE user_id = ?", (user_id,))
             cursor = conn.execute(
-                """INSERT INTO video_presets 
-                   (user_id, name, template, transition, color_effect, audio_filters_json, video_quality, is_default, created_at, updated_at)
+                """INSERT INTO video_presets
+                   (user_id, name, template, transition, color_effect, audio_filters_json, video_quality, is_default,
+                    created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, name, template, transition, color_effect, json.dumps(audio_filters) if audio_filters else None, video_quality, 1 if is_default else 0, now, now),
+                (user_id, name, template, transition, color_effect,
+                 json.dumps(audio_filters) if audio_filters else None, video_quality, 1 if is_default else 0, now, now),
             )
             return cursor.lastrowid
 
@@ -1514,16 +2464,16 @@ class Store:
             return None
 
     def update_video_preset(
-        self,
-        preset_id: int,
-        user_id: int,
-        name: Optional[str] = None,
-        template: Optional[str] = None,
-        transition: Optional[str] = None,
-        color_effect: Optional[str] = None,
-        audio_filters: Optional[Dict[str, Any]] = None,
-        video_quality: Optional[str] = None,
-        is_default: Optional[bool] = None,
+            self,
+            preset_id: int,
+            user_id: int,
+            name: Optional[str] = None,
+            template: Optional[str] = None,
+            transition: Optional[str] = None,
+            color_effect: Optional[str] = None,
+            audio_filters: Optional[Dict[str, Any]] = None,
+            video_quality: Optional[str] = None,
+            is_default: Optional[bool] = None,
     ) -> bool:
         now = time.time()
         with self._connect() as conn:
@@ -1534,7 +2484,7 @@ class Store:
             ).fetchone()
             if not existing:
                 return False
-            
+
             # Build update query
             updates = []
             params = []
@@ -1561,7 +2511,7 @@ class Store:
                     conn.execute("UPDATE video_presets SET is_default = 0 WHERE user_id = ?", (user_id,))
                 updates.append("is_default = ?")
                 params.append(1 if is_default else 0)
-            
+
             if updates:
                 updates.append("updated_at = ?")
                 params.append(now)

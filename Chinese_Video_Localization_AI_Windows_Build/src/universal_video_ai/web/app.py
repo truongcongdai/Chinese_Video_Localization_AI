@@ -27,16 +27,23 @@ import threading
 import gc
 import tempfile
 import zipfile
-import io
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
-try:
-    import openai
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None  # type: ignore[assignment]
 
-    OPENAI_AVAILABLE = True
+try:
+    import openai as _openai
 except ImportError:
-    OPENAI_AVAILABLE = False
+    _openai = None
+
+OPENAI_AVAILABLE = _openai is not None
 
 import requests
 
@@ -52,6 +59,10 @@ from universal_video_ai.orchestrator.service import (
 )
 from universal_video_ai.trends.service import TrendScanner
 from universal_video_ai.render.renderer import RenderConfig, AnimatedSubtitleConfig, VideoTemplateConfig
+from universal_video_ai.render.branding import (
+    BrandingConfig, build_branding_filters, fingerprint_comment,
+    stamp_fingerprint_metadata, write_branding_manifest,
+)
 from universal_video_ai.render.animated_subtitles import SubtitleEffect, SubtitleStyle
 from universal_video_ai.postprocess.video_transform import (
     TransformConfig,
@@ -75,13 +86,23 @@ from universal_video_ai.tts.premium import (
     ElevenLabsTTSBackend,
 )
 from universal_video_ai.translate.adapt import AdaptationConfig
+from universal_video_ai.publishing import (
+    PublishingPackConfig, PublishingPackService, PublishingLLMClient, PublishingLLMConfig,
+)
+from universal_video_ai.publishing.profiles import (
+    normalize_channel_profile, generic_channel_profile, legacy_van_diep_profile,
+)
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
 from universal_video_ai.config import REDIS_URL, TEMP_DIR
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
+from universal_video_ai.downloader.channel import (
+    ChannelListingService, ChannelVideoCandidate, URLIntent, VideoURLClassifier,
+)
+from universal_video_ai.downloader.platform import Platform
 
-from .store import Store
+from .store import Store, License, LicenseUsage, FreeTrial
 from .auth import (
     COOKIE_NAME, hash_password, verify_password,
     create_session_cookie_value, get_current_user_id,
@@ -164,7 +185,323 @@ WEB_WHISPER_PRO_MODEL = os.environ.get("WEB_WHISPER_PRO_MODEL", "medium")
 DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
+# License Server Configuration
+def get_license_server_url() -> str:
+    """Get LICENSE_SERVER_URL from Windows Registry or system env var only"""
+    # Priority: Windows Registry > System Environment Variable > Default
+    # .env file is NOT checked to prevent user modification
+    url = ""
+    
+    # 1. Check Windows Registry (Windows only)
+    if sys.platform == "win32":
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ChineseVideoLocalizationAI", 0, winreg.KEY_READ)
+            url, _ = winreg.QueryValueEx(key, "LICENSE_SERVER_URL")
+            winreg.CloseKey(key)
+            if url:
+                logger.info(f"LICENSE_SERVER_URL loaded from Windows Registry")
+                return url.strip()
+        except (WindowsError, FileNotFoundError):
+            pass
+    
+    # 2. Check system environment variable
+    url = os.environ.get("LICENSE_SERVER_URL", "").strip()
+    if url:
+        logger.info(f"LICENSE_SERVER_URL loaded from system environment variable")
+        return url
+    
+    # 3. Default license server URL
+    default_url = "http://113.160.14.1:8000"
+    logger.info(f"Using default LICENSE_SERVER_URL: {default_url}")
+    return default_url
+
+LICENSE_SERVER_URL = get_license_server_url()
+USE_LICENSE_SERVER = bool(LICENSE_SERVER_URL)
+
+# User Management Server Configuration
+def get_user_management_server_url() -> str:
+    """Get USER_MANAGEMENT_SERVER_URL from Windows Registry or system env var"""
+    url = ""
+    
+    if sys.platform == "win32":
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ChineseVideoLocalizationAI", 0, winreg.KEY_READ)
+            url, _ = winreg.QueryValueEx(key, "USER_MANAGEMENT_SERVER_URL")
+            winreg.CloseKey(key)
+            if url:
+                logger.info(f"USER_MANAGEMENT_SERVER_URL loaded from Windows Registry")
+                return url.strip()
+        except (WindowsError, FileNotFoundError):
+            pass
+    
+    url = os.environ.get("USER_MANAGEMENT_SERVER_URL", "").strip()
+    if url:
+        logger.info(f"USER_MANAGEMENT_SERVER_URL loaded from system environment variable")
+        return url
+    
+    # Default to license server URL with port 8001
+    if LICENSE_SERVER_URL:
+        default_url = LICENSE_SERVER_URL.rsplit(":", 1)[0] + ":8001"
+    else:
+        default_url = "http://113.160.14.1:8001"
+    logger.info(f"Using default USER_MANAGEMENT_SERVER_URL: {default_url}")
+    return default_url
+
+USER_MANAGEMENT_SERVER_URL = get_user_management_server_url()
+USE_USER_MANAGEMENT_SERVER = bool(USER_MANAGEMENT_SERVER_URL)
+
 store = Store(_DB_PATH)
+
+
+def validate_license_with_server(license_key: str, machine_id: str) -> Optional[Dict]:
+    """Validate license with centralized license server"""
+    if not USE_LICENSE_SERVER:
+        return None
+    
+    try:
+        response = requests.post(
+            f"{LICENSE_SERVER_URL}/api/licenses/validate",
+            json={"license_key": license_key, "machine_id": machine_id},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"License server returned error: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to validate license with server: {e}")
+        return None
+
+
+def update_license_usage_on_server(license_id: int, machine_id: str, jobs_delta: int = 0, tokens_delta: int = 0) -> bool:
+    """Update license usage on centralized license server"""
+    if not USE_LICENSE_SERVER:
+        return False
+    
+    try:
+        response = requests.post(
+            f"{LICENSE_SERVER_URL}/api/licenses/{license_id}/usage",
+            json={
+                "machine_id": machine_id,
+                "jobs_delta": jobs_delta,
+                "tokens_delta": tokens_delta
+            },
+            timeout=10
+        )
+        
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to update license usage on server: {e}")
+        return False
+
+
+def _require_license_or_trial(user_id: int) -> str:
+    """Authorize a job using an active license or a usable local trial.
+
+    Trials are stored locally because they belong to the web account/session,
+    even when paid licenses are validated by the centralized license server.
+    Keeping this decision in one place prevents the remote-license branch from
+    accidentally bypassing a trial that the UI just activated.
+    """
+    machine_id = store.get_machine_id()
+    user_license = store.get_license_by_user(user_id)
+    license_error: Optional[str] = None
+
+    if user_license and USE_LICENSE_SERVER:
+        validation_result = validate_license_with_server(user_license.license_key, machine_id)
+        if validation_result and validation_result.get("valid"):
+            license_data = validation_result.get("license", {})
+            jobs_used = int(license_data.get("jobs_used", 0) or 0)
+            tokens_used = int(license_data.get("tokens_used", 0) or 0)
+            max_jobs = int(license_data.get("max_jobs", 100) or 0)
+            max_tokens = int(license_data.get("max_tokens", 1000) or 0)
+            if max_jobs > 0 and jobs_used >= max_jobs:
+                license_error = f"Đã đạt giới hạn số jobs ({max_jobs})."
+            elif max_tokens > 0 and tokens_used >= max_tokens:
+                license_error = f"Đã đạt giới hạn số tokens ({max_tokens})."
+            else:
+                return "license"
+        else:
+            remote_error = (
+                validation_result.get("error", "License không hợp lệ")
+                if validation_result else "Không thể kết nối đến license server"
+            )
+            license_error = f"License validation failed: {remote_error}"
+    elif user_license:
+        can_proceed, limit_error = store.check_license_limits(user_license, user_id)
+        if can_proceed:
+            return "license"
+        license_error = f"License limit: {limit_error}"
+
+    trial = store.get_free_trial(user_id, machine_id)
+    if trial:
+        if trial.expiry_date < time.time():
+            raise HTTPException(403, "Trial đã hết hạn. Vui lòng kích hoạt license để tiếp tục.")
+        if trial.tokens_remaining <= 0:
+            raise HTTPException(403, "Đã hết token trial. Vui lòng kích hoạt license để tiếp tục.")
+        return "trial"
+
+    if license_error:
+        raise HTTPException(403, license_error)
+    if USE_LICENSE_SERVER:
+        raise HTTPException(
+            403,
+            "Vui lòng bắt đầu dùng thử miễn phí hoặc nhập license key để sử dụng.",
+        )
+
+    # Backward-compatible self-hosted mode: licenses remain optional when no
+    # centralized license server is configured.
+    return "unrestricted"
+
+
+def _ensure_registration_trial(user_id: int) -> None:
+    """Give newly cached/registered centralized users their promised trial once."""
+    if not USE_LICENSE_SERVER:
+        return
+    machine_id = store.get_machine_id()
+    if store.get_free_trial(user_id, machine_id) is None:
+        store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+
+
+def _resolve_publishing_config_for_user(
+        user_id: int, raw: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    config = PublishingPackConfig.from_dict(raw)
+    data = config.to_dict()
+    selected = str(config.channel_profile or "generic_reup")
+
+    if config.profile_data:
+        snapshot = normalize_channel_profile(config.profile_data, profile_id=selected)
+    elif selected == "generic_reup":
+        snapshot = generic_channel_profile(config.channel_name)
+    else:
+        saved = store.get_publishing_profile(user_id, selected)
+        if saved:
+            snapshot = normalize_channel_profile(saved.get("profile"), profile_id=selected)
+            snapshot["name"] = saved.get("name") or snapshot.get("name")
+        else:
+            # Never expose another user's profile and never silently fall back
+            # to an old global channel preset for a newly submitted job.
+            logger.warning("Publishing profile %s not found for user %s; using generic", selected, user_id)
+            selected = "generic_reup"
+            data["channel_profile"] = selected
+            snapshot = generic_channel_profile(config.channel_name)
+
+    if config.channel_name:
+        snapshot["channel_name"] = config.channel_name
+    data["channel_name"] = snapshot.get("channel_name") or config.channel_name or ""
+    data["profile_data"] = snapshot
+    return PublishingPackConfig.from_dict(data).to_dict()
+
+
+def _store_create_job(
+        *args: Any,
+        branding_config: Optional[Dict[str, Any]] = None,
+        publishing_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+):
+    """Create a job while remaining compatible with partially applied stores.
+
+    Both branding and Publishing Pack are optional post-processing settings.
+    Feature-detect the live Store signature so an old process does not crash
+    with an unexpected keyword argument while files are being upgraded.
+    """
+    normalized_branding = (
+        BrandingConfig.from_dict(branding_config).to_dict() if branding_config else None
+    )
+    resolved_user_id = kwargs.get("user_id")
+    if resolved_user_id is None and args:
+        resolved_user_id = args[0]
+    normalized_publishing = (
+        _resolve_publishing_config_for_user(int(resolved_user_id), publishing_config)
+        if publishing_config and resolved_user_id is not None else
+        (PublishingPackConfig.from_dict(publishing_config).to_dict() if publishing_config else None)
+    )
+
+    create_method = store.create_job
+    try:
+        parameters = inspect.signature(create_method).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    supports_branding = "branding_config" in parameters
+    supports_publishing = "publishing_config" in parameters
+
+    if supports_branding:
+        kwargs["branding_config"] = normalized_branding
+    if supports_publishing:
+        kwargs["publishing_config"] = normalized_publishing
+
+    job = create_method(*args, **kwargs)
+
+    if normalized_branding is not None and not supports_branding:
+        setter = getattr(store, "set_job_branding_config", None)
+        if callable(setter):
+            setter(job.id, normalized_branding)
+        else:
+            logger.warning("Store build does not support branding_config; apply the bundled store.py")
+    if normalized_publishing is not None and not supports_publishing:
+        setter = getattr(store, "set_job_publishing_config", None)
+        if callable(setter):
+            setter(job.id, normalized_publishing)
+        else:
+            logger.warning("Store build does not support publishing_config; apply the bundled store.py")
+
+    if normalized_branding is not None:
+        try:
+            job.branding_config = normalized_branding
+        except Exception:
+            pass
+    if normalized_publishing is not None:
+        try:
+            job.publishing_config = normalized_publishing
+        except Exception:
+            pass
+    return job
+
+
+def _is_expected_windows_client_disconnect(context: Dict[str, Any]) -> bool:
+    """Return True only for the known Proactor reset caused by browser seek/abort.
+
+    HTML5 video players frequently close one HTTP Range connection and open
+    another while seeking. On Windows, Proactor may surface that normal client
+    disconnect as WinError 10054 from its connection-lost callback.
+    """
+    if sys.platform != "win32":
+        return False
+    exc = context.get("exception")
+    if not isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    if winerror not in {64, 995, 10053, 10054}:
+        return False
+    callback_text = " ".join(
+        str(context.get(key, "")) for key in ("message", "handle", "protocol", "transport")
+    ).lower()
+    return "proactor" in callback_text or "connection_lost" in callback_text or "pipe" in callback_text
+
+
+@app.on_event("startup")
+async def install_windows_disconnect_handler() -> None:
+    loop = asyncio.get_running_loop()
+    if getattr(loop, "_uvai_disconnect_handler_installed", False):
+        return
+    previous_handler = loop.get_exception_handler()
+
+    def _handler(current_loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
+        if _is_expected_windows_client_disconnect(context):
+            logger.debug("Ignored normal browser Range disconnect on Windows: %s", context.get("exception"))
+            return
+        if previous_handler:
+            previous_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+    setattr(loop, "_uvai_disconnect_handler_installed", True)
 
 
 @app.on_event("startup")
@@ -198,6 +535,7 @@ def _extract_first_video_url(text: str) -> str:
     if not match:
         return raw
     return match.group(0).rstrip(".,;:!?)]}】》”’\"'")
+
 
 # SaaS/multi-user mode is the safe default: publishing must use the social
 # account connected by the current user.  The legacy shared tokens can only be
@@ -236,6 +574,53 @@ LANGUAGE_LABELS = {
 # already-finished jobs, just not for one that was mid-run at restart time.
 _running_tasks: dict[str, asyncio.Task] = {}
 
+# Channel/profile mode uses the same localization pipeline as single-video
+# jobs. The environment value is only the startup fallback; each submission
+# updates the live limit from NewJobBody.max_concurrent (the UI's 1-5 selector).
+_WEB_DEFAULT_MAX_CONCURRENT_JOBS = min(
+    5, max(1, int(os.environ.get("WEB_MAX_CONCURRENT_JOBS", "2")))
+)
+_job_run_limit = _WEB_DEFAULT_MAX_CONCURRENT_JOBS
+_job_run_active = 0
+_job_run_condition: Optional[asyncio.Condition] = None
+_video_url_classifier = VideoURLClassifier()
+_channel_listing_service = ChannelListingService()
+_CHANNEL_SCAN_VERSION = 2  # v2 adds strict Douyin profile ownership filtering
+
+
+def _get_job_run_condition() -> asyncio.Condition:
+    global _job_run_condition
+    if _job_run_condition is None:
+        _job_run_condition = asyncio.Condition()
+    return _job_run_condition
+
+
+async def _configure_job_run_limit(max_concurrent: int) -> int:
+    """Apply the concurrency selected in the UI to the live web queue."""
+    global _job_run_limit
+    normalized = min(5, max(1, int(max_concurrent)))
+    condition = _get_job_run_condition()
+    async with condition:
+        _job_run_limit = normalized
+        condition.notify_all()
+    return normalized
+
+
+async def _acquire_job_run_slot() -> None:
+    global _job_run_active
+    condition = _get_job_run_condition()
+    async with condition:
+        await condition.wait_for(lambda: _job_run_active < _job_run_limit)
+        _job_run_active += 1
+
+
+async def _release_job_run_slot() -> None:
+    global _job_run_active
+    condition = _get_job_run_condition()
+    async with condition:
+        _job_run_active = max(0, _job_run_active - 1)
+        condition.notify_all()
+
 
 def require_admin_user_id(user_id: int = Depends(get_current_user_id)) -> int:
     user = store.get_user_by_id(user_id)
@@ -255,7 +640,12 @@ class RegisterBody(BaseModel):
     username: str
     contact_identifier: str  # email address or phone number
     password: str
+    verification_code: str  # 6-digit OTP sent to email/phone
     referral_code: Optional[str] = None  # whoever invited this person, if anyone
+
+
+class SendVerificationCodeBody(BaseModel):
+    contact_identifier: str  # email address, phone number, or Telegram username (@username)
 
 
 class NewJobBody(BaseModel):
@@ -269,6 +659,11 @@ class NewJobBody(BaseModel):
     logo_path: Optional[str] = None
     logo_corner: str = "bottom_right"  # top_left | top_right | bottom_left | bottom_right
     logo_size_px: int = 120
+    # Optional global text branding. This same payload is inherited by every
+    # video created from a channel batch.
+    branding_config: Optional[Dict[str, Any]] = None
+    # Optional AI Publishing Pack generated after the Reup render finishes.
+    publishing_config: Optional[Dict[str, Any]] = None
     # Explicit Edge-TTS voice id from GET /api/voices, e.g.
     # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
     tts_voice: Optional[str] = None
@@ -294,7 +689,7 @@ class NewJobBody(BaseModel):
     animated_subtitle_config: Optional[Dict[str, Any]] = None
     # Queue management
     priority: str = "normal"  # normal | high
-    max_concurrent: int = 2
+    max_concurrent: int = Field(default=2, ge=1, le=5)
     # Video template configuration
     video_template_config: Optional[Dict[str, Any]] = None
     # Video transformation configuration (flip, border, split-screen, etc.)
@@ -302,6 +697,45 @@ class NewJobBody(BaseModel):
     # Audio configuration for uploaded videos
     keep_original_audio: int = 0
     background_music_strategy: str = "deterministic"
+
+
+class PublishingProfileBody(BaseModel):
+    name: str
+    channel_name: str = ""
+    language: str = "vi"
+    niche: str = ""
+    audience: str = ""
+    brand_line: str = ""
+    category: str = "Entertainment"
+    made_for_kids: bool = False
+    default_privacy: str = "private"
+    keywords: List[str] = Field(default_factory=list)
+    base_tags: List[str] = Field(default_factory=list)
+    base_hashtags: List[str] = Field(default_factory=list)
+    title_formula: str = ""
+    thumbnail_examples: List[str] = Field(default_factory=list)
+    description_template: str = ""
+    custom_instructions: str = ""
+    is_default: bool = False
+
+
+class ChannelAnalyzeBody(BaseModel):
+    url: str
+    # 0 means all public videos, capped by CHANNEL_SCAN_HARD_LIMIT.
+    max_videos: int = Field(default=0, ge=0, le=10000)
+    # quick | continue | deep | reset
+    mode: str = "quick"
+
+
+class ChannelProcessBody(NewJobBody):
+    # Keep the existing localization settings from NewJobBody and add only
+    # channel-specific controls. `url` is the channel/profile URL.
+    max_videos: int = Field(default=0, ge=0, le=10000)
+    skip_existing: bool = True
+    # Run a fresh deep scan before creating jobs. Existing catalog entries are
+    # retained and deduplicated, so repeated runs continue instead of starting
+    # from nine items again.
+    deep_scan: bool = True
 
 
 class RemixPlanBody(BaseModel):
@@ -343,6 +777,7 @@ class CreatorJobBody(BaseModel):
     tts_voice: Optional[str] = None
     image_provider: str = "stock"  # stock | cpu_ai | ai_video
     product_media_paths: List[str] = Field(default_factory=list)
+    branding_config: Optional[Dict[str, Any]] = None
 
 
 class CreatorSuggestionBody(BaseModel):
@@ -462,6 +897,17 @@ def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum:
     return value
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _parse_fractional_boxes_env(name: str) -> Tuple[Tuple[float, float, float, float], ...]:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -512,6 +958,10 @@ def _payment_config(amount_vnd: int = 0, transfer_content: str = "") -> Dict[str
     }
 
 
+class PublishingPackRetryBody(BaseModel):
+    component: str = "failed"  # failed | all | one component id
+
+
 class PublishBody(BaseModel):
     platforms: List[str]
     title: str
@@ -534,6 +984,40 @@ class CreateUserBody(BaseModel):
     credits: int = 10
 
 
+class LicenseBody(BaseModel):
+    license_key: str
+    user_id: Optional[int] = None
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    plan_type: str = "basic"  # basic | pro | enterprise
+    features: List[str] = Field(default_factory=list)
+    expiry_days: Optional[int] = None  # Days from now, None = lifetime
+    max_jobs: int = -1  # -1 = unlimited
+    max_tokens: int = -1  # -1 = unlimited
+    status: str = "active"
+    notes: Optional[str] = None
+
+
+class LicenseUpdateBody(BaseModel):
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    plan_type: Optional[str] = None
+    features: Optional[List[str]] = None
+    expiry_days: Optional[int] = None
+    max_jobs: Optional[int] = None
+    max_tokens: Optional[int] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LicenseValidateBody(BaseModel):
+    license_key: str
+
+
+class LicenseActivateBody(BaseModel):
+    license_key: str
+
+
 # ----------------------------------------------------------------- pages --
 
 @app.get("/", response_class=HTMLResponse)
@@ -550,10 +1034,11 @@ def index() -> HTMLResponse:
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?\d[\d\s.-]{7,14}\d$")
+_TELEGRAM_RE = re.compile(r"^@?[a-zA-Z0-9_]{5,32}$")
 
 
 def _classify_identifier(identifier: str) -> tuple[str, str]:
-    """Return (kind, normalized_value) where kind is 'email', 'phone', or
+    """Return (kind, normalized_value) where kind is 'email', 'phone', 'telegram', or
     'username' — lets one input box on the login/register form accept any
     of the three, and tells the register endpoint which DB column to use."""
     value = identifier.strip()
@@ -562,6 +1047,10 @@ def _classify_identifier(identifier: str) -> tuple[str, str]:
     digits_only = re.sub(r"[\s.-]", "", value)
     if _PHONE_RE.match(value):
         return "phone", digits_only
+    if _TELEGRAM_RE.match(value):
+        # Normalize Telegram username (ensure it starts with @)
+        telegram_username = value if value.startswith("@") else f"@{value}"
+        return "telegram", telegram_username.lower()
     return "username", value
 
 
@@ -591,20 +1080,185 @@ def _login_response(user_id: int) -> JSONResponse:
     return resp
 
 
+def _send_email_via_smtp(to_email: str, subject: str, body: str) -> bool:
+    """Send email using SMTP Gmail"""
+    smtp_enabled = os.environ.get("SMTP_ENABLED", "false").lower() == "true"
+    if not smtp_enabled:
+        logging.warning("SMTP is disabled in configuration")
+        return False
+    
+    try:
+        smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_email = os.environ.get("SMTP_EMAIL")
+        smtp_password = os.environ.get("SMTP_PASSWORD")
+        from_name = os.environ.get("SMTP_FROM_NAME", "Video Localization AI")
+        
+        if not smtp_email or not smtp_password:
+            logging.error("SMTP_EMAIL or SMTP_PASSWORD not configured")
+            return False
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = f"{from_name} <{smtp_email}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        # Send email
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+        
+        logging.info(f"Email sent successfully to {to_email}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send email to {to_email}: {e}")
+        return False
+
+
+def _send_telegram_message(chat_id: str, message: str) -> bool:
+    """Send message via Telegram Bot"""
+    telegram_enabled = os.environ.get("TELEGRAM_BOT_ENABLED", "false").lower() == "true"
+    if not telegram_enabled:
+        logging.warning("Telegram Bot is disabled in configuration")
+        return False
+    
+    try:
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        
+        if not bot_token:
+            logging.error("TELEGRAM_BOT_TOKEN not configured")
+            return False
+        
+        # Telegram Bot API endpoint
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        
+        data = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, json=data, timeout=10)
+        
+        if response.status_code == 200:
+            logging.info(f"Telegram message sent successfully to {chat_id}")
+            return True
+        else:
+            logging.error(f"Failed to send Telegram message: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Failed to send Telegram message to {chat_id}: {e}")
+        return False
+
+
+@app.post("/api/send-verification-code")
+def send_verification_code(body: SendVerificationCodeBody):
+    """Send a 6-digit verification code to email"""
+    kind, value = _classify_identifier(body.contact_identifier)
+    if kind != "email":
+        raise HTTPException(400, "Hiện tại chỉ hỗ trợ đăng ký qua Email. Vui lòng nhập email.")
+    
+    # Check if email is already registered
+    if store.get_user_by_identifier(value):
+        raise HTTPException(409, "Email này đã được đăng ký")
+    
+    # Generate and store verification code
+    code = store.create_verification_code(value, "register")
+    
+    # Send verification code via email
+    subject = "Mã xác minh đăng ký tài khoản"
+    body = f"""Chào bạn,
+
+Mã xác minh đăng ký tài khoản của bạn là: {code}
+
+Mã này có hiệu lực trong 5 phút.
+Vui lòng không chia sẻ mã này với bất kỳ ai.
+
+Nếu bạn không yêu cầu mã này, vui lòng bỏ qua email này.
+
+Trân trọng,
+Video Localization AI"""
+    sent = _send_email_via_smtp(value, subject, body)
+    
+    if not sent:
+        # Fallback: return code in response if sending failed
+        logging.warning("Failed to send verification code via email, returning in response instead")
+        return {
+            "ok": True,
+            "message": "Không thể gửi email. Mã hiển thị bên dưới để test.",
+            "code": code,
+            "expires_in": 300,
+            "sent_via": "fallback"
+        }
+    
+    return {
+        "ok": True,
+        "message": "Mã xác minh đã được gửi qua email",
+        "expires_in": 300,
+        "sent_via": "email"
+    }
+
+
 @app.post("/api/register")
 def register(body: RegisterBody):
     """
-    Self-service registration via email or phone number + password.
+    Self-service registration via email + password.
 
-    The very FIRST account ever created on this server (by any method —
-    this form, or a "Sign in with ..." button) becomes the admin. After
-    that, further self-registration is allowed by default (see
-    OPEN_REGISTRATION) so multiple people can sign up on their own;
-    set OPEN_REGISTRATION=false in .env to go back to "admin creates every
-    account by hand" instead.
+    All users registered via this form are regular users (not admin).
+    Admin accounts must be created from the admin panel.
+    
+    When USE_LICENSE_SERVER is true, users can register and get
+    a free trial with 25 tokens. They can activate a license key later
+    for unlimited access.
+    
+    When USE_USER_MANAGEMENT_SERVER is true, registration is proxied to
+    the centralized user management server.
     """
-    is_first_user = not store.any_users_exist()
-    if not is_first_user and not OPEN_REGISTRATION:
+    
+    if USE_USER_MANAGEMENT_SERVER:
+        # Proxy to User Management Server
+        try:
+            kind, value = _classify_identifier(body.contact_identifier)
+            if kind != "email":
+                raise HTTPException(400, "Vui lòng nhập đúng email")
+            
+            response = requests.post(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/register",
+                json={
+                    "username": body.username.strip(),
+                    "email": value,
+                    "password": body.password
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("success"):
+                # Create local user record for caching
+                user_id = store.create_user(
+                    body.username.strip(),
+                    hash_password(body.password),
+                    is_admin=False,
+                    credits=data.get("credits", 25),
+                    email=value,
+                    phone=None,
+                    referred_by_user_id=None,
+                )
+                _ensure_registration_trial(user_id)
+                return _login_response(user_id)
+            else:
+                raise HTTPException(400, data.get("message", "Registration failed"))
+        except requests.RequestException as e:
+            logger.error(f"Failed to register with user management server: {e}")
+            raise HTTPException(503, "Không thể kết nối đến server quản lý user")
+    
+    # Local registration (fallback)
+    if not OPEN_REGISTRATION:
         raise HTTPException(
             403,
             "Đăng ký đang bị khoá bởi quản trị viên. Liên hệ admin để được cấp tài khoản.",
@@ -621,10 +1275,16 @@ def register(body: RegisterBody):
         raise HTTPException(409, "Tên đăng nhập này đã được sử dụng")
 
     kind, value = _classify_identifier(body.contact_identifier)
-    if kind not in ("email", "phone"):
-        raise HTTPException(400, "Vui lòng nhập đúng email hoặc số điện thoại")
+    if kind != "email":
+        raise HTTPException(400, "Vui lòng nhập đúng email")
     if store.get_user_by_identifier(value):
-        raise HTTPException(409, "Email/số điện thoại này đã được đăng ký")
+        raise HTTPException(409, "Email này đã được đăng ký")
+    
+    # Verify the OTP code
+    success, error = store.verify_code(value, body.verification_code, "register")
+    if not success:
+        raise HTTPException(400, error or "Mã xác minh không hợp lệ")
+    
     email = value if kind == "email" else None
     phone = value if kind == "phone" else None
 
@@ -636,7 +1296,7 @@ def register(body: RegisterBody):
 
     user_id = store.create_user(
         username, hash_password(body.password),
-        is_admin=is_first_user, credits=10_000 if is_first_user else 10,
+        is_admin=False, credits=10,
         email=email, phone=phone,
         referred_by_user_id=referrer["id"] if referrer else None,
     )
@@ -647,6 +1307,10 @@ def register(body: RegisterBody):
         # requiring the friend to do anything further first).
         store.adjust_credits(user_id, REFERRAL_BONUS_CREDITS)
         store.adjust_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
+    
+    # Create free trial with 25 tokens when using license server
+    _ensure_registration_trial(user_id)
+    
     return _login_response(user_id)
 
 
@@ -659,6 +1323,10 @@ def bootstrap():
         "needs_registration": not store.any_users_exist(),
         "open_registration": OPEN_REGISTRATION,
         "job_cost_credits": JOB_COST_CREDITS,
+        "use_license_server": USE_LICENSE_SERVER,
+        "license_server_url": LICENSE_SERVER_URL if USE_LICENSE_SERVER else None,
+        "use_user_management_server": USE_USER_MANAGEMENT_SERVER,
+        "user_management_server_url": USER_MANAGEMENT_SERVER_URL if USE_USER_MANAGEMENT_SERVER else None,
         "top_up_packages": [
             {"credits": credits, "amount_vnd": amount}
             for credits, amount in sorted(TOP_UP_PACKAGES.items())
@@ -672,6 +1340,56 @@ def bootstrap():
 
 @app.post("/api/login")
 def login(body: LoginBody):
+    if USE_USER_MANAGEMENT_SERVER:
+        # Proxy to User Management Server
+        try:
+            response = requests.post(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/login",
+                json={
+                    "username": body.identifier,
+                    "password": body.password
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("success"):
+                # Check if local user exists, create if not
+                _kind, identifier = _classify_identifier(body.identifier)
+                local_user = store.get_user_by_identifier(identifier)
+                
+                if not local_user:
+                    # Create local cache record
+                    user_id = store.create_user(
+                        data.get("username", body.identifier),
+                        hash_password(body.password),
+                        is_admin=data.get("is_admin", False),
+                        credits=data.get("credits", 25),
+                        email=data.get("email"),
+                        phone=None,
+                        referred_by_user_id=None,
+                    )
+                else:
+                    user_id = local_user["id"]
+
+                # The central user server is the source of truth. Refresh the
+                # local cache on every login so a Make Admin/Make User change
+                # takes effect after the next sign-in instead of remaining
+                # stuck at the value from the account's first login.
+                store.set_admin(user_id, bool(data.get("is_admin", False)))
+                if data.get("credits") is not None:
+                    store.set_credits(user_id, int(data["credits"]))
+                _ensure_registration_trial(user_id)
+                
+                return _login_response(user_id)
+            else:
+                raise HTTPException(401, data.get("message", "Invalid username or password"))
+        except requests.RequestException as e:
+            logger.error(f"Failed to login with user management server: {e}")
+            raise HTTPException(503, "Không thể kết nối đến server quản lý user")
+    
+    # Local login (fallback)
     _kind, identifier = _classify_identifier(body.identifier)
     user = store.get_user_by_identifier(identifier)
     if not user or not user["password_hash"] or not verify_password(body.password, user["password_hash"]):
@@ -848,11 +1566,17 @@ def _build_service_for_job(job):
     )
 
     watermark_boxes = _parse_fractional_boxes_env("WATERMARK_BOXES_FRACTIONAL")
+    branding_config = BrandingConfig.from_dict(getattr(job, "branding_config", None))
+    if branding_config.enabled:
+        branding_config = branding_config.with_fingerprint_context(
+            job.user_id, job.id, job.source_url, job.target_language
+        )
 
     render_config = RenderConfig(
         preset=WEB_RENDER_PRESET,
         timeout_seconds=WEB_RENDER_TIMEOUT_SECONDS,
         watermark_boxes_fractional=watermark_boxes,
+        branding_config=branding_config,
     )
 
     # Build animated subtitle config if provided
@@ -940,6 +1664,7 @@ def _build_service_for_job(job):
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
+            branding_config=branding_config,
         )
     else:
         render_config = RenderConfig(
@@ -949,6 +1674,7 @@ def _build_service_for_job(job):
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
+            branding_config=branding_config,
         )
 
     translation_mode = getattr(job, "translation_mode", "faithful") or "faithful"
@@ -960,20 +1686,24 @@ def _build_service_for_job(job):
         translation_provider = "gemini"
         translation_api_key = gemini_settings.get("api_key")
         requested_model = getattr(job, "translation_model", None) or ""
-        available_models = (gemini_settings.get("extra") or {}).get("llm_models") or (gemini_settings.get("extra") or {}).get("models") or []
+        available_models = (gemini_settings.get("extra") or {}).get("llm_models") or (
+                    gemini_settings.get("extra") or {}).get("models") or []
         translation_model = requested_model if requested_model in available_models else (
-            gemini_settings.get("default_model") or (available_models[0] if available_models else "gemini-3.1-flash-lite")
+                gemini_settings.get("default_model") or (
+            available_models[0] if available_models else "gemini-3.1-flash-lite")
         )
         translation_base_url = None
     elif use_contextual_translation and openai_settings and openai_settings.get("api_key"):
         translation_provider = "openai"
         translation_api_key = openai_settings.get("api_key")
-        translation_model = getattr(job, "translation_model", None) or openai_settings.get("default_model") or "gpt-5.6-luna"
+        translation_model = getattr(job, "translation_model", None) or openai_settings.get(
+            "default_model") or "gpt-5.6-luna"
         translation_base_url = None
     elif use_contextual_translation:
         translation_provider = "ollama"
         translation_api_key = None
-        translation_model = getattr(job, "translation_model", None) or _env_first("OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL
+        translation_model = getattr(job, "translation_model", None) or _env_first(
+            "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL
         translation_base_url = _env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434"
     else:
         translation_provider = "none"
@@ -981,7 +1711,13 @@ def _build_service_for_job(job):
         translation_model = getattr(job, "translation_model", None) or ""
         translation_base_url = None
 
-    strict_translation_adapter = translation_provider == "gemini"
+    # Contextual adaptation is a quality pass, not a hard prerequisite for a
+    # usable localization. Keep fallback enabled by default even for Gemini;
+    # strict failure remains opt-in for debugging/QA.
+    strict_translation_adapter = (
+        translation_provider == "gemini"
+        and _env_bool("STRICT_TRANSLATION_ADAPTER", False)
+    )
     translation_adaptation = AdaptationConfig(
         enabled=use_contextual_translation,
         provider=translation_provider,
@@ -1000,22 +1736,28 @@ def _build_service_for_job(job):
         ),
         ollama_num_ctx=_env_int("OLLAMA_TRANSLATION_NUM_CTX", 8192, minimum=2048, maximum=131072),
         ollama_num_predict=_env_int("OLLAMA_TRANSLATION_NUM_PREDICT", 0, minimum=0, maximum=32768),
+        gemini_retry_count=_env_int("GEMINI_TRANSLATION_RETRIES", 2, minimum=0, maximum=5),
+        gemini_batch_size=_env_int("GEMINI_TRANSLATION_BATCH_SIZE", 24, minimum=2, maximum=100),
+        gemini_debug_dir=(
+            _env_first("GEMINI_TRANSLATION_DEBUG_DIR")
+            or str(Path(TEMP_DIR) / "translation_adaptation_debug")
+        ),
     )
 
     # Audio configuration: use job-specific settings if available, otherwise fall back to env vars
     keep_original_audio = getattr(job, "keep_original_audio", 0) or 0
     background_music_strategy = getattr(job, "background_music_strategy", "deterministic") or "deterministic"
-    
+
     # replace_source_audio = keep_original_audio == 0 AND background_music_strategy != "none"
     job_replace_audio = (keep_original_audio == 0) and (background_music_strategy != "none")
     env_replace_audio = os.getenv("COPYRIGHT_SAFE_AUDIO", "true").lower() in {"1", "true", "yes", "on"}
-    
+
     # Use job-specific config if the job has these fields (uploaded video), otherwise use env default
     replace_source_audio = job_replace_audio if hasattr(job, "keep_original_audio") else env_replace_audio
-    
+
     run_demucs_for_effects = (
-        os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
-        and shutil.which("demucs") is not None
+            os.getenv("RUN_DEMUCS_FOR_SOURCE_EFFECTS", "true").lower() in {"1", "true", "yes", "on"}
+            and shutil.which("demucs") is not None
     )
     job_subtitle_offset = getattr(job, "subtitle_offset_seconds", None)
     global_subtitle_offset = (
@@ -1036,7 +1778,7 @@ def _build_service_for_job(job):
         tts_provider=tts_provider,
         tts_provider_api_key=provider_settings.get("api_key") if provider_settings else None,
         tts_provider_model=getattr(job, "tts_model", None)
-        or (provider_settings.get("default_model") if provider_settings else None),
+                           or (provider_settings.get("default_model") if provider_settings else None),
         tts_style=getattr(job, "tts_style", "natural") or "natural",
         translation_adaptation=translation_adaptation,
         generate_subtitles=True,
@@ -1070,22 +1812,27 @@ def _is_content_os_job(job) -> bool:
     return bool(
         job
         and (
-            str(job.source_url or "").startswith("content_os://")
-            or str(job.source_language or "").startswith("content_os")
+                str(job.source_url or "").startswith("content_os://")
+                or str(job.source_language or "").startswith("content_os")
         )
     )
 
 
 def _is_non_retryable_job_error(exc: Exception) -> bool:
-    message = str(exc)
+    message = str(exc).lower()
     return any(
-        marker in message
+        marker.lower() in message
         for marker in (
             "Ollama local chưa chạy",
             "Ollama model chưa có",
             "missing_tts_provider_connection",
             "Chưa kết nối",
             "Provider này cần API key",
+            # Re-running the identical whole-file Demucs command cannot cure
+            # an allocator OOM and only burns another retry interval.
+            "DefaultCPUAllocator: not enough memory",
+            "No space left on device",
+            "not enough disk space",
         )
     )
 
@@ -1095,6 +1842,20 @@ RETRY_DELAY_SECONDS = 30
 
 
 async def _run_job(job_id: str) -> None:
+    slot_acquired = False
+    try:
+        await _acquire_job_run_slot()
+        slot_acquired = True
+        await _run_job_unlocked(job_id)
+    finally:
+        if slot_acquired:
+            await _release_job_run_slot()
+        # Also covers a task cancelled while waiting for a queue slot;
+        # _run_job_unlocked performs the same pop after normal runs.
+        _running_tasks.pop(job_id, None)
+
+
+async def _run_job_unlocked(job_id: str) -> None:
     job = store.get_job(job_id)
     if job is None:
         return
@@ -1151,7 +1912,7 @@ async def _run_job(job_id: str) -> None:
 
             store.update_job(job_id, progress_note="Đang xử lý (dịch, lồng tiếng, render)...")
             result = await service.localize(job.source_url, job_output_dir, target_language=job.target_language)
-            _finish_job_from_result(job_id, job, result)
+            await asyncio.to_thread(_finish_job_from_result, job_id, job, result)
             return  # Success, exit retry loop
 
         except Exception as exc:
@@ -1186,6 +1947,142 @@ async def _run_job(job_id: str) -> None:
             _running_tasks.pop(job_id, None)
 
 
+def _publishing_llm_client_for_job(job, config: PublishingPackConfig) -> PublishingLLMClient:
+    provider = config.provider
+    selected = provider
+    settings = None
+    if provider == "auto":
+        for candidate in ("gemini", "openai"):
+            candidate_settings = store.get_provider_settings(job.user_id, candidate)
+            if candidate_settings and candidate_settings.get("api_key"):
+                selected = candidate
+                settings = candidate_settings
+                break
+        else:
+            selected = "ollama" if _env_bool("PUBLISHING_OLLAMA_ENABLED", False) else "none"
+    elif provider in {"gemini", "openai"}:
+        settings = store.get_provider_settings(job.user_id, provider)
+
+    if selected == "gemini":
+        settings = settings or {}
+        discovered_models = (
+            (settings.get("extra") or {}).get("llm_models")
+            or (settings.get("extra") or {}).get("models")
+            or []
+        )
+        model = (
+            settings.get("default_model")
+            or _env_first("PUBLISHING_GEMINI_MODEL", "GEMINI_MODEL")
+            or (discovered_models[0] if discovered_models else None)
+            or "gemini-3.1-flash-lite"
+        )
+        llm_config = PublishingLLMConfig(
+            provider="gemini",
+            api_key=settings.get("api_key"),
+            model=model,
+            timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
+        )
+    elif selected == "openai":
+        settings = settings or {}
+        discovered_models = (
+            (settings.get("extra") or {}).get("llm_models")
+            or (settings.get("extra") or {}).get("models")
+            or []
+        )
+        llm_config = PublishingLLMConfig(
+            provider="openai",
+            api_key=settings.get("api_key"),
+            model=(
+                settings.get("default_model")
+                or _env_first("PUBLISHING_OPENAI_MODEL")
+                or (discovered_models[0] if discovered_models else None)
+                or "gpt-4.1-mini"
+            ),
+            base_url=(settings.get("extra") or {}).get("base_url") if settings else None,
+            timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
+        )
+    elif selected == "ollama":
+        llm_config = PublishingLLMConfig(
+            provider="ollama",
+            model=_env_first("PUBLISHING_OLLAMA_MODEL", "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL,
+            base_url=_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434",
+            timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
+        )
+    else:
+        llm_config = PublishingLLMConfig(provider="none")
+    return PublishingLLMClient(llm_config, logger=logger)
+
+
+def _generate_publishing_pack_for_result(job_id: str, job, result):
+    config = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+    if not config.enabled:
+        return None
+    store.update_job(
+        job_id,
+        publishing_pack_status="generating",
+        publishing_pack_error=None,
+        progress_note="[99%] Đang tạo AI Publishing Pack...",
+    )
+    try:
+        download = result.download_result
+        platform = getattr(getattr(download, "platform", None), "value", "")
+        source_metadata = {
+            "platform": platform,
+            "final_url": getattr(download, "final_url", job.source_url),
+            "title": getattr(download, "title", ""),
+            "description": getattr(download, "description", ""),
+            "uploader": getattr(download, "uploader", ""),
+            "thumbnail_url": getattr(download, "thumbnail_url", ""),
+            "duration": getattr(download, "duration", 0.0),
+            "tags": getattr(download, "tags", []) or [],
+            "raw_metadata": getattr(download, "raw_metadata", {}) or {},
+        }
+        translated_segments = [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in (getattr(result, "translated_segments", None) or [])
+        ]
+        source_segments = [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in (getattr(result, "source_segments", None) or [])
+        ]
+        service = PublishingPackService(
+            llm_client=_publishing_llm_client_for_job(job, config),
+            logger=logger,
+        )
+        generated = service.generate(
+            config=config,
+            output_dir=Path(result.final_video_path).parent,
+            final_video_path=Path(result.final_video_path),
+            source_video_path=Path(download.video_path) if getattr(download, "video_path", None) else None,
+            source_url=job.source_url,
+            source_metadata=source_metadata,
+            translated_segments=translated_segments,
+            source_segments=source_segments,
+            user_id=job.user_id,
+            job_id=job_id,
+            target_language=job.target_language,
+        )
+        store.update_job(
+            job_id,
+            publishing_pack_status=("ready" if generated.overall_status == "success" else "partial"),
+            publishing_pack_path=str(generated.pack_dir),
+            publish_ready_video_path=(
+                str(generated.publish_ready_video_path)
+                if generated.publish_ready_video_path else None
+            ),
+            publishing_pack_error=(" | ".join(generated.warnings) if generated.warnings else None),
+        )
+        return generated
+    except Exception as exc:
+        logger.exception("AI Publishing Pack failed for job %s (non-fatal)", job_id)
+        store.update_job(
+            job_id,
+            publishing_pack_status="error",
+            publishing_pack_error=str(exc)[:2000],
+        )
+        return None
+
+
 def _finish_job_from_result(job_id: str, job, result) -> None:
     current = store.get_job(job_id)
     if current and current.status == "cancelled":
@@ -1212,7 +2109,7 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
             if getattr(s, "has_timing", False)
         ]
         store.update_job(
-            job_id, status="done", progress_note="Hoàn tất",
+            job_id, status="running", progress_note="[98%] Đã render, đang hoàn thiện asset đăng bài...",
             final_video_path=str(result.final_video_path),
             source_video_path=str(result.download_result.video_path),
             title=title,
@@ -1222,9 +2119,6 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         if translated_segments:
             store.set_job_segments(job_id, translated_segments)
         _write_job_srt_artifacts(job_id, source_segments, translated_segments)
-        # Best-effort automated sanity check (quiet audio, wrong duration).
-        # Never fails the job over this — it's an informational warning
-        # badge in the UI, not a hard gate on publishing.
         try:
             source_duration = None
             if result.audio_pipeline_result and result.audio_pipeline_result.audio_result:
@@ -1234,16 +2128,51 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
                 store.set_job_qc_warnings(job_id, warnings)
         except Exception:
             logger.exception("Quality check failed for job %s (non-fatal)", job_id)
+
+        generated = _generate_publishing_pack_for_result(job_id, job, result)
+        if generated and generated.recommended_title:
+            title = generated.recommended_title
+        store.update_job(job_id, status="done", progress_note="Hoàn tất", title=title)
+        _update_license_usage(job.user_id, job_id)
     else:
         store.update_job(job_id, status="error",
                          error="Không tạo được video đầu ra (final_video_path rỗng)")
         _refund_job_credits(job)
 
 
+def _update_license_usage(user_id: int, job_id: str) -> None:
+    """Update license usage when a job completes successfully"""
+    try:
+        license = store.get_license_by_user(user_id)
+        if license:
+            store.update_license_usage(license.id, user_id, tokens_delta=1, jobs_delta=1)
+            if USE_LICENSE_SERVER and license.remote_license_id is not None:
+                machine_id = store.get_machine_id()
+                if not update_license_usage_on_server(
+                    license.remote_license_id,
+                    machine_id,
+                    tokens_delta=1,
+                    jobs_delta=1,
+                ):
+                    logger.warning(
+                        "Failed to update centralized usage for license %s (job %s)",
+                        license.remote_license_id,
+                        job_id,
+                    )
+        else:
+            # Consume trial token
+            machine_id = store.get_machine_id()
+            success, error = store.consume_trial_token(user_id, machine_id)
+            if not success:
+                logger.warning(f"Failed to consume trial token for user {user_id}: {error}")
+    except Exception as e:
+        logger.exception(f"Failed to update license usage for user {user_id}: {e}")
+
+
 def _write_job_srt_artifacts(
-    job_id: str,
-    source_segments: List[Dict[str, Any]],
-    translated_segments: List[Dict[str, Any]],
+        job_id: str,
+        source_segments: List[Dict[str, Any]],
+        translated_segments: List[Dict[str, Any]],
 ) -> None:
     job_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1278,7 +2207,7 @@ async def _run_render_from_review(job_id: str) -> None:
                           ] or None
 
         result = await service.finalize_from_review(prepared, edited_segments)
-        _finish_job_from_result(job_id, job, result)
+        await asyncio.to_thread(_finish_job_from_result, job_id, job, result)
     except Exception as exc:
         logger.exception("Job %s failed to render from review", job_id)
         store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
@@ -1961,7 +2890,7 @@ def _openrouter_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, An
 
 def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     """Generate script suggestions using OpenAI API (GPT-4, GPT-3.5, etc.)."""
-    if not OPENAI_AVAILABLE:
+    if _openai is None:
         raise RuntimeError("OpenAI library chưa được cài đặt. Chạy: pip install openai")
 
     api_key = _env_first("OPENAI_API_KEY")
@@ -1972,7 +2901,7 @@ def _openai_creator_suggestions(body: CreatorSuggestionBody) -> Dict[str, Any]:
     prompt, scene_count = _creator_ai_prompt(body, require_search=False)
 
     try:
-        client = openai.OpenAI(api_key=api_key)
+        client = _openai.OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model=configured_model,
             messages=[
@@ -2743,7 +3672,7 @@ def _generate_dalle_image(
         prompt: str, output_path: Path, aspect_ratio: str,
 ) -> Path:
     """Generate image using DALL-E API for better quality."""
-    if not OPENAI_AVAILABLE:
+    if _openai is None:
         raise RuntimeError("OpenAI library not available")
 
     openai_api_key = _env_first("OPENAI_API_KEY")
@@ -2760,7 +3689,7 @@ def _generate_dalle_image(
         size = "1024x1792"  # Portrait
 
     try:
-        client = openai.OpenAI(api_key=openai_api_key)
+        client = _openai.OpenAI(api_key=openai_api_key)
         response = client.images.generate(
             model="dall-e-3",
             prompt=image_prompt,
@@ -3512,12 +4441,18 @@ def _synthesize_creator_cues(
 def _add_creator_voice_and_subtitles(
         video_path: Path, voice_path: Path, subtitles_path: Path,
         output_path: Path, duration: float,
+        frame_width: int, frame_height: int,
+        branding_config: Optional[BrandingConfig] = None,
 ) -> None:
     # On Windows, an absolute `D:/...` path inside a filtergraph is parsed as
     # `filename=D` followed by a new `:` option. Run FFmpeg in the subtitle
     # directory and pass only the generated relative filename instead. This
     # also avoids fragile cross-platform escaping of drive letters/spaces.
     subtitle_filter = f"subtitles=filename={subtitles_path.name}"
+    branding_config = (branding_config or BrandingConfig()).normalized()
+    # Branding is below subtitles so the caption remains fully readable.
+    video_filters = build_branding_filters(branding_config, frame_width, frame_height)
+    video_filters.append(subtitle_filter)
     # Never time-compress or stretch narration. The selected duration drives
     # script length; if real TTS happens to run longer, the visual timeline is
     # extended before this function is called. A shorter voice gets silence at
@@ -3525,18 +4460,25 @@ def _add_creator_voice_and_subtitles(
     audio_filters = ["apad"]
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path), "-i", str(voice_path),
-        "-vf", subtitle_filter, "-filter:a", ",".join(audio_filters),
+        "-vf", ",".join(video_filters), "-filter:a", ",".join(audio_filters),
         "-map", "0:v:0", "-map", "1:a:0", "-t", f"{duration:.3f}",
         "-c:v", "libx264", "-preset", WEB_RENDER_PRESET, "-crf", str(WEB_RENDER_CRF),
         "-r", "30", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", str(output_path),
+        "-movflags", "+faststart",
     ]
+    comment = fingerprint_comment(branding_config)
+    if comment:
+        cmd.extend(["-metadata", f"comment={comment}", "-metadata", f"description={comment}"])
+    cmd.append(str(output_path))
     result = subprocess.run(
         cmd, cwd=str(subtitles_path.parent), capture_output=True, text=True,
         check=False, timeout=WEB_RENDER_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "FFmpeg voice/subtitle render failed")[-4000:])
+    if branding_config.enabled:
+        stamp_fingerprint_metadata(output_path, branding_config, logger)
+        write_branding_manifest(output_path, branding_config, source_path=video_path, logger=logger)
 
 
 def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
@@ -3856,8 +4798,14 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
 
         store.update_job(job_id, progress_note="Đang ghép voice và đóng subtitle...")
         output_path = output_dir / "output_generated.mp4"
+        creator_branding = BrandingConfig.from_dict(body.branding_config)
+        if creator_branding.enabled:
+            creator_branding = creator_branding.with_fingerprint_context(
+                job.user_id, job.id, body.topic, body.aspect_ratio
+            )
         _add_creator_voice_and_subtitles(
             visual_path, voice_path, subtitles_path, output_path, final_duration,
+            width, height, creator_branding,
         )
         store.update_job(
             job_id, status="done",
@@ -3867,12 +4815,99 @@ def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
             ),
             final_video_path=str(output_path), title=body.topic.strip()[:80],
         )
+        _update_license_usage(user_id, job_id)
     except Exception as exc:
         logger.exception("Creator job %s failed", job_id)
         store.update_job(job_id, status="error", error=f"{exc}\n{traceback.format_exc()[-1500:]}")
         _refund_job_credits(job)
     finally:
         _running_tasks.pop(job_id, None)
+
+
+def _profile_body_to_data(body: PublishingProfileBody, profile_id: str = "custom") -> Dict[str, Any]:
+    return normalize_channel_profile({
+        "id": profile_id,
+        "name": body.name,
+        "channel_name": body.channel_name,
+        "language": body.language,
+        "niche": body.niche,
+        "audience": body.audience,
+        "brand_line": body.brand_line,
+        "category": body.category,
+        "made_for_kids": body.made_for_kids,
+        "default_privacy": body.default_privacy,
+        "primary_keyword_groups": {"keywords": body.keywords},
+        "base_tags": body.base_tags,
+        "base_hashtags": body.base_hashtags,
+        "title_formula": body.title_formula,
+        "thumbnail_rules": {"max_words": 5, "examples": body.thumbnail_examples},
+        "description_template": body.description_template,
+        "custom_instructions": body.custom_instructions,
+    }, profile_id=profile_id)
+
+
+def _maybe_import_legacy_publishing_profile(user_id: int) -> None:
+    if store.list_publishing_profiles(user_id):
+        return
+    previous = store.latest_job_publishing_config(user_id) or {}
+    if str(previous.get("channel_profile") or "") != "van_diep_studio" and str(previous.get("channel_name") or "") != "Vạn Diệp Studio":
+        return
+    legacy = legacy_van_diep_profile()
+    store.save_publishing_profile(
+        user_id, name="Vạn Diệp Studio", profile=legacy, is_default=True,
+    )
+
+
+@app.get("/api/publishing/profiles")
+def list_publishing_profiles(user_id: int = Depends(get_current_user_id)):
+    _maybe_import_legacy_publishing_profile(user_id)
+    saved = store.list_publishing_profiles(user_id)
+    return {
+        "generic": {
+            "id": "generic_reup", "name": "Reup tổng quát", "is_default": not any(item.get("is_default") for item in saved),
+            "profile": generic_channel_profile(),
+        },
+        "profiles": saved,
+    }
+
+
+@app.post("/api/publishing/profiles")
+def create_publishing_profile(body: PublishingProfileBody, user_id: int = Depends(get_current_user_id)):
+    profile = _profile_body_to_data(body)
+    try:
+        return store.save_publishing_profile(
+            user_id, name=body.name, profile=profile, is_default=body.is_default,
+        )
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise HTTPException(409, "Bạn đã có hồ sơ kênh với tên này") from exc
+        raise
+
+
+@app.put("/api/publishing/profiles/{profile_id}")
+def update_publishing_profile(profile_id: str, body: PublishingProfileBody, user_id: int = Depends(get_current_user_id)):
+    if not store.get_publishing_profile(user_id, profile_id):
+        raise HTTPException(404, "Không tìm thấy hồ sơ kênh")
+    profile = _profile_body_to_data(body, profile_id=profile_id)
+    return store.save_publishing_profile(
+        user_id, profile_id=profile_id, name=body.name, profile=profile, is_default=body.is_default,
+    )
+
+
+@app.delete("/api/publishing/profiles/{profile_id}", status_code=204)
+def delete_publishing_profile(profile_id: str, user_id: int = Depends(get_current_user_id)):
+    if not store.delete_publishing_profile(user_id, profile_id):
+        raise HTTPException(404, "Không tìm thấy hồ sơ kênh")
+    return Response(status_code=204)
+
+
+@app.post("/api/publishing/profiles/{profile_id}/default")
+def set_default_publishing_profile(profile_id: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        store.set_default_publishing_profile(user_id, profile_id)
+    except ValueError as exc:
+        raise HTTPException(404, "Không tìm thấy hồ sơ kênh") from exc
+    return {"ok": True}
 
 
 @app.post("/api/remix/plan")
@@ -3889,6 +4924,22 @@ async def remix_plan(body: RemixPlanBody, user_id: int = Depends(get_current_use
 
 @app.post("/api/jobs")
 async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_id)):
+    normalized_url = _extract_first_video_url(body.url)
+    classification = await asyncio.to_thread(_video_url_classifier.classify, normalized_url)
+    if classification.platform.value in {"youtube", "tiktok", "douyin"}:
+        if classification.intent == URLIntent.CHANNEL:
+            raise HTTPException(
+                400,
+                "Đây là link kênh/profile. Hãy bật 'Tải toàn bộ video của kênh' để quét và xử lý cả kênh.",
+            )
+        if classification.intent != URLIntent.VIDEO:
+            raise HTTPException(
+                400,
+                "Link không phải link video cụ thể. Hãy dán đúng link của một video hoặc bật chế độ tải toàn bộ kênh.",
+            )
+        normalized_url = classification.resolved_url
+    body.url = normalized_url
+
     remix_plan = build_remix_plan(
         enabled=body.remix_enabled,
         platforms=body.remix_platforms,
@@ -3897,7 +4948,8 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         free_mode=True,
     )
     if body.remix_enabled:
-        body.processing_mode = body.processing_mode if body.processing_mode in {"quality", "pro"} else remix_plan.processing_mode
+        body.processing_mode = body.processing_mode if body.processing_mode in {"quality",
+                                                                                "pro"} else remix_plan.processing_mode
         if body.translation_mode == "faithful":
             body.translation_mode = remix_plan.translation_mode
         body.review_before_render = False  # Automatic mode - skip review step
@@ -3951,6 +5003,8 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
             "Liên hệ admin để được cấp thêm.",
         )
 
+    _require_license_or_trial(user_id)
+
     logo_path = None
     if body.logo_path:
         # body.logo_path is actually the opaque id POST /api/upload-logo
@@ -3964,13 +5018,15 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         elif candidate.exists():
             logo_path = str(candidate)
 
-    normalized_url = _extract_first_video_url(body.url)
-    job = store.create_job(
+    normalized_url = body.url
+    job = _store_create_job(
         user_id, normalized_url, body.target_language,
         source_language=body.source_language or "auto",
         logo_path=logo_path,
         logo_corner=body.logo_corner or "bottom_right",
         logo_size_px=body.logo_size_px or 120,
+        branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
+        publishing_config=PublishingPackConfig.from_dict(body.publishing_config).to_dict() if body.publishing_config else None,
         tts_voice=body.tts_voice or None,
         review_mode=body.review_before_render,
         animated_subtitle_config=body.animated_subtitle_config,
@@ -3995,26 +5051,320 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
+    await _configure_job_run_limit(body.max_concurrent)
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
     return job.to_dict()
 
 
+@app.post("/api/channel-downloads/analyze")
+async def analyze_channel_download(
+        body: ChannelAnalyzeBody,
+        user_id: int = Depends(get_current_user_id),
+):
+    mode = str(body.mode or "quick").strip().lower()
+    if mode not in {"quick", "continue", "deep", "reset"}:
+        raise HTTPException(400, "mode phải là quick, continue, deep hoặc reset")
+
+    raw_url = _extract_first_video_url(body.url)
+    try:
+        classification, canonical_url = _channel_listing_service.canonicalize(raw_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    legacy_catalog_reset = False
+    existing_state = store.get_channel_scan_state(user_id, canonical_url)
+    if (
+        classification.platform == Platform.DOUYIN
+        and existing_state
+        and int(existing_state.get("scan_version") or 1) < _CHANNEL_SCAN_VERSION
+    ):
+        # Older scanners could collect recommendation awemes from other creators.
+        # Purge that one legacy catalog once, then rebuild with Ownership Guard.
+        store.reset_channel_scan(user_id, canonical_url)
+        legacy_catalog_reset = True
+
+    if mode == "reset":
+        store.reset_channel_scan(user_id, canonical_url)
+
+    known_video_ids = store.get_channel_scan_video_ids(user_id, canonical_url)
+    try:
+        result = await asyncio.to_thread(
+            _channel_listing_service.scan,
+            raw_url,
+            body.max_videos,
+            force_refresh=mode in {"continue", "deep", "reset"},
+            known_video_ids=known_video_ids,
+            deep=mode in {"continue", "deep", "reset"},
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("Channel analyze failed for %s: %s", body.url, exc, exc_info=True)
+        state = store.get_channel_scan_state(user_id, canonical_url)
+        if state and int(state.get("total_discovered") or 0) > 0:
+            # Preserve already discovered videos and expose the current scan
+            # failure instead of pretending the catalog disappeared.
+            return {
+                "channel_url": body.url,
+                "resolved_url": canonical_url,
+                "platform": classification.platform.value,
+                "channel_title": state.get("channel_title") or "",
+                "channel_id": state.get("channel_id") or "",
+                "video_count": int(state.get("total_discovered") or 0),
+                "current_scan_count": 0,
+                "new_video_count": 0,
+                "warnings": [f"Lượt quét mới thất bại: {exc}"],
+                "truncated": not bool(state.get("complete")),
+                "complete": bool(state.get("complete")),
+                "has_more": state.get("has_more"),
+                "cursor": state.get("cursor") or "",
+                "scan_source": state.get("scan_source") or "saved_catalog",
+                "stop_reason": state.get("stop_reason") or "scan_error",
+                "network_pages": int(state.get("network_pages") or 0),
+                "catalog_total": int(state.get("total_discovered") or 0),
+                "preview": store.list_channel_scan_videos(user_id, canonical_url, limit=50),
+                "preview_truncated": int(state.get("total_discovered") or 0) > 50,
+                "scan_error": str(exc),
+            }
+        raise HTTPException(400, str(exc)) from exc
+
+    state = store.merge_channel_scan_result(
+        user_id,
+        original_url=result.channel_url,
+        canonical_url=canonical_url,
+        platform=result.platform.value,
+        channel_id=result.channel_id,
+        channel_title=result.channel_title,
+        videos=[video.to_dict() for video in result.videos],
+        cursor=result.cursor,
+        has_more=result.has_more,
+        complete=result.complete,
+        stop_reason=result.stop_reason,
+        scan_source=result.scan_source,
+        network_pages=result.network_pages,
+        scan_version=_CHANNEL_SCAN_VERSION,
+    )
+    total = int(state.get("total_discovered") or 0)
+    payload = result.to_dict(include_videos=False)
+    payload.update({
+        "video_count": total,
+        "current_scan_count": len(result.videos),
+        "new_video_count": int(state.get("new_count") or 0),
+        "catalog_total": total,
+        "complete": bool(state.get("complete")),
+        "has_more": state.get("has_more"),
+        "cursor": state.get("cursor") or "",
+        "preview": store.list_channel_scan_videos(user_id, canonical_url, limit=50),
+        "preview_truncated": total > 50,
+    })
+    if legacy_catalog_reset:
+        payload.setdefault("warnings", []).insert(
+            0,
+            "Đã tự xóa catalog Douyin cũ vì phiên bản trước có thể lẫn video đề xuất từ kênh khác; catalog hiện được dựng lại bằng Ownership Guard.",
+        )
+    return payload
+
+
+@app.post("/api/channel-downloads/process")
+async def process_channel_download(
+        body: ChannelProcessBody,
+        user_id: int = Depends(get_current_user_id),
+):
+    # Apply the batch's UI selection before scanning/creating tasks, including
+    # the case where every discovered video is skipped as an existing job.
+    await _configure_job_run_limit(body.max_concurrent)
+    if body.review_before_render:
+        raise HTTPException(
+            400,
+            "Chế độ xem/sửa phụ đề thủ công không dùng được khi xử lý toàn bộ kênh.",
+        )
+
+    raw_url = _extract_first_video_url(body.url)
+    try:
+        classification, canonical_url = _channel_listing_service.canonicalize(raw_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    legacy_catalog_reset = False
+    existing_state = store.get_channel_scan_state(user_id, canonical_url)
+    if (
+        classification.platform == Platform.DOUYIN
+        and existing_state
+        and int(existing_state.get("scan_version") or 1) < _CHANNEL_SCAN_VERSION
+    ):
+        store.reset_channel_scan(user_id, canonical_url)
+        legacy_catalog_reset = True
+
+    scan = None
+    scan_error = ""
+    newly_discovered = 0
+    known_video_ids = store.get_channel_scan_video_ids(user_id, canonical_url)
+    state = store.get_channel_scan_state(user_id, canonical_url)
+    should_scan = bool(body.deep_scan or state is None or not state.get("complete"))
+    if should_scan:
+        try:
+            scan = await asyncio.to_thread(
+                _channel_listing_service.scan,
+                raw_url,
+                body.max_videos,
+                force_refresh=True,
+                known_video_ids=known_video_ids,
+                deep=True,
+            )
+            state = store.merge_channel_scan_result(
+                user_id,
+                original_url=scan.channel_url,
+                canonical_url=canonical_url,
+                platform=scan.platform.value,
+                channel_id=scan.channel_id,
+                channel_title=scan.channel_title,
+                videos=[video.to_dict() for video in scan.videos],
+                cursor=scan.cursor,
+                has_more=scan.has_more,
+                complete=scan.complete,
+                stop_reason=scan.stop_reason,
+                scan_source=scan.scan_source,
+                network_pages=scan.network_pages,
+                scan_version=_CHANNEL_SCAN_VERSION,
+            )
+            newly_discovered = int(state.get("new_count") or 0)
+        except (ValueError, RuntimeError) as exc:
+            scan_error = str(exc)
+            logger.warning("Channel process scan failed for %s: %s", body.url, exc, exc_info=True)
+            state = store.get_channel_scan_state(user_id, canonical_url)
+            if not state or int(state.get("total_discovered") or 0) <= 0:
+                raise HTTPException(400, str(exc)) from exc
+
+    catalog_rows = store.list_channel_scan_videos(
+        user_id,
+        canonical_url,
+        limit=body.max_videos if body.max_videos > 0 else 0,
+    )
+    candidates: list[ChannelVideoCandidate] = []
+    for item in catalog_rows:
+        try:
+            duration = float(item.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        candidates.append(ChannelVideoCandidate(
+            source_url=str(item.get("source_url") or ""),
+            platform=classification.platform,
+            video_id=str(item.get("video_id") or ""),
+            title=str(item.get("title") or item.get("desc") or ""),
+            uploader=str(item.get("uploader") or ""),
+            duration=duration,
+            thumbnail_url=str(item.get("thumbnail_url") or item.get("thumbnail") or ""),
+            published_at=str(item.get("published_at") or item.get("timestamp") or ""),
+        ))
+    candidates = [candidate for candidate in candidates if candidate.source_url]
+    if not candidates:
+        raise HTTPException(400, "Catalog kênh chưa có video hợp lệ. Hãy chạy Quét sâu toàn bộ trước.")
+
+    skipped_existing: list[str] = []
+    if body.skip_existing:
+        existing = store.existing_source_urls_for_user(
+            user_id, [candidate.source_url for candidate in candidates]
+        )
+        skipped_existing = [candidate.source_url for candidate in candidates if candidate.source_url in existing]
+        candidates = [candidate for candidate in candidates if candidate.source_url not in existing]
+
+    user = store.get_user_by_id(user_id)
+    total_cost = JOB_COST_CREDITS * len(candidates)
+    if JOB_COST_CREDITS > 0 and user["credits"] < total_cost:
+        raise HTTPException(
+            402,
+            f"Kênh có {len(candidates)} video mới, cần {total_cost} credit nhưng tài khoản chỉ còn "
+            f"{user['credits']}. Giảm giới hạn video hoặc nạp thêm credit.",
+        )
+
+    base_payload = body.model_dump()
+    base_payload.pop("max_videos", None)
+    base_payload.pop("skip_existing", None)
+    base_payload.pop("deep_scan", None)
+    created: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    for candidate in candidates:
+        try:
+            payload = dict(base_payload)
+            payload["url"] = candidate.source_url
+            single_body = NewJobBody(**payload)
+            job = await create_job(single_body, user_id)
+            job_id = str(job.get("id") or "")
+            if job_id:
+                store.set_job_source_channel(
+                    job_id,
+                    user_id,
+                    channel_url=canonical_url,
+                    channel_title=str((state or {}).get("channel_title") or (scan.channel_title if scan else "")),
+                    channel_id=str((state or {}).get("channel_id") or (scan.channel_id if scan else "")),
+                    uploader=candidate.uploader,
+                )
+            created.append({
+                "job_id": job_id,
+                "source_url": candidate.source_url,
+                "source_channel_url": canonical_url,
+                "source_channel_title": str((state or {}).get("channel_title") or (scan.channel_title if scan else "")),
+                "uploader": candidate.uploader,
+                "title": candidate.title,
+            })
+        except Exception as exc:
+            logger.exception("Could not create channel job for %s", candidate.source_url)
+            failed.append({"source_url": candidate.source_url, "error": str(exc)})
+
+    state = store.get_channel_scan_state(user_id, canonical_url) or {}
+    warnings = list(scan.warnings if scan is not None else [])
+    if legacy_catalog_reset:
+        warnings.insert(
+            0,
+            "Đã tự làm sạch catalog Douyin cũ có nguy cơ lẫn video ngoài kênh và quét lại bằng Ownership Guard.",
+        )
+    if scan_error:
+        warnings.append(
+            f"Không quét thêm được trong lượt này ({scan_error}); đã dùng catalog đã lưu."
+        )
+    if not bool(state.get("complete")):
+        warnings.append(
+            "Catalog Douyin hiện vẫn được đánh dấu chưa hoàn tất. Bấm Quét tiếp hoặc Quét sâu "
+            "để thu thập thêm; bật bỏ qua video cũ để lần sau chỉ tạo job cho video mới."
+        )
+
+    return {
+        "ok": bool(created) or not candidates,
+        "platform": classification.platform.value,
+        "channel_title": state.get("channel_title") or (scan.channel_title if scan else ""),
+        "scanned": int(state.get("total_discovered") or len(catalog_rows)),
+        "catalog_total": int(state.get("total_discovered") or len(catalog_rows)),
+        "newly_discovered": newly_discovered,
+        "scan_complete": bool(state.get("complete")),
+        "has_more": state.get("has_more"),
+        "stop_reason": state.get("stop_reason") or "",
+        "created_count": len(created),
+        "skipped_existing_count": len(skipped_existing),
+        "failed_count": len(failed),
+        "created": created,
+        "skipped_existing": skipped_existing,
+        "failed": failed,
+        "warnings": warnings,
+        "max_concurrent_processing": _job_run_limit,
+    }
+
+
 @app.post("/api/upload-video")
 async def upload_video(
-    file: UploadFile = File(...),
-    target_language: str = Form("vi"),
-    source_language: str = Form("auto"),
-    logo_path: Optional[str] = Form(None),
-    logo_corner: str = Form("bottom_right"),
-    logo_size_px: int = Form(120),
-    tts_voice: Optional[str] = Form(None),
-    review_before_render: bool = Form(False),
-    animated_subtitle_config: Optional[str] = Form(None),
-    video_template_config: Optional[str] = Form(None),
-    keep_original_audio: int = Form(0),
-    background_music_strategy: str = Form("deterministic"),
-    user_id: int = Depends(get_current_user_id),
+        file: UploadFile = File(...),
+        target_language: str = Form("vi"),
+        source_language: str = Form("auto"),
+        logo_path: Optional[str] = Form(None),
+        logo_corner: str = Form("bottom_right"),
+        logo_size_px: int = Form(120),
+        branding_config: Optional[str] = Form(None),
+        publishing_config: Optional[str] = Form(None),
+        tts_voice: Optional[str] = Form(None),
+        review_before_render: bool = Form(False),
+        animated_subtitle_config: Optional[str] = Form(None),
+        video_template_config: Optional[str] = Form(None),
+        keep_original_audio: int = Form(0),
+        background_music_strategy: str = Form("deterministic"),
+        user_id: int = Depends(get_current_user_id),
 ):
     """Upload a video file directly instead of providing a URL."""
     # Validate file type
@@ -4022,7 +5372,7 @@ async def upload_video(
     file_ext = Path(file.filename or "").suffix.lower()
     if file_ext not in allowed_extensions:
         raise HTTPException(400, f"Định dạng file không được hỗ trợ. Chỉ chấp nhận: {', '.join(allowed_extensions)}")
-    
+
     # Validate file size (max 500MB)
     MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
     file_size = 0
@@ -4030,15 +5380,15 @@ async def upload_video(
         file_size += len(chunk)
         if file_size > MAX_FILE_SIZE:
             raise HTTPException(400, "File quá lớn. Kích thước tối đa: 500MB")
-    
+
     # Reset file pointer
     await file.seek(0)
-    
+
     # Generate unique filename
     video_id = uuid.uuid4().hex[:12]
     safe_filename = f"{user_id}_{video_id}{file_ext}"
     video_path = _VIDEO_UPLOAD_DIR / safe_filename
-    
+
     # Save uploaded file
     try:
         with open(video_path, "wb") as f:
@@ -4046,17 +5396,19 @@ async def upload_video(
                 f.write(chunk)
     except Exception as e:
         raise HTTPException(500, f"Lỗi khi lưu file: {str(e)}")
-    
+
     # Parse JSON configs
     try:
         animated_config = json.loads(animated_subtitle_config) if animated_subtitle_config else None
         template_config = json.loads(video_template_config) if video_template_config else None
+        branding_data = BrandingConfig.from_dict(json.loads(branding_config)).to_dict() if branding_config else None
+        publishing_data = PublishingPackConfig.from_dict(json.loads(publishing_config)).to_dict() if publishing_config else None
     except json.JSONDecodeError:
         raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
-    
+
     # Create job with file:// URL
     file_url = f"file://{video_path}"
-    job = store.create_job(
+    job = _store_create_job(
         user_id=user_id,
         source_url=file_url,
         target_language=target_language,
@@ -4064,6 +5416,8 @@ async def upload_video(
         logo_path=logo_path,
         logo_corner=logo_corner,
         logo_size_px=logo_size_px,
+        branding_config=branding_data,
+        publishing_config=publishing_data,
         tts_voice=tts_voice,
         review_mode=review_before_render,
         animated_subtitle_config=animated_config,
@@ -4071,15 +5425,15 @@ async def upload_video(
         keep_original_audio=keep_original_audio,
         background_music_strategy=background_music_strategy,
     )
-    
+
     # Deduct credits if needed
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
-    
+
     # Start job processing
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
-    
+
     return {"job_id": job.id, "job": job.to_dict()}
 
 
@@ -4093,9 +5447,11 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
         try:
             parsed = urllib.parse.urlparse(url)
             if parsed.scheme not in {"http", "https"}:
-                issues.append({"severity": "error", "code": "invalid_url", "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
+                issues.append({"severity": "error", "code": "invalid_url",
+                               "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
         except Exception:
-            issues.append({"severity": "error", "code": "invalid_url", "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
+            issues.append({"severity": "error", "code": "invalid_url",
+                           "message": f"Không tìm thấy link video hợp lệ trong: {raw_url}"})
 
     processing_mode = (body.processing_mode or "fast").strip().lower()
     if processing_mode not in {"fast", "quality", "pro"}:
@@ -4172,6 +5528,44 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
             "message": "Xem & sửa phụ đề trước render chỉ dùng cho 1 link mỗi lần.",
         })
 
+    branding = BrandingConfig.from_dict(body.branding_config)
+    if body.branding_config and body.branding_config.get("enabled") and not branding.enabled:
+        issues.append({
+            "severity": "error", "code": "branding_text_missing",
+            "message": "Đã bật bảo vệ thương hiệu nhưng chưa nhập tên kênh/watermark.",
+        })
+    elif branding.enabled:
+        issues.append({
+            "severity": "ok", "code": "global_branding",
+            "message": f"Watermark động và fingerprint sẽ được áp dụng với tên: {branding.text}.",
+        })
+
+    publishing = PublishingPackConfig.from_dict(body.publishing_config)
+    if publishing.enabled:
+        if not publishing.channel_name:
+            issues.append({
+                "severity": "error", "code": "publishing_channel_name_missing",
+                "message": "Đã bật AI Publishing Pack nhưng chưa có tên kênh.",
+            })
+        else:
+            issues.append({
+                "severity": "ok", "code": "publishing_pack",
+                "message": (
+                    f"Sau render sẽ tạo title, description, hashtag, thumbnail và gói đăng cho "
+                    f"{', '.join(publishing.platforms)} theo profile {publishing.channel_name}."
+                ),
+            })
+            if publishing.provider in {"gemini", "openai"}:
+                settings = store.get_provider_settings(user_id, publishing.provider)
+                if not settings or not settings.get("api_key"):
+                    issues.append({
+                        "severity": "warning", "code": "publishing_llm_fallback",
+                        "message": (
+                            f"Chưa kết nối {publishing.provider}; Publishing Pack vẫn chạy bằng bộ sinh "
+                            "deterministic nhưng nội dung AI sẽ ít linh hoạt hơn."
+                        ),
+                    })
+
     user = store.get_user_by_id(user_id)
     required_credits = JOB_COST_CREDITS * max(1, url_count)
     if JOB_COST_CREDITS > 0 and user["credits"] < required_credits:
@@ -4182,17 +5576,25 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
         })
 
     aspect = ((body.video_template_config or {}).get("target_aspect_ratio") or "source").strip()
-    if aspect not in {"source", "9:16", "16:9", "1:1"}:
+    if aspect not in {"auto", "source", "9:16", "16:9", "1:1"}:
         issues.append({"severity": "warning", "code": "unknown_aspect", "message": f"Tỷ lệ đầu ra lạ: {aspect}."})
+    elif aspect == "auto":
+        issues.append({
+            "severity": "ok", "code": "auto_aspect",
+            "message": "Auto khung hình đang bật: mỗi video trong batch giữ orientation riêng theo source (dọc/ngang), không ép cả kênh về một tỷ lệ cố định.",
+        })
     elif aspect == "16:9":
-        issues.append({"severity": "ok", "code": "youtube_16_9", "message": "Preset YouTube 16:9 sẵn sàng cho video ngang."})
+        issues.append(
+            {"severity": "ok", "code": "youtube_16_9", "message": "Preset YouTube 16:9 sẵn sàng cho video ngang."})
     elif aspect == "9:16":
-        issues.append({"severity": "ok", "code": "short_form_9_16", "message": "Preset 9:16 sẵn sàng cho Shorts/TikTok/Reels."})
+        issues.append(
+            {"severity": "ok", "code": "short_form_9_16", "message": "Preset 9:16 sẵn sàng cho Shorts/TikTok/Reels."})
 
     if body.animated_subtitle_config and (body.animated_subtitle_config.get("effect") == "karaoke"):
         issues.append({"severity": "ok", "code": "karaoke_subtitle", "message": "Subtitle Karaoke đang bật."})
     elif not body.animated_subtitle_config:
-        issues.append({"severity": "warning", "code": "subtitle_disabled", "message": "Subtitle động đang tắt; video có thể kém bắt mắt hơn."})
+        issues.append({"severity": "warning", "code": "subtitle_disabled",
+                       "message": "Subtitle động đang tắt; video có thể kém bắt mắt hơn."})
 
     return {"ok": not any(issue["severity"] == "error" for issue in issues), "issues": issues}
 
@@ -4251,11 +5653,12 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
         raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
 
-    job = store.create_job(
+    job = _store_create_job(
         user_id,
         f"creator:{body.topic.strip()}",
         body.target_language,
         source_language=f"creator:{'ai' if body.image_provider == 'cpu_ai' else body.image_provider}",
+        branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
     )
     if JOB_COST_CREDITS > 0:
         store.adjust_credits(user_id, -JOB_COST_CREDITS)
@@ -5053,7 +6456,8 @@ def _probe_provider(provider: str, api_key: Optional[str], api_secret: Optional[
             if model_id.startswith(("gpt-", "o")) and "tts" not in model_id and "audio" not in model_id
         })
         models = tts_models or PROVIDER_CATALOG["openai"]["models"]
-        voices = [{"id": f"openai:{voice}", "label": voice.title(), "gender": "neutral"} for voice in OPENAI_BUILTIN_VOICES]
+        voices = [{"id": f"openai:{voice}", "label": voice.title(), "gender": "neutral"} for voice in
+                  OPENAI_BUILTIN_VOICES]
         return {"models": models, "llm_models": llm_models or ["gpt-5.6-luna"], "voices": voices}
     if provider == "gemini":
         if not api_key:
@@ -5137,7 +6541,8 @@ def provider_settings(user_id: int = Depends(get_current_user_id)):
             "default_model": saved.get("default_model") if saved else (meta["models"][0] if meta["models"] else None),
             "default_voice": saved.get("default_voice") if saved else None,
             "available_models": (saved.get("extra", {}) if saved else {}).get("models") or meta["models"],
-            "available_llm_models": (saved.get("extra", {}) if saved else {}).get("llm_models") or (meta["models"] if key in {"gemini"} else []),
+            "available_llm_models": (saved.get("extra", {}) if saved else {}).get("llm_models") or (
+                meta["models"] if key in {"gemini"} else []),
             "available_voices": (saved.get("extra", {}) if saved else {}).get("voices") or meta["voices"],
             "connect_url": meta.get("connect_url"),
             "extra": saved.get("extra", {}) if saved else {},
@@ -5158,10 +6563,12 @@ def save_provider_settings(body: ProviderSettingsBody, user_id: int = Depends(ge
     extra = dict((current or {}).get("extra") or {})
     extra.update(body.extra or {})
     if api_key or (provider == "xtts"):
-        discovery = _probe_provider(provider, api_key or (current or {}).get("api_key"), body.api_secret or (current or {}).get("api_secret"))
+        discovery = _probe_provider(provider, api_key or (current or {}).get("api_key"),
+                                    body.api_secret or (current or {}).get("api_secret"))
         extra.update(discovery)
     discovered_models = extra.get("llm_models") or extra.get("models") or []
-    default_model = body.default_model or (discovered_models[0] if discovered_models else (meta["models"][0] if meta["models"] else None))
+    default_model = body.default_model or (
+        discovered_models[0] if discovered_models else (meta["models"][0] if meta["models"] else None))
     store.upsert_provider_settings(
         user_id=user_id,
         provider=provider,
@@ -5184,9 +6591,9 @@ def delete_provider_settings(provider: str, user_id: int = Depends(get_current_u
 
 @app.get("/api/voices")
 def list_voices(
-    language: str = "vi",
-    provider: str = "edge",
-    user_id: int = Depends(get_current_user_id),
+        language: str = "vi",
+        provider: str = "edge",
+        user_id: int = Depends(get_current_user_id),
 ):
     """Curated male/female voice choices for `language`, for the optional
     'chọn giọng đọc' dropdown. Empty list means: no curated options for
@@ -5444,15 +6851,44 @@ def job_queue_status(user_id: int = Depends(get_current_user_id)):
         "running": running,
         "review": review,
         "active": queued + running + review,
+        "processing_active": _job_run_active,
+        "max_concurrent_processing": _job_run_limit,
         "total_jobs": int(stats.get("total_jobs", 0) or 0),
     }
 
 
+def _delete_job_artifacts(job_id: str) -> None:
+    """Remove only the output directory owned by an exact, validated job id."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id or ""):
+        logger.warning("Refusing to remove artifacts for invalid job id %r", job_id)
+        return
+    jobs_root = (_OUTPUT_BASE_DIR / "web_jobs").resolve()
+    job_dir = (jobs_root / job_id).resolve()
+    if job_dir.parent != jobs_root:
+        logger.warning("Refusing to remove job artifacts outside %s: %s", jobs_root, job_dir)
+        return
+    try:
+        shutil.rmtree(job_dir, ignore_errors=False)
+        logger.info("Removed deleted job artifacts: %s", job_dir)
+    except FileNotFoundError:
+        return
+    except OSError:
+        # The DB deletion should still succeed even if Windows temporarily has
+        # an output file open. The directory remains visible for later cleanup.
+        logger.exception("Failed to remove deleted job artifacts: %s", job_dir)
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    task = _running_tasks.get(job_id)
+    if task:
+        task.cancel()
     deleted = store.delete_job(job_id, user_id)
     if not deleted:
         raise HTTPException(404, "Không tìm thấy job")
+    if job.status != "running":
+        _delete_job_artifacts(job_id)
     return {"ok": True}
 
 
@@ -5460,7 +6896,19 @@ def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
 def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
     if not body.job_ids:
         raise HTTPException(400, "Chưa chọn video cần xoá")
-    return {"ok": True, "deleted": store.delete_jobs(body.job_ids, user_id)}
+    owned_jobs = []
+    for job_id in list(dict.fromkeys(body.job_ids))[:200]:
+        job = store.get_job(job_id)
+        if job and job.user_id == user_id:
+            owned_jobs.append(job)
+            task = _running_tasks.get(job_id)
+            if task:
+                task.cancel()
+    deleted = store.delete_jobs([job.id for job in owned_jobs], user_id)
+    for job in owned_jobs:
+        if job.status != "running":
+            _delete_job_artifacts(job.id)
+    return {"ok": True, "deleted": deleted}
 
 
 @app.post("/api/jobs/bulk-download")
@@ -5504,6 +6952,14 @@ def bulk_download_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_
                 archive.writestr(f"{Path(name).stem}.vi.srt", _segments_to_srt_text(segments))
             if source_segments:
                 archive.writestr(f"{Path(name).stem}.source.srt", _segments_to_srt_text(source_segments))
+            pack_dir = Path(job.publishing_pack_path or "")
+            if pack_dir.is_dir():
+                for asset in pack_dir.rglob("*"):
+                    if asset.is_file():
+                        archive.write(
+                            asset,
+                            arcname=f"{Path(name).stem}.publishing_pack/{asset.relative_to(pack_dir)}",
+                        )
 
     return FileResponse(
         zip_path,
@@ -5574,6 +7030,265 @@ def get_job_source_video(job_id: str, user_id: int = Depends(get_current_user_id
     if not source_path.exists() or not source_path.is_file():
         raise HTTPException(404, "Không tìm thấy video nguồn của job")
     return FileResponse(source_path, media_type="video/mp4")
+
+
+@app.get("/api/jobs/{job_id}/publishing-pack")
+def get_publishing_pack(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    pack_dir = Path(job.publishing_pack_path or "")
+    if not pack_dir.is_dir():
+        if job.publishing_pack_status == "error":
+            raise HTTPException(422, job.publishing_pack_error or "AI Publishing Pack tạo thất bại")
+        raise HTTPException(404, "Job này chưa có AI Publishing Pack")
+
+    def read_json(name: str) -> Dict[str, Any]:
+        path = pack_dir / name
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    source_metadata = read_json("source_metadata.json")
+    youtube = read_json("youtube_metadata.json")
+    facebook = read_json("facebook_metadata.json")
+    analysis = read_json("content_analysis.json")
+    edit_plan = read_json("content_edit_plan.json")
+    originality = read_json("originality_report.json")
+    manifest = read_json("manifest.json")
+    component_state = read_json("component_status.json")
+    components = component_state.get("components", {}) if isinstance(component_state, dict) else {}
+    overall_status = (
+        component_state.get("overall_status")
+        if isinstance(component_state, dict)
+        else None
+    ) or manifest.get("overall_status") or ("success" if job.publishing_pack_status == "ready" else job.publishing_pack_status)
+    for platform_data in (youtube, facebook):
+        platform_data["thumbnail_urls"] = [
+            f"/api/jobs/{job_id}/publishing-assets/{urllib.parse.quote(name)}"
+            for name in platform_data.get("thumbnails", [])
+        ]
+    # Backward compatibility for Publishing Pack v1 directories created
+    # before component_status.json existed. Infer enough state from actual
+    # files so old completed jobs immediately gain selective retry controls.
+    if not components:
+        cfg = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+        now = time.time()
+        def inferred(status_value: str, error_value: Optional[str] = None) -> Dict[str, Any]:
+            return {"status": status_value, "attempts": 1 if status_value in {"success", "failed"} else 0, "error": error_value, "updated_at": now}
+        components = {
+            "analysis": inferred("success" if analysis else "failed", None if analysis else "Chưa có content_analysis.json"),
+            "youtube_metadata": inferred(
+                "success" if youtube else ("failed" if "youtube" in cfg.platforms else "skipped"),
+                None if youtube or "youtube" not in cfg.platforms else "Chưa có youtube_metadata.json",
+            ),
+            "facebook_metadata": inferred(
+                "success" if facebook else ("failed" if "facebook" in cfg.platforms else "skipped"),
+                None if facebook or "facebook" not in cfg.platforms else "Chưa có facebook_metadata.json",
+            ),
+            "youtube_thumbnails": inferred(
+                "success" if youtube.get("thumbnails") else ("failed" if cfg.generate_thumbnails and "youtube" in cfg.platforms else "skipped"),
+                None if youtube.get("thumbnails") or not (cfg.generate_thumbnails and "youtube" in cfg.platforms) else "Chưa có thumbnail YouTube",
+            ),
+            "facebook_thumbnails": inferred(
+                "success" if facebook.get("thumbnails") else ("failed" if cfg.generate_thumbnails and "facebook" in cfg.platforms else "skipped"),
+                None if facebook.get("thumbnails") or not (cfg.generate_thumbnails and "facebook" in cfg.platforms) else "Chưa có thumbnail Facebook",
+            ),
+            "publish_ready": inferred(
+                "success" if job.publish_ready_video_path and Path(job.publish_ready_video_path).is_file() else ("failed" if cfg.generate_publish_ready_video else "skipped"),
+                None if (job.publish_ready_video_path and Path(job.publish_ready_video_path).is_file()) or not cfg.generate_publish_ready_video else "Chưa có publish_ready.mp4",
+            ),
+        }
+        active_statuses = [item["status"] for item in components.values() if item["status"] != "skipped"]
+        if active_statuses and all(value == "success" for value in active_statuses):
+            overall_status = "success"
+        elif any(value == "success" for value in active_statuses):
+            overall_status = "partial"
+        else:
+            overall_status = "failed"
+
+    source_thumbnail_file = Path(str(source_metadata.get("source_thumbnail_file") or "")).name
+    source_metadata["source_thumbnail_url"] = (
+        f"/api/jobs/{job_id}/publishing-assets/{urllib.parse.quote(source_thumbnail_file)}"
+        if source_thumbnail_file and (pack_dir / source_thumbnail_file).is_file()
+        else None
+    )
+    return {
+        "status": job.publishing_pack_status,
+        "overall_status": overall_status,
+        "components": components,
+        "error": job.publishing_pack_error,
+        "source_metadata": source_metadata,
+        "content_analysis": analysis,
+        "youtube": youtube,
+        "facebook": facebook,
+        "content_edit_plan": edit_plan,
+        "originality_report": originality,
+        "manifest": manifest,
+        "download_url": f"/api/jobs/{job_id}/publishing-pack.zip",
+        "publish_ready_video_url": (
+            f"/api/jobs/{job_id}/publish-ready-video"
+            if job.publish_ready_video_path and Path(job.publish_ready_video_path).is_file()
+            else None
+        ),
+    }
+
+
+def _publishing_retry_source_metadata(job, pack_dir: Path) -> Dict[str, Any]:
+    path = pack_dir / "source_metadata.json"
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    return {
+        "source_url": job.source_url,
+        "final_url": job.source_url,
+        "title": job.title or "",
+        "description": "",
+        "uploader": "",
+        "thumbnail_url": "",
+        "duration": 0.0,
+        "tags": [],
+    }
+
+
+def _publishing_retry_segments(raw: Optional[str]) -> List[Dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+@app.post("/api/jobs/{job_id}/publishing-pack/retry")
+def retry_publishing_pack_component(
+    job_id: str,
+    body: PublishingPackRetryBody,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Retry only failed/selected publishing assets; never rerun localization/render."""
+    job = _get_owned_job(job_id, user_id)
+    config = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+    if not config.enabled:
+        raise HTTPException(400, "AI Publishing Pack đang bị tắt cho job này")
+    final_video_path = Path(job.final_video_path or "")
+    if not final_video_path.is_file():
+        raise HTTPException(404, "Không tìm thấy final.mp4 của job")
+    pack_dir = Path(job.publishing_pack_path or (final_video_path.parent / "publishing_pack"))
+    pack_dir.mkdir(parents=True, exist_ok=True)
+
+    component = str(body.component or "failed").strip().lower()
+    allowed = {
+        "failed", "all_failed", "all", "analysis", "youtube_metadata",
+        "facebook_metadata", "youtube_thumbnails", "facebook_thumbnails", "publish_ready",
+    }
+    if component not in allowed:
+        raise HTTPException(400, f"Publishing component không hợp lệ: {component}")
+
+    store.update_job(
+        job_id,
+        publishing_pack_status="generating",
+        publishing_pack_path=str(pack_dir),
+        publishing_pack_error=None,
+        progress_note="[99%] Đang tạo lại thành phần AI Publishing Pack...",
+    )
+    service = PublishingPackService(
+        llm_client=_publishing_llm_client_for_job(job, config),
+        logger=logger,
+    )
+    try:
+        result = service.retry_components(
+            component=component,
+            config=config,
+            output_dir=final_video_path.parent,
+            final_video_path=final_video_path,
+            source_video_path=Path(job.source_video_path) if job.source_video_path else None,
+            source_url=job.source_url,
+            source_metadata=_publishing_retry_source_metadata(job, pack_dir),
+            translated_segments=_publishing_retry_segments(job.segments_json),
+            source_segments=_publishing_retry_segments(job.source_segments_json),
+            user_id=job.user_id,
+            job_id=job.id,
+            target_language=job.target_language,
+        )
+    except ValueError as exc:
+        store.update_job(job_id, publishing_pack_status="partial", publishing_pack_error=str(exc)[:2000])
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Publishing Pack component retry failed for job %s", job_id)
+        store.update_job(job_id, publishing_pack_status="partial", publishing_pack_error=str(exc)[:2000])
+        raise HTTPException(500, f"Không thể tạo lại Publishing Pack: {exc}") from exc
+
+    store.update_job(
+        job_id,
+        publishing_pack_status=("ready" if result.overall_status == "success" else "partial"),
+        publishing_pack_path=str(result.pack_dir),
+        publish_ready_video_path=(str(result.publish_ready_video_path) if result.publish_ready_video_path else None),
+        publishing_pack_error=(" | ".join(result.warnings) if result.warnings else None),
+        progress_note="Hoàn tất video; AI Publishing Pack đã được cập nhật.",
+    )
+    return {
+        "ok": True,
+        "overall_status": result.overall_status,
+        "retried": component,
+        "warnings": result.warnings,
+    }
+
+
+@app.get("/api/jobs/{job_id}/publishing-assets/{asset_name}")
+def get_publishing_asset(asset_name: str, job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    pack_dir = Path(job.publishing_pack_path or "").resolve()
+    if not pack_dir.is_dir():
+        raise HTTPException(404, "Publishing Pack chưa sẵn sàng")
+    safe_name = Path(asset_name).name
+    asset = (pack_dir / safe_name).resolve()
+    if asset.parent != pack_dir or not asset.is_file():
+        raise HTTPException(404, "Không tìm thấy asset")
+    media_type = "image/jpeg" if asset.suffix.lower() in {".jpg", ".jpeg"} else "application/octet-stream"
+    return FileResponse(asset, media_type=media_type)
+
+
+@app.get("/api/jobs/{job_id}/publishing-pack.zip")
+def download_publishing_pack(job_id: str, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    pack_dir = Path(job.publishing_pack_path or "")
+    if not pack_dir.is_dir():
+        raise HTTPException(404, "Publishing Pack chưa sẵn sàng")
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(prefix=f"publishing_pack_{job_id}_", suffix=".zip", delete=False, dir=str(TEMP_DIR))
+    zip_path = Path(temp.name)
+    temp.close()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for asset in pack_dir.rglob("*"):
+            if asset.is_file():
+                archive.write(asset, arcname=f"publishing_pack/{asset.relative_to(pack_dir)}")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{job_id}_publishing_pack.zip",
+        background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True)),
+    )
+
+
+@app.get("/api/jobs/{job_id}/publish-ready-video")
+def get_publish_ready_video(job_id: str, download: bool = False, user_id: int = Depends(get_current_user_id)):
+    job = _get_owned_job(job_id, user_id)
+    path = Path(job.publish_ready_video_path or "")
+    if not path.is_file():
+        raise HTTPException(404, "Chưa có bản publish-ready")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{job_id}_publish_ready.mp4" if download else None,
+    )
 
 
 @app.get("/api/jobs/{job_id}/prepublish-check")
@@ -5679,7 +7394,8 @@ def _segment_quality_report(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     if empty:
         warnings.append(f"{empty} segment đang rỗng.")
     if too_long:
-        warnings.append(f"{too_long} segment có chữ quá dài so với timestamp; nên rút gọn để TTS/subtitle tự nhiên hơn.")
+        warnings.append(
+            f"{too_long} segment có chữ quá dài so với timestamp; nên rút gọn để TTS/subtitle tự nhiên hơn.")
     score = 100 - min(55, too_long * 6 + empty * 10)
     return {"score": max(0, score), "warnings": warnings}
 
@@ -5762,10 +7478,19 @@ def _segments_to_srt_response(segments: List[Dict[str, Any]], filename: str) -> 
     )
 
 
+def _social_publish_video_path(job) -> Path:
+    config = PublishingPackConfig.from_dict(getattr(job, "publishing_config", None))
+    publish_ready = Path(getattr(job, "publish_ready_video_path", None) or "")
+    if config.enabled and config.use_publish_ready_for_social_publish and publish_ready.is_file():
+        return publish_ready
+    return Path(job.final_video_path or "")
+
+
 @app.post("/api/jobs/{job_id}/publish")
 def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
-    if not job.final_video_path or not Path(job.final_video_path).exists():
+    publish_video_path = _social_publish_video_path(job)
+    if not publish_video_path.is_file():
         raise HTTPException(400, "Video chưa sẵn sàng để đăng")
 
     results = []
@@ -5778,7 +7503,7 @@ def publish_job(job_id: str, body: PublishBody, user_id: int = Depends(get_curre
 
         access_token, account_ref = _resolve_publish_credentials(user_id, platform)
         result = uploader.upload(
-            Path(job.final_video_path), body.title, body.description, body.hashtags,
+            publish_video_path, body.title, body.description, body.hashtags,
             access_token=access_token, account_ref=account_ref,
         )
         store.log_publish(job_id, result.platform, result.success, result.message, result.remote_url)
@@ -5827,11 +7552,14 @@ def _run_scheduled_post(row) -> None:
         if not job or job.user_id != row["user_id"] or not job.final_video_path or not Path(
                 job.final_video_path).exists():
             raise RuntimeError("Video nguồn không còn tồn tại")
+        publish_video_path = _social_publish_video_path(job)
+        if not publish_video_path.is_file():
+            raise RuntimeError("Video publish-ready không còn tồn tại")
         for platform in json.loads(row["platforms_json"]):
             uploader = get_uploader(platform)
             token, account_ref = _resolve_publish_credentials(row["user_id"], platform)
             result = uploader.upload(
-                Path(job.final_video_path), row["title"], row["description"],
+                publish_video_path, row["title"], row["description"],
                 json.loads(row["hashtags_json"]), access_token=token, account_ref=account_ref,
             )
             store.log_publish(job.id, result.platform, result.success, result.message, result.remote_url)
@@ -6149,6 +7877,49 @@ def admin_adjust_credits(target_user_id: int, body: CreditsAdjustBody,
     return {"ok": True, "credits": user["credits"]}
 
 
+@app.put("/api/admin/users/{target_user_id}/role")
+def admin_change_user_role(target_user_id: int, body: dict, _admin_id: int = Depends(require_admin_user_id)):
+    """Change user role (admin <-> regular user)"""
+    if not store.get_user_by_id(target_user_id):
+        raise HTTPException(404, "Không tìm thấy user")
+    
+    is_admin = body.get("is_admin", False)
+    store.set_admin(target_user_id, is_admin)
+    
+    return {"ok": True, "is_admin": is_admin}
+
+
+@app.post("/api/admin/create-first-admin")
+def create_first_admin(body: dict):
+    """Create the first admin account (only works if no users exist)"""
+    if store.any_users_exist():
+        raise HTTPException(403, "Đã có user trong hệ thống. Không thể tạo admin đầu tiên.")
+    
+    username = body.get("username")
+    password = body.get("password")
+    email = body.get("email")
+    
+    if not username or not password:
+        raise HTTPException(400, "Thiếu username hoặc password")
+    
+    if len(password) < 8:
+        raise HTTPException(400, "Mật khẩu cần tối thiểu 8 ký tự")
+    
+    if store.get_user_by_username(username):
+        raise HTTPException(409, "Tên đăng nhập đã tồn tại")
+    
+    if email and store.get_user_by_identifier(email):
+        raise HTTPException(409, "Email đã tồn tại")
+    
+    user_id = store.create_user(
+        username, hash_password(password),
+        is_admin=True, credits=10_000,
+        email=email, phone=None
+    )
+    
+    return {"ok": True, "user_id": user_id, "message": "Admin đầu tiên đã được tạo"}
+
+
 @app.get("/api/admin/stats")
 def admin_stats(_admin_id: int = Depends(require_admin_user_id)):
     return store.admin_stats()
@@ -6199,6 +7970,232 @@ def admin_reject_top_up_request(
     if row is None:
         raise HTTPException(404, "Không tìm thấy yêu cầu nạp đang chờ")
     return {"ok": True, "status": row["status"]}
+
+
+# ---------------------------------------------------------------- License Management --
+
+@app.post("/api/admin/licenses")
+def admin_create_license(body: LicenseBody, _admin_id: int = Depends(require_admin_user_id)):
+    """Create a new license key (admin only)"""
+    # Generate expiry date from days
+    expiry_date = None
+    if body.expiry_days:
+        expiry_date = time.time() + (body.expiry_days * 24 * 60 * 60)
+    
+    license_data = {
+        "license_key": body.license_key,
+        "user_id": body.user_id,
+        "customer_name": body.customer_name,
+        "customer_email": body.customer_email,
+        "plan_type": body.plan_type,
+        "features": body.features,
+        "expiry_date": expiry_date,
+        "max_jobs": body.max_jobs,
+        "max_tokens": body.max_tokens,
+        "status": body.status,
+        "notes": body.notes,
+    }
+    
+    try:
+        license = store.create_license(license_data)
+        return license.to_dict()
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "License key đã tồn tại")
+
+
+@app.get("/api/admin/licenses")
+def admin_list_licenses(
+    status: Optional[str] = None,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    """List all licenses (admin only)"""
+    licenses = store.list_licenses(status=status)
+    return [license.to_dict() for license in licenses]
+
+
+@app.get("/api/admin/licenses/{license_id}")
+def admin_get_license(license_id: int, _admin_id: int = Depends(require_admin_user_id)):
+    """Get a specific license by ID (admin only)"""
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM licenses WHERE id = ?", (license_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Không tìm thấy license")
+        return License.from_row(row).to_dict()
+
+
+@app.put("/api/admin/licenses/{license_id}")
+def admin_update_license(
+    license_id: int,
+    body: LicenseUpdateBody,
+    _admin_id: int = Depends(require_admin_user_id),
+):
+    """Update a license (admin only)"""
+    updates = {}
+    if body.customer_name is not None:
+        updates["customer_name"] = body.customer_name
+    if body.customer_email is not None:
+        updates["customer_email"] = body.customer_email
+    if body.plan_type is not None:
+        updates["plan_type"] = body.plan_type
+    if body.features is not None:
+        updates["features"] = body.features
+    if body.expiry_days is not None:
+        updates["expiry_date"] = time.time() + (body.expiry_days * 24 * 60 * 60)
+    if body.max_jobs is not None:
+        updates["max_jobs"] = body.max_jobs
+    if body.max_tokens is not None:
+        updates["max_tokens"] = body.max_tokens
+    if body.status is not None:
+        updates["status"] = body.status
+    if body.notes is not None:
+        updates["notes"] = body.notes
+    
+    if not updates:
+        raise HTTPException(400, "Không có field nào để cập nhật")
+    
+    if not store.update_license(license_id, updates):
+        raise HTTPException(404, "Không tìm thấy license")
+    
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM licenses WHERE id = ?", (license_id,)).fetchone()
+        return License.from_row(row).to_dict()
+
+
+@app.delete("/api/admin/licenses/{license_id}", status_code=204)
+def admin_delete_license(license_id: int, _admin_id: int = Depends(require_admin_user_id)):
+    """Delete a license (admin only)"""
+    if not store.delete_license(license_id):
+        raise HTTPException(404, "Không tìm thấy license")
+    return Response(status_code=204)
+
+
+@app.post("/api/licenses/validate")
+def validate_license(body: LicenseValidateBody):
+    """Validate a license key (public endpoint)"""
+    license_key = body.license_key.strip()
+    if USE_LICENSE_SERVER:
+        result = validate_license_with_server(license_key, store.get_machine_id())
+        if result is None:
+            return {"valid": False, "error": "Không thể kết nối đến license server"}
+        return result
+
+    is_valid, license, error = store.validate_license(license_key)
+    if is_valid:
+        return {
+            "valid": True,
+            "license": license.to_dict() if license else None,
+        }
+    return {
+        "valid": False,
+        "error": error,
+    }
+
+
+@app.post("/api/licenses/activate")
+def activate_license(
+    body: LicenseActivateBody,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Activate a license key for the current user"""
+    license_key = body.license_key.strip()
+    if not license_key:
+        raise HTTPException(400, "Vui lòng nhập license key")
+
+    if USE_LICENSE_SERVER:
+        validation = validate_license_with_server(license_key, store.get_machine_id())
+        if validation is None:
+            raise HTTPException(503, "Không thể kết nối đến license server")
+        if not validation.get("valid"):
+            raise HTTPException(400, validation.get("error") or "License không hợp lệ")
+        remote_license = validation.get("license")
+        if not isinstance(remote_license, dict):
+            raise HTTPException(502, "License server trả về dữ liệu không hợp lệ")
+        try:
+            license = store.link_remote_license(remote_license, user_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"ok": True, "license": license.to_dict()}
+
+    is_valid, license, error = store.validate_license(license_key)
+    if not is_valid:
+        raise HTTPException(400, error or "License không hợp lệ")
+    
+    # Link license to user if not already linked
+    if license.user_id is None:
+        store.update_license(license.id, {"user_id": user_id})
+    elif license.user_id != user_id:
+        raise HTTPException(400, "License đã được kích hoạt bởi user khác")
+    
+    return {
+        "ok": True,
+        "license": license.to_dict(),
+    }
+
+
+@app.get("/api/me/license")
+def get_my_license(user_id: int = Depends(get_current_user_id)):
+    """Get the current user's active license"""
+    license = store.get_license_by_user(user_id)
+    if not license:
+        return {"license": None}
+    
+    result = license.to_dict()
+    usage = store.get_license_usage(license.id, user_id)
+    result["usage"] = usage.to_dict() if usage else None
+
+    if USE_LICENSE_SERVER:
+        validation = validate_license_with_server(license.license_key, store.get_machine_id())
+        if validation and validation.get("valid") and isinstance(validation.get("license"), dict):
+            remote = validation["license"]
+            for field in (
+                "customer_name", "customer_email", "plan_type", "features",
+                "expiry_date", "max_jobs", "max_tokens", "status",
+            ):
+                if field in remote:
+                    result[field] = remote[field]
+            result["usage"] = {
+                "tokens_used": int(remote.get("tokens_used", 0) or 0),
+                "jobs_completed": int(remote.get("jobs_used", 0) or 0),
+            }
+        elif validation:
+            result["validation_error"] = validation.get("error") or "License không hợp lệ"
+    return {"license": result}
+
+
+@app.get("/api/me/free-trial")
+def get_my_free_trial(user_id: int = Depends(get_current_user_id)):
+    """Get the current user's free trial status"""
+    machine_id = store.get_machine_id()
+    trial = store.get_free_trial(user_id, machine_id)
+    if not trial:
+        return {"trial": None}
+    return {"trial": trial.to_dict()}
+
+
+@app.post("/api/me/free-trial/start")
+def start_free_trial(user_id: int = Depends(get_current_user_id)):
+    """Start or restart a free trial for the current user"""
+    machine_id = store.get_machine_id()
+    
+    # Check if trial already exists
+    existing = store.get_free_trial(user_id, machine_id)
+    if existing:
+        # Allow restart if trial expired or out of tokens
+        if existing.expiry_date < time.time():
+            # Trial expired - create new one
+            trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+            return {"trial": trial.to_dict(), "message": "Trial đã được làm mới"}
+        elif existing.tokens_remaining <= 0:
+            # Out of tokens - create new one
+            trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+            return {"trial": trial.to_dict(), "message": "Token đã được nạp lại"}
+        else:
+            # Active trial with remaining tokens
+            raise HTTPException(400, "Đang có trial hoạt động, còn lại {} token".format(existing.tokens_remaining))
+    
+    # No existing trial - create new one
+    trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+    return {"trial": trial.to_dict()}
 
 
 # ---------------------------------------------------------------- Trend Scanner --
@@ -6272,6 +8269,7 @@ def submit_feedback(body: FeedbackBody, user_id: int = Depends(get_current_user_
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # Include Content OS router
 app.include_router(content_os_router)

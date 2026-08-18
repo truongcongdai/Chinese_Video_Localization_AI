@@ -109,6 +109,7 @@ def test_create_job_remix_applies_visible_transform_defaults(monkeypatch):
     monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 999})
     monkeypatch.setattr(web_app.store, "create_job", fake_create_job)
     monkeypatch.setattr(web_app.store, "adjust_credits", lambda user_id, delta: 998)
+    monkeypatch.setattr(web_app, "_require_license_or_trial", lambda user_id: "trial")
     monkeypatch.setattr(web_app.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(web_app, "_configure_job_run_limit", fake_configure_job_run_limit)
     monkeypatch.setattr(
