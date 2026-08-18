@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+User Management Server for centralized user account management
+Runs alongside License Server on the same machine
+"""
+import sqlite3
+import hashlib
+import secrets
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+from dataclasses import dataclass, asdict
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import uvicorn
+import os
+import bcrypt
+
+# Database setup
+DB_PATH = "users.db"
+
+
+@dataclass
+class User:
+    id: Optional[int]
+    username: str
+    email: str
+    password_hash: str
+    credits: int
+    is_admin: bool
+    created_at: float
+    updated_at: float
+    reset_token: Optional[str] = None
+    reset_token_expiry: Optional[float] = None
+
+
+class UserRegister(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+class UserUpdate(BaseModel):
+    credits: Optional[int] = None
+    is_admin: Optional[bool] = None
+    password: Optional[str] = None
+
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordConfirm(BaseModel):
+    token: str
+    new_password: str
+
+
+app = FastAPI(title="User Management Server", version="1.0.0")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            credits INTEGER DEFAULT 0,
+            is_admin BOOLEAN DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            reset_token TEXT,
+            reset_token_expiry REAL
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password: str) -> str:
+    """Hash password using bcrypt"""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify password against hash"""
+    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+
+
+def generate_reset_token() -> str:
+    """Generate password reset token"""
+    return secrets.token_urlsafe(32)
+
+
+def user_from_row(row) -> User:
+    """Convert database row to User dataclass"""
+    return User(
+        id=row["id"],
+        username=row["username"],
+        email=row["email"],
+        password_hash=row["password_hash"],
+        credits=row["credits"],
+        is_admin=bool(row["is_admin"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        reset_token=row["reset_token"],
+        reset_token_expiry=row["reset_token_expiry"]
+    )
+
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+
+# API Endpoints
+
+@app.get("/")
+async def root():
+    return {"message": "User Management Server v1.0.0", "status": "running"}
+
+
+@app.post("/api/users/register", response_model=Dict)
+async def register_user(user_data: UserRegister):
+    """Register a new user"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Check if username or email already exists
+    cursor.execute("SELECT id FROM users WHERE username = ? OR email = ?", 
+                   (user_data.username, user_data.email))
+    if cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username or email already exists")
+    
+    # Hash password
+    password_hash = hash_password(user_data.password)
+    
+    now = datetime.now().timestamp()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO users (username, email, password_hash, credits, is_admin, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_data.username, user_data.email, password_hash, 25, False, now, now))
+        
+        conn.commit()
+        user_id = cursor.lastrowid
+        conn.close()
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "message": "User registered successfully",
+            "credits": 25
+        }
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username or email already exists")
+
+
+@app.post("/api/users/login", response_model=Dict)
+async def login_user(user_data: UserLogin):
+    """Login user"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE username = ?", (user_data.username,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    user = user_from_row(row)
+    
+    if not verify_password(user_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    return {
+        "success": True,
+        "user_id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "credits": user.credits,
+        "is_admin": user.is_admin
+    }
+
+
+@app.post("/api/users/reset-password", response_model=Dict)
+async def request_password_reset(request: ResetPasswordRequest):
+    """Request password reset"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE email = ?", (request.email,))
+    row = cursor.fetchone()
+    
+    if not row:
+        conn.close()
+        # Don't reveal if email exists
+        return {"success": True, "message": "If email exists, reset token sent"}
+    
+    user = user_from_row(row)
+    
+    # Generate reset token
+    reset_token = generate_reset_token()
+    reset_token_expiry = (datetime.now() + timedelta(hours=1)).timestamp()
+    
+    cursor.execute("""
+        UPDATE users 
+        SET reset_token = ?, reset_token_expiry = ?, updated_at = ?
+        WHERE id = ?
+    """, (reset_token, reset_token_expiry, datetime.now().timestamp(), user.id))
+    
+    conn.commit()
+    conn.close()
+    
+    # TODO: Send email with reset token
+    # For now, return token for testing
+    return {
+        "success": True,
+        "message": "Reset token sent to email",
+        "reset_token": reset_token  # Remove in production
+    }
+
+
+@app.post("/api/users/reset-password/confirm", response_model=Dict)
+async def confirm_password_reset(request: ResetPasswordConfirm):
+    """Confirm password reset with token"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE reset_token = ?", (request.token,))
+    row = cursor.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    
+    user = user_from_row(row)
+    
+    # Check if token is expired
+    if user.reset_token_expiry and datetime.now().timestamp() > user.reset_token_expiry:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+    
+    # Update password
+    password_hash = hash_password(request.new_password)
+    
+    cursor.execute("""
+        UPDATE users 
+        SET password_hash = ?, reset_token = NULL, reset_token_expiry = NULL, updated_at = ?
+        WHERE id = ?
+    """, (password_hash, datetime.now().timestamp(), user.id))
+    
+    conn.commit()
+    conn.close()
+    
+    return {"success": True, "message": "Password reset successfully"}
+
+
+@app.get("/api/users", response_model=List[Dict])
+async def list_users():
+    """List all users (admin only)"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users ORDER BY created_at DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    users = []
+    for row in rows:
+        user = user_from_row(row)
+        user_dict = asdict(user)
+        # Remove sensitive data
+        user_dict.pop("password_hash", None)
+        user_dict.pop("reset_token", None)
+        users.append(user_dict)
+    
+    return users
+
+
+@app.get("/api/users/{user_id}", response_model=Dict)
+async def get_user(user_id: int):
+    """Get user by ID"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = user_from_row(row)
+    user_dict = asdict(user)
+    user_dict.pop("password_hash", None)
+    user_dict.pop("reset_token", None)
+    
+    return user_dict
+
+
+@app.put("/api/users/{user_id}", response_model=Dict)
+async def update_user(user_id: int, update_data: UserUpdate):
+    """Update user (admin only)"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = user_from_row(row)
+    
+    # Build update query
+    updates = []
+    params = []
+    
+    if update_data.credits is not None:
+        updates.append("credits = ?")
+        params.append(update_data.credits)
+    
+    if update_data.is_admin is not None:
+        updates.append("is_admin = ?")
+        params.append(update_data.is_admin)
+    
+    if update_data.password:
+        updates.append("password_hash = ?")
+        params.append(hash_password(update_data.password))
+    
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(datetime.now().timestamp())
+        params.append(user_id)
+        
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, params)
+        conn.commit()
+    
+    conn.close()
+    
+    return {"success": True, "message": "User updated successfully"}
+
+
+@app.delete("/api/users/{user_id}", response_model=Dict)
+async def delete_user(user_id: int):
+    """Delete user (admin only)"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    conn.commit()
+    conn.close()
+    
+    return {"success": True, "message": "User deleted successfully"}
+
+
+if __name__ == "__main__":
+    init_db()
+    uvicorn.run(app, host="0.0.0.0", port=8001)

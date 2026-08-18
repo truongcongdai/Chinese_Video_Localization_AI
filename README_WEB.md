@@ -5,6 +5,20 @@ Web app này dùng lại 100% pipeline xử lý video hiện có (`LocalizationS
 
 ## Chạy thử (local, không qua Docker)
 
+### Cách 1: Tự động sinh file .env (khuyên dùng)
+
+```bash
+cd dist
+python generate_env.py
+# Chỉnh sửa file .env để điền thông tin SMTP, API keys nếu cần
+python run_web.py
+# mở http://localhost:8080
+```
+
+Script `generate_env.py` sẽ tự động sinh file `.env` với các giá trị ngẫu nhiên an toàn cho `WEB_SESSION_SECRET` và các field bảo mật khác. Bạn chỉ cần chỉnh sửa các field cần thiết như SMTP email/password.
+
+### Cách 2: Tạo thủ công
+
 ```bash
 pip install -r requirements.txt
 export WEB_SESSION_SECRET=$(openssl rand -hex 32)

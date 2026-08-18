@@ -177,6 +177,11 @@ $("#register-form").addEventListener("submit", (ev) => {
   doRegister();
 });
 
+$("#send-verification-btn").addEventListener("click", (ev) => {
+  ev.preventDefault();
+  sendVerificationCode();
+});
+
 async function doLogin() {
   $("#auth-error").textContent = "";
   try {
@@ -205,36 +210,59 @@ async function doRegister() {
   } catch (e) { $("#auth-error").textContent = e.message; }
 }
 
-$("#register-send-code").onclick = async () => {
-  const email = $("#register-contact").value.trim();
-  const button = $("#register-send-code");
-  const status = $("#register-code-status");
-  if (!email) {
-    status.textContent = "Nhập email trước khi yêu cầu mã.";
+let countdownInterval = null;
+
+async function sendVerificationCode() {
+  $("#auth-error").textContent = "";
+  const contact = $("#register-contact").value.trim();
+  if (!contact) {
+    $("#auth-error").textContent = "Vui lòng nhập email";
     return;
   }
-  button.disabled = true;
-  status.textContent = "Đang gửi mã xác minh…";
+  
   try {
-    const result = await api("/api/send-verification-code", {
-      method: "POST", body: JSON.stringify({ contact_identifier: email }),
+    const btn = $("#send-verification-btn");
+    btn.disabled = true;
+    btn.textContent = "Đang gửi...";
+    
+    const response = await api("/api/send-verification-code", { 
+      method: "POST", 
+      body: JSON.stringify({ contact_identifier: contact }) 
     });
-    status.textContent = result.message || "Đã gửi mã. Kiểm tra cả thư rác nếu chưa thấy email.";
-    let remaining = 60;
-    button.textContent = `Gửi lại (${remaining}s)`;
-    const timer = setInterval(() => {
-      remaining -= 1;
-      button.textContent = remaining > 0 ? `Gửi lại (${remaining}s)` : "Gửi lại mã";
-      if (remaining <= 0) {
-        clearInterval(timer);
-        button.disabled = false;
+    
+    // Display code only if sending failed (fallback mode)
+    if (response.sent_via === "fallback" && response.code) {
+      $("#verification-code-display").textContent = `⚠️ Không thể gửi email. Mã xác minh: ${response.code} (hết hạn sau ${response.expires_in}s)`;
+    } else {
+      $("#verification-code-display").textContent = `✅ Mã xác minh đã được gửi qua email. Kiểm tra hộp thư của bạn.`;
+    }
+    
+    // Start 60 second countdown
+    let secondsLeft = 60;
+    btn.textContent = `Gửi lại (${secondsLeft}s)`;
+    
+    // Clear any existing countdown
+    if (countdownInterval) {
+      clearInterval(countdownInterval);
+    }
+    
+    countdownInterval = setInterval(() => {
+      secondsLeft--;
+      if (secondsLeft <= 0) {
+        clearInterval(countdownInterval);
+        countdownInterval = null;
+        btn.disabled = false;
+        btn.textContent = "Gửi mã";
+      } else {
+        btn.textContent = `Gửi lại (${secondsLeft}s)`;
       }
     }, 1000);
-  } catch (error) {
-    status.textContent = error.message;
-    button.disabled = false;
+  } catch (e) { 
+    $("#auth-error").textContent = e.message;
+    $("#send-verification-btn").disabled = false;
+    $("#send-verification-btn").textContent = "Gửi mã";
   }
-};
+}
 
 async function startIdentityLogin(provider) {
   try {

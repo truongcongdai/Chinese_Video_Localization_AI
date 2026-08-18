@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+import os
 
 # Database setup
 DB_PATH = Path("licenses.db")
@@ -78,6 +79,11 @@ class LicenseResponse(BaseModel):
 
 app = FastAPI(title="License Server", version="1.0.0")
 
+# Mount static files
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -86,6 +92,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 def get_db():
     conn = sqlite3.connect(str(DB_PATH))

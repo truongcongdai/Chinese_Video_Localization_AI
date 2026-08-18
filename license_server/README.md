@@ -146,20 +146,35 @@ GET /api/licenses/{license_id}/usage
 
 To use the license server with the Chinese Video Localization AI application:
 
-1. Set the `LICENSE_SERVER_URL` environment variable in your `.env` file:
-   ```
-   LICENSE_SERVER_URL=http://your-license-server.com
-   ```
+### Windows (Recommended)
 
-2. Leave it empty to use local database (backward compatibility):
+1. Run `set_license_server.bat` as Administrator:
+   ```bash
+   set_license_server.bat
    ```
-   LICENSE_SERVER_URL=
-   ```
+   Enter your license server URL when prompted.
 
-3. The application will automatically:
-   - Validate licenses with the server
-   - Check usage limits
-   - Update usage statistics
+2. Or set system environment variable:
+   - Right-click "This PC" → Properties → Advanced system settings
+   - Environment Variables → System variables → New
+   - Variable name: `LICENSE_SERVER_URL`
+   - Variable value: `http://your-license-server.com`
+
+### Linux/Mac
+
+Set environment variable:
+```bash
+export LICENSE_SERVER_URL=http://your-license-server.com
+```
+
+### Priority Order
+
+The application checks configuration in this order:
+1. Windows Registry (Windows only)
+2. System environment variable
+3. .env file (for backward compatibility)
+
+Leave empty to use local database (backward compatibility).
 
 ## Admin Panel
 

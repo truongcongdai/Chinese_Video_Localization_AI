@@ -574,6 +574,21 @@ CREATE TABLE IF NOT EXISTS free_trials (
 
 CREATE INDEX IF NOT EXISTS idx_free_trials_user_id ON free_trials(user_id);
 CREATE INDEX IF NOT EXISTS idx_free_trials_machine_id ON free_trials(machine_id);
+
+-- Verification codes for email/phone OTP
+CREATE TABLE IF NOT EXISTS verification_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identifier TEXT NOT NULL,  -- email or phone number
+    code TEXT NOT NULL,
+    code_type TEXT NOT NULL,  -- 'register' or 'reset_password'
+    expires_at REAL NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_codes_identifier ON verification_codes(identifier);
+CREATE INDEX IF NOT EXISTS idx_verification_codes_expires_at ON verification_codes(expires_at);
 """
 
 _MIGRATIONS = [
@@ -687,6 +702,7 @@ _MIGRATIONS = [
      "ALTER TABLE content_os_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
     # Trend Scanner tables (new feature, no migration needed for fresh installs)
     # License system tables (new feature, no migration needed for fresh installs)
+    # Verification codes table (new feature, no migration needed for fresh installs)
 ]
 
 
@@ -2474,7 +2490,76 @@ class Store:
             )
             if cur.rowcount > 0:
                 return True, None
-            return False, "Không thể cập nhật trial"
+
+    # ---- Verification code management ----
+    def create_verification_code(self, identifier: str, code_type: str = "register") -> str:
+        """Create a 6-digit verification code for email/phone"""
+        import random
+        code = str(random.randint(100000, 999999))
+        now = time.time()
+        expires_at = now + (5 * 60)  # 5 minutes expiry
+        
+        with self._connect() as conn:
+            # Delete any existing unused codes for this identifier (invalidate old codes)
+            conn.execute(
+                "DELETE FROM verification_codes WHERE identifier = ? AND used = 0",
+                (identifier,)
+            )
+            
+            # Cleanup old expired and used codes periodically to prevent database bloat
+            self._cleanup_old_verification_codes(conn)
+            
+            # Insert new code
+            conn.execute(
+                """INSERT INTO verification_codes (identifier, code, code_type, expires_at, used, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                (identifier, code, code_type, expires_at, now, now),
+            )
+        
+        return code
+
+    def _cleanup_old_verification_codes(self, conn):
+        """Clean up old verification codes to prevent database bloat"""
+        now = time.time()
+        # Delete codes that are both used AND expired (older than 1 hour)
+        one_hour_ago = now - (60 * 60)
+        conn.execute(
+            "DELETE FROM verification_codes WHERE used = 1 AND expires_at < ?",
+            (one_hour_ago,)
+        )
+        # Delete unused codes that are expired (older than 10 minutes)
+        ten_minutes_ago = now - (10 * 60)
+        conn.execute(
+            "DELETE FROM verification_codes WHERE used = 0 AND expires_at < ?",
+            (ten_minutes_ago,)
+        )
+
+    def verify_code(self, identifier: str, code: str, code_type: str = "register") -> Tuple[bool, Optional[str]]:
+        """Verify a code and mark it as used"""
+        now = time.time()
+        with self._connect() as conn:
+            # Find the most recent unused code for this identifier
+            row = conn.execute(
+                """SELECT * FROM verification_codes 
+                   WHERE identifier = ? AND code = ? AND code_type = ? AND used = 0
+                   ORDER BY created_at DESC LIMIT 1""",
+                (identifier, code, code_type),
+            ).fetchone()
+            
+            if not row:
+                return False, "Mã xác minh không hợp lệ hoặc đã được sử dụng"
+            
+            # Check expiry
+            if row["expires_at"] < now:
+                return False, "Mã xác minh đã hết hạn"
+            
+            # Mark as used
+            conn.execute(
+                "UPDATE verification_codes SET used = 1, updated_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            
+            return True, None
 
     def get_machine_id(self) -> str:
         """Generate a machine ID based on hardware fingerprint"""

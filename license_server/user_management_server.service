@@ -1,0 +1,13 @@
+[Unit]
+Description=User Management Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/license-server
+ExecStart=/usr/bin/python3 /opt/license-server/user_management_server.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

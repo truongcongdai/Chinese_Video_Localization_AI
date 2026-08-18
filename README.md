@@ -55,9 +55,27 @@ agent-reach doctor
 
 ## Configuration
 
-Create a `.env` file in the project root:
+### Quick Setup (Recommended)
+
+For the web UI, use the auto-generated environment setup:
+
+```bash
+cd dist
+python generate_env.py
+# Edit .env to add your API keys if needed
+python run_web.py
+```
+
+This script automatically generates secure random values for `WEB_SESSION_SECRET` and other sensitive fields. You only need to fill in optional fields like SMTP credentials and API keys.
+
+### Manual Setup
+
+Create a `.env` file in the project root or `dist/` folder:
 
 ```env
+# Web UI (REQUIRED for login sessions)
+WEB_SESSION_SECRET=<generate with: openssl rand -hex 32>
+
 # AI Providers (choose one or more)
 GEMINI_API_KEY=your_gemini_api_key
 OPENAI_API_KEY=your_openai_api_key

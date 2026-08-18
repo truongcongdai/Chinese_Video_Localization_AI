@@ -44,25 +44,21 @@ echo [4/6] Building with Nuitka...
 echo This will take 20-60 minutes depending on your CPU...
 echo.
 
+set PYTHONPATH=%PYTHONPATH%;%CD%\src
+
 python -m nuitka ^
     --standalone ^
     --onefile ^
     --enable-plugin=anti-bloat ^
-    --enable-plugin=numpy ^
     --enable-plugin=pylint-warnings ^
     --windows-console-mode=force ^
-    --windows-icon-from-ico=none ^
     --output-filename=ChineseVideoLocalizationAI.exe ^
     --include-data-dir=src/universal_video_ai/web/static=universal_video_ai/web/static ^
     --include-data-file=.env.example=.env.example ^
-    --include-module=universal_video_ai.web.app ^
-    --include-module=universal_video_ai.orchestrator ^
-    --include-module=universal_video_ai.config ^
     --include-package=universal_video_ai ^
     --assume-yes-for-downloads ^
     --show-progress ^
     --show-memory ^
-    --show-release-memory ^
     scripts/run_web.py
 
 if %errorlevel% neq 0 (

@@ -186,8 +186,18 @@
       <button class="btn gradient" type="submit" style="width:100%">🔐 Đăng nhập</button>
     </form>
     <form id="register-form" class="hidden">
-      <div class="field"><label>Email</label><input id="register-contact" type="email" autocomplete="email" required></div>
-      <div class="field"><label>Mã xác minh</label><div style="display:flex;gap:8px"><input id="register-verification-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6 chữ số" required><button class="btn secondary" id="register-send-code" type="button">Gửi mã</button></div><div id="register-code-status" class="muted-help">Mã chỉ được gửi qua email và không hiển thị trên trang.</div></div>
+      <div class="field">
+        <label>Email</label>
+        <div style="display: flex; gap: 8px;">
+          <input id="register-contact" type="email" autocomplete="email" required style="flex: 1;" placeholder="example@gmail.com">
+          <button type="button" id="send-verification-btn" class="btn" style="white-space: nowrap;">Gửi mã</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Mã xác minh (OTP)</label>
+        <input id="register-verification-code" placeholder="Nhập 6 chữ số" required maxlength="6">
+        <div id="verification-code-display" style="color: #00a000; font-size: 14px; font-weight: bold; margin-top: 5px; padding: 8px; background: #f0fff0; border-radius: 4px;"></div>
+      </div>
       <div class="field"><label>Tên đăng nhập</label><input id="register-username" autocomplete="username" required></div>
       <div class="field"><label>Mật khẩu</label><input id="register-password" type="password" autocomplete="new-password" required></div>
       <div class="field"><label>Mã giới thiệu (nếu có)</label><input id="register-referral-code" placeholder="VD: 6QNRHSW"></div>

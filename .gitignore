@@ -14,6 +14,9 @@ tests/test_channel_store_dedup.py
 tests/test_douyin_deep_scan.py
 tests/test_reup_ai_publishing_pack.py
 tests/test_translation_adaptation_resilience.py
+dist/ChineseVideoLocalizationAI.zip
+dist/ChineseVideoLocalizationAI/
+dist.rar
 
 
 logs/*
