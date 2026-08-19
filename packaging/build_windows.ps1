@@ -10,12 +10,13 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 
 $Python = Join-Path $ProjectRoot ".venv-build\Scripts\python.exe"
 if (-not (Test-Path $Python)) {
-    py -3.12 -m venv .venv-build
+    py -3.10 -m venv .venv-build
 }
 
 & $Python -m pip install --upgrade pip wheel setuptools
 & $Python -m pip install -r requirements.txt
 & $Python -m pip install nuitka ordered-set zstandard
+& $Python -m pip install -e .
 
 $FfmpegBin = Join-Path $ProjectRoot "vendor\ffmpeg\bin"
 foreach ($Tool in @("ffmpeg.exe", "ffprobe.exe")) {
@@ -40,6 +41,8 @@ New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
     --include-package=edge_tts `
     --include-package=easyocr `
     --include-package=demucs `
+    --include-package=passlib `
+    --include-package=passlib.handlers `
     --include-package-data=whisper `
     --include-package-data=easyocr `
     --include-data-dir=src/universal_video_ai/web/static=universal_video_ai/web/static `

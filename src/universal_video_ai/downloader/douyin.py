@@ -194,141 +194,105 @@ class DouyinDownloader(BaseDownloader):
 
         return None
 
-    def _download_douyin_scraping(self, video_id: str, output_dir: Path) -> Optional[DownloadResult]:
-        """Download Douyin by scraping HTML from iesdouyin.com"""
-        logger.info(f"🕷️ Scraping Douyin HTML for video: {video_id}")
+    def _download_douyin_api(self, video_id: str, output_dir: Path) -> Optional[DownloadResult]:
+        """Download Douyin using official API (no cookies required)"""
+        logger.info(f"📱 Using Douyin API for video: {video_id}")
 
-        url = f"https://www.iesdouyin.com/share/video/{video_id}/"
-
+        # Use Android app user agent to access the official API
         headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'User-Agent': 'com.ss.android.ugc.aweme/280102 (Linux; U; Android 12; vi_VN; Pixel 6; Build/SQ3A.220605.009; Cronet/TTNetVersion:6d4c8c0d 2021-08-20 QuicVersion:0144d359 2021-07-28)'
         }
 
+        api_url = f"https://aweme.snssdk.com/aweme/v1/feed/?aweme_id={video_id}"
+
         try:
-            # 1. Fetch HTML
-            logger.info(f"🌐 Fetching: {url}")
-            response = requests.get(url, headers=headers, timeout=30)
+            logger.info(f"🌐 Fetching from API: {api_url}")
+            response = requests.get(api_url, headers=headers, timeout=30)
 
             if response.status_code != 200:
-                logger.error(f"❌ Failed to fetch HTML: {response.status_code}")
+                logger.error(f"❌ API request failed: {response.status_code}")
                 return None
 
-            html = response.text
+            data = json.loads(response.text)
+            aweme_list = data.get('aweme_list', [])
 
-            # 2. Extract _ROUTER_DATA
-            match = re.search(r'window\._ROUTER_DATA\s*=\s*({.*?})\s*</script>', html, re.DOTALL)
-            if not match:
-                logger.error("❌ Cannot find _ROUTER_DATA in HTML")
+            if not aweme_list:
+                logger.error("❌ No videos found in API response")
                 return None
 
-            # 3. Parse JSON
-            data_str = unquote(match.group(1))
-            data = json.loads(data_str)
-
-            # 4. Find video URL in loaderData
-            loader_data = data.get('loaderData')
-            if not loader_data:
-                logger.error("❌ loaderData is None")
-                return None
-
-            logger.info(f"🔍 loaderData keys: {list(loader_data.keys())}")
-
-            video_url = None
-            title = f"douyin_{video_id}"
-            uploader = ""
-            thumbnail_url = ""
-            raw_metadata = {}
-
-            # Duyệt qua TẤT CẢ keys, tìm key có video data
-            for key, page_data in loader_data.items():
-                if not isinstance(page_data, dict):
-                    continue
-
-                # Tìm videoInfoRes trong page_data
-                video_info_res = page_data.get('videoInfoRes')
-                if not video_info_res:
-                    continue
-
-                logger.info(f"✅ Found videoInfoRes in key: {key}")
-
-                item_list = video_info_res.get('item_list', [])
-                if not item_list:
-                    logger.warning(f"⚠️ item_list is empty in key: {key}")
-                    continue
-
-                # Lấy item đầu tiên
-                item = item_list[0]
-                video_data = item.get('video')
-                if not video_data:
-                    logger.warning(f"⚠️ video data is None in key: {key}")
-                    continue
-
-                # Thử nhiều field khác nhau để lấy video URL
-                for field_name in ['play_addr', 'download_addr', 'play_addr_h264']:
-                    addr_data = video_data.get(field_name)
-                    if addr_data and isinstance(addr_data, dict):
-                        url_list = addr_data.get('url_list', [])
-                        if url_list and isinstance(url_list, list) and len(url_list) > 0:
-                            video_url = url_list[0]
-                            # Douyin's own returned URL is the WATERMARKED
-                            # stream — it's the same video served from a
-                            # "/playwm/" path ("wm" = watermark). Swapping
-                            # that for "/play/" fetches the identical video
-                            # from Douyin's own CDN with no logo/@handle
-                            # burned into the pixels at all. This is the
-                            # standard, well-documented way every Douyin
-                            # "no watermark" downloader works — it isn't
-                            # re-encoding or cropping anything, just
-                            # requesting the clean stream Douyin already
-                            # serves for in-app playback.
-                            if 'playwm' in video_url:
-                                video_url = video_url.replace('playwm', 'play')
-                                logger.info("🧼 Rewrote play URL to the non-watermarked stream")
-                            logger.info(f"🎥 Found video URL in {field_name}: {video_url[:100]}...")
-                            break
-
-                if video_url:
-                    # Preserve source metadata for the post-render Publishing Pack.
-                    title = item.get('desc', title)
-                    author = item.get('author') or {}
-                    uploader = str(author.get('nickname') or author.get('unique_id') or '')
-                    cover = (video_data.get('cover') or video_data.get('dynamic_cover') or {})
-                    cover_urls = cover.get('url_list') if isinstance(cover, dict) else []
-                    thumbnail_url = str(cover_urls[0]) if cover_urls else ''
-                    raw_metadata = {
-                        "aweme_id": str(item.get("aweme_id") or video_id),
-                        "author": author,
-                        "statistics": item.get("statistics") or {},
-                        "create_time": item.get("create_time"),
-                    }
+            # Find the matching video
+            aweme = None
+            for item in aweme_list:
+                if str(item.get('aweme_id')) == video_id:
+                    aweme = item
                     break
 
-            if not video_url:
-                logger.error("❌ Cannot find video URL in any loaderData key")
+            if not aweme:
+                logger.warning(f"⚠️ Video {video_id} not found in list, using first item")
+                aweme = aweme_list[0]
+
+            video_data = aweme.get('video')
+            if not video_data:
+                logger.error("❌ No video data in API response")
                 return None
 
-            # 5. Download video
+            # Try to get video URL from different fields
+            video_url = None
+            for field_name in ['download_addr', 'play_addr', 'play_addr_h264']:
+                addr_data = video_data.get(field_name)
+                if addr_data and isinstance(addr_data, dict):
+                    url_list = addr_data.get('url_list', [])
+                    if url_list and isinstance(url_list, list) and len(url_list) > 0:
+                        video_url = url_list[0]
+                        logger.info(f"🎥 Found video URL in {field_name}: {video_url[:100]}...")
+                        break
+
+            if not video_url:
+                logger.error("❌ Cannot find video URL in API response")
+                return None
+
+            # Extract metadata
+            title = aweme.get('desc', f"douyin_{video_id}")
+            author = aweme.get('author') or {}
+            uploader = str(author.get('nickname') or author.get('unique_id') or '')
+            
+            cover = (video_data.get('cover') or video_data.get('dynamic_cover') or {})
+            cover_urls = cover.get('url_list') if isinstance(cover, dict) else []
+            thumbnail_url = str(cover_urls[0]) if cover_urls else ''
+
+            raw_metadata = {
+                "aweme_id": str(aweme.get("aweme_id") or video_id),
+                "author": author,
+                "statistics": aweme.get("statistics") or {},
+                "create_time": aweme.get("create_time"),
+            }
+
+            # Download video
             output_path = output_dir / _safe_video_filename(title, video_id)
             logger.info(f"📥 Downloading video to: {output_path}")
-            
-            file_size = self._download_stream_with_resume(video_url, output_path, headers)
+
+            download_headers = {
+                'User-Agent': headers['User-Agent'],
+                'Referer': 'https://www.douyin.com/',
+            }
+
+            file_size = self._download_stream_with_resume(video_url, output_path, download_headers)
             if file_size is None:
                 return None
-            logger.info(f"✅ Downloaded via scraping: {output_path} ({file_size / (1024 * 1024):.2f} MB)")
+
+            logger.info(f"✅ Downloaded via API: {output_path} ({file_size / (1024 * 1024):.2f} MB)")
 
             return DownloadResult(
                 success=True,
                 platform=self.platform,
-                original_url=url,
-                final_url=url,
+                original_url=api_url,
+                final_url=api_url,
                 video_path=output_path,
                 title=title,
                 uploader=uploader,
-                duration=0,
-                width=0,
-                height=0,
+                duration=aweme.get('duration', 0) / 1000 if aweme.get('duration') else 0,
+                width=video_data.get('width', 0),
+                height=video_data.get('height', 0),
                 filesize=file_size,
                 extension="mp4",
                 description=title,
@@ -339,14 +303,14 @@ class DouyinDownloader(BaseDownloader):
         except OSError as e:
             if e.errno == errno.ENOSPC:
                 raise
-            logger.error(f"❌ Scraping error: {e}", exc_info=True)
+            logger.error(f"❌ API download error: {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"❌ Scraping error: {e}", exc_info=True)
+            logger.error(f"❌ API download error: {e}", exc_info=True)
             return None
 
     def download(self, url: str, output_dir: Path) -> DownloadResult:
-        """Smart download with scraping fallback to yt-dlp"""
+        """Smart download with API fallback to yt-dlp"""
         requested_video_id = self._extract_video_id(url)
         logger.info(
             "📥 Downloading Douyin video url=%s requested_video_id=%s output_dir=%s",
@@ -357,7 +321,7 @@ class DouyinDownloader(BaseDownloader):
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Strategy 1: HTML scraping (no login required)
+        # Strategy 1: Official API (no login required)
         resolved_url = self._resolve_short_url(url)
         resolved_video_id = self._extract_video_id(resolved_url)
         if requested_video_id and resolved_video_id and requested_video_id != resolved_video_id:
@@ -369,8 +333,8 @@ class DouyinDownloader(BaseDownloader):
         video_id = requested_video_id or resolved_video_id
 
         if video_id:
-            logger.info("🎯 Strategy 1: Douyin HTML scraping...")
-            result = self._download_douyin_scraping(video_id, output_dir)
+            logger.info("🎯 Strategy 1: Douyin official API...")
+            result = self._download_douyin_api(video_id, output_dir)
             if result and result.success:
                 return result
 
