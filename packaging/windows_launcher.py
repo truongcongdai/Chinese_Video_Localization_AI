@@ -24,6 +24,9 @@ ffmpeg_dir = APP_DIR / "ffmpeg" / "bin"
 if ffmpeg_dir.is_dir():
     os.environ["PATH"] = str(ffmpeg_dir) + os.pathsep + os.environ.get("PATH", "")
 
+# Fix Windows console encoding for subprocess calls (demucs, etc.)
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 env_path = APP_DIR / ".env"
 if not env_path.exists():
     env_path.write_text(
