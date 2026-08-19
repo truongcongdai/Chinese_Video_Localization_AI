@@ -1,4 +1,7 @@
 yt-dlp>=2024.1.1
+# yt-dlp needs this to decrypt Chromium cookies through the Linux keyring
+# when DOUYIN_COOKIES_FROM_BROWSER (or its generic equivalent) is enabled.
+SecretStorage>=3.3.3; sys_platform == "linux"
 playwright>=1.40.0
 python-dotenv>=1.0.1
 demucs

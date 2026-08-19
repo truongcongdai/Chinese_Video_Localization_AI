@@ -128,6 +128,14 @@ def test_fresh_cookie_error_is_actionable_and_not_hidden(tmp_path, monkeypatch):
     assert _is_non_retryable_job_error(RuntimeError("Fresh cookies are needed")) is True
 
 
+def test_missing_secretstorage_is_not_retried():
+    error = RuntimeError(
+        "secretstorage not available as the `secretstorage` module is not installed"
+    )
+
+    assert _is_non_retryable_job_error(error) is True
+
+
 def test_extract_video_url_from_douyin_share_text():
     share_text = (
         "3.07 04/08 :9pm t@r.EH qRk:/ 《狂飙》深度解析78：笑着倒醋，转身开枪！"

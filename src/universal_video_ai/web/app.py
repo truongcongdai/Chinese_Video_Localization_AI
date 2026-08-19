@@ -1379,6 +1379,10 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             # session cannot manufacture the fresh cookie the extractor needs.
             "fresh cookies",
             "Douyin yêu cầu cookie mới",
+            # Browser-cookie decryption cannot start until this optional
+            # Linux keyring dependency is installed. Waiting and repeating
+            # the same yt-dlp invocation cannot change the environment.
+            "secretstorage not available",
         )
     )
 
