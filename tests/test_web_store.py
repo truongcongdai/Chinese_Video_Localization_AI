@@ -121,3 +121,13 @@ def test_registration_device_uses_device_token_not_shared_network_fingerprint(tm
     assert store.claim_registration_device(second_user, "device-one", "different") is False
     assert store.release_registration_devices(first_user) == 1
     assert store.registration_device_owner("device-one") is None
+
+
+def test_local_user_keeps_stable_central_account_id(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    local_id = store.create_user("central-member", "hash", central_user_id=814)
+
+    assert store.central_user_id(local_id) == 814
+
+    store.set_central_user_id(local_id, 912)
+    assert store.central_user_id(local_id) == 912

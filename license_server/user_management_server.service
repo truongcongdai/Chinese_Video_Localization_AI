@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/license-server
+EnvironmentFile=-/opt/license-server/server.env
 ExecStart=/usr/bin/python3 /opt/license-server/user_management_server.py
 Restart=always
 

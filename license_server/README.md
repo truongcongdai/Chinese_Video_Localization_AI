@@ -7,7 +7,8 @@ Lightweight centralized license management system for Chinese Video Localization
 - **Centralized License Management**: Create, manage, and revoke licenses from a single server
 - **Machine Binding**: Bind licenses to specific machines for security
 - **Usage Tracking**: Track jobs and tokens usage per license
-- **Web Admin Panel**: Easy-to-use admin interface for license management
+- **Web Admin Panel**: Authenticated same-origin operations console
+- **Client Telemetry**: Bounded metadata snapshots over the existing public port
 - **REST API**: Simple API for license validation and usage updates
 - **SQLite Database**: No external database required - uses SQLite for minimal resource usage
 
@@ -64,6 +65,29 @@ Lightweight centralized license management system for Chinese Video Localization
    ```
 
 3. Access admin panel at `http://localhost:8000/static/admin.html`
+
+## Production configuration
+
+Create `/opt/license-server/server.env` and keep it readable only by the
+service account:
+
+```env
+LICENSE_ADMIN_SESSION_SECRET=replace-with-openssl-rand-hex-32
+USER_MANAGEMENT_INTERNAL_URL=http://127.0.0.1:8001
+TELEMETRY_RETENTION_DAYS=180
+# Set true after HTTPS is enabled.
+LICENSE_ADMIN_COOKIE_SECURE=false
+```
+
+The admin browser, telemetry ingest and license management all use port 8000.
+The desktop web app remains on `127.0.0.1:8080`; never forward or open 8080 on
+the router/server. Existing EXE releases still authenticate on port 8001, so
+keep that port during a rolling upgrade. It can be bound to `127.0.0.1` only
+after all clients have migrated to an account facade on port 8000.
+
+Telemetry is best effort: changed job metadata is sent in batches of at most
+100; unchanged clients send only a heartbeat. Video, audio, subtitles, API
+keys and local paths are not uploaded.
 
 ## API Endpoints
 

@@ -26,6 +26,7 @@ VERIFICATION_MAX_ATTEMPTS = 5
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    central_user_id INTEGER,
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT,
     credits INTEGER NOT NULL DEFAULT 10,
@@ -575,23 +576,16 @@ CREATE TABLE IF NOT EXISTS free_trials (
 CREATE INDEX IF NOT EXISTS idx_free_trials_user_id ON free_trials(user_id);
 CREATE INDEX IF NOT EXISTS idx_free_trials_machine_id ON free_trials(machine_id);
 
--- Verification codes for email/phone OTP
-CREATE TABLE IF NOT EXISTS verification_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    identifier TEXT NOT NULL,  -- email or phone number
-    code TEXT NOT NULL,
-    code_type TEXT NOT NULL,  -- 'register' or 'reset_password'
-    expires_at REAL NOT NULL,
-    used INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-
+-- Additional lookup indexes for the hashed verification-code table above.
 CREATE INDEX IF NOT EXISTS idx_verification_codes_identifier ON verification_codes(identifier);
 CREATE INDEX IF NOT EXISTS idx_verification_codes_expires_at ON verification_codes(expires_at);
 """
 
 _MIGRATIONS = [
+    # Local EXE databases use their own auto-increment ids. Keep the id issued
+    # by the account server separately so licenses and telemetry never depend
+    # on two unrelated SQLite sequences happening to match.
+    ("users", "central_user_id", "ALTER TABLE users ADD COLUMN central_user_id INTEGER"),
     ("users", "credits", "ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 10"),
     ("users", "is_admin", "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"),
     # Alternative sign-up/sign-in identifiers alongside the original
@@ -974,6 +968,11 @@ class Store:
                     if column == "is_admin":
                         ran_is_admin_migration = True
 
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_central_user_id "
+                "ON users(central_user_id) WHERE central_user_id IS NOT NULL"
+            )
+
             if migrated_legacy_projects:
                 # The first Content OS schema stored platforms as a JSON list.
                 # Preserve that value when adding the canonical singular column;
@@ -1012,13 +1011,13 @@ class Store:
     def create_user(
             self, username: str, password_hash: str, is_admin: bool = False,
             credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
-            referred_by_user_id: Optional[int] = None,
+            referred_by_user_id: Optional[int] = None, central_user_id: Optional[int] = None,
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO users (username, password_hash, credits, is_admin, email, phone, "
-                "referral_code, referred_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (username, password_hash, credits, int(is_admin), email, phone,
+                "INSERT INTO users (central_user_id, username, password_hash, credits, is_admin, email, phone, "
+                "referral_code, referred_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (central_user_id, username, password_hash, credits, int(is_admin), email, phone,
                  self._new_referral_code(conn), referred_by_user_id, time.time()),
             )
             return cur.lastrowid
@@ -1102,6 +1101,22 @@ class Store:
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
             return cur.fetchone()
+
+    def set_central_user_id(self, user_id: int, central_user_id: int) -> None:
+        """Attach the stable account-server id to a local cached account."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET central_user_id = ? WHERE id = ?",
+                (int(central_user_id), int(user_id)),
+            )
+
+    def central_user_id(self, user_id: int) -> int:
+        """Return the remote id, falling back for pre-migration/offline users."""
+        user = self.get_user_by_id(user_id)
+        if not user:
+            return int(user_id)
+        value = user["central_user_id"] if "central_user_id" in user.keys() else None
+        return int(value) if value is not None else int(user_id)
 
     def any_users_exist(self) -> bool:
         with self._connect() as conn:
@@ -2490,76 +2505,6 @@ class Store:
             )
             if cur.rowcount > 0:
                 return True, None
-
-    # ---- Verification code management ----
-    def create_verification_code(self, identifier: str, code_type: str = "register") -> str:
-        """Create a 6-digit verification code for email/phone"""
-        import random
-        code = str(random.randint(100000, 999999))
-        now = time.time()
-        expires_at = now + (5 * 60)  # 5 minutes expiry
-        
-        with self._connect() as conn:
-            # Delete any existing unused codes for this identifier (invalidate old codes)
-            conn.execute(
-                "DELETE FROM verification_codes WHERE identifier = ? AND used = 0",
-                (identifier,)
-            )
-            
-            # Cleanup old expired and used codes periodically to prevent database bloat
-            self._cleanup_old_verification_codes(conn)
-            
-            # Insert new code
-            conn.execute(
-                """INSERT INTO verification_codes (identifier, code, code_type, expires_at, used, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 0, ?, ?)""",
-                (identifier, code, code_type, expires_at, now, now),
-            )
-        
-        return code
-
-    def _cleanup_old_verification_codes(self, conn):
-        """Clean up old verification codes to prevent database bloat"""
-        now = time.time()
-        # Delete codes that are both used AND expired (older than 1 hour)
-        one_hour_ago = now - (60 * 60)
-        conn.execute(
-            "DELETE FROM verification_codes WHERE used = 1 AND expires_at < ?",
-            (one_hour_ago,)
-        )
-        # Delete unused codes that are expired (older than 10 minutes)
-        ten_minutes_ago = now - (10 * 60)
-        conn.execute(
-            "DELETE FROM verification_codes WHERE used = 0 AND expires_at < ?",
-            (ten_minutes_ago,)
-        )
-
-    def verify_code(self, identifier: str, code: str, code_type: str = "register") -> Tuple[bool, Optional[str]]:
-        """Verify a code and mark it as used"""
-        now = time.time()
-        with self._connect() as conn:
-            # Find the most recent unused code for this identifier
-            row = conn.execute(
-                """SELECT * FROM verification_codes 
-                   WHERE identifier = ? AND code = ? AND code_type = ? AND used = 0
-                   ORDER BY created_at DESC LIMIT 1""",
-                (identifier, code, code_type),
-            ).fetchone()
-            
-            if not row:
-                return False, "Mã xác minh không hợp lệ hoặc đã được sử dụng"
-            
-            # Check expiry
-            if row["expires_at"] < now:
-                return False, "Mã xác minh đã hết hạn"
-            
-            # Mark as used
-            conn.execute(
-                "UPDATE verification_codes SET used = 1, updated_at = ? WHERE id = ?",
-                (now, row["id"]),
-            )
-            
-            return True, None
 
     def get_machine_id(self) -> str:
         """Generate a machine ID based on hardware fingerprint"""

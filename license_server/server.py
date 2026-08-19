@@ -5,25 +5,41 @@ Runs on Ubuntu with minimal resources (1 CPU, 512MB RAM)
 """
 import sqlite3
 import hashlib
+import hmac
+import base64
 import secrets
 import json
 import logging
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from dataclasses import dataclass, asdict
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Cookie, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import os
+import requests
 
 # Database setup
 DB_PATH = Path("licenses.db")
 logger = logging.getLogger(__name__)
 VALID_QUOTA_TYPES = {"credit", "time"}
 VALID_LICENSE_STATUSES = {"active", "revoked", "expired"}
+USER_MANAGEMENT_INTERNAL_URL = os.environ.get(
+    "USER_MANAGEMENT_INTERNAL_URL", "http://127.0.0.1:8001"
+).rstrip("/")
+ADMIN_COOKIE_NAME = "license_admin_session"
+ADMIN_SESSION_TTL_SECONDS = int(os.environ.get("LICENSE_ADMIN_SESSION_TTL_SECONDS", "28800"))
+_admin_session_secret = os.environ.get("LICENSE_ADMIN_SESSION_SECRET", "").encode("utf-8")
+_last_telemetry_cleanup_at = 0.0
+if not _admin_session_secret:
+    _admin_session_secret = secrets.token_bytes(32)
+    logger.warning(
+        "LICENSE_ADMIN_SESSION_SECRET is not set; admin sessions will expire when the service restarts"
+    )
 
 @dataclass
 class License:
@@ -77,6 +93,41 @@ class LicenseResponse(BaseModel):
     license: Optional[Dict]
     error: Optional[str]
 
+
+class AdminLogin(BaseModel):
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=512)
+
+
+class TelemetryJob(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    title: Optional[str] = Field(default=None, max_length=500)
+    source_url: Optional[str] = Field(default=None, max_length=2000)
+    source_channel_title: Optional[str] = Field(default=None, max_length=500)
+    status: str = Field(min_length=1, max_length=40)
+    progress_note: Optional[str] = Field(default=None, max_length=1000)
+    error: Optional[str] = Field(default=None, max_length=2000)
+    target_language: Optional[str] = Field(default=None, max_length=40)
+    created_at: float
+    updated_at: float
+    has_video: bool = False
+
+
+class ClientTelemetry(BaseModel):
+    license_key: str = Field(min_length=8, max_length=256)
+    machine_id: str = Field(min_length=1, max_length=256)
+    user_id: int = Field(gt=0)
+    app_version: Optional[str] = Field(default=None, max_length=80)
+    jobs: List[TelemetryJob] = Field(default_factory=list)
+
+
+class AdminCreditSet(BaseModel):
+    set_to: int = Field(ge=0, le=1_000_000_000)
+
+
+class AdminRoleSet(BaseModel):
+    is_admin: bool
+
 app = FastAPI(title="License Server", version="1.0.0")
 
 # Mount static files
@@ -84,11 +135,17 @@ static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# CORS middleware
+# Same-origin is the production path. Explicitly opt in extra browser origins
+# only when a separate trusted frontend is intentionally deployed.
+_cors_origins = [
+    value.strip()
+    for value in os.environ.get("LICENSE_CORS_ALLOWED_ORIGINS", "").split(",")
+    if value.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=bool(_cors_origins) and "*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -99,13 +156,16 @@ async def startup_event():
     init_db()
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode = WAL")
+    cursor.execute("PRAGMA synchronous = NORMAL")
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
@@ -146,9 +206,112 @@ def init_db():
     if "quota_type" not in columns:
         cursor.execute("ALTER TABLE licenses ADD COLUMN quota_type TEXT NOT NULL DEFAULT 'credit'")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS client_nodes (
+            license_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            machine_id TEXT NOT NULL,
+            app_version TEXT,
+            last_seen REAL NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (license_id, machine_id),
+            FOREIGN KEY (license_id) REFERENCES licenses(id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS client_jobs (
+            license_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            machine_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            title TEXT,
+            source_url TEXT,
+            source_channel_title TEXT,
+            status TEXT NOT NULL,
+            progress_note TEXT,
+            error TEXT,
+            target_language TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            has_video INTEGER NOT NULL DEFAULT 0,
+            received_at REAL NOT NULL,
+            PRIMARY KEY (machine_id, job_id),
+            FOREIGN KEY (license_id) REFERENCES licenses(id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_jobs_user_updated "
+        "ON client_jobs(user_id, updated_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_jobs_status ON client_jobs(status)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_nodes_seen ON client_nodes(last_seen DESC)"
+    )
     
     conn.commit()
     conn.close()
+
+
+def _encode_admin_session(user_id: int, username: str) -> str:
+    payload = {
+        "uid": int(user_id),
+        "username": str(username),
+        "exp": int(time.time()) + ADMIN_SESSION_TTL_SECONDS,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=")
+    signature = hmac.new(_admin_session_secret, encoded, hashlib.sha256).hexdigest().encode("ascii")
+    return (encoded + b"." + signature).decode("ascii")
+
+
+def _decode_admin_session(token: str) -> Optional[Dict]:
+    try:
+        encoded, supplied_signature = token.encode("ascii").rsplit(b".", 1)
+        expected_signature = hmac.new(
+            _admin_session_secret, encoded, hashlib.sha256
+        ).hexdigest().encode("ascii")
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            return None
+        padding = b"=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def require_admin_session(
+    license_admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_COOKIE_NAME),
+) -> Dict:
+    session = _decode_admin_session(license_admin_session or "")
+    if not session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin login required")
+    return session
+
+
+def _account_server_request(method: str, path: str, **kwargs) -> requests.Response:
+    try:
+        response = requests.request(
+            method,
+            f"{USER_MANAGEMENT_INTERNAL_URL}{path}",
+            timeout=5,
+            **kwargs,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Account service unavailable for %s: %s", path, exc)
+        raise HTTPException(status_code=503, detail="Account service is unavailable") from exc
+    if response.status_code >= 400:
+        detail = None
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            pass
+        raise HTTPException(status_code=response.status_code, detail=detail or "Account service request failed")
+    return response
 
 def generate_license_key() -> str:
     """Generate a unique license key"""
@@ -207,8 +370,274 @@ def license_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> Dict:
 async def root():
     return {"message": "License Server v1.0.0", "status": "running"}
 
+
+@app.post("/api/admin/login")
+def admin_login(body: AdminLogin, response: Response):
+    account_response = _account_server_request(
+        "POST",
+        "/api/users/login",
+        json={"username": body.username.strip(), "password": body.password},
+    )
+    account = account_response.json()
+    if not account.get("success") or not account.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Tài khoản không có quyền quản trị")
+    token = _encode_admin_session(int(account["user_id"]), str(account.get("username") or body.username))
+    response.set_cookie(
+        ADMIN_COOKIE_NAME,
+        token,
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="strict",
+        secure=os.environ.get("LICENSE_ADMIN_COOKIE_SECURE", "false").lower() in {"1", "true", "yes"},
+        path="/",
+    )
+    return {"ok": True, "username": account.get("username")}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response):
+    response.delete_cookie(ADMIN_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/admin/session")
+def admin_session(session: Dict = Depends(require_admin_session)):
+    return {"authenticated": True, "username": session.get("username")}
+
+
+@app.post("/api/client/telemetry")
+def ingest_client_telemetry(body: ClientTelemetry):
+    """Accept a small, idempotent snapshot from a local EXE over port 8000."""
+    global _last_telemetry_cleanup_at
+    if len(body.jobs) > 100:
+        raise HTTPException(status_code=413, detail="A telemetry batch can contain at most 100 jobs")
+
+    now = time.time()
+    conn = get_db()
+    try:
+        license_row = conn.execute(
+            "SELECT * FROM licenses WHERE license_key = ?", (body.license_key,)
+        ).fetchone()
+        if not license_row:
+            raise HTTPException(status_code=401, detail="Unknown license")
+        license_record = license_from_row(license_row)
+        if license_record.status != "active":
+            raise HTTPException(status_code=403, detail="License is not active")
+        if license_record.expiry_date and license_record.expiry_date < now:
+            raise HTTPException(status_code=403, detail="License has expired")
+        if license_record.machine_id and license_record.machine_id != body.machine_id:
+            raise HTTPException(status_code=403, detail="License is bound to another machine")
+        if license_record.user_id is not None and int(license_record.user_id) != body.user_id:
+            raise HTTPException(status_code=403, detail="License belongs to another account")
+
+        conn.execute(
+            """INSERT INTO client_nodes
+               (license_id, user_id, machine_id, app_version, last_seen, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(license_id, machine_id) DO UPDATE SET
+                   user_id=excluded.user_id,
+                   app_version=excluded.app_version,
+                   last_seen=excluded.last_seen""",
+            (
+                license_record.id,
+                body.user_id,
+                body.machine_id,
+                body.app_version,
+                now,
+                now,
+            ),
+        )
+        for job in body.jobs:
+            conn.execute(
+                """INSERT INTO client_jobs
+                   (license_id, user_id, machine_id, job_id, title, source_url,
+                    source_channel_title, status, progress_note, error, target_language,
+                    created_at, updated_at, has_video, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(machine_id, job_id) DO UPDATE SET
+                     license_id=excluded.license_id,
+                     user_id=excluded.user_id,
+                     title=excluded.title,
+                     source_url=excluded.source_url,
+                     source_channel_title=excluded.source_channel_title,
+                     status=excluded.status,
+                     progress_note=excluded.progress_note,
+                     error=excluded.error,
+                     target_language=excluded.target_language,
+                     created_at=excluded.created_at,
+                     updated_at=excluded.updated_at,
+                     has_video=excluded.has_video,
+                     received_at=excluded.received_at""",
+                (
+                    license_record.id,
+                    body.user_id,
+                    body.machine_id,
+                    job.id,
+                    job.title,
+                    job.source_url,
+                    job.source_channel_title,
+                    job.status,
+                    job.progress_note,
+                    job.error,
+                    job.target_language,
+                    job.created_at,
+                    job.updated_at,
+                    int(job.has_video),
+                    now,
+                ),
+            )
+        if now - _last_telemetry_cleanup_at >= 3600:
+            retention_days = max(7, int(os.environ.get("TELEMETRY_RETENTION_DAYS", "180")))
+            conn.execute(
+                "DELETE FROM client_jobs WHERE updated_at < ?",
+                (now - retention_days * 86400,),
+            )
+            _last_telemetry_cleanup_at = now
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "accepted": len(body.jobs), "server_time": now}
+
+
+@app.get("/api/admin/users")
+def admin_users(_session: Dict = Depends(require_admin_session)):
+    return _account_server_request("GET", "/api/users").json()
+
+
+@app.put("/api/admin/users/{user_id}/role")
+def admin_set_role(
+    user_id: int,
+    body: AdminRoleSet,
+    _session: Dict = Depends(require_admin_session),
+):
+    return _account_server_request(
+        "PUT", f"/api/users/{user_id}", json={"is_admin": body.is_admin}
+    ).json()
+
+
+@app.post("/api/admin/users/{user_id}/credits")
+def admin_set_credits(
+    user_id: int,
+    body: AdminCreditSet,
+    _session: Dict = Depends(require_admin_session),
+):
+    current = _account_server_request("GET", f"/api/users/{user_id}").json()
+    delta = body.set_to - int(current.get("credits", 0))
+    return _account_server_request(
+        "POST", f"/api/users/{user_id}/credits", json={"amount": delta}
+    ).json()
+
+
+@app.get("/api/admin/stats")
+def central_admin_stats(_session: Dict = Depends(require_admin_session)):
+    now = time.time()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT status, COUNT(*) count FROM client_jobs GROUP BY status").fetchall()
+        by_status = {row["status"]: int(row["count"]) for row in rows}
+        online = conn.execute(
+            "SELECT COUNT(*) count FROM client_nodes WHERE last_seen >= ?", (now - 300,)
+        ).fetchone()["count"]
+        jobs_last_7d = conn.execute(
+            "SELECT COUNT(*) count FROM client_jobs WHERE created_at >= ?", (now - 7 * 86400,)
+        ).fetchone()["count"]
+        reporting_users = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) count FROM client_nodes"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    return {
+        "reporting_users": int(reporting_users),
+        "total_jobs": sum(by_status.values()),
+        "jobs_by_status": by_status,
+        "jobs_last_7d": int(jobs_last_7d),
+        "online_devices": int(online),
+    }
+
+
+@app.get("/api/admin/user-activity-summary")
+def central_activity_summaries(_session: Dict = Depends(require_admin_session)):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT user_id, status, COUNT(*) count FROM client_jobs GROUP BY user_id, status"
+        ).fetchall()
+        seen_rows = conn.execute(
+            "SELECT user_id, MAX(last_seen) last_seen, COUNT(*) device_count "
+            "FROM client_nodes GROUP BY user_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    result: Dict[str, Dict] = {}
+    for row in rows:
+        key = str(row["user_id"])
+        item = result.setdefault(
+            key, {"user_id": row["user_id"], "total_jobs": 0, "queue_count": 0, "by_status": {}}
+        )
+        count = int(row["count"])
+        item["by_status"][row["status"]] = count
+        item["total_jobs"] += count
+        if row["status"] in {"queued", "running", "review"}:
+            item["queue_count"] += count
+    for row in seen_rows:
+        key = str(row["user_id"])
+        item = result.setdefault(
+            key, {"user_id": row["user_id"], "total_jobs": 0, "queue_count": 0, "by_status": {}}
+        )
+        item["last_seen"] = row["last_seen"]
+        item["device_count"] = int(row["device_count"])
+        item["online"] = float(row["last_seen"]) >= time.time() - 300
+    return result
+
+
+@app.get("/api/admin/users/{user_id}/activity")
+def central_user_activity(
+    user_id: int,
+    limit: int = 100,
+    _session: Dict = Depends(require_admin_session),
+):
+    limit = max(1, min(limit, 200))
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM client_jobs WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        counts = conn.execute(
+            "SELECT status, COUNT(*) count FROM client_jobs WHERE user_id = ? GROUP BY status",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_status = {row["status"]: int(row["count"]) for row in counts}
+    return {
+        "user_id": user_id,
+        "total_jobs": sum(by_status.values()),
+        "queue_count": sum(by_status.get(name, 0) for name in ("queued", "running", "review")),
+        "by_status": by_status,
+        "jobs": [
+            {
+                "id": row["job_id"],
+                "title": row["title"],
+                "source_url": row["source_url"],
+                "source_channel_title": row["source_channel_title"],
+                "status": row["status"],
+                "progress_note": row["progress_note"],
+                "error": row["error"],
+                "target_language": row["target_language"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "has_video": bool(row["has_video"]),
+            }
+            for row in rows
+        ],
+    }
+
 @app.post("/api/licenses", response_model=Dict)
-async def create_license(license_data: LicenseCreate):
+async def create_license(
+    license_data: LicenseCreate,
+    _session: Dict = Depends(require_admin_session),
+):
     """Create a new license"""
     if license_data.quota_type not in VALID_QUOTA_TYPES:
         raise HTTPException(status_code=400, detail="quota_type must be credit or time")
@@ -399,7 +828,7 @@ async def update_usage(license_id: int, usage_data: Dict):
     return {"success": True}
 
 @app.get("/api/licenses", response_model=List[Dict])
-async def list_licenses():
+async def list_licenses(_session: Dict = Depends(require_admin_session)):
     """List all licenses"""
     conn = get_db()
     cursor = conn.cursor()
@@ -430,7 +859,10 @@ async def get_license_by_user(user_id: int):
     return {"license": payload}
 
 @app.get("/api/licenses/{license_id}", response_model=Dict)
-async def get_license(license_id: int):
+async def get_license(
+    license_id: int,
+    _session: Dict = Depends(require_admin_session),
+):
     """Get license by ID"""
     conn = get_db()
     cursor = conn.cursor()
@@ -446,7 +878,11 @@ async def get_license(license_id: int):
     return payload
 
 @app.put("/api/licenses/{license_id}", response_model=Dict)
-async def update_license(license_id: int, update_data: LicenseUpdate):
+async def update_license(
+    license_id: int,
+    update_data: LicenseUpdate,
+    _session: Dict = Depends(require_admin_session),
+):
     """Update license"""
     conn = get_db()
     cursor = conn.cursor()
@@ -520,7 +956,10 @@ async def update_license(license_id: int, update_data: LicenseUpdate):
     return {"success": True, "message": "License updated successfully"}
 
 @app.delete("/api/licenses/{license_id}", response_model=Dict)
-async def delete_license(license_id: int):
+async def delete_license(
+    license_id: int,
+    _session: Dict = Depends(require_admin_session),
+):
     """Delete license"""
     conn = get_db()
     cursor = conn.cursor()
@@ -534,7 +973,10 @@ async def delete_license(license_id: int):
     return {"success": True, "message": "License deleted successfully"}
 
 @app.get("/api/licenses/{license_id}/usage")
-async def get_license_usage(license_id: int):
+async def get_license_usage(
+    license_id: int,
+    _session: Dict = Depends(require_admin_session),
+):
     """Get license usage statistics"""
     conn = get_db()
     cursor = conn.cursor()
@@ -556,6 +998,47 @@ async def get_license_usage(license_id: int):
         })
     
     return {"license_id": license_id, "usage": usage}
+
+
+# Authenticated, same-origin facade used by the admin panel. The legacy
+# /api/licenses routes remain available for older EXE builds during rollout;
+# new administrative clients should only use these routes.
+@app.get("/api/admin/licenses", response_model=List[Dict])
+async def admin_list_licenses(_session: Dict = Depends(require_admin_session)):
+    return await list_licenses()
+
+
+@app.post("/api/admin/licenses", response_model=Dict)
+async def admin_create_license(
+    body: LicenseCreate,
+    _session: Dict = Depends(require_admin_session),
+):
+    return await create_license(body)
+
+
+@app.put("/api/admin/licenses/{license_id}", response_model=Dict)
+async def admin_update_license(
+    license_id: int,
+    body: LicenseUpdate,
+    _session: Dict = Depends(require_admin_session),
+):
+    return await update_license(license_id, body)
+
+
+@app.delete("/api/admin/licenses/{license_id}", response_model=Dict)
+async def admin_delete_license(
+    license_id: int,
+    _session: Dict = Depends(require_admin_session),
+):
+    return await delete_license(license_id)
+
+
+@app.get("/api/admin/licenses/{license_id}/usage")
+async def admin_license_usage(
+    license_id: int,
+    _session: Dict = Depends(require_admin_session),
+):
+    return await get_license_usage(license_id)
 
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 

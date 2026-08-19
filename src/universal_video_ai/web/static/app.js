@@ -8,6 +8,7 @@ let pollTimer = null;
 let pollTimer2 = null;
 let selectedTopupPackage = null;
 let selectedHistoryJobs = new Set();
+const historyJobsById = new Map();
 let latestResultJobId = null;
 let _confirmResolver = null;
 
@@ -385,6 +386,7 @@ async function loadLicenseInfo() {
     const licenseInfo = $("#license-info");
     const trialInfo = $("#trial-info");
     const licenseActions = $("#license-actions");
+    const licenseCard = $("#license-card");
     
     if (licenseRes.license) {
       const l = licenseRes.license;
@@ -393,6 +395,7 @@ async function loadLicenseInfo() {
         !l.validation_error &&
         (!l.expiry_date || l.expiry_date > Date.now() / 1000)
       );
+      licenseCard.classList.toggle("hidden", licenseIsActive);
       licenseActions.classList.toggle("hidden", licenseIsActive);
       const usage = l.usage || { tokens_used: 0, jobs_completed: 0 };
       const isTimePlan = l.quota_type === "time";
@@ -417,6 +420,7 @@ async function loadLicenseInfo() {
         </div>
       `;
     } else {
+      licenseCard.classList.remove("hidden");
       licenseActions.classList.remove("hidden");
       $("#userbar-credits").textContent = `💳 ${currentMe?.credits ?? 0}`;
       $("#stat-credits").textContent = currentMe?.credits ?? 0;
@@ -433,6 +437,7 @@ async function loadLicenseInfo() {
       trialInfo.innerHTML = "";
     }
   } catch (e) {
+    $("#license-card")?.classList.remove("hidden");
     $("#license-actions")?.classList.remove("hidden");
     console.error("Failed to load license info:", e);
   }
@@ -2903,6 +2908,7 @@ async function refreshJobs() {
     $("#latest-result-card").classList.add("hidden");
   }
   window._jobsById = Object.fromEntries(jobs.map(j => [j.id, j]));
+  jobs.forEach(job => historyJobsById.set(job.id, job));
   for (const job of jobs) {
     const prevStatus = _lastKnownStatus[job.id];
     if (prevStatus && prevStatus !== job.status && (job.status === "done" || job.status === "error")) {
@@ -3042,9 +3048,15 @@ async function refreshJobs() {
 function updateHistorySelection(jobs = []) {
   const visibleIds = jobs.map(j => j.id);
   const selectedVisible = visibleIds.filter(id => selectedHistoryJobs.has(id)).length;
-  $("#history-selected-count").textContent = selectedHistoryJobs.size ? `${selectedHistoryJobs.size} mục đã chọn` : "";
+  const retryableCount = [...selectedHistoryJobs].filter(id => {
+    const job = historyJobsById.get(id);
+    return job && ["done", "error", "cancelled"].includes(job.status) && !job.is_content_os;
+  }).length;
+  $("#history-selected-count").textContent = selectedHistoryJobs.size ? `${selectedHistoryJobs.size} mục đã chọn` : "Chưa chọn mục";
   $("#history-bulk-delete").disabled = selectedHistoryJobs.size === 0;
   $("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;
+  $("#history-bulk-retry").disabled = retryableCount === 0;
+  $("#history-bulk-retry").textContent = retryableCount ? `Chạy lại (${retryableCount})` : "Chạy lại đã chọn";
   $("#history-select-all").checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
   $("#history-select-all").indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
 }
@@ -3078,6 +3090,36 @@ $("#history-bulk-download").onclick = async () => {
   const ids = [...selectedHistoryJobs];
   if (!ids.length) return;
   await downloadJobsZip(ids);
+};
+$("#history-bulk-retry").onclick = async () => {
+  const ids = [...selectedHistoryJobs];
+  if (!ids.length) return;
+  const retryable = ids.filter(id => {
+    const job = historyJobsById.get(id);
+    return job && ["done", "error", "cancelled"].includes(job.status) && !job.is_content_os;
+  });
+  if (!retryable.length) return;
+  const accepted = await showConfirmDialog(
+    `Chạy lại ${retryable.length} video?`,
+    "Mỗi video sẽ tạo một job mới với cấu hình cũ và tiêu credit như một job bình thường. Bản cũ vẫn được giữ trong lịch sử.",
+    `Chạy lại ${retryable.length} video`,
+  );
+  if (!accepted) return;
+  const button = $("#history-bulk-retry");
+  button.disabled = true;
+  try {
+    const result = await api("/api/jobs/bulk-retry", {
+      method: "POST",
+      body: JSON.stringify({ job_ids: retryable }),
+    });
+    selectedHistoryJobs.clear();
+    await Promise.all([refreshJobs(), refreshMe()]);
+    if (result.skipped) alert(`Đã tạo ${result.created} job mới; bỏ qua ${result.skipped} mục không thể chạy lại.`);
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    button.disabled = false;
+  }
 };
 
 async function downloadJobsZip(ids) {

@@ -53,6 +53,10 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
 
 
+class CreditsAdjust(BaseModel):
+    amount: int
+
+
 class ResetPasswordRequest(BaseModel):
     email: str
 
@@ -64,11 +68,17 @@ class ResetPasswordConfirm(BaseModel):
 
 app = FastAPI(title="User Management Server", version="1.0.0")
 
-# CORS middleware
+# The desktop and license services call this API server-to-server. Browser
+# access is disabled by default; opt in only a known management origin.
+_cors_origins = [
+    value.strip()
+    for value in os.environ.get("USER_MANAGEMENT_CORS_ALLOWED_ORIGINS", "").split(",")
+    if value.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=bool(_cors_origins) and "*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -98,6 +108,14 @@ def init_db():
             reset_token_expiry REAL
         )
     """)
+
+    # Preserve a recoverable admin account across upgrades. Fresh central
+    # installs previously created every account as a regular user even though
+    # the local EXE promoted its first account.
+    if not cursor.execute("SELECT 1 FROM users WHERE is_admin = 1 LIMIT 1").fetchone():
+        first = cursor.execute("SELECT id FROM users ORDER BY created_at ASC LIMIT 1").fetchone()
+        if first:
+            cursor.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (first["id"],))
     
     conn.commit()
     conn.close()
@@ -155,6 +173,7 @@ async def register_user(user_data: UserRegister):
     cursor = conn.cursor()
     
     # Check if username or email already exists
+    is_first_user = cursor.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
     cursor.execute("SELECT id FROM users WHERE username = ? OR email = ?", 
                    (user_data.username, user_data.email))
     if cursor.fetchone():
@@ -170,7 +189,7 @@ async def register_user(user_data: UserRegister):
         cursor.execute("""
             INSERT INTO users (username, email, password_hash, credits, is_admin, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_data.username, user_data.email, password_hash, 25, False, now, now))
+        """, (user_data.username, user_data.email, password_hash, 25, is_first_user, now, now))
         
         conn.commit()
         user_id = cursor.lastrowid
@@ -180,7 +199,8 @@ async def register_user(user_data: UserRegister):
             "success": True,
             "user_id": user_id,
             "message": "User registered successfully",
-            "credits": 25
+            "credits": 25,
+            "is_admin": is_first_user,
         }
     except sqlite3.IntegrityError:
         conn.close()
@@ -376,6 +396,24 @@ async def update_user(user_id: int, update_data: UserUpdate):
     return {"success": True, "message": "User updated successfully"}
 
 
+@app.post("/api/users/{user_id}/credits", response_model=Dict)
+async def adjust_user_credits(user_id: int, body: CreditsAdjust):
+    """Internal account-service endpoint used by the public port-8000 facade."""
+    conn = get_db()
+    cursor = conn.execute(
+        "UPDATE users SET credits = MAX(0, credits + ?), updated_at = ? WHERE id = ?",
+        (body.amount, datetime.now().timestamp(), user_id),
+    )
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    conn.commit()
+    row = conn.execute("SELECT credits FROM users WHERE id = ?", (user_id,)).fetchone()
+    credits = int(row["credits"])
+    conn.close()
+    return {"success": True, "credits": credits}
+
+
 @app.delete("/api/users/{user_id}", response_model=Dict)
 async def delete_user(user_id: int):
     """Delete user (admin only)"""
@@ -396,4 +434,7 @@ async def delete_user(user_id: int):
 
 if __name__ == "__main__":
     init_db()
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Keep the current default during the rolling EXE upgrade: older builds
+    # still authenticate directly on 8001. Set USER_MANAGEMENT_HOST=127.0.0.1
+    # only after those clients have moved behind the port-8000 facade.
+    uvicorn.run(app, host=os.environ.get("USER_MANAGEMENT_HOST", "0.0.0.0"), port=8001)

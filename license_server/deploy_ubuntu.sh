@@ -43,7 +43,7 @@ source venv/bin/activate
 
 echo -e "${GREEN}[5/8] Installing Python dependencies...${NC}"
 pip install --upgrade pip
-pip install fastapi uvicorn[standard] pydantic python-multipart
+pip install fastapi uvicorn[standard] pydantic python-multipart requests bcrypt
 
 echo -e "${GREEN}[6/8] Copying application files...${NC}"
 # Copy server.py and static files to the server
@@ -65,6 +65,7 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment="PATH=$APP_DIR/venv/bin"
+EnvironmentFile=-$APP_DIR/server.env
 ExecStart=$APP_DIR/venv/bin/uvicorn server:app --host 0.0.0.0 --port $PORT
 Restart=always
 RestartSec=10

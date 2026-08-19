@@ -44,9 +44,10 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     port = int(os.environ.get("WEB_PORT", "8080"))
+    host = os.environ.get("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
     uvicorn.run(
         "universal_video_ai.web.app:app",
-        host="0.0.0.0",
+        host=host,
         port=port,
         log_level=os.environ.get("LOG_LEVEL", "info").lower(),
     )

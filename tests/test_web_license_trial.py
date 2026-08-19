@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 import time
 
 import pytest
@@ -106,11 +107,14 @@ def test_central_login_refreshes_cached_admin_role(monkeypatch):
     }
 
 
-def test_license_admin_updates_role_at_the_user_source():
+def test_license_admin_uses_authenticated_same_origin_facade():
     html = (web_app._REPO_ROOT / "license_server" / "static" / "admin.html").read_text(encoding="utf-8")
 
-    assert "`${USER_MANAGEMENT_API_BASE}/${userId}`" in html
-    assert "usersApiSource === 'user-management'" in html
+    assert "const ADMIN_API = `${location.origin}/api/admin`;" in html
+    assert "`${ADMIN_API}/users/${id}/role`" in html
+    assert ":8080/api" not in html
+    assert ":8001/api" not in html
+    assert "credentials:'same-origin'" in html
 
 
 def test_failed_registration_email_never_exposes_otp(monkeypatch):
@@ -152,9 +156,43 @@ def test_active_license_hides_activation_and_trial_actions():
     html = (web_app._REPO_ROOT / "src" / "universal_video_ai" / "web" / "static" / "index.html").read_text(encoding="utf-8")
     app_js = (web_app._REPO_ROOT / "src" / "universal_video_ai" / "web" / "static" / "app.js").read_text(encoding="utf-8")
 
+    assert 'class="card hidden" id="license-card"' in html
     assert 'id="license-actions"' in html
+    assert 'licenseCard.classList.toggle("hidden", licenseIsActive);' in app_js
     assert 'licenseActions.classList.toggle("hidden", licenseIsActive);' in app_js
+    assert 'licenseCard.classList.remove("hidden");' in app_js
     assert 'licenseActions.classList.remove("hidden");' in app_js
+
+
+def test_bulk_retry_clones_eligible_selected_jobs_and_charges_once(monkeypatch):
+    jobs = {
+        "done-1": SimpleNamespace(id="done-1", user_id=7, status="done"),
+        "error-1": SimpleNamespace(id="error-1", user_id=7, status="error"),
+        "running-1": SimpleNamespace(id="running-1", user_id=7, status="running"),
+    }
+    created = []
+    charged = []
+    scheduled = []
+    monkeypatch.setattr(web_app.store, "get_job", lambda job_id: jobs.get(job_id))
+    monkeypatch.setattr(web_app.store, "get_user_by_id", lambda user_id: {"credits": 10})
+    monkeypatch.setattr(
+        web_app.store,
+        "retry_job",
+        lambda job_id, user_id: created.append(SimpleNamespace(id=f"new-{job_id}")) or created[-1],
+    )
+    monkeypatch.setattr(web_app, "_is_content_os_job", lambda job: False)
+    monkeypatch.setattr(web_app, "_job_credit_cost", lambda user_id: 1)
+    monkeypatch.setattr(web_app, "_adjust_user_credits", lambda user_id, delta: charged.append((user_id, delta)))
+    monkeypatch.setattr(web_app, "_schedule_retried_job", lambda old, new: scheduled.append((old.id, new.id)))
+
+    result = asyncio.run(web_app.bulk_retry_jobs(
+        web_app.BulkDeleteBody(job_ids=list(jobs)), user_id=7,
+    ))
+
+    assert result["created"] == 2
+    assert result["skipped"] == 1
+    assert charged == [(7, -2)]
+    assert scheduled == [("done-1", "new-done-1"), ("error-1", "new-error-1")]
 
 
 def test_windows_build_embeds_public_license_server_default():

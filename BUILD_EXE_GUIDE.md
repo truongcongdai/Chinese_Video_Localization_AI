@@ -102,6 +102,7 @@ Project này có thể đóng gói thành file .exe để chạy trên Windows m
 2. Mở file .env và cấu hình:
    ```env
    WEB_SESSION_SECRET=your-secret-key-here
+   WEB_HOST=127.0.0.1
    WEB_PORT=8080
    ```
 
@@ -111,6 +112,7 @@ Project này có thể đóng gói thành file .exe để chạy trên Windows m
 2. Thiết lập các biến môi trường quan trọng:
    ```env
    WEB_SESSION_SECRET=your-secret-key-here
+   WEB_HOST=127.0.0.1
    WEB_PORT=8080
    LOG_LEVEL=INFO
    ```

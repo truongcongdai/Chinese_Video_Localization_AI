@@ -259,8 +259,21 @@ def get_user_management_server_url() -> str:
 USER_MANAGEMENT_SERVER_URL = get_user_management_server_url()
 USE_USER_MANAGEMENT_SERVER = bool(USER_MANAGEMENT_SERVER_URL)
 USER_MANAGEMENT_MIRROR_ENABLED = bool(os.environ.get("USER_MANAGEMENT_SERVER_URL", "").strip()) or sys.platform == "win32"
+CLIENT_TELEMETRY_ENABLED = (
+    os.environ.get("CLIENT_TELEMETRY_ENABLED", "true").lower() not in {"0", "false", "no"}
+)
+CLIENT_TELEMETRY_INTERVAL_SECONDS = max(
+    30, int(os.environ.get("CLIENT_TELEMETRY_INTERVAL_SECONDS", "90"))
+)
+CLIENT_TELEMETRY_HEARTBEAT_SECONDS = max(
+    CLIENT_TELEMETRY_INTERVAL_SECONDS,
+    int(os.environ.get("CLIENT_TELEMETRY_HEARTBEAT_SECONDS", "180")),
+)
 
 store = Store(_DB_PATH)
+_telemetry_task: Optional[asyncio.Task] = None
+_telemetry_snapshot_hashes: Dict[str, str] = {}
+_telemetry_last_sent: Dict[str, float] = {}
 
 
 def validate_license_with_server(license_key: str, machine_id: str) -> Optional[Dict]:
@@ -289,22 +302,100 @@ def update_license_usage_on_server(license_id: int, machine_id: str, jobs_delta:
     """Update license usage on centralized license server"""
     if not USE_LICENSE_SERVER:
         return False
-    
     try:
         response = requests.post(
             f"{LICENSE_SERVER_URL}/api/licenses/{license_id}/usage",
             json={
                 "machine_id": machine_id,
                 "jobs_delta": jobs_delta,
-                "tokens_delta": tokens_delta
+                "tokens_delta": tokens_delta,
             },
-            timeout=10
+            timeout=10,
         )
-        
         return response.status_code == 200
     except Exception as e:
         logger.error(f"Failed to update license usage on server: {e}")
         return False
+
+
+def _telemetry_payloads() -> List[Dict[str, Any]]:
+    """Build bounded metadata snapshots; media and local paths never leave the EXE."""
+    machine_id = store.get_machine_id()
+    payloads: List[Dict[str, Any]] = []
+    seen_users: set[int] = set()
+    for license_record in store.list_licenses(status="active", limit=100):
+        if license_record.user_id is None or license_record.user_id in seen_users:
+            continue
+        local_user_id = int(license_record.user_id)
+        seen_users.add(local_user_id)
+        activity = store.admin_user_activity(local_user_id, limit=100)
+        jobs = []
+        for job in activity.get("jobs", []):
+            jobs.append({
+                "id": str(job.get("id") or "")[:80],
+                "title": (str(job["title"])[:500] if job.get("title") else None),
+                "source_url": (str(job["source_url"])[:2000] if job.get("source_url") else None),
+                "source_channel_title": (
+                    str(job["source_channel_title"])[:500]
+                    if job.get("source_channel_title") else None
+                ),
+                "status": str(job.get("status") or "unknown")[:40],
+                "progress_note": (
+                    str(job["progress_note"])[:1000] if job.get("progress_note") else None
+                ),
+                "error": (str(job["error"])[:2000] if job.get("error") else None),
+                "target_language": (
+                    str(job["target_language"])[:40] if job.get("target_language") else None
+                ),
+                "created_at": float(job.get("created_at") or 0),
+                "updated_at": float(job.get("updated_at") or job.get("created_at") or 0),
+                "has_video": bool(job.get("has_video")),
+            })
+        payloads.append({
+            "license_key": license_record.license_key,
+            "machine_id": machine_id,
+            "user_id": store.central_user_id(local_user_id),
+            "app_version": os.environ.get("APP_VERSION", "local-exe"),
+            "jobs": jobs,
+        })
+    return payloads
+
+
+def _push_client_telemetry_once() -> None:
+    now = time.time()
+    for payload in _telemetry_payloads():
+        identity = f"{payload['user_id']}:{payload['machine_id']}"
+        snapshot_bytes = json.dumps(payload["jobs"], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        snapshot_hash = hashlib.sha256(snapshot_bytes).hexdigest()
+        unchanged = _telemetry_snapshot_hashes.get(identity) == snapshot_hash
+        if unchanged and now - _telemetry_last_sent.get(identity, 0) < CLIENT_TELEMETRY_HEARTBEAT_SECONDS:
+            continue
+        # Heartbeats do not resend the job list. Changed snapshots are bounded
+        # at 100 rows, keeping bandwidth and server write locks predictable.
+        outgoing = payload if not unchanged else {**payload, "jobs": []}
+        try:
+            response = requests.post(
+                f"{LICENSE_SERVER_URL}/api/client/telemetry",
+                json=outgoing,
+                timeout=(2, 4),
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.debug("Telemetry deferred: %s", exc)
+            continue
+        _telemetry_snapshot_hashes[identity] = snapshot_hash
+        _telemetry_last_sent[identity] = now
+
+
+async def _client_telemetry_loop() -> None:
+    machine_id = store.get_machine_id()
+    # Stable per-device jitter prevents a new release from making every EXE
+    # hit port 8000 at the same second.
+    initial_delay = 12 + int(hashlib.sha256(machine_id.encode("utf-8")).hexdigest()[:4], 16) % 30
+    await asyncio.sleep(initial_delay)
+    while True:
+        await asyncio.to_thread(_push_client_telemetry_once)
+        await asyncio.sleep(CLIENT_TELEMETRY_INTERVAL_SECONDS)
 
 
 def get_license_for_user_on_server(user_id: int) -> Optional[Dict[str, Any]]:
@@ -313,7 +404,7 @@ def get_license_for_user_on_server(user_id: int) -> Optional[Dict[str, Any]]:
         return None
     try:
         response = requests.get(
-            f"{LICENSE_SERVER_URL}/api/licenses/by-user/{user_id}", timeout=10
+            f"{LICENSE_SERVER_URL}/api/licenses/by-user/{store.central_user_id(user_id)}", timeout=10
         )
         if getattr(response, "status_code", 200) == 404:
             return None
@@ -364,7 +455,7 @@ def _mirror_user_credit_delta(user_id: int, delta: int) -> None:
         return
     try:
         response = requests.post(
-            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{user_id}/credits",
+            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{store.central_user_id(user_id)}/credits",
             json={"amount": delta}, timeout=3,
         )
         response.raise_for_status()
@@ -378,7 +469,7 @@ def _mirror_user_role(user_id: int, is_admin: bool) -> None:
         return
     try:
         response = requests.put(
-            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{user_id}",
+            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{store.central_user_id(user_id)}",
             json={"is_admin": is_admin}, timeout=3,
         )
         response.raise_for_status()
@@ -612,6 +703,30 @@ def recover_jobs_interrupted_by_restart() -> None:
     recovered = store.fail_interrupted_jobs(JOB_COST_CREDITS)
     if recovered:
         logger.warning("Recovered %s interrupted jobs", recovered)
+
+
+@app.on_event("startup")
+async def start_client_telemetry() -> None:
+    global _telemetry_task
+    if not (USE_LICENSE_SERVER and CLIENT_TELEMETRY_ENABLED):
+        return
+    if _telemetry_task is None or _telemetry_task.done():
+        _telemetry_task = asyncio.create_task(
+            _client_telemetry_loop(), name="client-telemetry"
+        )
+
+
+@app.on_event("shutdown")
+async def stop_client_telemetry() -> None:
+    global _telemetry_task
+    if _telemetry_task is None:
+        return
+    _telemetry_task.cancel()
+    try:
+        await _telemetry_task
+    except asyncio.CancelledError:
+        pass
+    _telemetry_task = None
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -1423,6 +1538,7 @@ def register(body: RegisterBody, request: Request = None):
                     email=value,
                     phone=None,
                     referred_by_user_id=None,
+                    central_user_id=data.get("user_id"),
                 )
                 if not store.claim_registration_device(user_id, device_hash, fingerprint_hash):
                     raise HTTPException(409, "Thiết bị này đã được dùng để đăng ký tài khoản khác")
@@ -1521,9 +1637,13 @@ def login(body: LoginBody, request: Request = None):
                         email=data.get("email"),
                         phone=None,
                         referred_by_user_id=None,
+                        central_user_id=data.get("user_id"),
                     )
                 else:
                     user_id = local_user["id"]
+
+                if data.get("user_id") is not None:
+                    store.set_central_user_id(user_id, int(data["user_id"]))
 
                 # Refresh the cache from the centralized account source. The
                 # admin dashboard writes both sources so this remains current.
@@ -7084,6 +7204,71 @@ def bulk_delete_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_us
     return {"ok": True, "deleted": deleted}
 
 
+def _schedule_retried_job(old_job, new_job) -> None:
+    """Start a cloned job while preserving creator/localization routing."""
+    source_language = str(old_job.source_language or "")
+    if source_language.startswith("creator"):
+        topic = old_job.source_url.removeprefix("creator:").strip()
+        image_provider = source_language.partition(":")[2] or "stock"
+        retry_body = CreatorJobBody(
+            topic=topic,
+            target_language=old_job.target_language,
+            image_provider=image_provider,
+        )
+        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, new_job.id, retry_body))
+    else:
+        task = asyncio.create_task(_run_job(new_job.id))
+    _running_tasks[new_job.id] = task
+
+
+@app.post("/api/jobs/bulk-retry")
+async def bulk_retry_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
+    """Clone selected completed/failed/cancelled jobs with their original settings."""
+    if not body.job_ids:
+        raise HTTPException(400, "Chưa chọn video cần chạy lại")
+
+    requested_ids = list(dict.fromkeys(body.job_ids))[:200]
+    eligible = []
+    for job_id in requested_ids:
+        job = store.get_job(job_id)
+        if (
+            job
+            and job.user_id == user_id
+            and job.status in {"done", "error", "cancelled"}
+            and not _is_content_os_job(job)
+        ):
+            eligible.append(job)
+    if not eligible:
+        raise HTTPException(400, "Không có video đã chọn nào có thể chạy lại")
+
+    credit_cost = _job_credit_cost(user_id)
+    user = store.get_user_by_id(user_id)
+    total_credit_cost = credit_cost * len(eligible)
+    if credit_cost > 0 and (not user or int(user["credits"]) < total_credit_cost):
+        current = int(user["credits"]) if user else 0
+        raise HTTPException(
+            402,
+            f"Không đủ credit để chạy lại {len(eligible)} video "
+            f"(còn {current}, cần {total_credit_cost})",
+        )
+
+    created_jobs = []
+    for old_job in eligible:
+        new_job = store.retry_job(old_job.id, user_id)
+        if new_job is None:
+            continue
+        _schedule_retried_job(old_job, new_job)
+        created_jobs.append(new_job)
+    if credit_cost > 0 and created_jobs:
+        _adjust_user_credits(user_id, -(credit_cost * len(created_jobs)))
+    return {
+        "ok": True,
+        "created": len(created_jobs),
+        "skipped": len(requested_ids) - len(created_jobs),
+        "job_ids": [job.id for job in created_jobs],
+    }
+
+
 @app.post("/api/jobs/bulk-download")
 def bulk_download_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
     if not body.job_ids:
@@ -7525,17 +7710,7 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
         raise HTTPException(404, "Không tìm thấy job")
     if credit_cost > 0:
         _adjust_user_credits(user_id, -credit_cost)
-    if old_job.source_language.startswith("creator"):
-        topic = old_job.source_url.removeprefix("creator:").strip()
-        image_provider = old_job.source_language.partition(":")[2] or "stock"
-        retry_body = CreatorJobBody(
-            topic=topic, target_language=old_job.target_language,
-            image_provider=image_provider,
-        )
-        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, new_job.id, retry_body))
-    else:
-        task = asyncio.create_task(_run_job(new_job.id))
-    _running_tasks[new_job.id] = task
+    _schedule_retried_job(old_job, new_job)
     return new_job.to_dict()
 
 

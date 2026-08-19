@@ -6,7 +6,7 @@
 <title>Video Studio</title>
 <meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/assets/app.css?v=20260818-product-ui">
+<link rel="stylesheet" href="/assets/app.css?v=20260819-history-polish">
 </head>
 <body>
 
@@ -113,7 +113,7 @@
 
 <div id="landing-view">
   <nav class="landing-nav">
-    <div class="landing-brand">Video Studio</div>
+    <div class="landing-brand"><span class="brand-cut" aria-hidden="true"></span><span>Video Studio<small>Xưởng bản địa hoá</small></span></div>
     <div class="landing-nav-actions">
       <a href="#landing-pricing">Bảng giá</a>
       <button class="btn secondary small" id="landing-login-btn" type="button">Đăng nhập</button>
@@ -196,7 +196,7 @@
       <div class="field">
         <label>Mã xác minh (OTP)</label>
         <input id="register-verification-code" placeholder="Nhập 6 chữ số" required maxlength="6">
-        <div id="verification-code-display" style="color: #00a000; font-size: 14px; font-weight: bold; margin-top: 5px; padding: 8px; background: #f0fff0; border-radius: 4px;"></div>
+        <div id="verification-code-display" class="muted-help" style="margin-top:6px">Mã chỉ được gửi qua email và không hiển thị trên trang.</div>
       </div>
       <div class="field"><label>Tên đăng nhập</label><input id="register-username" autocomplete="username" required></div>
       <div class="field"><label>Mật khẩu</label><input id="register-password" type="password" autocomplete="new-password" required></div>
@@ -216,17 +216,18 @@
 
 <div id="app-view" class="wrap hidden">
   <header>
-    <div>
-      <h1>Video Studio</h1>
-      <div class="sub">Dịch, dựng và chuẩn bị video để xuất bản trong một quy trình rõ ràng</div>
+    <div class="app-identity">
+      <span class="brand-cut" aria-hidden="true"></span>
+      <div><h1>Video Studio</h1>
+      <div class="sub">Xưởng bản địa hoá · từ video nguồn đến bản xuất</div></div>
     </div>
     <div id="userbar">
       <span id="userbar-credits" class="credits-badge" title="Credit còn lại"></span>
       <span id="userbar-name"></span>
-      <button class="btn secondary small" id="topup-btn">💰 Nạp token</button>
-      <button class="btn secondary small hidden" id="feedback-header-btn" title="Gửi phản hồi, góp ý hoặc báo lỗi">💬 Phản hồi</button>
-      <button class="btn secondary small hidden" id="admin-btn">⚙️ Quản trị</button>
-      <button class="btn secondary small" id="logout-btn">🚪 Đăng xuất</button>
+      <button class="btn secondary small" id="topup-btn">Nạp credit</button>
+      <button class="btn secondary small hidden" id="feedback-header-btn" title="Gửi phản hồi, góp ý hoặc báo lỗi">Phản hồi</button>
+      <button class="btn secondary small hidden" id="admin-btn">Quản trị</button>
+      <button class="btn secondary small" id="logout-btn">Đăng xuất</button>
     </div>
   </header>
 
@@ -241,7 +242,7 @@
     </div>
   </div>
 
-  <div class="card" id="license-card">
+  <div class="card hidden" id="license-card">
     <h3 style="margin-top:0">License & Trial</h3>
     <div id="license-info" style="margin-bottom:12px">
       <div style="font-size:13px;color:var(--text-dim)">Chưa có license nào được kích hoạt.</div>
@@ -257,10 +258,10 @@
   <div class="card" id="job-queue-card">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
       <div>
-        <h3 class="section-title" style="margin-bottom:4px">Job Queue</h3>
-        <div id="job-queue-note" style="font-size:13px;color:var(--text-dim)">Dang kiem tra trang thai queue...</div>
+      <h3 class="section-title" style="margin-bottom:4px">Hàng xử lý</h3>
+        <div id="job-queue-note" style="font-size:13px;color:var(--text-dim)">Đang kiểm tra trạng thái…</div>
       </div>
-      <button class="btn secondary small" id="job-queue-refresh-btn" type="button">Refresh</button>
+      <button class="btn secondary small" id="job-queue-refresh-btn" type="button">Làm mới</button>
     </div>
     <div class="stat-grid" id="job-queue-stats" style="margin-top:16px;margin-bottom:0">
       <div class="stat-box"><div class="num" id="queue-active-count">0</div><div class="label">Active jobs</div></div>
@@ -1631,32 +1632,40 @@
     </div>
   </div>
 
-  <div class="card">
-    <h3 style="margin-top:0">Lịch sử</h3>
-    <div class="history-toolbar">
-      <input id="history-search" placeholder="Tìm theo tên hoặc link...">
-      <select id="history-status-filter">
-        <option value="">Tất cả trạng thái</option>
-        <option value="done">Hoàn tất</option>
-        <option value="running">Đang chạy</option>
-        <option value="queued">Đang chờ</option>
-        <option value="review">Chờ chỉnh phụ đề</option>
-        <option value="error">Lỗi</option>
-      </select>
-      <div><label>Từ ngày</label><input type="date" id="history-date-from"></div>
-      <div><label>Đến ngày</label><input type="date" id="history-date-to"></div>
-      <button class="btn secondary small" id="history-clear-btn">🔄 Xoá lọc</button>
+  <div class="card history-card">
+    <div class="history-heading">
+      <div><span class="history-kicker">Thư viện công việc</span><h3>Lịch sử video</h3></div>
+      <span id="history-selected-count" class="history-selected-count">Chưa chọn mục</span>
     </div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
-      <label style="margin:0"><input type="checkbox" id="history-select-all" style="width:auto"> Chọn tất cả</label>
-      <button class="btn secondary small" id="history-bulk-download" disabled>Tải ZIP mục đã chọn</button>
-      <button class="btn danger small" id="history-bulk-delete" disabled>🗑️ Xoá mục đã chọn</button>
-      <span id="history-selected-count" style="font-size:12px;color:var(--text-dim)"></span>
+    <div class="history-toolbar">
+      <div class="history-search-field"><label for="history-search">Tìm nhanh</label><input id="history-search" placeholder="Tên video hoặc đường dẫn…"></div>
+      <div class="history-filter-grid">
+        <div><label for="history-status-filter">Trạng thái</label><select id="history-status-filter">
+          <option value="">Tất cả</option>
+          <option value="done">Hoàn tất</option>
+          <option value="running">Đang chạy</option>
+          <option value="queued">Đang chờ</option>
+          <option value="review">Chờ chỉnh phụ đề</option>
+          <option value="error">Lỗi</option>
+        </select></div>
+        <div><label for="history-date-from">Từ ngày</label><input type="date" id="history-date-from"></div>
+        <div><label for="history-date-to">Đến ngày</label><input type="date" id="history-date-to"></div>
+      </div>
+      <button class="history-clear" id="history-clear-btn" type="button">Xóa toàn bộ bộ lọc</button>
+    </div>
+    <div class="history-selection-bar">
+      <label class="history-select-all"><input type="checkbox" id="history-select-all"> <span>Chọn tất cả đang hiển thị</span></label>
+      <div class="history-bulk-actions">
+        <button class="btn gradient small" id="history-bulk-retry" disabled>Chạy lại đã chọn</button>
+        <button class="btn secondary small" id="history-bulk-download" disabled>Tải ZIP</button>
+        <button class="btn danger small" id="history-bulk-delete" disabled>Xóa</button>
+      </div>
     </div>
     <div id="job-list"></div>
     <div id="empty-history" class="hidden">
-      Chưa có video nào. Dán link ở trên để bắt đầu — có thể dán nhiều link (mỗi dòng 1 link) để xử lý hàng loạt,
-      chọn giọng đọc, chèn logo riêng, hoặc tick "xem &amp; sửa phụ đề trước khi render" nếu muốn tinh chỉnh bản dịch.
+      <span class="empty-history-mark" aria-hidden="true">＋</span>
+      <strong>Chưa có video trong lịch sử</strong>
+      <span>Dán một hoặc nhiều đường dẫn ở khu vực Video source để bắt đầu.</span>
     </div>
   </div>
   </aside>
@@ -1944,6 +1953,6 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260818-license-douyin" defer></script>
+<script src="/assets/app.js?v=20260819-history-retry" defer></script>
 </body>
 </html>

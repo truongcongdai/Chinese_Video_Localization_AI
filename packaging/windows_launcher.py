@@ -29,6 +29,7 @@ if not env_path.exists():
     env_path.write_text(
         "# Generated locally on first launch. Do not share this file.\n"
         f"WEB_SESSION_SECRET={secrets.token_urlsafe(48)}\n"
+        "WEB_HOST=127.0.0.1\n"
         "WEB_PORT=8080\n",
         encoding="utf-8",
     )
@@ -52,8 +53,9 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     port = int(os.environ.get("WEB_PORT", "8080"))
+    host = os.environ.get("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
     threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level=os.environ.get("LOG_LEVEL", "info").lower())
+    uvicorn.run(app, host=host, port=port, log_level=os.environ.get("LOG_LEVEL", "info").lower())
 
 
 if __name__ == "__main__":

@@ -68,14 +68,41 @@ def test_history_bulk_download_and_status_filter_are_available() -> None:
     assert '<option value="done">Hoàn tất</option>' in html
     assert 'data-history-status=' not in html
     assert 'id="history-bulk-download"' in html
+    assert 'id="history-bulk-retry"' in html
+    assert 'class="card history-card"' in html
     assert 'params.set("status", status)' in app_js
     assert 'fetch("/api/jobs/bulk-download"' in app_js
+    assert 'api("/api/jobs/bulk-retry"' in app_js
     assert 'data-download-zip="${job.id}"' in app_js
     assert "downloadJobsZip([btn.dataset.downloadZip])" in app_js
     assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
     assert 'data-cancel="${job.id}"' in app_js
     assert '/cancel`' in app_js
-    assert 'app.js?v=20260818-license-douyin' in html
+    assert 'app.js?v=20260819-history-retry' in html
+
+
+def test_workbench_visual_system_is_loaded() -> None:
+    html = _read_static_file("index.html")
+    css = _read_static_file("app.css")
+
+    assert "app.css?v=20260819-history-polish" in html
+    assert 'class="app-identity"' in html
+    assert "Workbench UI" in css
+    assert "--accent:#c84a30" in css
+    assert "backdrop-filter:none" in css
+
+
+def test_desktop_launchers_bind_loopback_by_default() -> None:
+    root = STATIC_DIR.parents[3]
+    launchers = [
+        root / "scripts" / "run_web.py",
+        root / "scripts" / "run_web_wrapper.py",
+        root / "packaging" / "windows_launcher.py",
+    ]
+
+    for launcher in launchers:
+        source = launcher.read_text(encoding="utf-8")
+        assert 'os.environ.get("WEB_HOST", "127.0.0.1")' in source
 
 
 def test_remix_panel_is_toggleable_and_cache_busted() -> None:
@@ -92,7 +119,7 @@ def test_remix_panel_is_toggleable_and_cache_busted() -> None:
     assert "function syncRemixPanel()" in app_js
     assert '$("#remix-panel").classList.toggle("hidden", !ev.target.checked);' not in app_js
     assert 'subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0' in app_js
-    assert 'app.js?v=20260818-license-douyin' in html
+    assert 'app.js?v=20260819-history-retry' in html
 
 
 def test_subtitle_time_display_keeps_tenths() -> None:
