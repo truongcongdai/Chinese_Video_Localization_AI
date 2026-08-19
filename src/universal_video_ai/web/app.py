@@ -193,6 +193,8 @@ WEB_WHISPER_QUALITY_MODEL = os.environ.get("WEB_WHISPER_QUALITY_MODEL", "small")
 WEB_WHISPER_PRO_MODEL = os.environ.get("WEB_WHISPER_PRO_MODEL", "medium")
 DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
+DEFAULT_USER_CREDITS = 15
+DEFAULT_TRIAL_TOKENS = 15
 
 # License Server Configuration
 def get_license_server_url() -> str:
@@ -269,11 +271,16 @@ CLIENT_TELEMETRY_HEARTBEAT_SECONDS = max(
     CLIENT_TELEMETRY_INTERVAL_SECONDS,
     int(os.environ.get("CLIENT_TELEMETRY_HEARTBEAT_SECONDS", "180")),
 )
+CENTRAL_ACCOUNT_SYNC_INTERVAL_SECONDS = max(
+    15, int(os.environ.get("CENTRAL_ACCOUNT_SYNC_INTERVAL_SECONDS", "30"))
+)
 
 store = Store(_DB_PATH)
 _telemetry_task: Optional[asyncio.Task] = None
 _telemetry_snapshot_hashes: Dict[str, str] = {}
 _telemetry_last_sent: Dict[str, float] = {}
+_central_account_last_sync: Dict[int, float] = {}
+_central_account_sync_lock = threading.Lock()
 
 
 def validate_license_with_server(license_key: str, machine_id: str) -> Optional[Dict]:
@@ -425,7 +432,10 @@ def _get_user_license(user_id: int) -> Optional[License]:
     remote: Optional[Dict[str, Any]] = None
     if license_record is not None:
         validation = validate_license_with_server(license_record.license_key, store.get_machine_id())
-        if validation and validation.get("valid") and isinstance(validation.get("license"), dict):
+        # The central server also returns the record for revoked/expired
+        # licenses. Cache that status locally so an entitlement cannot remain
+        # active merely because the EXE had an older SQLite snapshot.
+        if validation and isinstance(validation.get("license"), dict):
             remote = validation["license"]
     if remote is None:
         remote = get_license_for_user_on_server(user_id)
@@ -454,10 +464,23 @@ def _mirror_user_credit_delta(user_id: int, delta: int) -> None:
     if not USER_MANAGEMENT_MIRROR_ENABLED or delta == 0:
         return
     try:
+        central_user_id = store.central_user_id(user_id)
         response = requests.post(
-            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{store.central_user_id(user_id)}/credits",
+            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{central_user_id}/credits",
             json={"amount": delta}, timeout=3,
         )
+        if response.status_code == 404:
+            # Rolling-upgrade fallback: the original account service supports
+            # absolute PUT updates but not the newer atomic delta route.
+            current_response = requests.get(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/{central_user_id}", timeout=3
+            )
+            current_response.raise_for_status()
+            current = max(0, int(current_response.json().get("credits", 0)) + delta)
+            response = requests.put(
+                f"{USER_MANAGEMENT_SERVER_URL}/api/users/{central_user_id}",
+                json={"credits": current}, timeout=3,
+            )
         response.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("Could not mirror credit delta for user %s: %s", user_id, exc)
@@ -475,6 +498,33 @@ def _mirror_user_role(user_id: int, is_admin: bool) -> None:
         response.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("Could not mirror role for user %s: %s", user_id, exc)
+
+
+def _sync_central_account(user_id: int, *, force: bool = False) -> None:
+    """Refresh mutable account fields without polling port 8001 too often."""
+    if not USE_USER_MANAGEMENT_SERVER:
+        return
+    now = time.monotonic()
+    with _central_account_sync_lock:
+        previous = _central_account_last_sync.get(user_id, 0.0)
+        if not force and now - previous < CENTRAL_ACCOUNT_SYNC_INTERVAL_SECONDS:
+            return
+        # Reserve the window before network I/O so concurrent /api/me calls
+        # from one browser cannot create a small request burst.
+        _central_account_last_sync[user_id] = now
+    try:
+        response = requests.get(
+            f"{USER_MANAGEMENT_SERVER_URL}/api/users/{store.central_user_id(user_id)}",
+            timeout=(2, 4),
+        )
+        response.raise_for_status()
+        account = response.json()
+        if account.get("credits") is not None:
+            store.set_credits(user_id, max(0, int(account["credits"])))
+        if account.get("is_admin") is not None:
+            store.set_admin(user_id, bool(account["is_admin"]))
+    except (requests.RequestException, TypeError, ValueError) as exc:
+        logger.debug("Central account refresh deferred for user %s: %s", user_id, exc)
 
 
 def _adjust_user_credits(user_id: int, delta: int) -> int:
@@ -555,7 +605,7 @@ def _ensure_registration_trial(user_id: int) -> None:
         return
     machine_id = store.get_machine_id()
     if store.get_free_trial(user_id, machine_id) is None:
-        store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+        store.create_free_trial(user_id, machine_id, tokens=DEFAULT_TRIAL_TOKENS, days=30)
 
 
 def _resolve_publishing_config_for_user(
@@ -1200,7 +1250,7 @@ class CreditsAdjustBody(BaseModel):
 class CreateUserBody(BaseModel):
     username: str
     password: str
-    credits: int = 10
+    credits: int = DEFAULT_USER_CREDITS
 
 
 class LicenseBody(BaseModel):
@@ -1471,7 +1521,7 @@ def register(body: RegisterBody, request: Request = None):
     regular users unless an admin promotes them.
     
     When USE_LICENSE_SERVER is true, users can register and get
-    a free trial with 25 tokens. They can activate a license key later
+    a free trial with the configured default token balance. They can activate a license key later
     for unlimited access.
     
     When USE_USER_MANAGEMENT_SERVER is true, registration is proxied to
@@ -1534,7 +1584,7 @@ def register(body: RegisterBody, request: Request = None):
                     username,
                     hash_password(body.password),
                     is_admin=is_first_user or bool(data.get("is_admin", False)),
-                    credits=10_000 if is_first_user else data.get("credits", 25),
+                    credits=10_000 if is_first_user else data.get("credits", DEFAULT_USER_CREDITS),
                     email=value,
                     phone=None,
                     referred_by_user_id=None,
@@ -1562,7 +1612,7 @@ def register(body: RegisterBody, request: Request = None):
 
     user_id = store.create_user(
         username, hash_password(body.password),
-        is_admin=is_first_user, credits=10_000 if is_first_user else 10,
+        is_admin=is_first_user, credits=10_000 if is_first_user else DEFAULT_USER_CREDITS,
         email=email, phone=phone,
         referred_by_user_id=referrer["id"] if referrer else None,
     )
@@ -1576,7 +1626,7 @@ def register(body: RegisterBody, request: Request = None):
         _adjust_user_credits(user_id, REFERRAL_BONUS_CREDITS)
         _adjust_user_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
     
-    # Create free trial with 25 tokens when using license server
+    # Create the standard free trial when using the license server.
     _ensure_registration_trial(user_id)
     
     return _login_response(user_id)
@@ -1633,7 +1683,7 @@ def login(body: LoginBody, request: Request = None):
                         data.get("username", body.identifier),
                         hash_password(body.password),
                         is_admin=data.get("is_admin", False),
-                        credits=data.get("credits", 25),
+                        credits=data.get("credits", DEFAULT_USER_CREDITS),
                         email=data.get("email"),
                         phone=None,
                         referred_by_user_id=None,
@@ -1678,6 +1728,7 @@ def logout():
 
 @app.get("/api/me")
 def me(user_id: int = Depends(get_current_user_id)):
+    _sync_central_account(user_id)
     user = store.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -1795,7 +1846,7 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
         user_id = store.create_user_oauth(
             username, provider, result.provider_user_id,
             email=result.email, is_admin=is_first_user,
-            credits=10_000 if is_first_user else 10,
+            credits=10_000 if is_first_user else DEFAULT_USER_CREDITS,
         )
     else:
         user_id = user["id"]
@@ -8543,18 +8594,24 @@ def start_free_trial(user_id: int = Depends(get_current_user_id)):
         # Allow restart if trial expired or out of tokens
         if existing.expiry_date < time.time():
             # Trial expired - create new one
-            trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+            trial = store.create_free_trial(
+                user_id, machine_id, tokens=DEFAULT_TRIAL_TOKENS, days=30
+            )
             return {"trial": trial.to_dict(), "message": "Trial đã được làm mới"}
         elif existing.tokens_remaining <= 0:
             # Out of tokens - create new one
-            trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+            trial = store.create_free_trial(
+                user_id, machine_id, tokens=DEFAULT_TRIAL_TOKENS, days=30
+            )
             return {"trial": trial.to_dict(), "message": "Token đã được nạp lại"}
         else:
             # Active trial with remaining tokens
             raise HTTPException(400, "Đang có trial hoạt động, còn lại {} token".format(existing.tokens_remaining))
     
     # No existing trial - create new one
-    trial = store.create_free_trial(user_id, machine_id, tokens=25, days=30)
+    trial = store.create_free_trial(
+        user_id, machine_id, tokens=DEFAULT_TRIAL_TOKENS, days=30
+    )
     return {"trial": trial.to_dict()}
 
 

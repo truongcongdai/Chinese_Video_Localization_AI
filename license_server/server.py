@@ -74,6 +74,7 @@ class LicenseCreate(BaseModel):
     notes: Optional[str] = None
 
 class LicenseUpdate(BaseModel):
+    user_id: Optional[int] = None
     status: Optional[str] = None
     plan_type: Optional[str] = None
     quota_type: Optional[str] = None
@@ -521,10 +522,12 @@ def admin_set_credits(
     body: AdminCreditSet,
     _session: Dict = Depends(require_admin_session),
 ):
-    current = _account_server_request("GET", f"/api/users/{user_id}").json()
-    delta = body.set_to - int(current.get("credits", 0))
+    # Use the original absolute-update endpoint so this facade also works
+    # while an older account-service build is still running on port 8001.
+    # Newer builds expose a delta endpoint too, but requiring it here caused
+    # rolling upgrades to fail with a misleading 404 Not Found.
     return _account_server_request(
-        "POST", f"/api/users/{user_id}/credits", json={"amount": delta}
+        "PUT", f"/api/users/{user_id}", json={"credits": body.set_to}
     ).json()
 
 
@@ -536,7 +539,14 @@ def central_admin_stats(_session: Dict = Depends(require_admin_session)):
         rows = conn.execute("SELECT status, COUNT(*) count FROM client_jobs GROUP BY status").fetchall()
         by_status = {row["status"]: int(row["count"]) for row in rows}
         online = conn.execute(
-            "SELECT COUNT(*) count FROM client_nodes WHERE last_seen >= ?", (now - 300,)
+            "SELECT COUNT(*) count FROM ("
+            "SELECT machine_id FROM client_nodes WHERE last_seen >= ? "
+            "UNION "
+            "SELECT lu.machine_id FROM license_usage lu "
+            "JOIN licenses l ON l.id = lu.license_id "
+            "WHERE l.user_id IS NOT NULL AND lu.last_check >= ?"
+            ")",
+            (now - 300, now - 300),
         ).fetchone()["count"]
         jobs_last_7d = conn.execute(
             "SELECT COUNT(*) count FROM client_jobs WHERE created_at >= ?", (now - 7 * 86400,)
@@ -563,8 +573,13 @@ def central_activity_summaries(_session: Dict = Depends(require_admin_session)):
             "SELECT user_id, status, COUNT(*) count FROM client_jobs GROUP BY user_id, status"
         ).fetchall()
         seen_rows = conn.execute(
-            "SELECT user_id, MAX(last_seen) last_seen, COUNT(*) device_count "
-            "FROM client_nodes GROUP BY user_id"
+            "SELECT user_id, MAX(last_seen) last_seen, "
+            "COUNT(DISTINCT machine_id) device_count FROM ("
+            "SELECT user_id, machine_id, last_seen FROM client_nodes "
+            "UNION ALL "
+            "SELECT l.user_id, lu.machine_id, lu.last_check FROM license_usage lu "
+            "JOIN licenses l ON l.id = lu.license_id WHERE l.user_id IS NOT NULL"
+            ") GROUP BY user_id"
         ).fetchall()
     finally:
         conn.close()
@@ -720,7 +735,7 @@ async def validate_license(validation: LicenseValidation):
         conn.close()
         return LicenseResponse(
             valid=False,
-            license=None,
+            license=asdict(license),
             error=f"License is {license.status}"
         )
     
@@ -736,7 +751,7 @@ async def validate_license(validation: LicenseValidation):
         
         return LicenseResponse(
             valid=False,
-            license=None,
+            license={**asdict(license), "status": "expired"},
             error="License has expired"
         )
     
@@ -849,6 +864,28 @@ async def get_license_by_user(user_id: int):
         "ORDER BY created_at DESC LIMIT 1",
         (user_id,),
     ).fetchone()
+    # Licenses created before the user_id column existed were associated by
+    # customer email. Resolve that legacy link once, then persist it so all
+    # later EXE polls and telemetry stay on the indexed user_id path.
+    if not row:
+        try:
+            account = _account_server_request("GET", f"/api/users/{user_id}").json()
+        except HTTPException:
+            account = {}
+        email = str(account.get("email") or "").strip()
+        if email:
+            row = conn.execute(
+                "SELECT * FROM licenses WHERE user_id IS NULL AND status = 'active' "
+                "AND customer_email = ? COLLATE NOCASE ORDER BY created_at DESC LIMIT 1",
+                (email,),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE licenses SET user_id = ?, updated_at = ? WHERE id = ? AND user_id IS NULL",
+                    (user_id, time.time(), row["id"]),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM licenses WHERE id = ?", (row["id"],)).fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="License not found")
@@ -909,6 +946,10 @@ async def update_license(
     if update_data.status is not None:
         updates.append("status = ?")
         params.append(update_data.status)
+
+    if update_data.user_id is not None:
+        updates.append("user_id = ?")
+        params.append(update_data.user_id)
 
     if update_data.plan_type is not None:
         updates.append("plan_type = ?")

@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
     central_user_id INTEGER,
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT,
-    credits INTEGER NOT NULL DEFAULT 10,
+    credits INTEGER NOT NULL DEFAULT 15,
     is_admin INTEGER NOT NULL DEFAULT 0,
     email TEXT,
     phone TEXT,
@@ -586,7 +586,7 @@ _MIGRATIONS = [
     # by the account server separately so licenses and telemetry never depend
     # on two unrelated SQLite sequences happening to match.
     ("users", "central_user_id", "ALTER TABLE users ADD COLUMN central_user_id INTEGER"),
-    ("users", "credits", "ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 10"),
+    ("users", "credits", "ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 15"),
     ("users", "is_admin", "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"),
     # Alternative sign-up/sign-in identifiers alongside the original
     # `username`. All three of email/phone/username are optional at the SQL
@@ -1010,7 +1010,7 @@ class Store:
     # ---- users ----
     def create_user(
             self, username: str, password_hash: str, is_admin: bool = False,
-            credits: int = 10, email: Optional[str] = None, phone: Optional[str] = None,
+            credits: int = 15, email: Optional[str] = None, phone: Optional[str] = None,
             referred_by_user_id: Optional[int] = None, central_user_id: Optional[int] = None,
     ) -> int:
         with self._connect() as conn:
@@ -1040,7 +1040,7 @@ class Store:
 
     def create_user_oauth(
             self, username: str, oauth_provider: str, oauth_id: str,
-            email: Optional[str] = None, is_admin: bool = False, credits: int = 10,
+            email: Optional[str] = None, is_admin: bool = False, credits: int = 15,
     ) -> int:
         """
         Create an account for someone who signed up/in via "Sign in with
@@ -1275,7 +1275,7 @@ class Store:
         with self._connect() as conn:
             conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (int(is_admin), user_id))
 
-    def create_user_by_admin(self, username: str, password_hash: str, credits: int = 10) -> int:
+    def create_user_by_admin(self, username: str, password_hash: str, credits: int = 15) -> int:
         return self.create_user(username, password_hash, is_admin=False, credits=credits)
 
     # ---- jobs ----

@@ -103,7 +103,7 @@ python run_web.py
 ### 4. Đăng ký và Activate License
 
 1. Mở browser: `http://localhost:8080`
-2. Đăng ký tài khoản (nhận free trial 25 tokens, 30 ngày)
+2. Đăng ký tài khoản (mặc định 15 credit, free trial 15 tokens trong 30 ngày)
 3. Nhập license key từ admin để activate unlimited access
 4. Bắt đầu sử dụng
 

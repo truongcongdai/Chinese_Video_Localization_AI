@@ -20,6 +20,7 @@ import bcrypt
 
 # Database setup
 DB_PATH = "users.db"
+DEFAULT_USER_CREDITS = 15
 
 
 @dataclass
@@ -189,7 +190,10 @@ async def register_user(user_data: UserRegister):
         cursor.execute("""
             INSERT INTO users (username, email, password_hash, credits, is_admin, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_data.username, user_data.email, password_hash, 25, is_first_user, now, now))
+        """, (
+            user_data.username, user_data.email, password_hash,
+            DEFAULT_USER_CREDITS, is_first_user, now, now,
+        ))
         
         conn.commit()
         user_id = cursor.lastrowid
@@ -199,7 +203,7 @@ async def register_user(user_data: UserRegister):
             "success": True,
             "user_id": user_id,
             "message": "User registered successfully",
-            "credits": 25,
+            "credits": DEFAULT_USER_CREDITS,
             "is_admin": is_first_user,
         }
     except sqlite3.IntegrityError:

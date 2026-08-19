@@ -107,6 +107,76 @@ def test_central_login_refreshes_cached_admin_role(monkeypatch):
     }
 
 
+def test_periodic_account_sync_updates_local_credit_and_role_once(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"credits": 37, "is_admin": True}
+
+    calls = []
+    updates = []
+    monkeypatch.setattr(web_app, "USE_USER_MANAGEMENT_SERVER", True)
+    monkeypatch.setattr(web_app.store, "central_user_id", lambda user_id: 88)
+    monkeypatch.setattr(
+        web_app.requests, "get", lambda *args, **kwargs: calls.append((args, kwargs)) or FakeResponse()
+    )
+    monkeypatch.setattr(
+        web_app.store, "set_credits", lambda user_id, value: updates.append(("credits", user_id, value))
+    )
+    monkeypatch.setattr(
+        web_app.store, "set_admin", lambda user_id, value: updates.append(("admin", user_id, value))
+    )
+    web_app._central_account_last_sync.clear()
+
+    web_app._sync_central_account(7)
+    web_app._sync_central_account(7)
+
+    assert len(calls) == 1
+    assert updates == [("credits", 7, 37), ("admin", 7, True)]
+
+
+def test_credit_mirror_falls_back_to_legacy_absolute_update(monkeypatch):
+    class FakeResponse:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise web_app.requests.HTTPError(str(self.status_code))
+
+        def json(self):
+            return self._payload
+
+    puts = []
+    monkeypatch.setattr(web_app, "USER_MANAGEMENT_MIRROR_ENABLED", True)
+    monkeypatch.setattr(web_app.store, "central_user_id", lambda user_id: 88)
+    monkeypatch.setattr(web_app.requests, "post", lambda *args, **kwargs: FakeResponse(404))
+    monkeypatch.setattr(
+        web_app.requests, "get", lambda *args, **kwargs: FakeResponse(200, {"credits": 20})
+    )
+    monkeypatch.setattr(
+        web_app.requests,
+        "put",
+        lambda *args, **kwargs: puts.append((args, kwargs)) or FakeResponse(200),
+    )
+
+    web_app._mirror_user_credit_delta(7, -3)
+
+    assert puts[0][1]["json"] == {"credits": 17}
+
+
+def test_default_account_and_trial_balances_are_fifteen(tmp_path):
+    isolated_store = Store(tmp_path / "defaults.sqlite3")
+    user_id = isolated_store.create_user("member", "hash")
+
+    assert isolated_store.get_user_by_id(user_id)["credits"] == 15
+    assert web_app.DEFAULT_USER_CREDITS == 15
+    assert web_app.DEFAULT_TRIAL_TOKENS == 15
+
+
 def test_license_admin_uses_authenticated_same_origin_facade():
     html = (web_app._REPO_ROOT / "license_server" / "static" / "admin.html").read_text(encoding="utf-8")
 
@@ -162,6 +232,7 @@ def test_active_license_hides_activation_and_trial_actions():
     assert 'licenseActions.classList.toggle("hidden", licenseIsActive);' in app_js
     assert 'licenseCard.classList.remove("hidden");' in app_js
     assert 'licenseActions.classList.remove("hidden");' in app_js
+    assert 'value="15"' in html
 
 
 def test_bulk_retry_clones_eligible_selected_jobs_and_charges_once(monkeypatch):

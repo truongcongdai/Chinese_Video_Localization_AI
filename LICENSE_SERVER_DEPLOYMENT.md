@@ -166,7 +166,7 @@ Hoặc từ bên ngoài: `http://113.160.14.1:8000/static/admin.html`
 ### 3.3 User Registration với License Server
 
 Khi `USE_LICENSE_SERVER=true`:
-- User có thể đăng ký và nhận free trial (25 tokens, 30 ngày)
+- User mới nhận mặc định 15 credit và free trial 15 tokens trong 30 ngày.
 - User có thể activate license key để có unlimited access
 - Tất cả user data được lưu trong local database của client
 - License validation và usage tracking được gửi đến license server
