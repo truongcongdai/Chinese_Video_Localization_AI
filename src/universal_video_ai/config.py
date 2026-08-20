@@ -87,6 +87,15 @@ YOUTUBE_RESEARCH_ENABLE_THUMBNAIL_FACE_DETECTION = _env_bool(
     "YOUTUBE_RESEARCH_ENABLE_THUMBNAIL_FACE_DETECTION", False,
 )
 
+
+def is_ai_channel_agent_enabled() -> bool:
+    """Read the opt-in Channel Agent flag from the centralized configuration."""
+
+    return _env_bool("AI_CHANNEL_AGENT_ENABLED", False)
+
+
+AI_CHANNEL_AGENT_ENABLED = is_ai_channel_agent_enabled()
+
 # AI Content OS Feature Flag
 CONTENT_OS_ENABLED = _env_bool("CONTENT_OS_ENABLED", False)
 CONTENT_OS_MAX_AUTO_REVISIONS = _env_int("CONTENT_OS_MAX_AUTO_REVISIONS", 1, minimum=0)

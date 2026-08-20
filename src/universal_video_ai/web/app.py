@@ -86,7 +86,7 @@ from universal_video_ai.publishing.profiles import (
 )
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
-from universal_video_ai.config import REDIS_URL, TEMP_DIR
+from universal_video_ai.config import REDIS_URL, TEMP_DIR, is_ai_channel_agent_enabled
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
 from universal_video_ai.downloader.channel import (
@@ -101,6 +101,7 @@ from .auth import (
 )
 from . import oauth as oauth_module
 from . import identity_oauth
+from .channel_agent_router import router as channel_agent_router
 from .content_os_router import router as content_os_router
 
 logger = logging.getLogger("universal_video_ai.web")
@@ -926,6 +927,9 @@ def bootstrap():
         "identity_providers": {
             name: identity_oauth.get_identity_oauth_client(name).is_configured()
             for name in ("google", "github", "facebook")
+        },
+        "features": {
+            "ai_channel_agent": is_ai_channel_agent_enabled(),
         },
     }
 
@@ -7527,3 +7531,4 @@ def health():
 
 # Include Content OS router
 app.include_router(content_os_router)
+app.include_router(channel_agent_router)

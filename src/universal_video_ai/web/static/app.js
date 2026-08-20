@@ -71,6 +71,8 @@ async function initAuth() {
   const boot = await api("/api/bootstrap");
   bootstrapConfig = boot;
   needsRegistrationGlobal = boot.needs_registration;
+  const channelAgentEnabled = !!(boot.features && boot.features.ai_channel_agent);
+  document.querySelector('[data-feature="channel-agent"].feature-tab')?.classList.toggle("hidden", !channelAgentEnabled);
 
   if (needsRegistrationGlobal) {
     $("#auth-title").textContent = "Tạo tài khoản admin";
@@ -3500,11 +3502,28 @@ document.addEventListener("DOMContentLoaded", () => {
           if (feature === "content-os") {
             initContentOS();
           }
+          if (feature === "channel-agent") {
+            initChannelAgent();
+          }
         }
       });
     };
   });
 });
+
+// ---------------- AI Channel Agent (CP0) ----------------
+async function initChannelAgent() {
+  try {
+    const status = await api("/api/channel-agent/status");
+    $("#channel-agent-youtube").textContent = status.youtube_connected ? "Connected" : "Not connected";
+    const ollama = status.ollama_available === true
+      ? "available"
+      : (status.ollama_available === false ? "unavailable" : "not checked");
+    $("#channel-agent-status").textContent = `Version ${status.version} · Ollama ${ollama}`;
+  } catch (e) {
+    $("#channel-agent-status").textContent = `Status unavailable: ${e.message}`;
+  }
+}
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];
