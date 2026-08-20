@@ -396,6 +396,14 @@ class YouTubeReadOnlyService:
             raise YouTubeUnavailableError()
         raise YouTubeUnavailableError()
 
+    def data_request(self, user_id: int, resource: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Make an authenticated read-only YouTube Data API request.
+
+        CP2 providers reuse the same token refresh and sanitized provider-error
+        handling as CP1 instead of creating another Google client.
+        """
+        return self._get_json(user_id, f"{YOUTUBE_DATA_API}/{resource.lstrip('/')}", params)
+
     def get_own_channel(self, user_id: int) -> YouTubeChannelIdentity:
         payload = self._get_json(
             user_id,

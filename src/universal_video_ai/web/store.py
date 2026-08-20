@@ -195,8 +195,10 @@ CREATE TABLE IF NOT EXISTS user_provider_settings (
 
 CREATE TABLE IF NOT EXISTS trend_scans (
     id TEXT PRIMARY KEY,
+    scan_key TEXT,
     user_id INTEGER NOT NULL,
     topic TEXT NOT NULL,
+    query_json TEXT DEFAULT '{}',
     platforms_json TEXT NOT NULL,
     providers_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -216,6 +218,7 @@ CREATE TABLE IF NOT EXISTS trend_items (
     provider TEXT NOT NULL,
     source_url TEXT NOT NULL,
     title TEXT,
+    description TEXT,
     author TEXT,
     thumbnail_url TEXT,
     duration_seconds REAL,
@@ -225,6 +228,10 @@ CREATE TABLE IF NOT EXISTS trend_items (
     share_count INTEGER,
     published_at TEXT,
     trend_score REAL,
+    niche_relevance_score REAL,
+    opportunity_score REAL,
+    relevance_status TEXT DEFAULT 'unscored',
+    match_reason_json TEXT,
     raw_json TEXT,
     download_status TEXT DEFAULT 'found',
     local_path TEXT,
@@ -232,6 +239,41 @@ CREATE TABLE IF NOT EXISTS trend_items (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(user_id, platform, source_url)
+);
+
+CREATE TABLE IF NOT EXISTS trend_queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    relevance_language TEXT,
+    region_code TEXT,
+    published_within_days INTEGER NOT NULL DEFAULT 30,
+    duration_filter TEXT NOT NULL DEFAULT 'long',
+    search_order TEXT NOT NULL DEFAULT 'date',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    topic_terms TEXT,
+    exclusion_terms TEXT,
+    notes TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, query)
+);
+
+CREATE TABLE IF NOT EXISTS trend_item_queries (
+    item_id INTEGER NOT NULL,
+    query_id INTEGER NOT NULL,
+    first_matched_at REAL NOT NULL,
+    last_matched_at REAL NOT NULL,
+    PRIMARY KEY(item_id, query_id)
+);
+
+CREATE TABLE IF NOT EXISTS trend_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL,
+    captured_at REAL NOT NULL,
+    view_count INTEGER,
+    like_count INTEGER,
+    comment_count INTEGER
 );
 
 -- Content OS tables (feature-flagged content creation workflow)
@@ -508,6 +550,90 @@ _MIGRATIONS = [
     # Scope evidence is required to distinguish old upload-only YouTube
     # credentials from credentials explicitly re-consented for Analytics.
     ("social_accounts", "scopes", "ALTER TABLE social_accounts ADD COLUMN scopes TEXT"),
+    # Legacy Trend Scanner installations used several smaller variants of
+    # these tables. CREATE TABLE IF NOT EXISTS does not add missing columns,
+    # so every field used by current Store methods needs an additive upgrade.
+    ("trend_scans", "id", "ALTER TABLE trend_scans ADD COLUMN id TEXT"),
+    ("trend_scans", "scan_key", "ALTER TABLE trend_scans ADD COLUMN scan_key TEXT"),
+    ("trend_scans", "user_id", "ALTER TABLE trend_scans ADD COLUMN user_id INTEGER"),
+    ("trend_scans", "topic", "ALTER TABLE trend_scans ADD COLUMN topic TEXT"),
+    ("trend_scans", "query_json", "ALTER TABLE trend_scans ADD COLUMN query_json TEXT DEFAULT '{}'"),
+    ("trend_scans", "platforms_json", "ALTER TABLE trend_scans ADD COLUMN platforms_json TEXT DEFAULT '[]'"),
+    ("trend_scans", "providers_json", "ALTER TABLE trend_scans ADD COLUMN providers_json TEXT DEFAULT '[]'"),
+    ("trend_scans", "status", "ALTER TABLE trend_scans ADD COLUMN status TEXT DEFAULT 'pending'"),
+    ("trend_scans", "progress_note", "ALTER TABLE trend_scans ADD COLUMN progress_note TEXT"),
+    ("trend_scans", "warnings_json", "ALTER TABLE trend_scans ADD COLUMN warnings_json TEXT DEFAULT '[]'"),
+    ("trend_scans", "error", "ALTER TABLE trend_scans ADD COLUMN error TEXT"),
+    ("trend_scans", "max_results", "ALTER TABLE trend_scans ADD COLUMN max_results INTEGER DEFAULT 20"),
+    ("trend_scans", "created_at", "ALTER TABLE trend_scans ADD COLUMN created_at REAL"),
+    ("trend_scans", "updated_at", "ALTER TABLE trend_scans ADD COLUMN updated_at REAL"),
+    ("trend_items", "id", "ALTER TABLE trend_items ADD COLUMN id INTEGER"),
+    ("trend_items", "scan_id", "ALTER TABLE trend_items ADD COLUMN scan_id TEXT"),
+    ("trend_items", "user_id", "ALTER TABLE trend_items ADD COLUMN user_id INTEGER"),
+    ("trend_items", "platform", "ALTER TABLE trend_items ADD COLUMN platform TEXT"),
+    ("trend_items", "provider", "ALTER TABLE trend_items ADD COLUMN provider TEXT"),
+    ("trend_items", "source_url", "ALTER TABLE trend_items ADD COLUMN source_url TEXT"),
+    ("trend_items", "title", "ALTER TABLE trend_items ADD COLUMN title TEXT"),
+    ("trend_items", "description", "ALTER TABLE trend_items ADD COLUMN description TEXT"),
+    ("trend_items", "author", "ALTER TABLE trend_items ADD COLUMN author TEXT"),
+    ("trend_items", "thumbnail_url", "ALTER TABLE trend_items ADD COLUMN thumbnail_url TEXT"),
+    ("trend_items", "duration_seconds", "ALTER TABLE trend_items ADD COLUMN duration_seconds REAL"),
+    ("trend_items", "view_count", "ALTER TABLE trend_items ADD COLUMN view_count INTEGER"),
+    ("trend_items", "like_count", "ALTER TABLE trend_items ADD COLUMN like_count INTEGER"),
+    ("trend_items", "comment_count", "ALTER TABLE trend_items ADD COLUMN comment_count INTEGER"),
+    ("trend_items", "share_count", "ALTER TABLE trend_items ADD COLUMN share_count INTEGER"),
+    ("trend_items", "published_at", "ALTER TABLE trend_items ADD COLUMN published_at TEXT"),
+    ("trend_items", "trend_score", "ALTER TABLE trend_items ADD COLUMN trend_score REAL DEFAULT 0"),
+    ("trend_items", "niche_relevance_score", "ALTER TABLE trend_items ADD COLUMN niche_relevance_score REAL"),
+    ("trend_items", "opportunity_score", "ALTER TABLE trend_items ADD COLUMN opportunity_score REAL"),
+    ("trend_items", "relevance_status", "ALTER TABLE trend_items ADD COLUMN relevance_status TEXT DEFAULT 'unscored'"),
+    ("trend_items", "match_reason_json", "ALTER TABLE trend_items ADD COLUMN match_reason_json TEXT"),
+    ("trend_items", "raw_json", "ALTER TABLE trend_items ADD COLUMN raw_json TEXT DEFAULT '{}'"),
+    ("trend_items", "download_status", "ALTER TABLE trend_items ADD COLUMN download_status TEXT DEFAULT 'found'"),
+    ("trend_items", "local_path", "ALTER TABLE trend_items ADD COLUMN local_path TEXT"),
+    ("trend_items", "error", "ALTER TABLE trend_items ADD COLUMN error TEXT"),
+    ("trend_items", "created_at", "ALTER TABLE trend_items ADD COLUMN created_at REAL"),
+    ("trend_items", "updated_at", "ALTER TABLE trend_items ADD COLUMN updated_at REAL"),
+    ("trend_items", "source_id", "ALTER TABLE trend_items ADD COLUMN source_id TEXT"),
+    ("trend_items", "channel_id", "ALTER TABLE trend_items ADD COLUMN channel_id TEXT"),
+    ("trend_items", "rights_status", "ALTER TABLE trend_items ADD COLUMN rights_status TEXT NOT NULL DEFAULT 'idea_only'"),
+    ("trend_items", "first_seen_at", "ALTER TABLE trend_items ADD COLUMN first_seen_at REAL"),
+    ("trend_items", "last_seen_at", "ALTER TABLE trend_items ADD COLUMN last_seen_at REAL"),
+    ("trend_items", "observed_vph", "ALTER TABLE trend_items ADD COLUMN observed_vph REAL"),
+    ("trend_items", "approx_vph", "ALTER TABLE trend_items ADD COLUMN approx_vph REAL"),
+    ("trend_items", "engagement_rate", "ALTER TABLE trend_items ADD COLUMN engagement_rate REAL"),
+    ("trend_items", "outlier_ratio", "ALTER TABLE trend_items ADD COLUMN outlier_ratio REAL"),
+    ("trend_items", "channel_typical_views", "ALTER TABLE trend_items ADD COLUMN channel_typical_views REAL"),
+    ("trend_items", "freshness_score", "ALTER TABLE trend_items ADD COLUMN freshness_score REAL"),
+    ("trend_items", "competition_proxy", "ALTER TABLE trend_items ADD COLUMN competition_proxy REAL"),
+    ("trend_items", "score_confidence", "ALTER TABLE trend_items ADD COLUMN score_confidence TEXT"),
+    ("trend_items", "available_signal_count", "ALTER TABLE trend_items ADD COLUMN available_signal_count INTEGER NOT NULL DEFAULT 0"),
+    ("trend_items", "score_explanation_json", "ALTER TABLE trend_items ADD COLUMN score_explanation_json TEXT"),
+    ("trend_items", "snapshot_count", "ALTER TABLE trend_items ADD COLUMN snapshot_count INTEGER NOT NULL DEFAULT 0"),
+    ("trend_queries", "id", "ALTER TABLE trend_queries ADD COLUMN id INTEGER"),
+    ("trend_queries", "user_id", "ALTER TABLE trend_queries ADD COLUMN user_id INTEGER"),
+    ("trend_queries", "query", "ALTER TABLE trend_queries ADD COLUMN query TEXT"),
+    ("trend_queries", "relevance_language", "ALTER TABLE trend_queries ADD COLUMN relevance_language TEXT"),
+    ("trend_queries", "region_code", "ALTER TABLE trend_queries ADD COLUMN region_code TEXT"),
+    ("trend_queries", "published_within_days", "ALTER TABLE trend_queries ADD COLUMN published_within_days INTEGER DEFAULT 30"),
+    ("trend_queries", "duration_filter", "ALTER TABLE trend_queries ADD COLUMN duration_filter TEXT DEFAULT 'long'"),
+    ("trend_queries", "search_order", "ALTER TABLE trend_queries ADD COLUMN search_order TEXT DEFAULT 'date'"),
+    ("trend_queries", "enabled", "ALTER TABLE trend_queries ADD COLUMN enabled INTEGER DEFAULT 1"),
+    ("trend_queries", "topic_terms", "ALTER TABLE trend_queries ADD COLUMN topic_terms TEXT"),
+    ("trend_queries", "exclusion_terms", "ALTER TABLE trend_queries ADD COLUMN exclusion_terms TEXT"),
+    ("trend_queries", "notes", "ALTER TABLE trend_queries ADD COLUMN notes TEXT"),
+    ("trend_queries", "created_at", "ALTER TABLE trend_queries ADD COLUMN created_at REAL"),
+    ("trend_queries", "updated_at", "ALTER TABLE trend_queries ADD COLUMN updated_at REAL"),
+    ("trend_item_queries", "item_id", "ALTER TABLE trend_item_queries ADD COLUMN item_id INTEGER"),
+    ("trend_item_queries", "query_id", "ALTER TABLE trend_item_queries ADD COLUMN query_id INTEGER"),
+    ("trend_item_queries", "first_matched_at", "ALTER TABLE trend_item_queries ADD COLUMN first_matched_at REAL"),
+    ("trend_item_queries", "last_matched_at", "ALTER TABLE trend_item_queries ADD COLUMN last_matched_at REAL"),
+    ("trend_snapshots", "id", "ALTER TABLE trend_snapshots ADD COLUMN id INTEGER"),
+    ("trend_snapshots", "item_id", "ALTER TABLE trend_snapshots ADD COLUMN item_id INTEGER"),
+    ("trend_snapshots", "captured_at", "ALTER TABLE trend_snapshots ADD COLUMN captured_at REAL"),
+    ("trend_snapshots", "view_count", "ALTER TABLE trend_snapshots ADD COLUMN view_count INTEGER"),
+    ("trend_snapshots", "like_count", "ALTER TABLE trend_snapshots ADD COLUMN like_count INTEGER"),
+    ("trend_snapshots", "comment_count", "ALTER TABLE trend_snapshots ADD COLUMN comment_count INTEGER"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -753,7 +879,9 @@ class Store:
                 for table in
                 ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
                  "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
-                 "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts")
+                 "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts",
+                 "trend_scans", "trend_items", "trend_queries", "trend_item_queries",
+                 "trend_snapshots")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -765,6 +893,35 @@ class Store:
                     conn.execute(ddl)
                     if column == "is_admin":
                         ran_is_admin_migration = True
+
+            # A legacy table may not have declared id as INTEGER PRIMARY KEY.
+            # Preserve its rows and give null compatibility ids their stable
+            # SQLite rowid; current inserts also set ids explicitly below.
+            for table in ("trend_items", "trend_queries", "trend_snapshots"):
+                conn.execute(f"UPDATE {table} SET id = rowid WHERE id IS NULL")
+
+            # CP2 uses UUID scan identifiers, while the original Trend Scanner
+            # table deployed in the Windows app uses INTEGER PRIMARY KEY. Keep
+            # that legacy key intact and address CP2 scans through a separate
+            # text key. Existing rows receive a stable compatibility key.
+            conn.execute(
+                "UPDATE trend_scans SET scan_key=CAST(id AS TEXT) "
+                "WHERE scan_key IS NULL AND id IS NOT NULL"
+            )
+
+            # Indexes referencing legacy columns must be created only after
+            # the additive migrations above have established those columns.
+            for ddl in (
+                "CREATE INDEX IF NOT EXISTS idx_trend_queries_user ON trend_queries(user_id, enabled)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_items_user_score ON trend_items(user_id, trend_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_items_user_opportunity ON trend_items(user_id, opportunity_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_items_user_source ON trend_items(user_id, platform, source_id)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_item_queries_query ON trend_item_queries(query_id)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_snapshots_item_time ON trend_snapshots(item_id, captured_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_scans_user_time ON trend_scans(user_id, created_at DESC)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trend_scans_scan_key ON trend_scans(scan_key) WHERE scan_key IS NOT NULL",
+            ):
+                conn.execute(ddl)
 
             if migrated_legacy_projects:
                 # The first Content OS schema stored platforms as a JSON list.
@@ -1881,6 +2038,273 @@ class Store:
                 "VALUES (?,?,?,?,?,?)",
                 (job_id, platform, int(success), message, remote_url, time.time()),
             )
+
+    # ---- Channel Agent trend research (per-user, metadata only) ----
+    def list_trend_queries(self, user_id: int, *, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM trend_queries WHERE user_id = ?"
+        params: List[Any] = [user_id]
+        if enabled_only:
+            sql += " AND enabled = 1"
+        sql += " ORDER BY created_at ASC"
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def create_trend_query(self, user_id: int, query: str, **fields: Any) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM trend_queries WHERE user_id=? AND query=? LIMIT 1",
+                (user_id, query.strip()),
+            ).fetchone():
+                raise sqlite3.IntegrityError("duplicate trend query")
+            cur = conn.execute(
+                """INSERT INTO trend_queries
+                (user_id, query, relevance_language, region_code, published_within_days,
+                 duration_filter, search_order, enabled, topic_terms, exclusion_terms, notes,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, query.strip(), fields.get("relevance_language"), fields.get("region_code"),
+                 int(fields.get("published_within_days", 30)), fields.get("duration_filter", "long"),
+                 fields.get("search_order", "date"), int(bool(fields.get("enabled", True))),
+                 fields.get("topic_terms"), fields.get("exclusion_terms"), fields.get("notes"), now, now),
+            )
+            row_id = int(cur.lastrowid)
+            conn.execute("UPDATE trend_queries SET id=rowid WHERE rowid=? AND id IS NULL", (row_id,))
+            return row_id
+
+    def update_trend_query(self, user_id: int, query_id: int, **fields: Any) -> bool:
+        allowed = {"query", "relevance_language", "region_code", "published_within_days",
+                   "duration_filter", "search_order", "enabled", "topic_terms",
+                   "exclusion_terms", "notes"}
+        updates: List[str] = []
+        values: List[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            updates.append(f"{key} = ?")
+            values.append(int(bool(value)) if key == "enabled" else value)
+        if not updates:
+            return False
+        updates.append("updated_at = ?")
+        values.extend([time.time(), query_id, user_id])
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE trend_queries SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+                values,
+            )
+            return cur.rowcount > 0
+
+    def delete_trend_query(self, user_id: int, query_id: int) -> bool:
+        with self._connect() as conn:
+            owned = conn.execute(
+                "SELECT 1 FROM trend_queries WHERE id = ? AND user_id = ?", (query_id, user_id)
+            ).fetchone()
+            if not owned:
+                return False
+            conn.execute("DELETE FROM trend_item_queries WHERE query_id = ?", (query_id,))
+            conn.execute("DELETE FROM trend_queries WHERE id = ? AND user_id = ?", (query_id, user_id))
+            return True
+
+    def create_trend_scan(self, scan_id: str, user_id: int, topic: str, max_results: int) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            schema = {str(row["name"]): row for row in conn.execute("PRAGMA table_info(trend_scans)")}
+            columns = [
+                "scan_key", "user_id", "topic", "platforms_json", "providers_json", "status",
+                "progress_note", "warnings_json", "max_results", "created_at", "updated_at",
+            ]
+            values: List[Any] = [
+                scan_id, user_id, topic, '["youtube"]', '["youtube_data_api"]', "running",
+                "Searching public metadata", "[]", max_results, now, now,
+            ]
+            # A fresh CP2 database has a TEXT primary key. The deployed legacy
+            # table has INTEGER PRIMARY KEY AUTOINCREMENT, which must be left
+            # for SQLite to generate to avoid a datatype mismatch.
+            id_column = schema.get("id")
+            id_type = str(id_column["type"] if id_column is not None else "").upper()
+            if "INT" not in id_type:
+                columns.insert(0, "id")
+                values.insert(0, scan_id)
+            # The legacy scanner requires query_json on every insert. It is
+            # harmless compatibility metadata on fresh CP2 databases.
+            if "query_json" in schema:
+                columns.append("query_json")
+                values.append(json.dumps({"topic": topic}, ensure_ascii=False))
+            placeholders = ",".join("?" for _ in columns)
+            conn.execute(
+                f"INSERT INTO trend_scans ({','.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+
+    def finish_trend_scan(self, scan_id: str, *, status: str, note: str,
+                          warnings: Optional[List[str]] = None, error: Optional[str] = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trend_scans SET status=?,progress_note=?,warnings_json=?,error=?,updated_at=? WHERE scan_key=?",
+                (status, note, json.dumps(warnings or [], ensure_ascii=False), error, time.time(), scan_id),
+            )
+
+    def latest_trend_scan(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM trend_scans WHERE user_id=? ORDER BY created_at DESC LIMIT 1", (user_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["scan_id"] = result.get("scan_key") or str(result.get("id"))
+        return result
+
+    def upsert_trend_candidate(self, user_id: int, video: Dict[str, Any], rights_status: str) -> int:
+        now = float(video.get("captured_at") or time.time())
+        source_url = str(video["source_url"])
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT rowid AS _rowid,id FROM trend_items WHERE user_id=? AND platform='youtube' AND source_url=? LIMIT 1",
+                (user_id, source_url),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE trend_items SET scan_id=?,source_id=?,title=?,description=?,author=?,channel_id=?,
+                    thumbnail_url=?,duration_seconds=?,view_count=?,like_count=?,comment_count=?,
+                    published_at=?,last_seen_at=?,updated_at=? WHERE rowid=?""",
+                    (video["scan_id"], video["source_id"], video.get("title"), video.get("description"),
+                     video.get("channel_title"), video.get("channel_id"), video.get("thumbnail_url"),
+                     video.get("duration_seconds"), video.get("view_count"), video.get("like_count"),
+                     video.get("comment_count"), video.get("published_at"), now, now, existing["_rowid"]),
+                )
+            else:
+                cur = conn.execute(
+                    """INSERT INTO trend_items
+                    (scan_id,user_id,platform,provider,source_url,source_id,title,description,author,channel_id,
+                     thumbnail_url,duration_seconds,view_count,like_count,comment_count,published_at,
+                     trend_score,raw_json,rights_status,first_seen_at,last_seen_at,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (video["scan_id"], user_id, "youtube", "youtube_data_api", source_url,
+                     video["source_id"], video.get("title"), video.get("description"), video.get("channel_title"),
+                     video.get("channel_id"), video.get("thumbnail_url"), video.get("duration_seconds"),
+                     video.get("view_count"), video.get("like_count"), video.get("comment_count"),
+                     video.get("published_at"), 0.0, "{}", rights_status, now, now, now, now),
+                )
+                conn.execute("UPDATE trend_items SET id=rowid WHERE rowid=? AND id IS NULL", (cur.lastrowid,))
+            row = conn.execute(
+                "SELECT id FROM trend_items WHERE user_id=? AND platform='youtube' AND source_url=?",
+                (user_id, source_url),
+            ).fetchone()
+            return int(row["id"])
+
+    def match_trend_candidate_query(self, item_id: int, query_id: int, captured_at: float) -> None:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT rowid AS _rowid FROM trend_item_queries WHERE item_id=? AND query_id=? LIMIT 1",
+                (item_id, query_id),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE trend_item_queries SET last_matched_at=? WHERE rowid=?",
+                    (captured_at, existing["_rowid"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO trend_item_queries(item_id,query_id,first_matched_at,last_matched_at) VALUES (?,?,?,?)",
+                    (item_id, query_id, captured_at, captured_at),
+                )
+
+    def add_trend_snapshot(self, item_id: int, captured_at: float, views: Optional[int],
+                           likes: Optional[int], comments: Optional[int]) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM trend_snapshots WHERE item_id=? ORDER BY captured_at DESC,id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO trend_snapshots(item_id,captured_at,view_count,like_count,comment_count) VALUES (?,?,?,?,?)",
+                (item_id, captured_at, views, likes, comments),
+            )
+            conn.execute("UPDATE trend_snapshots SET id=rowid WHERE id IS NULL")
+            conn.execute(
+                "UPDATE trend_items SET snapshot_count=snapshot_count+1 WHERE id=?", (item_id,)
+            )
+        return dict(previous) if previous else None
+
+    def update_trend_candidate_score(self, user_id: int, item_id: int, **values: Any) -> bool:
+        allowed = {"observed_vph", "approx_vph", "engagement_rate", "outlier_ratio",
+                   "channel_typical_views", "freshness_score", "competition_proxy",
+                   "trend_score", "niche_relevance_score", "opportunity_score",
+                   "relevance_status", "match_reason_json", "score_confidence",
+                   "available_signal_count", "score_explanation_json"}
+        fields = [(key, value) for key, value in values.items() if key in allowed]
+        if not fields:
+            return False
+        sql = ",".join(f"{key}=?" for key, _ in fields)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE trend_items SET {sql},updated_at=? WHERE id=? AND user_id=?",
+                [value for _, value in fields] + [time.time(), item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def list_trend_candidates(self, user_id: int, limit: int = 100,
+                              min_score: float = 0.0, min_relevance: float = 0.0,
+                              include_filtered: bool = True) -> List[Dict[str, Any]]:
+        clauses = ["i.user_id=?", "i.platform='youtube'", "COALESCE(i.trend_score,0)>=?"]
+        params: List[Any] = [user_id, min_score]
+        if not include_filtered:
+            clauses.append("i.niche_relevance_score IS NOT NULL")
+            clauses.append("i.niche_relevance_score>=?")
+            params.append(min_relevance)
+        elif min_relevance > 0:
+            clauses.append("COALESCE(i.niche_relevance_score,0)>=?")
+            params.append(min_relevance)
+        params.append(min(200, max(1, limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT i.*,
+                (SELECT group_concat(q.query, ' | ') FROM trend_item_queries m
+                 JOIN trend_queries q ON q.id=m.query_id WHERE m.item_id=i.id) AS matched_queries
+                FROM trend_items i WHERE """ + " AND ".join(clauses) +
+                " ORDER BY COALESCE(i.opportunity_score,0) DESC,i.trend_score DESC,i.last_seen_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._trend_item_dict(row) for row in rows]
+
+    def get_trend_candidate(self, user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT i.*,
+                (SELECT group_concat(q.query, ' | ') FROM trend_item_queries m
+                 JOIN trend_queries q ON q.id=m.query_id WHERE m.item_id=i.id) AS matched_queries
+                FROM trend_items i WHERE i.id=? AND i.user_id=?""", (item_id, user_id)
+            ).fetchone()
+        return self._trend_item_dict(row) if row else None
+
+    def list_trend_snapshots(self, user_id: int, item_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT s.* FROM trend_snapshots s JOIN trend_items i ON i.id=s.item_id
+                WHERE s.item_id=? AND i.user_id=? ORDER BY s.captured_at DESC LIMIT ?""",
+                (item_id, user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _trend_item_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        try:
+            result["score_explanations"] = json.loads(result.pop("score_explanation_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["score_explanations"] = []
+        try:
+            result["match_reasons"] = json.loads(result.pop("match_reason_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["match_reasons"] = []
+        result.pop("raw_json", None)
+        result.pop("local_path", None)
+        score = float(result.get("trend_score") or 0.0)
+        result["trend_status"] = "hot" if score >= 0.90 else (
+            "rising" if score >= 0.75 else ("watch" if score >= 0.60 else "normal")
+        )
+        return result
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(

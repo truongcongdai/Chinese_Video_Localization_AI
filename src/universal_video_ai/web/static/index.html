@@ -1480,6 +1480,30 @@
         <div id="channel-agent-traffic" class="muted-help">Loading...</div>
         <h3 class="section-title" style="margin-top:22px">Content type</h3>
         <div id="channel-agent-content-type" class="muted-help">Loading...</div>
+        <div style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+          <div class="template-library-heading">
+            <h3 class="section-title">YouTube Trend Scanner</h3>
+            <button class="btn gradient small" id="trend-research-scan" type="button">Scan Now</button>
+          </div>
+          <p class="muted-help">Metadata-only research. Scores rank observed signals; they are not viral predictions or reuse permission.</p>
+          <div class="row" style="align-items:end;margin-top:12px">
+            <div class="field" style="flex:1"><label>Research query</label><input id="trend-research-new-query" maxlength="200" placeholder="家族修仙 一口气看完"></div>
+            <div class="field"><label>Duration</label><select id="trend-research-duration"><option value="long">Long-form</option><option value="any">Any</option><option value="medium">4–20 min</option><option value="short">Short</option></select></div>
+            <button class="btn secondary small" id="trend-research-add" type="button">Add query</button>
+          </div>
+          <div class="row">
+            <div class="field" style="flex:1"><label>Topic terms (comma separated)</label><input id="trend-research-topic-terms" maxlength="2000" placeholder="家族, 修仙, 长生, 老祖"></div>
+            <div class="field" style="flex:1"><label>Exclude terms (optional)</label><input id="trend-research-exclusion-terms" maxlength="2000" placeholder="短剧, 电视剧"></div>
+          </div>
+          <div id="trend-research-message" class="muted-help"></div>
+          <div id="trend-research-queries" style="margin-top:12px"></div>
+          <div class="template-library-heading" style="margin-top:22px">
+            <h3 class="section-title">Ranked research opportunities</h3>
+            <label class="muted-help"><input type="checkbox" id="trend-research-show-filtered"> Show low relevance</label>
+          </div>
+          <div id="trend-research-candidates" class="muted-help">No scan loaded.</div>
+          <div id="trend-research-detail" class="hidden" style="margin-top:18px"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1882,6 +1906,6 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260820-channel-agent-cp1" defer></script>
+<script src="/assets/app.js?v=20260820-channel-agent-cp21" defer></script>
 </body>
 </html>

@@ -366,6 +366,165 @@ curl -b cookies.txt "http://127.0.0.1:8080/api/channel-agent/youtube/overview?da
 
 Do not paste session cookies into issue reports or commit `cookies.txt`.
 
-## Next checkpoint after CP1
+## CP2 — YouTube Trend Scanner
 
-**CP2 — YouTube Trend Scanner**
+CP2 is a manual, metadata-only research tool. It uses the authenticated
+YouTube Data API and never invokes yt-dlp, downloads a source video/audio,
+fetches subtitle media, or stores thumbnail binaries. Thumbnail URLs remain
+metadata links.
+
+The scan flow is:
+
+```text
+enabled user queries
+  → search.list
+  → batched videos.list and channels.list
+  → canonical per-user candidates
+  → append-only metric snapshots
+  → deterministic query/topic relevance gate
+  → capped recent-channel baseline enrichment
+  → deterministic opportunity ranking
+```
+
+The existing web `trend_scans` and canonical `trend_items` storage is reused.
+CP2 adds per-user query rows, candidate/query matches, append-only snapshots,
+and scoring fields. A video matching several queries remains one candidate.
+
+### Signals and scoring
+
+- **Observed VPH** uses two repeated snapshots and the CP0 `view_velocity`
+  primitive. Equal timestamps, negative deltas, and counter resets safely
+  produce zero. It is unavailable on the first scan.
+- **Approximate VPH** is explicitly separate and uses current views divided by
+  age, with a one-hour minimum denominator. It is a low-confidence first-scan
+  estimate, never presented as observed velocity.
+- **Engagement** reuses CP0 `(likes + comments) / views` handling.
+- **Outlier ratio** compares the candidate with the median views of up to ten
+  recent videos from that channel. Long-form scans exclude baseline videos
+  below twenty minutes. Missing/zero baselines leave the signal unavailable.
+- **Freshness** uses continuous seven-day exponential decay bounded to 0–1.
+- **Competition proxy** is an inverse supply heuristic using result and unique
+  channel counts. It is not keyword search volume or true competition.
+- **Trend score** keeps the CP0 30/25/20/15/10 signal weights and renormalizes
+  only the available weights, so a missing outlier does not become a hidden
+  penalty. The result is a ranking heuristic, not a viral probability.
+- **Confidence** is high only with all five signals and observed velocity;
+  three or more available signals are medium, otherwise low.
+
+Threshold labels are `HOT` at 90+, `RISING` at 75+, `WATCH` at 60+, and
+`NORMAL` below 60. These are documented display categories, not guarantees.
+Explanations are deterministic templates; CP2 uses no LLM.
+
+## CP2.1 — Trend Relevance & Quality Gate
+
+CP2.1 keeps `trend_score` unchanged and adds a separate deterministic
+`niche_relevance_score`. Relevance is computed locally from each saved search
+query, optional per-query topic terms, optional per-query exclusion terms, and
+the result title/description metadata already returned by `videos.list`.
+There is no LLM, embedding model, paid API, or media download.
+
+Text is normalized with Unicode NFKC, case folding, accent removal for Latin
+text, punctuation folding, Latin word tokens, and overlapping two-character
+Chinese motifs. This makes Chinese, Vietnamese, and English profiles usable
+without a language-specific tokenizer.
+
+The bounded relevance heuristic uses:
+
+- exact query in title: `+0.65`; exact query only in description: `+0.20`
+- configured topic terms in title: `+0.18` each, capped at `0.45`
+- configured topic terms only in description: `+0.06` each, capped at `0.18`
+- query/topic motif matches in title: `+0.18` each, capped at `0.54`
+- motif matches only in description: `+0.05` each, capped at `0.15`
+- configured exclusions in title: `-0.50` each; description: `-0.15` each,
+  with total exclusion penalty capped at `0.80`
+
+Title evidence intentionally outweighs description evidence. Exclusion terms
+are profile configuration, not a permanent global blacklist. The UI exposes
+comma-separated topic and exclusion fields on each saved query. Optional
+installation-wide additions are also supported:
+
+```env
+CHANNEL_AGENT_TREND_TOPIC_TERMS=家族,修仙,长生,老祖,宗门,凡人修仙,多子多福
+CHANNEL_AGENT_TREND_EXCLUSION_TERMS=短剧,电视剧
+CHANNEL_AGENT_TREND_MIN_RELEVANCE=0.55
+```
+
+These values are examples for the current cultivation experiment, not
+hardcoded keywords. Other channels should provide their own topic profile.
+
+The final ranking is:
+
+```text
+opportunity_score = trend_score * niche_relevance_score
+```
+
+Both inputs and the result are bounded `0..1`. A high-velocity but unrelated
+video therefore cannot outrank a strongly relevant candidate solely through
+raw momentum. Candidates below the configured relevance threshold are still
+stored, snapshotted, and assigned their independent trend score. They are
+marked `low_relevance` and omitted from the default Ranked Research
+Opportunities response/table. The **Show low relevance** control and
+`include_filtered=true` API query expose them for audit.
+
+The candidate endpoint accepts `min_relevance` and `include_filtered`.
+Historical candidates are migrated additively as `unscored`; no snapshot is
+deleted. Rescanning recalculates relevance and opportunity from current
+metadata and the saved query profile.
+
+### Research seed queries
+
+These are editable starting ideas, not guaranteed winning keywords:
+
+```text
+家族修仙 一口气看完
+修仙家族 超长合集
+长生家族
+长生世家
+家族老祖
+长生老祖
+建立修仙家族
+凡人家族修仙
+弱小家族崛起
+苟道长生 家族
+```
+
+No seed is inserted automatically. Users create, edit, enable, or delete their
+own queries in the dashboard.
+
+### Rights
+
+External discoveries default to `idea_only`: they are idea/reference sources
+until usage rights are independently verified. A result matching the connected
+user's own channel may be marked `owned`. Public metadata, a high score, or a
+YouTube link never establishes a license or permission to reupload.
+
+### API quota discipline
+
+Scanning occurs only when the user clicks **Scan Now**. Defaults are capped at
+five enabled queries, ten search results per query, and five channels selected
+for baseline enrichment. Environment guards are:
+
+```env
+CHANNEL_AGENT_TREND_MAX_QUERIES=5
+CHANNEL_AGENT_TREND_RESULTS_PER_QUERY=10
+CHANNEL_AGENT_TREND_MAX_ENRICHMENT_CHANNELS=5
+CHANNEL_AGENT_TREND_MIN_RELEVANCE=0.55
+```
+
+Hard maximums are 10 queries, 25 results/query, and 10 enrichment channels.
+Search has no automatic pagination, daemon, scheduler, or polling loop.
+
+### CP2 manual verification
+
+```bash
+AI_CHANNEL_AGENT_ENABLED=true python scripts/run_web.py
+```
+
+Log in, open AI Channel Agent, add an editable query, and click Scan Now. The
+first scan should create one snapshot per unique candidate, leave observed VPH
+unavailable, and optionally show approximate VPH. After waiting, scan again;
+repeated candidates should have at least two snapshot rows and observed VPH.
+
+## Next checkpoint
+
+**CP3 — Competitor Intelligence**

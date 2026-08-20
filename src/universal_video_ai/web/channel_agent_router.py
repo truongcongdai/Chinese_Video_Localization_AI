@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import sqlite3
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -15,6 +16,16 @@ from universal_video_ai.channel_agent.youtube import (
     YouTubeReadOnlyError,
     YouTubeReadOnlyService,
     default_date_range,
+)
+from universal_video_ai.channel_agent.trends import (
+    MAX_QUERIES_PER_SCAN,
+    MAX_RESULTS_PER_QUERY,
+    MAX_ENRICHMENT_CHANNELS,
+    TrendScanAlreadyRunning,
+    TrendScanError,
+    YouTubeTrendScanner,
+    YouTubeTrendSearchProvider,
+    trend_min_relevance,
 )
 from universal_video_ai.web.auth import get_current_user_id
 from universal_video_ai.web.store import Store
@@ -32,6 +43,32 @@ class ChannelAgentStatusResponse(BaseModel):
     ollama_available: Optional[bool]
 
 
+class TrendQueryBody(BaseModel):
+    query: str
+    relevance_language: Optional[str] = None
+    region_code: Optional[str] = None
+    published_within_days: int = 30
+    duration_filter: str = "long"
+    search_order: str = "date"
+    enabled: bool = True
+    topic_terms: Optional[str] = None
+    exclusion_terms: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TrendQueryUpdateBody(BaseModel):
+    query: Optional[str] = None
+    relevance_language: Optional[str] = None
+    region_code: Optional[str] = None
+    published_within_days: Optional[int] = None
+    duration_filter: Optional[str] = None
+    search_order: Optional[str] = None
+    enabled: Optional[bool] = None
+    topic_terms: Optional[str] = None
+    exclusion_terms: Optional[str] = None
+    notes: Optional[str] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -41,6 +78,30 @@ def _store_from_request(request: Request) -> Store:
 
 def _service(store: Store) -> YouTubeReadOnlyService:
     return YouTubeReadOnlyService(GoogleOAuthTokenService(store))
+
+
+def _trend_service(store: Store) -> YouTubeTrendScanner:
+    youtube = _service(store)
+    return YouTubeTrendScanner(store, YouTubeTrendSearchProvider(youtube))
+
+
+def _validate_trend_query(data: dict[str, Any]) -> dict[str, Any]:
+    if "query" in data:
+        data["query"] = str(data["query"] or "").strip()
+        if not data["query"] or len(data["query"]) > 200:
+            raise HTTPException(422, "Research query must contain 1–200 characters.")
+    if data.get("published_within_days") is not None and not 1 <= int(data["published_within_days"]) <= 365:
+        raise HTTPException(422, "published_within_days must be between 1 and 365.")
+    if data.get("duration_filter") is not None and data["duration_filter"] not in {"any", "short", "medium", "long"}:
+        raise HTTPException(422, "Unsupported duration_filter.")
+    if data.get("search_order") is not None and data["search_order"] not in {"relevance", "date", "viewCount"}:
+        raise HTTPException(422, "Unsupported search_order.")
+    for field in ("topic_terms", "exclusion_terms"):
+        if field in data and data[field] is not None:
+            data[field] = str(data[field]).strip() or None
+            if data[field] and len(data[field]) > 2000:
+                raise HTTPException(422, f"{field} must contain at most 2000 characters.")
+    return data
 
 
 def _require_enabled() -> None:
@@ -163,3 +224,104 @@ def youtube_content_type(
     _require_enabled()
     start, end = _dates(days, start_date, end_date)
     return _provider_call(lambda: _service(store).get_content_types(user_id, start, end)).to_dict()
+
+
+@router.get("/trends/queries")
+def trend_queries(user_id: int = Depends(get_current_user_id),
+                  store: Store = Depends(_store_from_request)) -> list[dict[str, Any]]:
+    _require_enabled()
+    return store.list_trend_queries(user_id)
+
+
+@router.post("/trends/queries", status_code=201)
+def create_trend_query(body: TrendQueryBody, user_id: int = Depends(get_current_user_id),
+                       store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    data = _validate_trend_query(body.model_dump())
+    try:
+        query_id = store.create_trend_query(user_id, **data)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "This research query already exists.") from exc
+    return next(item for item in store.list_trend_queries(user_id) if item["id"] == query_id)
+
+
+@router.put("/trends/queries/{query_id}")
+def update_trend_query(query_id: int, body: TrendQueryUpdateBody,
+                       user_id: int = Depends(get_current_user_id),
+                       store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    data = _validate_trend_query(body.model_dump(exclude_unset=True))
+    try:
+        updated = store.update_trend_query(user_id, query_id, **data)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "This research query already exists.") from exc
+    if not updated:
+        raise HTTPException(404, "Research query not found.")
+    return next(item for item in store.list_trend_queries(user_id) if item["id"] == query_id)
+
+
+@router.delete("/trends/queries/{query_id}", status_code=204)
+def delete_trend_query(query_id: int, user_id: int = Depends(get_current_user_id),
+                       store: Store = Depends(_store_from_request)) -> None:
+    _require_enabled()
+    if not store.delete_trend_query(user_id, query_id):
+        raise HTTPException(404, "Research query not found.")
+
+
+@router.post("/trends/scan")
+def scan_trends(user_id: int = Depends(get_current_user_id),
+                store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _trend_service(store).scan(user_id)
+    except TrendScanAlreadyRunning as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except TrendScanError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except YouTubeReadOnlyError as exc:
+        message = str(exc)
+        if exc.code == "youtube_quota_exceeded":
+            message = "YouTube API quota is unavailable for this scan. Try again later or reduce the number of research queries."
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": message}) from exc
+
+
+@router.get("/trends/status")
+def trend_scan_status(user_id: int = Depends(get_current_user_id),
+                      store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    return {
+        "last_scan": store.latest_trend_scan(user_id),
+        "limits": {"max_queries": MAX_QUERIES_PER_SCAN,
+                   "results_per_query": MAX_RESULTS_PER_QUERY,
+                   "max_enrichment_channels": MAX_ENRICHMENT_CHANNELS,
+                   "min_relevance": trend_min_relevance()},
+    }
+
+
+@router.get("/trends/candidates")
+def trend_candidates(limit: int = Query(50, ge=1, le=200),
+                     min_score: float = Query(0.0, ge=0.0, le=1.0),
+                     min_relevance: Optional[float] = Query(None, ge=0.0, le=1.0),
+                     include_filtered: bool = Query(False),
+                     user_id: int = Depends(get_current_user_id),
+                     store: Store = Depends(_store_from_request)) -> list[dict[str, Any]]:
+    _require_enabled()
+    threshold = trend_min_relevance() if min_relevance is None else min_relevance
+    return store.list_trend_candidates(
+        user_id,
+        limit=limit,
+        min_score=min_score,
+        min_relevance=0.0 if include_filtered and min_relevance is None else threshold,
+        include_filtered=include_filtered,
+    )
+
+
+@router.get("/trends/candidates/{candidate_id}")
+def trend_candidate_detail(candidate_id: int, user_id: int = Depends(get_current_user_id),
+                           store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    candidate = store.get_trend_candidate(user_id, candidate_id)
+    if not candidate:
+        raise HTTPException(404, "Trend candidate not found.")
+    candidate["snapshots"] = store.list_trend_snapshots(user_id, candidate_id)
+    return candidate

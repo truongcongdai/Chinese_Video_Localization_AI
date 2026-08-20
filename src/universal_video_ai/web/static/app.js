@@ -3590,6 +3590,11 @@ async function initChannelAgent() {
           contentType.items.map(item => [item.content_type, channelAgentNumber(item.views), channelAgentNumber(item.watch_time_minutes), `${item.percentage_of_views.toFixed(1)}%`])
         )
       : '<div class="muted-help">Content-type breakdown is not available for this channel.</div>';
+    try {
+      await loadTrendResearch();
+    } catch (trendError) {
+      $("#trend-research-message").textContent = `Trend Scanner unavailable: ${trendError.message}`;
+    }
   } catch (e) {
     statusNode.textContent = `YouTube data unavailable: ${e.message}`;
     connectNode.classList.remove("hidden");
@@ -3602,6 +3607,134 @@ async function initChannelAgent() {
 
 $("#channel-agent-refresh").onclick = initChannelAgent;
 $("#channel-agent-connect-btn").onclick = () => startConnect("youtube");
+
+function trendAge(value) {
+  if (!value) return "—";
+  const hours = Math.max(0, (Date.now() - new Date(value).getTime()) / 3600000);
+  return hours < 48 ? `${Math.round(hours)}h` : `${Math.round(hours / 24)}d`;
+}
+
+function trendCandidateTable(candidates) {
+  if (!candidates.length) return '<div class="muted-help">No ranked opportunities meet the current relevance threshold.</div>';
+  return `<div style="overflow-x:auto"><table class="admin-table"><thead><tr>${["Trend", "Relevance", "Opportunity", "Status", "Title", "Channel", "Views", "VPH", "Outlier", "Engagement", "Age", "Match reason", "Rights"].map(value => `<th>${value}</th>`).join("")}</tr></thead><tbody>${candidates.map(item => `
+    <tr><td>${Math.round((item.trend_score || 0) * 100)}</td>
+    <td>${item.niche_relevance_score != null ? `${Math.round(item.niche_relevance_score * 100)}%` : "—"}</td>
+    <td>${item.opportunity_score != null ? Math.round(item.opportunity_score * 100) : "—"}</td>
+    <td>${escapeHtml(String(item.relevance_status === "low_relevance" ? "LOW RELEVANCE" : (item.relevance_status === "unscored" ? "UNSCORED" : item.trend_status || "normal")).toUpperCase())}</td>
+    <td><button class="btn secondary small" data-trend-candidate="${item.id}">${escapeHtml(item.title || item.source_id)}</button></td>
+    <td>${escapeHtml(item.author || "—")}</td><td>${channelAgentNumber(item.view_count)}</td>
+    <td>${item.observed_vph != null ? channelAgentNumber(item.observed_vph) : (item.approx_vph != null ? `~${channelAgentNumber(item.approx_vph)}` : "—")}</td>
+    <td>${item.outlier_ratio != null ? `${item.outlier_ratio.toFixed(1)}x` : "—"}</td>
+    <td>${item.engagement_rate != null ? `${(item.engagement_rate * 100).toFixed(1)}%` : "—"}</td>
+    <td>${trendAge(item.published_at)}</td>
+    <td>${escapeHtml((item.match_reasons || []).join(" + ") || "—")}</td>
+    <td>${escapeHtml(item.rights_status || "idea_only")}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+async function loadTrendResearch() {
+  const includeFiltered = $("#trend-research-show-filtered")?.checked || false;
+  const [queries, candidates, status] = await Promise.all([
+    api("/api/channel-agent/trends/queries"),
+    api(`/api/channel-agent/trends/candidates?limit=50&include_filtered=${includeFiltered}`),
+    api("/api/channel-agent/trends/status"),
+  ]);
+  $("#trend-research-queries").innerHTML = queries.length ? queries.map(item => `
+    <div data-trend-query-row="${item.id}" style="margin-bottom:12px;padding:10px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+      <div class="row" style="align-items:center">
+        <input data-trend-query-text value="${escapeHtml(item.query)}" maxlength="200" style="flex:1">
+        <select data-trend-query-duration>${["long", "any", "medium", "short"].map(value => `<option value="${value}" ${item.duration_filter === value ? "selected" : ""}>${value}</option>`).join("")}</select>
+        <label class="muted-help"><input type="checkbox" data-trend-query-enabled ${item.enabled ? "checked" : ""}> enabled</label>
+        <button class="btn secondary small" data-trend-query-save>Save</button>
+        <button class="btn secondary small" data-trend-query-delete>Delete</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input data-trend-query-topics value="${escapeHtml(item.topic_terms || "")}" maxlength="2000" placeholder="Topic terms: 家族, 修仙, 老祖" style="flex:1">
+        <input data-trend-query-exclusions value="${escapeHtml(item.exclusion_terms || "")}" maxlength="2000" placeholder="Exclude terms: 短剧, 电视剧" style="flex:1">
+      </div>
+    </div>`).join("") : '<div class="muted-help">Add a research query to begin. Seed examples are suggestions only.</div>';
+  const last = status.last_scan;
+  $("#trend-research-message").textContent = last
+    ? `Last scan: ${new Date(last.updated_at * 1000).toLocaleString()} · ${last.progress_note || last.status}`
+    : `Manual scans only · max ${status.limits.max_queries} queries · ${status.limits.results_per_query} results/query`;
+  $("#trend-research-candidates").innerHTML = trendCandidateTable(candidates);
+  bindTrendResearchActions();
+}
+
+function bindTrendResearchActions() {
+  document.querySelectorAll("[data-trend-query-save]").forEach(button => {
+    button.onclick = async () => {
+      const row = button.closest("[data-trend-query-row]");
+      await api(`/api/channel-agent/trends/queries/${row.dataset.trendQueryRow}`, {
+        method: "PUT", body: JSON.stringify({
+          query: row.querySelector("[data-trend-query-text]").value,
+          duration_filter: row.querySelector("[data-trend-query-duration]").value,
+          enabled: row.querySelector("[data-trend-query-enabled]").checked,
+          topic_terms: row.querySelector("[data-trend-query-topics]").value,
+          exclusion_terms: row.querySelector("[data-trend-query-exclusions]").value,
+        }),
+      });
+      await loadTrendResearch();
+    };
+  });
+  document.querySelectorAll("[data-trend-query-delete]").forEach(button => {
+    button.onclick = async () => {
+      const row = button.closest("[data-trend-query-row]");
+      await api(`/api/channel-agent/trends/queries/${row.dataset.trendQueryRow}`, {method: "DELETE"});
+      await loadTrendResearch();
+    };
+  });
+  document.querySelectorAll("[data-trend-candidate]").forEach(button => {
+    button.onclick = () => showTrendCandidate(Number(button.dataset.trendCandidate));
+  });
+}
+
+async function showTrendCandidate(id) {
+  const item = await api(`/api/channel-agent/trends/candidates/${id}`);
+  const detail = $("#trend-research-detail");
+  detail.classList.remove("hidden");
+  detail.innerHTML = `
+    <h3 class="section-title">${escapeHtml(item.title || item.source_id)}</h3>
+    <p><a href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener">Open original YouTube page</a></p>
+    <p class="muted-help">${escapeHtml(item.author || "Unknown channel")} · ${escapeHtml(item.matched_queries || "")}</p>
+    <p><strong>Trend:</strong> ${Math.round((item.trend_score || 0) * 100)} · <strong>Relevance:</strong> ${item.niche_relevance_score != null ? `${Math.round(item.niche_relevance_score * 100)}%` : "—"} · <strong>Opportunity:</strong> ${item.opportunity_score != null ? Math.round(item.opportunity_score * 100) : "—"}</p>
+    <p><strong>Matched:</strong> ${escapeHtml((item.match_reasons || []).join(" + ") || "—")}</p>
+    <p>${(item.score_explanations || []).map(reason => `• ${escapeHtml(reason)}`).join("<br>")}</p>
+    <p class="muted-help">Confidence: ${escapeHtml(item.score_confidence || "low")} · Signals: ${item.available_signal_count || 0}/5 · Rights: ${escapeHtml(item.rights_status || "idea_only")}</p>
+    <h4>Snapshot history</h4>
+    ${channelAgentTable(["Captured", "Views", "Likes", "Comments"], (item.snapshots || []).map(snapshot => [new Date(snapshot.captured_at * 1000).toLocaleString(), channelAgentNumber(snapshot.view_count), channelAgentNumber(snapshot.like_count), channelAgentNumber(snapshot.comment_count)]))}`;
+}
+
+$("#trend-research-add").onclick = async () => {
+  const input = $("#trend-research-new-query");
+  try {
+    await api("/api/channel-agent/trends/queries", {method: "POST", body: JSON.stringify({
+      query: input.value, duration_filter: $("#trend-research-duration").value,
+      topic_terms: $("#trend-research-topic-terms").value,
+      exclusion_terms: $("#trend-research-exclusion-terms").value,
+    })});
+    input.value = "";
+    $("#trend-research-topic-terms").value = "";
+    $("#trend-research-exclusion-terms").value = "";
+    await loadTrendResearch();
+  } catch (e) { $("#trend-research-message").textContent = e.message; }
+};
+
+$("#trend-research-show-filtered").onchange = loadTrendResearch;
+
+$("#trend-research-scan").onclick = async () => {
+  const button = $("#trend-research-scan");
+  button.disabled = true;
+  $("#trend-research-message").textContent = "Scanning public YouTube metadata...";
+  try {
+    const result = await api("/api/channel-agent/trends/scan", {method: "POST"});
+    $("#trend-research-message").textContent = `${result.queries_scanned} queries · ${result.candidates_found} candidates · ${result.snapshots_created} snapshots · ${result.filtered_low_relevance || 0} low relevance`;
+    await loadTrendResearch();
+  } catch (e) {
+    $("#trend-research-message").textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+};
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

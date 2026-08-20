@@ -153,4 +153,4 @@ def test_channel_agent_ui_is_hidden_until_bootstrap_enables_it() -> None:
     assert "boot.features.ai_channel_agent" in javascript
     assert 'api("/api/channel-agent/youtube/status")' in javascript
     assert 'id="channel-agent-connect-btn"' in html
-    assert "channel-agent-cp1" in html
+    assert "channel-agent-cp2" in html
