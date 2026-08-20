@@ -56,7 +56,8 @@ async function api(path, opts = {}) {
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
-    throw new Error(body.detail || `HTTP ${resp.status}`);
+    const detail = body.detail;
+    throw new Error((detail && detail.message) || detail || `HTTP ${resp.status}`);
   }
   return resp.status === 204 ? null : resp.json();
 }
@@ -300,6 +301,7 @@ async function refreshMe() {
 window.addEventListener("message", (ev) => {
   if (ev.data === "social-connected") {
     loadConnections();
+    if (bootstrapConfig.features?.ai_channel_agent) initChannelAgent();
   }
 });
 
@@ -3511,19 +3513,95 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 });
 
-// ---------------- AI Channel Agent (CP0) ----------------
+// ---------------- AI Channel Agent (CP1) ----------------
+function channelAgentNumber(value) {
+  return value == null ? "—" : new Intl.NumberFormat().format(value);
+}
+
+function channelAgentDuration(seconds) {
+  if (seconds == null) return "—";
+  const total = Math.max(0, Math.round(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function channelAgentTable(headers, rows) {
+  if (!rows.length) return '<div class="muted-help">No data yet.</div>';
+  const heading = headers.map(item => `<th>${escapeHtml(item)}</th>`).join("");
+  const body = rows.map(row => `<tr>${row.map(value => `<td>${escapeHtml(value)}</td>`).join("")}</tr>`).join("");
+  return `<div style="overflow-x:auto"><table class="admin-table"><thead><tr>${heading}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
 async function initChannelAgent() {
+  const statusNode = $("#channel-agent-status");
+  const connectNode = $("#channel-agent-connect");
+  const dashboardNode = $("#channel-agent-dashboard");
+  statusNode.textContent = "Loading YouTube connection...";
+  connectNode.classList.add("hidden");
+  dashboardNode.classList.add("hidden");
   try {
-    const status = await api("/api/channel-agent/status");
-    $("#channel-agent-youtube").textContent = status.youtube_connected ? "Connected" : "Not connected";
-    const ollama = status.ollama_available === true
-      ? "available"
-      : (status.ollama_available === false ? "unavailable" : "not checked");
-    $("#channel-agent-status").textContent = `Version ${status.version} · Ollama ${ollama}`;
+    const status = await api("/api/channel-agent/youtube/status");
+    if (!status.connected) {
+      connectNode.classList.remove("hidden");
+      const missingScope = status.credential_present && !status.analytics_scope_granted;
+      $("#channel-agent-connect-message").textContent = missingScope
+        ? "Reconnect YouTube to enable Analytics access."
+        : (status.credential_present
+          ? "YouTube authorization is no longer usable. Please reconnect."
+          : "YouTube account is not connected.");
+      $("#channel-agent-connect-btn").textContent = status.credential_present ? "Reconnect YouTube" : "Connect YouTube";
+      statusNode.textContent = missingScope ? "Analytics permission missing" : "YouTube not connected";
+      return;
+    }
+
+    statusNode.textContent = "YouTube Connected · Loading channel data...";
+    const [channel, overview, videos, traffic, contentType] = await Promise.all([
+      api("/api/channel-agent/youtube/channel"),
+      api("/api/channel-agent/youtube/overview?days=28"),
+      api("/api/channel-agent/youtube/top-videos?days=28&limit=10"),
+      api("/api/channel-agent/youtube/traffic-sources?days=28"),
+      api("/api/channel-agent/youtube/content-type?days=28"),
+    ]);
+    dashboardNode.classList.remove("hidden");
+    statusNode.textContent = "YouTube Connected";
+    $("#channel-agent-channel-title").textContent = `Channel: ${channel.title}`;
+    $("#channel-agent-handle").textContent = channel.custom_url || "";
+    $("#channel-agent-subscribers").textContent = channel.hidden_subscriber_count
+      ? "Hidden" : channelAgentNumber(channel.subscriber_count);
+    $("#channel-agent-lifetime-views").textContent = channelAgentNumber(channel.view_count);
+    $("#channel-agent-video-count").textContent = channelAgentNumber(channel.video_count);
+    $("#channel-agent-period-views").textContent = channelAgentNumber(overview.views);
+    $("#channel-agent-watch-time").textContent = channelAgentNumber(overview.watch_time_minutes);
+    $("#channel-agent-subs-gained").textContent = channelAgentNumber(overview.subscribers_gained);
+    $("#channel-agent-avg-duration").textContent = channelAgentDuration(overview.average_view_duration_seconds);
+    const noData = [overview.views, overview.watch_time_minutes, overview.likes, overview.comments]
+      .every(value => value == null || Number(value) === 0);
+    $("#channel-agent-no-data").classList.toggle("hidden", !noData);
+    $("#channel-agent-top-videos").innerHTML = channelAgentTable(
+      ["Video", "Views", "Watch minutes", "Avg duration", "Likes", "Comments"],
+      videos.map(video => [video.title || video.video_id, channelAgentNumber(video.views), channelAgentNumber(video.estimated_minutes_watched), channelAgentDuration(video.average_view_duration_seconds), channelAgentNumber(video.likes), channelAgentNumber(video.comments)])
+    );
+    $("#channel-agent-traffic").innerHTML = channelAgentTable(
+      ["Source", "Views", "Watch minutes", "% views"],
+      traffic.map(item => [item.source, channelAgentNumber(item.views), channelAgentNumber(item.watch_time_minutes), `${item.percentage_of_views.toFixed(1)}%`])
+    );
+    $("#channel-agent-content-type").innerHTML = contentType.available
+      ? channelAgentTable(
+          ["Type", "Views", "Watch minutes", "% views"],
+          contentType.items.map(item => [item.content_type, channelAgentNumber(item.views), channelAgentNumber(item.watch_time_minutes), `${item.percentage_of_views.toFixed(1)}%`])
+        )
+      : '<div class="muted-help">Content-type breakdown is not available for this channel.</div>';
   } catch (e) {
-    $("#channel-agent-status").textContent = `Status unavailable: ${e.message}`;
+    statusNode.textContent = `YouTube data unavailable: ${e.message}`;
+    connectNode.classList.remove("hidden");
+    $("#channel-agent-connect-message").textContent = e.message.toLowerCase().includes("permission")
+      ? "Reconnect YouTube to enable Analytics access."
+      : "Refresh the dashboard or reconnect YouTube if authorization expired.";
+    $("#channel-agent-connect-btn").textContent = "Reconnect YouTube";
   }
 }
+
+$("#channel-agent-refresh").onclick = initChannelAgent;
+$("#channel-agent-connect-btn").onclick = () => startConnect("youtube");
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

@@ -179,6 +179,7 @@ DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
+app.state.store = store
 
 
 def _resolve_publishing_config_for_user(
@@ -7291,13 +7292,19 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
             access_token=result.access_token, refresh_token=result.refresh_token,
             expires_at=result.expires_at, account_name=result.account_name,
             account_ref=result.account_ref,
+            scopes=result.scopes,
         )
         label = result.account_name or "tài khoản của bạn"
         return HTMLResponse(
             close_html.format(message=f"✓ Đã kết nối {platform} ({label}). Có thể đóng cửa sổ này."))
     except Exception as exc:
         logger.exception("OAuth callback failed for platform=%s", platform)
-        return HTMLResponse(close_html.format(message=f"Kết nối thất bại: {exc}"), status_code=400)
+        return HTMLResponse(
+            close_html.format(
+                message="Kết nối thất bại. Vui lòng thử lại hoặc kiểm tra cấu hình OAuth."
+            ),
+            status_code=400,
+        )
 
 
 @app.delete("/api/social/connections/{platform}")

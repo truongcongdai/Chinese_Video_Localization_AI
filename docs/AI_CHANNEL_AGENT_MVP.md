@@ -2,11 +2,10 @@
 
 ## Purpose
 
-AI Channel Agent is an opt-in personal/development subsystem for metadata-first
-content research and, in later checkpoints, read-only channel analysis. CP0 only
-adds architectural boundaries, deterministic ranking primitives, status/API
-plumbing, and a gated placeholder UI. It does not collect data, generate
-content, schedule work, or publish.
+AI Channel Agent is an opt-in personal/development subsystem. CP0 established
+its boundaries and deterministic ranking primitives; CP1 adds authenticated,
+read-only analysis of the current user's own YouTube channel. It does not
+generate content, schedule work, or publish.
 
 The first experiment may research Vietnamese faceless long-form niches, but no
 niche is hardcoded in the implementation.
@@ -53,9 +52,8 @@ niche is hardcoded in the implementation.
   readonly access.
 - `social/youtube.py` uploads private videos through direct YouTube REST calls
   and can also use legacy shared refresh-token environment variables.
-- No `googleapiclient` dependency is installed. There is no YouTube Analytics
-  API implementation, traffic-source reporting, or Channel Agent read-only
-  connection yet.
+- No `googleapiclient` dependency is installed. CP1 uses the existing
+  `requests` stack for YouTube Data and Analytics API reads.
 
 The existing publishing OAuth is not silently treated as a CP0 research
 connection. CP1 must decide how to reuse it without changing upload behavior or
@@ -248,17 +246,126 @@ Expected: the app starts without YouTube/Ollama credentials, the endpoint
 reports `enabled` as true, and the tab appears after login with real CP0 states
 and zero persisted CP0 items.
 
-## Known limitations
+## CP0 known limitations (historical baseline)
 
-- There is no Channel Agent YouTube connection or Analytics API client yet.
+- CP0 had no Channel Agent YouTube connection or Analytics API client.
 - Ollama is deliberately not probed in CP0, so its status is unknown.
 - Placeholder counts are zero because CP0 has no collectors or persistence.
 - The pre-existing full test suite has two collection errors, and the focused
   baseline has four unrelated failures described above.
 - CP0 does not mount or expand the existing YouTube research router.
 
-## Next checkpoint
+## CP1 — YouTube Read-Only Connection
 
-**CP1 — YouTube Read-Only Connection**
+CP1 reuses the established per-user social connection rather than creating a
+second Google OAuth system. The browser starts at
+`GET /api/social/connect/youtube`, returns to
+`/api/social/callback/youtube`, and stores the result in the existing
+`social_accounts` row for the authenticated application user. The callback's
+single-use `oauth_states` record binds the returned credential to the user who
+started the flow.
 
-CP1 will be reviewed separately. It must not begin as part of CP0.
+The existing private-upload permission remains in the requested scope set so a
+reconnect does not remove upload capability from the old publishing workflow.
+CP1 adds only:
+
+```text
+https://www.googleapis.com/auth/youtube.readonly
+https://www.googleapis.com/auth/yt-analytics.readonly
+```
+
+No monetary/revenue scope is requested. Newly granted scopes are recorded on
+the existing credential row. A legacy credential without recorded Analytics
+permission is not silently assumed to have it: the dashboard asks the user to
+reconnect and Google is called with `prompt=consent`. A refresh token does not
+gain new scopes by itself.
+
+### Google Cloud setup
+
+In the same Google Cloud project and OAuth client already used by the web app:
+
+1. Enable **YouTube Data API v3**.
+2. Enable **YouTube Analytics API**.
+3. Configure the OAuth consent screen and add the YouTube/Analytics scopes
+   above (plus the existing upload scope used by legacy publishing).
+4. Use an OAuth client of type **Web application**.
+5. Add the exact authorized redirect URI used by this installation, for
+   example `http://127.0.0.1:8080/api/social/callback/youtube` for local use.
+6. Set the existing environment variables without committing their values:
+
+   ```env
+   GOOGLE_CLIENT_ID=your-oauth-client-id
+   GOOGLE_CLIENT_SECRET=your-oauth-client-secret
+   ```
+
+An OAuth Client ID/Client Secret identifies the application and drives user
+consent. A YouTube API key is a different credential; CP1 does not require one
+because every request reads the authenticated user's own channel with OAuth.
+
+If the consent screen is in Testing mode, add intended accounts as test users.
+Never put an access token or refresh token in source, documentation, browser
+JavaScript, or a Channel Agent API response.
+
+### CP1 service/API behavior
+
+The service obtains the current user's `social_accounts` row, verifies scope
+evidence, and refreshes an expired access token centrally through the existing
+`GoogleOAuth` client. It then makes direct `requests` calls to official Google
+REST endpoints. No `google-api-python-client` or other dependency was added.
+
+Authenticated, feature-gated endpoints are:
+
+```text
+GET /api/channel-agent/status
+GET /api/channel-agent/youtube/status
+GET /api/channel-agent/youtube/channel
+GET /api/channel-agent/youtube/overview?days=28
+GET /api/channel-agent/youtube/top-videos?days=28&limit=10
+GET /api/channel-agent/youtube/traffic-sources?days=28
+GET /api/channel-agent/youtube/content-type?days=28
+```
+
+Reports also accept `start_date=YYYY-MM-DD&end_date=YYYY-MM-DD`. The default
+28-day range ends yesterday. Top-video metadata is enriched with one batched
+`videos.list` request, not one request per video. Content type uses the
+`creatorContentType` Analytics dimension and returns `available: false` when
+that report is unsupported for the connected channel/account context.
+
+The dashboard loads only when its tab is opened or Refresh is clicked. It does
+not poll Google. A channel with zero subscribers, views, videos, or report rows
+is a valid connected channel and displays “No analytics data yet.”
+
+### CP1 manual smoke test
+
+PowerShell:
+
+```powershell
+$env:AI_CHANNEL_AGENT_ENABLED='false'; python scripts/run_web.py
+$env:AI_CHANNEL_AGENT_ENABLED='true'; python scripts/run_web.py
+```
+
+POSIX shell:
+
+```bash
+AI_CHANNEL_AGENT_ENABLED=false python scripts/run_web.py
+AI_CHANNEL_AGENT_ENABLED=true python scripts/run_web.py
+```
+
+Open `http://127.0.0.1:8080`, log in, open AI Channel Agent, and connect or
+reconnect YouTube. Complete Google consent and verify channel identity,
+lifetime statistics, 28-day overview, top videos, traffic sources, and content
+type. Empty tables must remain a successful zero-data state.
+
+These APIs use the existing `vai_session` HttpOnly cookie. A browser-exported
+cookie can be supplied for local diagnostics without printing it:
+
+```bash
+curl -b cookies.txt http://127.0.0.1:8080/api/channel-agent/youtube/status
+curl -b cookies.txt "http://127.0.0.1:8080/api/channel-agent/youtube/overview?days=28"
+```
+
+Do not paste session cookies into issue reports or commit `cookies.txt`.
+
+## Next checkpoint after CP1
+
+**CP2 — YouTube Trend Scanner**

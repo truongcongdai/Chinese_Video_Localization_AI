@@ -16,6 +16,11 @@ from universal_video_ai.channel_agent.models import RightsStatus, SourceMetadata
 from universal_video_ai.web.channel_agent_router import channel_agent_status, router
 
 
+class _NoOAuthStore:
+    def get_social_account(self, user_id: int, platform: str):
+        return None
+
+
 def test_channel_agent_flag_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AI_CHANNEL_AGENT_ENABLED", raising=False)
 
@@ -101,12 +106,14 @@ def test_source_metadata_defaults_rights_to_unknown() -> None:
 def test_channel_agent_status_api_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AI_CHANNEL_AGENT_ENABLED", "false")
 
-    response = channel_agent_status()
+    response = channel_agent_status(user_id=1, store=_NoOAuthStore())
 
     assert response.model_dump() == {
         "enabled": False,
         "version": "mvp",
         "youtube_connected": False,
+        "youtube_credential_present": False,
+        "youtube_connection_verified": None,
         "ollama_available": None,
     }
 
@@ -116,12 +123,14 @@ def test_channel_agent_status_api_when_enabled_has_no_external_dependency(
 ) -> None:
     monkeypatch.setenv("AI_CHANNEL_AGENT_ENABLED", "true")
 
-    response = channel_agent_status()
+    response = channel_agent_status(user_id=1, store=_NoOAuthStore())
 
     assert response.model_dump() == {
         "enabled": True,
         "version": "mvp",
         "youtube_connected": False,
+        "youtube_credential_present": False,
+        "youtube_connection_verified": None,
         "ollama_available": None,
     }
     assert "/api/channel-agent/status" in {route.path for route in router.routes}
@@ -142,4 +151,6 @@ def test_channel_agent_ui_is_hidden_until_bootstrap_enables_it() -> None:
     assert 'data-feature="channel-agent"' in html
     assert "AI Channel Agent" in html
     assert "boot.features.ai_channel_agent" in javascript
-    assert 'api("/api/channel-agent/status")' in javascript
+    assert 'api("/api/channel-agent/youtube/status")' in javascript
+    assert 'id="channel-agent-connect-btn"' in html
+    assert "channel-agent-cp1" in html

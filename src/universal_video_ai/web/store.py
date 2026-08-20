@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS social_accounts (
     expires_at REAL,
     account_name TEXT,               -- display name shown in the UI ("Connected as ...")
     account_ref TEXT,                -- platform-specific id (e.g. FB page id, open_id)
+    scopes TEXT,                     -- provider-granted OAuth scopes (space separated)
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(user_id, platform)
@@ -504,6 +505,9 @@ _MIGRATIONS = [
     # time, in the /api/register handler — this table just tracks the link.
     ("users", "referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
     ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
+    # Scope evidence is required to distinguish old upload-only YouTube
+    # credentials from credentials explicitly re-consented for Analytics.
+    ("social_accounts", "scopes", "ALTER TABLE social_accounts ADD COLUMN scopes TEXT"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -749,7 +753,7 @@ class Store:
                 for table in
                 ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
                  "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
-                 "content_os_memories", "channel_scan_states", "channel_scan_videos")
+                 "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -1883,6 +1887,7 @@ class Store:
             self, user_id: int, platform: str, access_token: Optional[str],
             refresh_token: Optional[str] = None, expires_at: Optional[float] = None,
             account_name: Optional[str] = None, account_ref: Optional[str] = None,
+            scopes: Optional[str] = None,
     ) -> None:
         now = time.time()
         with self._connect() as conn:
@@ -1890,18 +1895,35 @@ class Store:
                 """
                 INSERT INTO social_accounts
                 (user_id, platform, access_token, refresh_token, expires_at,
-                 account_name, account_ref, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform) DO
+                 account_name, account_ref, scopes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform) DO
                 UPDATE SET
                     access_token=excluded.access_token,
                     refresh_token= COALESCE (excluded.refresh_token, social_accounts.refresh_token),
                     expires_at=excluded.expires_at,
                     account_name=excluded.account_name,
                     account_ref=excluded.account_ref,
+                    scopes=COALESCE(excluded.scopes, social_accounts.scopes),
                     updated_at=excluded.updated_at
                 """,
                 (user_id, platform, access_token, refresh_token, expires_at,
-                 account_name, account_ref, now, now),
+                 account_name, account_ref, scopes, now, now),
+            )
+
+    def update_social_access_token(
+            self, user_id: int, platform: str, access_token: str,
+            expires_at: Optional[float], scopes: Optional[str] = None,
+    ) -> None:
+        """Update an already-owned credential after centralized refresh."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE social_accounts
+                SET access_token = ?, expires_at = ?,
+                    scopes = COALESCE(?, scopes), updated_at = ?
+                WHERE user_id = ? AND platform = ?
+                """,
+                (access_token, expires_at, scopes, time.time(), user_id, platform),
             )
 
     def get_social_account(self, user_id: int, platform: str) -> Optional[sqlite3.Row]:
