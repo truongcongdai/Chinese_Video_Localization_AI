@@ -3524,10 +3524,12 @@ function channelAgentDuration(seconds) {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
-function channelAgentTable(headers, rows) {
+function channelAgentTable(headers, rows, htmlColumns = []) {
   if (!rows.length) return '<div class="muted-help">No data yet.</div>';
   const heading = headers.map(item => `<th>${escapeHtml(item)}</th>`).join("");
-  const body = rows.map(row => `<tr>${row.map(value => `<td>${escapeHtml(value)}</td>`).join("")}</tr>`).join("");
+  const body = rows.map(row => `<tr>${row.map((value, index) =>
+    `<td>${htmlColumns.includes(index) ? String(value ?? "") : escapeHtml(value)}</td>`
+  ).join("")}</tr>`).join("");
   return `<div style="overflow-x:auto"><table class="admin-table"><thead><tr>${heading}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
@@ -3594,6 +3596,11 @@ async function initChannelAgent() {
       await loadTrendResearch();
     } catch (trendError) {
       $("#trend-research-message").textContent = `Trend Scanner unavailable: ${trendError.message}`;
+    }
+    try {
+      await loadCompetitors();
+    } catch (competitorError) {
+      $("#competitor-message").textContent = `Competitor Intelligence unavailable: ${competitorError.message}`;
     }
   } catch (e) {
     statusNode.textContent = `YouTube data unavailable: ${e.message}`;
@@ -3735,6 +3742,130 @@ $("#trend-research-scan").onclick = async () => {
     button.disabled = false;
   }
 };
+
+function competitorTable(items) {
+  if (!items.length) return '<div class="muted-help">No qualified/watch competitors. Refresh discovered channels or enable Show low relevance for audit.</div>';
+  return channelAgentTable(
+    ["Score", "Relevance", "Niche hit", "Status", "Channel", "Match reason", "Subscribers", "Median views", "Breakout", "Candidate hits", "Recent uploads"],
+    items.map(item => [
+      item.competitor_score != null ? Math.round(item.competitor_score * 100) : "—",
+      item.competitor_relevance_score != null ? `${Math.round(item.competitor_relevance_score * 100)}%` : "—",
+      item.niche_hit_rate != null ? `${Math.round(item.niche_hit_rate * 100)}%` : "—",
+      (item.competitor_relevance_status || "unscored").toUpperCase(),
+      `<button class="btn secondary small" data-competitor-id="${item.id}">${escapeHtml(item.channel_title)}</button>`,
+      (item.competitor_match_reasons || []).slice(0, 2).join(" · ") || "—",
+      item.hidden_subscriber_count ? "Hidden" : channelAgentNumber(item.subscriber_count),
+      channelAgentNumber(item.median_views),
+      item.breakout_frequency != null ? `${(item.breakout_frequency * 100).toFixed(0)}%` : "—",
+      channelAgentNumber(item.source_candidate_count), channelAgentNumber(item.recent_upload_count),
+    ]), [4]
+  );
+}
+
+async function loadCompetitors() {
+  const includeFiltered = $("#competitor-show-filtered").checked;
+  const includeFilteredPatterns = $("#competitor-show-filtered-patterns").checked;
+  const [items, gaps] = await Promise.all([
+    api(`/api/channel-agent/competitors?include_filtered=${includeFiltered}`),
+    api(`/api/channel-agent/competitors/gaps?include_filtered=${includeFilteredPatterns}`),
+  ]);
+  $("#competitor-list").innerHTML = competitorTable(items);
+  $("#competitor-gaps").innerHTML = gaps.length ? channelAgentTable(
+    ["Pattern", "Quality", "Status", "Competitors", "Breakouts", "Median outlier", "Qualified candidates", "Confidence", "Evidence"],
+    gaps.map(gap => [gap.pattern, gap.gap_quality_score != null ? `${Math.round(gap.gap_quality_score * 100)}%` : "—",
+      (gap.gap_quality_status || "unscored").toUpperCase(), gap.supporting_competitor_count, gap.supporting_breakout_count,
+      gap.median_outlier != null ? `${gap.median_outlier.toFixed(1)}x` : "—", gap.qualified_candidate_count,
+      gap.confidence, (gap.evidence || []).map(video =>
+        `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title || video.video_id)}</a>`
+      ).join("<br>")]), [8]
+  ) : '<div class="muted-help">No evidence-backed opportunity gaps yet.</div>';
+  document.querySelectorAll("[data-competitor-id]").forEach(button => {
+    button.onclick = () => showCompetitor(Number(button.dataset.competitorId));
+  });
+}
+
+async function showCompetitor(id) {
+  const item = await api(`/api/channel-agent/competitors/${id}`);
+  const detail = $("#competitor-detail");
+  detail.classList.remove("hidden");
+  const videos = item.videos || [];
+  const breakouts = videos.filter(video => video.outlier_ratio != null && video.outlier_ratio >= 2);
+  const patterns = item.patterns || [];
+  const buckets = item.duration_buckets || [];
+  const snapshots = item.snapshots || [];
+  detail.innerHTML = `
+    <div class="template-library-heading"><h3 class="section-title">${escapeHtml(item.channel_title)}</h3>
+      <a href="${escapeHtml(item.channel_url)}" target="_blank" rel="noopener">Open channel</a></div>
+    <div class="stat-grid" style="margin-top:10px">
+      <div class="stat-box"><div class="num">${item.hidden_subscriber_count ? "Hidden" : channelAgentNumber(item.subscriber_count)}</div><div class="label">Subscribers</div></div>
+      <div class="stat-box"><div class="num">${channelAgentNumber(item.lifetime_view_count)}</div><div class="label">Lifetime views</div></div>
+      <div class="stat-box"><div class="num">${channelAgentNumber(item.median_views)}</div><div class="label">Recent median views</div></div>
+      <div class="stat-box"><div class="num">${item.breakout_frequency != null ? `${(item.breakout_frequency * 100).toFixed(0)}%` : "—"}</div><div class="label">Breakout frequency</div></div>
+      <div class="stat-box"><div class="num">${channelAgentNumber(item.video_count)}</div><div class="label">Channel videos</div></div>
+      <div class="stat-box"><div class="num">${channelAgentDuration(item.median_duration_seconds)}</div><div class="label">Median duration</div></div>
+      <div class="stat-box"><div class="num">${item.competitor_relevance_score != null ? `${Math.round(item.competitor_relevance_score * 100)}%` : "—"}</div><div class="label">Niche relevance</div></div>
+      <div class="stat-box"><div class="num">${item.niche_hit_rate != null ? `${Math.round(item.niche_hit_rate * 100)}%` : "—"}</div><div class="label">Niche hit rate</div></div>
+    </div>
+    <p class="muted-help">${channelAgentNumber(item.recent_upload_count)} analyzed ${escapeHtml(item.sample_mode || "long")} videos · ${item.uploads_per_week != null ? item.uploads_per_week.toFixed(1) : "—"} uploads/week (sample estimate) · Confidence: ${escapeHtml(item.score_confidence || "low")}</p>
+    <p><strong>Status:</strong> ${escapeHtml((item.competitor_relevance_status || "unscored").toUpperCase())}<br>${(item.competitor_match_reasons || []).map(reason => `• ${escapeHtml(reason)}`).join("<br>")}</p>
+    <h4>Top breakout videos</h4>
+    ${channelAgentTable(["Title", "Views", "Outlier", "Duration", "Published", "Engagement"], breakouts.slice(0, 10).map(video => [
+      `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title || video.video_id)}</a>`,
+      channelAgentNumber(video.view_count), video.outlier_ratio != null ? `${video.outlier_ratio.toFixed(1)}x` : "—",
+      channelAgentDuration(video.duration_seconds), video.published_at ? new Date(video.published_at).toLocaleDateString() : "—",
+      video.engagement_rate != null ? `${(video.engagement_rate * 100).toFixed(1)}%` : "—",
+    ]), [0])}
+    <h4>Observed title patterns</h4>
+    ${channelAgentTable(["Pattern", "Quality", "Status", "Support", "Breakouts", "Median outlier", "Evidence"], patterns.map(pattern => [
+      pattern.pattern, pattern.pattern_quality_score != null ? `${Math.round(pattern.pattern_quality_score * 100)}%` : "—",
+      (pattern.pattern_quality_status || "unscored").toUpperCase(), pattern.pattern_support ?? pattern.video_count, pattern.breakout_count,
+      pattern.median_outlier != null ? `${pattern.median_outlier.toFixed(1)}x` : "—",
+      (pattern.evidence || []).map(video => `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title)}</a>`).join("<br>"),
+    ]), [6])}
+    <h4>Duration performance</h4>
+    ${channelAgentTable(["Bucket", "Videos", "Median views", "Median outlier", "Breakouts"], buckets.map(bucket => [
+      bucket.bucket, bucket.video_count, channelAgentNumber(bucket.median_views),
+      bucket.median_outlier != null ? `${bucket.median_outlier.toFixed(1)}x` : "—", bucket.breakout_count,
+    ]))}
+    <h4>Channel snapshot history</h4>
+    ${channelAgentTable(["Captured", "Subscribers", "Lifetime views", "Videos"], snapshots.map(snapshot => [
+      new Date(snapshot.captured_at * 1000).toLocaleString(), channelAgentNumber(snapshot.subscriber_count),
+      channelAgentNumber(snapshot.lifetime_view_count), channelAgentNumber(snapshot.video_count),
+    ]))}`;
+}
+
+$("#competitor-discover").onclick = async () => {
+  $("#competitor-message").textContent = "Discovering qualified competitor channels...";
+  try {
+    const result = await api("/api/channel-agent/competitors/discover", {method: "POST"});
+    $("#competitor-message").textContent = `${result.competitors_discovered} competitors discovered from ${result.qualified_channels} qualified channels.`;
+    await loadCompetitors();
+  } catch (e) { $("#competitor-message").textContent = e.message; }
+};
+
+$("#competitor-add").onclick = async () => {
+  try {
+    await api("/api/channel-agent/competitors", {method: "POST", body: JSON.stringify({reference: $("#competitor-reference").value})});
+    $("#competitor-reference").value = "";
+    $("#competitor-message").textContent = "Competitor added. Click Refresh to analyze recent metadata.";
+    await loadCompetitors();
+  } catch (e) { $("#competitor-message").textContent = e.message; }
+};
+
+$("#competitor-refresh").onclick = async () => {
+  const button = $("#competitor-refresh");
+  button.disabled = true;
+  $("#competitor-message").textContent = "Refreshing competitor metadata and recent uploads...";
+  try {
+    const result = await api("/api/channel-agent/competitors/refresh", {method: "POST", body: JSON.stringify({mode: $("#competitor-mode").value})});
+    $("#competitor-message").textContent = `${result.competitors_refreshed} competitors refreshed.`;
+    await loadCompetitors();
+  } catch (e) { $("#competitor-message").textContent = e.message; }
+  finally { button.disabled = false; }
+};
+
+$("#competitor-show-filtered").onchange = loadCompetitors;
+$("#competitor-show-filtered-patterns").onchange = loadCompetitors;
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

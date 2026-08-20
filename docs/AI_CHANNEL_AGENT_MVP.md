@@ -525,6 +525,181 @@ first scan should create one snapshot per unique candidate, leave observed VPH
 unavailable, and optionally show approximate VPH. After waiting, scan again;
 repeated candidates should have at least two snapshot rows and observed VPH.
 
+## CP3 — Competitor Intelligence
+
+CP3 is a manual, metadata-only research layer built on qualified CP2
+candidates. It answers which channels repeatedly produce relevant breakout
+videos without downloading video, audio, subtitles, or thumbnail binaries.
+It uses the existing per-user Google OAuth token service and official YouTube
+Data API REST calls.
+
+The workflow is:
+
+```text
+qualified CP2 candidates
+  → deduplicated YouTube channel IDs
+  → batched channels.list metadata
+  → uploads playlist + playlistItems.list
+  → batched videos.list metadata
+  → long/short/all comparable sample
+  → baseline, breakout, patterns, duration analysis
+  → append-only competitor snapshot
+```
+
+Users may also add a channel ID, handle, or channel URL manually. Manual
+resolution uses official `channels.list` selectors where possible and at most
+one `search.list` channel lookup as a fallback. Competitors are canonical per
+`user_id + platform + channel_id`; a channel discovered by several candidates
+is stored once.
+
+### Baseline, breakouts, and score
+
+The default sample is the 20 most recent uploads, capped at 50. Long-form mode
+compares videos of at least 20 minutes; short mode compares videos of at most
+3 minutes; all mode is available for mixed research. The baseline is median
+views of the comparable recent sample. Missing or zero baselines leave outlier
+ratios unavailable rather than inventing a value.
+
+Breakout labels are deterministic research labels:
+
+```text
+2x or more   above baseline
+5x or more   strong
+10x or more  exceptional
+```
+
+They are not viral guarantees. Breakout frequency is the proportion of the
+analyzed sample at or above 2x its median. Consistency is the proportion with
+at least half the median. Upload cadence is a recent-sample estimate based on
+observed publish timestamps. Fewer than five analyzed videos is low
+confidence, 5–14 is medium, and 15 or more is high.
+
+The bounded competitor ranking heuristic is:
+
+```text
+30% breakout frequency
+25% median opportunity score of matching CP2 candidates
+20% median niche relevance of matching CP2 candidates
+15% log-normalized recent median views
+10% consistency
+```
+
+Available weights are renormalized when a signal is missing. Subscriber count
+is deliberately not a score component, so a smaller channel with repeated
+outliers can outrank a large but weak channel. The score is experimental and
+is not a success prediction.
+
+### Patterns, durations, and opportunity gaps
+
+Title patterns use local Unicode normalization, Latin tokens, overlapping
+Chinese bigrams, configured per-query topic terms, and repeated observed term
+pairs. A term or pair must occur in at least two sampled titles. Every pattern
+retains actual video IDs, titles, and YouTube URLs as evidence; the service
+does not fabricate semantic clusters and uses no LLM or embeddings.
+
+Duration analysis reports count, median views, median outlier, and breakout
+count for under 20, 20–40, 40–60, 60–90, 90–120, and 120+ minute buckets.
+These are descriptive sample ranges, not causal claims.
+
+The opportunity-gap foundation aggregates patterns that have actual breakout
+evidence across competitors. It reports supporting competitor and breakout
+counts, median outlier, the number of current qualified candidates matching
+the pattern, an inverse-supply competition proxy, confidence, and inspectable
+evidence links. It does not generate topics, scripts, titles, or production
+jobs.
+
+### Persistence, isolation, rights, and quota
+
+Competitor channels, recent-video metadata, and append-only channel snapshots
+use additive SQLite tables and idempotent migrations. All reads and mutations
+are scoped to the authenticated application user. Access tokens and refresh
+tokens remain only in the existing OAuth storage.
+
+Competitor video rows are `idea_only` research/reference evidence. CP3 has no
+download, reupload, publishing, or rights claim action.
+
+Discovery and refresh are explicit buttons; there is no scheduler or polling.
+Quota controls are:
+
+```env
+CHANNEL_AGENT_COMPETITOR_MAX_CHANNELS=10
+CHANNEL_AGENT_COMPETITOR_RECENT_VIDEOS=20
+```
+
+The first value is hard-capped at 20 and the second at 50. Refresh uses one
+uploads-playlist request per selected competitor and combines video IDs into
+`videos.list` batches of up to 50. It does not use `search.list` for routine
+recent-video collection.
+
+### CP3 manual verification
+
+```bash
+AI_CHANNEL_AGENT_ENABLED=true python scripts/run_web.py
+```
+
+Log in, open AI Channel Agent, ensure qualified Trend Scanner candidates
+exist, click **Discover from Trends**, then **Refresh**. Verify channel cards,
+median baseline, breakout videos, evidence-backed title patterns, duration
+buckets, and opportunity gaps. Open evidence links to confirm their source
+videos. No media should be downloaded.
+
+## CP3.1 — Competitor Relevance and Pattern Quality Gate
+
+CP3.1 preserves the independent CP3 `competitor_score` and raw evidence while
+adding a separate channel relevance decision. The profile is assembled from
+enabled saved query text, per-query topic/exclusion terms, and optional
+environment additions. Strong terms are derived from that user profile;
+cultivation vocabulary is not permanently built into the scoring engine.
+
+For each recent video, title matches carry more weight than description
+matches. Generic/support terms cannot create a niche hit on their own.
+Channel relevance combines available signals as follows:
+
+```text
+45% matching recent-video rate
+25% median recent-video relevance
+20% median qualified CP2 candidate relevance
+10% channel-name relevance
+```
+
+Channel-name exclusions and the proportion of excluded recent videos apply
+explicit penalties. A channel needs both a score of at least 0.55 and a recent
+niche-hit rate of at least 30% to be `qualified`. Scores of at least 0.35 with
+at least a 15% hit rate are `watch`; weaker channels are `low_relevance`.
+Channels without a usable recent sample/profile remain `unscored`. These
+statuses do not alter `competitor_score`.
+
+Pattern extraction still retains observed single terms and compounds, but now
+stores bounded relevance, specificity, distinct-video support, quality score,
+and status. Quality combines 45% niche association, 25% specificity, 15%
+distinct-video support, and 15% breakout support. Generic single terms such
+as format markers can remain visible in audit mode but cannot qualify by
+frequency alone. Duplicate video IDs count once.
+
+Default Opportunity Gaps require qualified pattern evidence from qualified
+competitors, breakout evidence, and two distinct competitor channels. Gap
+quality combines pattern quality, cross-channel support, and unique breakout
+support. **Show filtered patterns** exposes rejected/watch evidence without
+deleting it.
+
+The small default generic and exclusion profiles are replaceable. Relevant
+controls are:
+
+```env
+CHANNEL_AGENT_COMPETITOR_STRONG_TERMS=
+CHANNEL_AGENT_COMPETITOR_GENERIC_TERMS=家族,前世,穿越,一口气看完,合集,完结,完整版,一个,时候
+CHANNEL_AGENT_COMPETITOR_EXCLUSION_TERMS=短剧,短劇,电视剧,電視劇,甜宠,甜寵,霸总,霸總,都市剧,都市劇
+CHANNEL_AGENT_COMPETITOR_MIN_RELEVANCE=0.55
+CHANNEL_AGENT_COMPETITOR_WATCH_RELEVANCE=0.35
+CHANNEL_AGENT_PATTERN_MIN_SUPPORT=2
+CHANNEL_AGENT_PATTERN_MIN_QUALITY=0.55
+CHANNEL_AGENT_GAP_MIN_COMPETITORS=2
+```
+
+Existing competitor rows migrate additively to `unscored` and become scored
+on the next explicit Refresh. **Show low relevance** retrieves filtered rows
+for audit. No competitor, video, pattern evidence, or snapshot is deleted.
+
 ## Next checkpoint
 
-**CP3 — Competitor Intelligence**
+**CP4 — Local Ollama Content Brain**

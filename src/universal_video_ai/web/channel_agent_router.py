@@ -27,6 +27,15 @@ from universal_video_ai.channel_agent.trends import (
     YouTubeTrendSearchProvider,
     trend_min_relevance,
 )
+from universal_video_ai.channel_agent.competitors import (
+    MAX_COMPETITORS,
+    RECENT_VIDEOS,
+    CompetitorError,
+    CompetitorIntelligenceService,
+    CompetitorRefreshRunning,
+    YouTubeCompetitorProvider,
+    opportunity_gaps,
+)
 from universal_video_ai.web.auth import get_current_user_id
 from universal_video_ai.web.store import Store
 
@@ -69,6 +78,16 @@ class TrendQueryUpdateBody(BaseModel):
     notes: Optional[str] = None
 
 
+class CompetitorAddBody(BaseModel):
+    reference: str
+    notes: Optional[str] = None
+
+
+class CompetitorRefreshBody(BaseModel):
+    competitor_id: Optional[int] = None
+    mode: str = "long"
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -83,6 +102,11 @@ def _service(store: Store) -> YouTubeReadOnlyService:
 def _trend_service(store: Store) -> YouTubeTrendScanner:
     youtube = _service(store)
     return YouTubeTrendScanner(store, YouTubeTrendSearchProvider(youtube))
+
+
+def _competitor_service(store: Store) -> CompetitorIntelligenceService:
+    youtube = _service(store)
+    return CompetitorIntelligenceService(store, YouTubeCompetitorProvider(youtube))
 
 
 def _validate_trend_query(data: dict[str, Any]) -> dict[str, Any]:
@@ -325,3 +349,101 @@ def trend_candidate_detail(candidate_id: int, user_id: int = Depends(get_current
         raise HTTPException(404, "Trend candidate not found.")
     candidate["snapshots"] = store.list_trend_snapshots(user_id, candidate_id)
     return candidate
+
+
+@router.get("/competitors")
+def competitors(include_filtered: bool = Query(False),
+                user_id: int = Depends(get_current_user_id),
+                store: Store = Depends(_store_from_request)) -> list[dict[str, Any]]:
+    _require_enabled()
+    return store.list_competitors(user_id, limit=MAX_COMPETITORS, include_filtered=include_filtered)
+
+
+@router.post("/competitors/discover")
+def discover_competitors(user_id: int = Depends(get_current_user_id),
+                         store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    return _provider_call(lambda: _competitor_service(store).discover(user_id))
+
+
+@router.post("/competitors", status_code=201)
+def add_competitor(body: CompetitorAddBody, user_id: int = Depends(get_current_user_id),
+                   store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    if not body.reference.strip() or len(body.reference) > 500:
+        raise HTTPException(422, "Enter a valid YouTube channel URL, handle, or channel ID.")
+    try:
+        return _competitor_service(store).add(user_id, body.reference, body.notes)
+    except CompetitorError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except YouTubeReadOnlyError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
+
+
+@router.post("/competitors/refresh")
+def refresh_competitors(body: CompetitorRefreshBody,
+                        user_id: int = Depends(get_current_user_id),
+                        store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _competitor_service(store).refresh(user_id, body.competitor_id, body.mode)
+    except CompetitorRefreshRunning as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except CompetitorError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except YouTubeReadOnlyError as exc:
+        message = str(exc)
+        if exc.code == "youtube_quota_exceeded":
+            message = "YouTube API quota is unavailable for competitor refresh. Try fewer competitors or refresh later."
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": message}) from exc
+
+
+@router.get("/competitors/gaps")
+def competitor_gaps(include_filtered: bool = Query(False),
+                    user_id: int = Depends(get_current_user_id),
+                    store: Store = Depends(_store_from_request)) -> list[dict[str, Any]]:
+    _require_enabled()
+    channels = store.list_competitors(user_id, limit=MAX_COMPETITORS, include_filtered=True)
+    candidates = store.list_trend_candidates(
+        user_id, limit=200, min_relevance=trend_min_relevance(), include_filtered=False,
+    )
+    return opportunity_gaps(channels, candidates, include_filtered=include_filtered)
+
+
+@router.get("/competitors/{competitor_id}")
+def competitor_detail(competitor_id: int, user_id: int = Depends(get_current_user_id),
+                      store: Store = Depends(_store_from_request)) -> dict[str, Any]:
+    _require_enabled()
+    competitor = store.get_competitor(user_id, competitor_id)
+    if not competitor:
+        raise HTTPException(404, "Competitor not found.")
+    competitor["videos"] = store.list_competitor_videos(user_id, competitor_id, limit=RECENT_VIDEOS)
+    competitor["snapshots"] = store.list_competitor_snapshots(user_id, competitor_id)
+    return competitor
+
+
+@router.get("/competitors/{competitor_id}/videos")
+def competitor_videos(competitor_id: int, limit: int = Query(20, ge=1, le=100),
+                      user_id: int = Depends(get_current_user_id),
+                      store: Store = Depends(_store_from_request)) -> list[dict[str, Any]]:
+    _require_enabled()
+    if not store.get_competitor(user_id, competitor_id):
+        raise HTTPException(404, "Competitor not found.")
+    return store.list_competitor_videos(user_id, competitor_id, limit)
+
+
+@router.get("/competitors/{competitor_id}/snapshots")
+def competitor_snapshots(competitor_id: int, user_id: int = Depends(get_current_user_id),
+                         store: Store = Depends(_store_from_request)) -> list[dict[str, Any]]:
+    _require_enabled()
+    if not store.get_competitor(user_id, competitor_id):
+        raise HTTPException(404, "Competitor not found.")
+    return store.list_competitor_snapshots(user_id, competitor_id)
+
+
+@router.delete("/competitors/{competitor_id}", status_code=204)
+def delete_competitor(competitor_id: int, user_id: int = Depends(get_current_user_id),
+                      store: Store = Depends(_store_from_request)) -> None:
+    _require_enabled()
+    if not store.delete_competitor(user_id, competitor_id):
+        raise HTTPException(404, "Competitor not found.")

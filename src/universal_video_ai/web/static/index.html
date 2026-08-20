@@ -1504,6 +1504,34 @@
           <div id="trend-research-candidates" class="muted-help">No scan loaded.</div>
           <div id="trend-research-detail" class="hidden" style="margin-top:18px"></div>
         </div>
+        <div style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+          <div class="template-library-heading">
+            <h3 class="section-title">Competitor Intelligence</h3>
+            <div>
+              <button class="btn secondary small" id="competitor-discover" type="button">Discover from Trends</button>
+              <button class="btn gradient small" id="competitor-refresh" type="button">Refresh</button>
+            </div>
+          </div>
+          <p class="muted-help">Qualified niche channels only. Metadata research, not reuse permission or a viral prediction.</p>
+          <div class="row" style="align-items:end;margin-top:12px">
+            <div class="field" style="flex:1"><label>Channel URL, @handle, or channel ID</label><input id="competitor-reference" maxlength="500" placeholder="https://youtube.com/@channel"></div>
+            <div class="field"><label>Sample</label><select id="competitor-mode"><option value="long">Long-form</option><option value="short">Shorts</option><option value="all">All</option></select></div>
+            <button class="btn secondary small" id="competitor-add" type="button">Add competitor</button>
+          </div>
+          <div id="competitor-message" class="muted-help"></div>
+          <label class="muted-help" style="display:inline-flex;align-items:center;gap:6px;margin-top:8px">
+            <input id="competitor-show-filtered" type="checkbox" style="width:auto"> Show low relevance
+          </label>
+          <div id="competitor-list" class="muted-help" style="margin-top:12px">No competitors loaded.</div>
+          <div id="competitor-detail" class="hidden" style="margin-top:18px"></div>
+          <div class="template-library-heading" style="margin-top:22px">
+            <h3 class="section-title">Opportunity gaps</h3>
+            <label class="muted-help" style="display:inline-flex;align-items:center;gap:6px">
+              <input id="competitor-show-filtered-patterns" type="checkbox" style="width:auto"> Show filtered patterns
+            </label>
+          </div>
+          <div id="competitor-gaps" class="muted-help">Refresh competitors to calculate evidence-backed gaps.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -1906,6 +1934,6 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260820-channel-agent-cp21" defer></script>
+<script src="/assets/app.js?v=20260820-channel-agent-cp31" defer></script>
 </body>
 </html>

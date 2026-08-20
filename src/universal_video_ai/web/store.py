@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import statistics
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -274,6 +275,83 @@ CREATE TABLE IF NOT EXISTS trend_snapshots (
     view_count INTEGER,
     like_count INTEGER,
     comment_count INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS competitor_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL DEFAULT 'youtube',
+    channel_id TEXT NOT NULL,
+    channel_title TEXT NOT NULL,
+    channel_url TEXT NOT NULL,
+    custom_url TEXT,
+    thumbnail_url TEXT,
+    subscriber_count INTEGER,
+    hidden_subscriber_count INTEGER NOT NULL DEFAULT 0,
+    lifetime_view_count INTEGER,
+    video_count INTEGER,
+    uploads_playlist_id TEXT,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    source_candidate_count INTEGER NOT NULL DEFAULT 0,
+    tracked INTEGER NOT NULL DEFAULT 1,
+    notes TEXT,
+    sample_mode TEXT NOT NULL DEFAULT 'long',
+    recent_upload_count INTEGER,
+    median_views REAL,
+    mean_views REAL,
+    median_duration_seconds REAL,
+    median_engagement_rate REAL,
+    breakout_frequency REAL,
+    breakout_count INTEGER,
+    consistency_score REAL,
+    uploads_per_week REAL,
+    median_upload_interval_hours REAL,
+    competitor_score REAL,
+    competitor_relevance_score REAL,
+    competitor_relevance_status TEXT NOT NULL DEFAULT 'unscored',
+    competitor_match_reasons_json TEXT,
+    niche_hit_rate REAL,
+    niche_matching_video_count INTEGER,
+    niche_analyzed_video_count INTEGER,
+    score_confidence TEXT,
+    patterns_json TEXT,
+    duration_buckets_json TEXT,
+    analyzed_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, platform, channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS competitor_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competitor_id INTEGER NOT NULL,
+    captured_at REAL NOT NULL,
+    subscriber_count INTEGER,
+    lifetime_view_count INTEGER,
+    video_count INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS competitor_videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competitor_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    video_url TEXT NOT NULL,
+    title TEXT,
+    description TEXT,
+    thumbnail_url TEXT,
+    published_at TEXT,
+    duration_seconds INTEGER,
+    view_count INTEGER,
+    like_count INTEGER,
+    comment_count INTEGER,
+    engagement_rate REAL,
+    outlier_ratio REAL,
+    breakout_strength TEXT,
+    rights_status TEXT NOT NULL DEFAULT 'idea_only',
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    UNIQUE(competitor_id, video_id)
 );
 
 -- Content OS tables (feature-flagged content creation workflow)
@@ -634,6 +712,72 @@ _MIGRATIONS = [
     ("trend_snapshots", "view_count", "ALTER TABLE trend_snapshots ADD COLUMN view_count INTEGER"),
     ("trend_snapshots", "like_count", "ALTER TABLE trend_snapshots ADD COLUMN like_count INTEGER"),
     ("trend_snapshots", "comment_count", "ALTER TABLE trend_snapshots ADD COLUMN comment_count INTEGER"),
+    ("competitor_channels", "id", "ALTER TABLE competitor_channels ADD COLUMN id INTEGER"),
+    ("competitor_channels", "user_id", "ALTER TABLE competitor_channels ADD COLUMN user_id INTEGER"),
+    ("competitor_channels", "platform", "ALTER TABLE competitor_channels ADD COLUMN platform TEXT DEFAULT 'youtube'"),
+    ("competitor_channels", "channel_id", "ALTER TABLE competitor_channels ADD COLUMN channel_id TEXT"),
+    ("competitor_channels", "channel_title", "ALTER TABLE competitor_channels ADD COLUMN channel_title TEXT"),
+    ("competitor_channels", "channel_url", "ALTER TABLE competitor_channels ADD COLUMN channel_url TEXT"),
+    ("competitor_channels", "custom_url", "ALTER TABLE competitor_channels ADD COLUMN custom_url TEXT"),
+    ("competitor_channels", "thumbnail_url", "ALTER TABLE competitor_channels ADD COLUMN thumbnail_url TEXT"),
+    ("competitor_channels", "subscriber_count", "ALTER TABLE competitor_channels ADD COLUMN subscriber_count INTEGER"),
+    ("competitor_channels", "hidden_subscriber_count", "ALTER TABLE competitor_channels ADD COLUMN hidden_subscriber_count INTEGER DEFAULT 0"),
+    ("competitor_channels", "lifetime_view_count", "ALTER TABLE competitor_channels ADD COLUMN lifetime_view_count INTEGER"),
+    ("competitor_channels", "video_count", "ALTER TABLE competitor_channels ADD COLUMN video_count INTEGER"),
+    ("competitor_channels", "uploads_playlist_id", "ALTER TABLE competitor_channels ADD COLUMN uploads_playlist_id TEXT"),
+    ("competitor_channels", "first_seen_at", "ALTER TABLE competitor_channels ADD COLUMN first_seen_at REAL"),
+    ("competitor_channels", "last_seen_at", "ALTER TABLE competitor_channels ADD COLUMN last_seen_at REAL"),
+    ("competitor_channels", "source_candidate_count", "ALTER TABLE competitor_channels ADD COLUMN source_candidate_count INTEGER DEFAULT 0"),
+    ("competitor_channels", "tracked", "ALTER TABLE competitor_channels ADD COLUMN tracked INTEGER DEFAULT 1"),
+    ("competitor_channels", "notes", "ALTER TABLE competitor_channels ADD COLUMN notes TEXT"),
+    ("competitor_channels", "sample_mode", "ALTER TABLE competitor_channels ADD COLUMN sample_mode TEXT DEFAULT 'long'"),
+    ("competitor_channels", "recent_upload_count", "ALTER TABLE competitor_channels ADD COLUMN recent_upload_count INTEGER"),
+    ("competitor_channels", "median_views", "ALTER TABLE competitor_channels ADD COLUMN median_views REAL"),
+    ("competitor_channels", "mean_views", "ALTER TABLE competitor_channels ADD COLUMN mean_views REAL"),
+    ("competitor_channels", "median_duration_seconds", "ALTER TABLE competitor_channels ADD COLUMN median_duration_seconds REAL"),
+    ("competitor_channels", "median_engagement_rate", "ALTER TABLE competitor_channels ADD COLUMN median_engagement_rate REAL"),
+    ("competitor_channels", "breakout_frequency", "ALTER TABLE competitor_channels ADD COLUMN breakout_frequency REAL"),
+    ("competitor_channels", "breakout_count", "ALTER TABLE competitor_channels ADD COLUMN breakout_count INTEGER"),
+    ("competitor_channels", "consistency_score", "ALTER TABLE competitor_channels ADD COLUMN consistency_score REAL"),
+    ("competitor_channels", "uploads_per_week", "ALTER TABLE competitor_channels ADD COLUMN uploads_per_week REAL"),
+    ("competitor_channels", "median_upload_interval_hours", "ALTER TABLE competitor_channels ADD COLUMN median_upload_interval_hours REAL"),
+    ("competitor_channels", "competitor_score", "ALTER TABLE competitor_channels ADD COLUMN competitor_score REAL"),
+    ("competitor_channels", "competitor_relevance_score", "ALTER TABLE competitor_channels ADD COLUMN competitor_relevance_score REAL"),
+    ("competitor_channels", "competitor_relevance_status", "ALTER TABLE competitor_channels ADD COLUMN competitor_relevance_status TEXT DEFAULT 'unscored'"),
+    ("competitor_channels", "competitor_match_reasons_json", "ALTER TABLE competitor_channels ADD COLUMN competitor_match_reasons_json TEXT"),
+    ("competitor_channels", "niche_hit_rate", "ALTER TABLE competitor_channels ADD COLUMN niche_hit_rate REAL"),
+    ("competitor_channels", "niche_matching_video_count", "ALTER TABLE competitor_channels ADD COLUMN niche_matching_video_count INTEGER"),
+    ("competitor_channels", "niche_analyzed_video_count", "ALTER TABLE competitor_channels ADD COLUMN niche_analyzed_video_count INTEGER"),
+    ("competitor_channels", "score_confidence", "ALTER TABLE competitor_channels ADD COLUMN score_confidence TEXT"),
+    ("competitor_channels", "patterns_json", "ALTER TABLE competitor_channels ADD COLUMN patterns_json TEXT"),
+    ("competitor_channels", "duration_buckets_json", "ALTER TABLE competitor_channels ADD COLUMN duration_buckets_json TEXT"),
+    ("competitor_channels", "analyzed_at", "ALTER TABLE competitor_channels ADD COLUMN analyzed_at REAL"),
+    ("competitor_channels", "created_at", "ALTER TABLE competitor_channels ADD COLUMN created_at REAL"),
+    ("competitor_channels", "updated_at", "ALTER TABLE competitor_channels ADD COLUMN updated_at REAL"),
+    ("competitor_snapshots", "id", "ALTER TABLE competitor_snapshots ADD COLUMN id INTEGER"),
+    ("competitor_snapshots", "competitor_id", "ALTER TABLE competitor_snapshots ADD COLUMN competitor_id INTEGER"),
+    ("competitor_snapshots", "captured_at", "ALTER TABLE competitor_snapshots ADD COLUMN captured_at REAL"),
+    ("competitor_snapshots", "subscriber_count", "ALTER TABLE competitor_snapshots ADD COLUMN subscriber_count INTEGER"),
+    ("competitor_snapshots", "lifetime_view_count", "ALTER TABLE competitor_snapshots ADD COLUMN lifetime_view_count INTEGER"),
+    ("competitor_snapshots", "video_count", "ALTER TABLE competitor_snapshots ADD COLUMN video_count INTEGER"),
+    ("competitor_videos", "id", "ALTER TABLE competitor_videos ADD COLUMN id INTEGER"),
+    ("competitor_videos", "competitor_id", "ALTER TABLE competitor_videos ADD COLUMN competitor_id INTEGER"),
+    ("competitor_videos", "video_id", "ALTER TABLE competitor_videos ADD COLUMN video_id TEXT"),
+    ("competitor_videos", "video_url", "ALTER TABLE competitor_videos ADD COLUMN video_url TEXT"),
+    ("competitor_videos", "title", "ALTER TABLE competitor_videos ADD COLUMN title TEXT"),
+    ("competitor_videos", "description", "ALTER TABLE competitor_videos ADD COLUMN description TEXT"),
+    ("competitor_videos", "thumbnail_url", "ALTER TABLE competitor_videos ADD COLUMN thumbnail_url TEXT"),
+    ("competitor_videos", "published_at", "ALTER TABLE competitor_videos ADD COLUMN published_at TEXT"),
+    ("competitor_videos", "duration_seconds", "ALTER TABLE competitor_videos ADD COLUMN duration_seconds INTEGER"),
+    ("competitor_videos", "view_count", "ALTER TABLE competitor_videos ADD COLUMN view_count INTEGER"),
+    ("competitor_videos", "like_count", "ALTER TABLE competitor_videos ADD COLUMN like_count INTEGER"),
+    ("competitor_videos", "comment_count", "ALTER TABLE competitor_videos ADD COLUMN comment_count INTEGER"),
+    ("competitor_videos", "engagement_rate", "ALTER TABLE competitor_videos ADD COLUMN engagement_rate REAL"),
+    ("competitor_videos", "outlier_ratio", "ALTER TABLE competitor_videos ADD COLUMN outlier_ratio REAL"),
+    ("competitor_videos", "breakout_strength", "ALTER TABLE competitor_videos ADD COLUMN breakout_strength TEXT"),
+    ("competitor_videos", "rights_status", "ALTER TABLE competitor_videos ADD COLUMN rights_status TEXT DEFAULT 'idea_only'"),
+    ("competitor_videos", "first_seen_at", "ALTER TABLE competitor_videos ADD COLUMN first_seen_at REAL"),
+    ("competitor_videos", "last_seen_at", "ALTER TABLE competitor_videos ADD COLUMN last_seen_at REAL"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -881,7 +1025,8 @@ class Store:
                  "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
                  "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts",
                  "trend_scans", "trend_items", "trend_queries", "trend_item_queries",
-                 "trend_snapshots")
+                 "trend_snapshots", "competitor_channels", "competitor_snapshots",
+                 "competitor_videos")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -897,7 +1042,8 @@ class Store:
             # A legacy table may not have declared id as INTEGER PRIMARY KEY.
             # Preserve its rows and give null compatibility ids their stable
             # SQLite rowid; current inserts also set ids explicitly below.
-            for table in ("trend_items", "trend_queries", "trend_snapshots"):
+            for table in ("trend_items", "trend_queries", "trend_snapshots", "competitor_channels",
+                          "competitor_snapshots", "competitor_videos"):
                 conn.execute(f"UPDATE {table} SET id = rowid WHERE id IS NULL")
 
             # CP2 uses UUID scan identifiers, while the original Trend Scanner
@@ -920,6 +1066,12 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS idx_trend_snapshots_item_time ON trend_snapshots(item_id, captured_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_trend_scans_user_time ON trend_scans(user_id, created_at DESC)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_trend_scans_scan_key ON trend_scans(scan_key) WHERE scan_key IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_channels_user_score ON competitor_channels(user_id, competitor_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_channels_user_relevance ON competitor_channels(user_id, competitor_relevance_status, competitor_relevance_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_channels_identity ON competitor_channels(user_id, platform, channel_id)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_snapshots_time ON competitor_snapshots(competitor_id, captured_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_videos_identity ON competitor_videos(competitor_id, video_id)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_videos_outlier ON competitor_videos(competitor_id, outlier_ratio DESC)",
             ):
                 conn.execute(ddl)
 
@@ -2304,6 +2456,196 @@ class Store:
         result["trend_status"] = "hot" if score >= 0.90 else (
             "rising" if score >= 0.75 else ("watch" if score >= 0.60 else "normal")
         )
+        return result
+
+    # ---- Channel Agent competitor intelligence (per-user, metadata only) ----
+    def list_qualified_trend_channels(self, user_id: int, min_relevance: float,
+                                      limit: int = 10) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT channel_id,author,opportunity_score,niche_relevance_score
+                FROM trend_items WHERE user_id=? AND platform='youtube' AND channel_id IS NOT NULL
+                AND channel_id<>'' AND relevance_status='relevant'
+                AND niche_relevance_score>=? ORDER BY opportunity_score DESC LIMIT 1000""",
+                (user_id, min_relevance),
+            ).fetchall()
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            entry = grouped.setdefault(str(row["channel_id"]), {
+                "channel_id": str(row["channel_id"]), "channel_title": row["author"],
+                "opportunities": [], "relevances": [], "source_candidate_count": 0,
+            })
+            entry["source_candidate_count"] += 1
+            if row["opportunity_score"] is not None:
+                entry["opportunities"].append(float(row["opportunity_score"]))
+            if row["niche_relevance_score"] is not None:
+                entry["relevances"].append(float(row["niche_relevance_score"]))
+        result: List[Dict[str, Any]] = []
+        for entry in grouped.values():
+            opportunities = entry.pop("opportunities")
+            relevances = entry.pop("relevances")
+            entry["median_opportunity_score"] = statistics.median(opportunities) if opportunities else None
+            entry["median_relevance_score"] = statistics.median(relevances) if relevances else None
+            result.append(entry)
+        result.sort(key=lambda item: (item["median_opportunity_score"] or 0, item["source_candidate_count"]), reverse=True)
+        return result[:min(200, max(1, limit))]
+
+    def upsert_competitor(self, user_id: int, channel: Dict[str, Any], *,
+                          source_candidate_count: int = 0, tracked: bool = True,
+                          notes: Optional[str] = None) -> int:
+        now = time.time()
+        channel_id = str(channel["channel_id"])
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rowid AS _rowid,id FROM competitor_channels WHERE user_id=? AND platform='youtube' AND channel_id=? LIMIT 1",
+                (user_id, channel_id),
+            ).fetchone()
+            values = (
+                channel.get("channel_title") or "YouTube channel", channel.get("channel_url") or f"https://www.youtube.com/channel/{channel_id}",
+                channel.get("custom_url"), channel.get("thumbnail_url"), channel.get("subscriber_count"),
+                int(bool(channel.get("hidden_subscriber_count"))), channel.get("lifetime_view_count"),
+                channel.get("video_count"), channel.get("uploads_playlist_id"), now,
+                max(0, int(source_candidate_count or 0)), int(bool(tracked)), notes,
+            )
+            if row:
+                conn.execute(
+                    """UPDATE competitor_channels SET channel_title=?,channel_url=?,custom_url=?,thumbnail_url=?,
+                    subscriber_count=?,hidden_subscriber_count=?,lifetime_view_count=?,video_count=?,uploads_playlist_id=?,
+                    last_seen_at=?,source_candidate_count=MAX(source_candidate_count,?),tracked=?,notes=COALESCE(?,notes),updated_at=?
+                    WHERE rowid=?""",
+                    (*values, now, row["_rowid"]),
+                )
+                return int(row["id"])
+            cur = conn.execute(
+                """INSERT INTO competitor_channels
+                (user_id,platform,channel_id,channel_title,channel_url,custom_url,thumbnail_url,
+                 subscriber_count,hidden_subscriber_count,lifetime_view_count,video_count,uploads_playlist_id,
+                 first_seen_at,last_seen_at,source_candidate_count,tracked,notes,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (user_id, "youtube", channel_id, values[0], values[1], values[2], values[3], values[4], values[5],
+                 values[6], values[7], values[8], now, now, values[10], values[11], notes, now, now),
+            )
+            conn.execute("UPDATE competitor_channels SET id=rowid WHERE rowid=? AND id IS NULL", (cur.lastrowid,))
+            return int(cur.lastrowid)
+
+    def list_competitors(self, user_id: int, *, competitor_id: Optional[int] = None,
+                         limit: int = 100, include_filtered: bool = True) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM competitor_channels WHERE user_id=?"
+        params: List[Any] = [user_id]
+        if competitor_id is not None:
+            sql += " AND id=?"
+            params.append(competitor_id)
+        if not include_filtered:
+            sql += " AND competitor_relevance_status IN ('qualified','watch')"
+        sql += " ORDER BY CASE competitor_relevance_status WHEN 'qualified' THEN 0 WHEN 'watch' THEN 1 ELSE 2 END,COALESCE(competitor_score,0) DESC,last_seen_at DESC LIMIT ?"
+        params.append(min(200, max(1, limit)))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._competitor_dict(row) for row in rows]
+
+    def get_competitor(self, user_id: int, competitor_id: int) -> Optional[Dict[str, Any]]:
+        rows = self.list_competitors(user_id, competitor_id=competitor_id, limit=1, include_filtered=True)
+        return rows[0] if rows else None
+
+    def delete_competitor(self, user_id: int, competitor_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT id FROM competitor_channels WHERE id=? AND user_id=?", (competitor_id, user_id)).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM competitor_snapshots WHERE competitor_id=?", (competitor_id,))
+            conn.execute("DELETE FROM competitor_videos WHERE competitor_id=?", (competitor_id,))
+            conn.execute("DELETE FROM competitor_channels WHERE id=? AND user_id=?", (competitor_id, user_id))
+            return True
+
+    def update_competitor_analysis(self, user_id: int, competitor_id: int, analysis: Dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE competitor_channels SET sample_mode=?,recent_upload_count=?,median_views=?,mean_views=?,
+                median_duration_seconds=?,median_engagement_rate=?,breakout_frequency=?,breakout_count=?,
+                consistency_score=?,uploads_per_week=?,median_upload_interval_hours=?,competitor_score=?,
+                competitor_relevance_score=?,competitor_relevance_status=?,competitor_match_reasons_json=?,
+                niche_hit_rate=?,niche_matching_video_count=?,niche_analyzed_video_count=?,
+                score_confidence=?,patterns_json=?,duration_buckets_json=?,analyzed_at=?,updated_at=?
+                WHERE id=? AND user_id=?""",
+                (analysis.get("sample_mode"), analysis.get("recent_upload_count"), analysis.get("median_views"),
+                 analysis.get("mean_views"), analysis.get("median_duration_seconds"), analysis.get("median_engagement_rate"),
+                 analysis.get("breakout_frequency"), analysis.get("breakout_count"), analysis.get("consistency_score"),
+                 analysis.get("uploads_per_week"), analysis.get("median_upload_interval_hours"), analysis.get("competitor_score"),
+                 analysis.get("competitor_relevance_score"), analysis.get("competitor_relevance_status", "unscored"),
+                 json.dumps(analysis.get("competitor_match_reasons", []), ensure_ascii=False),
+                 analysis.get("niche_hit_rate"), analysis.get("niche_matching_video_count"),
+                 analysis.get("niche_analyzed_video_count"),
+                 analysis.get("score_confidence"), json.dumps(analysis.get("patterns", []), ensure_ascii=False),
+                 json.dumps(analysis.get("duration_buckets", []), ensure_ascii=False), analysis.get("analyzed_at"),
+                 time.time(), competitor_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def upsert_competitor_video(self, competitor_id: int, video: Dict[str, Any]) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rowid AS _rowid,id FROM competitor_videos WHERE competitor_id=? AND video_id=? LIMIT 1",
+                (competitor_id, video["video_id"]),
+            ).fetchone()
+            payload = (video.get("video_url"), video.get("title"), video.get("description"), video.get("thumbnail_url"),
+                       video.get("published_at"), video.get("duration_seconds"), video.get("view_count"),
+                       video.get("like_count"), video.get("comment_count"), video.get("engagement_rate"),
+                       video.get("outlier_ratio"), video.get("breakout_strength"), now)
+            if row:
+                conn.execute(
+                    """UPDATE competitor_videos SET video_url=?,title=?,description=?,thumbnail_url=?,published_at=?,
+                    duration_seconds=?,view_count=?,like_count=?,comment_count=?,engagement_rate=?,outlier_ratio=?,
+                    breakout_strength=?,last_seen_at=? WHERE rowid=?""", (*payload, row["_rowid"]),
+                )
+                return int(row["id"])
+            cur = conn.execute(
+                """INSERT INTO competitor_videos
+                (competitor_id,video_id,video_url,title,description,thumbnail_url,published_at,duration_seconds,
+                 view_count,like_count,comment_count,engagement_rate,outlier_ratio,breakout_strength,rights_status,
+                 first_seen_at,last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'idea_only',?,?)""",
+                (competitor_id, video["video_id"], *payload[:-1], now, now),
+            )
+            conn.execute("UPDATE competitor_videos SET id=rowid WHERE rowid=? AND id IS NULL", (cur.lastrowid,))
+            return int(cur.lastrowid)
+
+    def list_competitor_videos(self, user_id: int, competitor_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT v.* FROM competitor_videos v JOIN competitor_channels c ON c.id=v.competitor_id
+                WHERE v.competitor_id=? AND c.user_id=? ORDER BY COALESCE(v.outlier_ratio,0) DESC,v.published_at DESC LIMIT ?""",
+                (competitor_id, user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_competitor_snapshot(self, user_id: int, competitor_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO competitor_snapshots(competitor_id,captured_at,subscriber_count,lifetime_view_count,video_count)
+                SELECT id,?,subscriber_count,lifetime_view_count,video_count FROM competitor_channels WHERE id=? AND user_id=?""",
+                (time.time(), competitor_id, user_id),
+            )
+            conn.execute("UPDATE competitor_snapshots SET id=rowid WHERE id IS NULL")
+            return cur.rowcount > 0
+
+    def list_competitor_snapshots(self, user_id: int, competitor_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT s.* FROM competitor_snapshots s JOIN competitor_channels c ON c.id=s.competitor_id
+                WHERE s.competitor_id=? AND c.user_id=? ORDER BY s.captured_at DESC LIMIT ?""",
+                (competitor_id, user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _competitor_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target in (("patterns_json", "patterns"), ("duration_buckets_json", "duration_buckets"),
+                               ("competitor_match_reasons_json", "competitor_match_reasons")):
+            try:
+                result[target] = json.loads(result.pop(source) or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = []
         return result
 
     # ---- social accounts (per-user OAuth connections) ----
