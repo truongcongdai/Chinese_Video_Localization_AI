@@ -160,7 +160,10 @@ class AudioPipeline:
             # Best-effort: only populated when the backend actually ran (not
             # a cache hit) and exposes `last_detected_language` (WhisperBackend
             # does; NoOp/other backends simply won't have the attribute).
-            detected_language = getattr(self.speech_service.backend, "last_detected_language", None)
+            detected_language = (
+                getattr(self.speech_service, "last_detected_language", None)
+                or getattr(self.speech_service.backend, "last_detected_language", None)
+            )
             self.logger.debug(
                 "AudioPipeline: transcript length=%d segments=%d detected_language=%s",
                 len(transcript) if transcript else 0,

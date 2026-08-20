@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from typing import Optional
+import uuid
 
 __all__ = ["DemucsProcessor", "DemucsOutput", "DemucsConfig", "DEMUCS_AVAILABLE"]
 
@@ -143,9 +144,11 @@ class DemucsProcessor:
             "other": stems_dir / f"other.{self.config.output_format}",
         }
 
-        # Check all stems exist
+        # Check all stems exist and are non-empty. A killed Demucs process can
+        # leave zero-byte placeholders which must never be treated as a cache
+        # hit on the next job attempt.
         for stem_name, stem_path in stem_files.items():
-            if not stem_path.exists():
+            if not stem_path.exists() or stem_path.stat().st_size <= 0:
                 self.logger.debug("Stem file missing: %s (%s)", stem_name, stem_path)
                 return None
 
@@ -175,6 +178,29 @@ class DemucsProcessor:
             cmd.extend(["--segment", str(self.config.segment_length)])
         cmd.extend(str(path) for path in audio_paths)
         return cmd
+
+    def _needs_short_input_alias(self, audio_path: Path, output_dir: Path) -> bool:
+        """Return whether Demucs' derived stem path is unsafe on Windows."""
+        stem_path = (
+            output_dir
+            / self.config.model
+            / audio_path.stem
+            / f"vocals.{self.config.output_format.lower()}"
+        )
+        # Leave headroom below legacy MAX_PATH. Demucs/PyTorch dependencies
+        # do not consistently opt in to Windows long-path handling even when
+        # Python itself can open the original input.
+        return len(str(stem_path.resolve())) >= 240
+
+    def _create_short_input_alias(self, audio_path: Path) -> Path:
+        alias_path = audio_path.parent / f"demucs_input_{uuid.uuid4().hex[:12]}{audio_path.suffix}"
+        try:
+            alias_path.hardlink_to(audio_path)
+        except OSError:
+            # A custom output/input filesystem may not support hard links.
+            # Copying is slower, but preserves a reliable fallback.
+            shutil.copy2(audio_path, alias_path)
+        return alias_path
 
     def _run_checked(self, cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -300,6 +326,25 @@ class DemucsProcessor:
         output_dir = self.get_output_dir(audio_path, output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        existing_output = self._find_stem_files(output_dir, audio_path.stem)
+        if existing_output is not None:
+            self.logger.info(
+                "Reusing completed Demucs stems for %s from %s",
+                audio_path, existing_output.vocals.parent,
+            )
+            return existing_output
+
+        if self._needs_short_input_alias(audio_path, output_dir):
+            alias_path = self._create_short_input_alias(audio_path)
+            self.logger.info(
+                "Demucs input name is too long for a safe Windows stem path; using short alias %s",
+                alias_path,
+            )
+            try:
+                return self.separate(alias_path, output_dir=output_dir)
+            finally:
+                alias_path.unlink(missing_ok=True)
+
         self.logger.info("Separating audio %s using Demucs model=%s", audio_path, self.config.model)
 
         if audio_path.stat().st_size > self.config.chunk_threshold_bytes:
@@ -323,7 +368,11 @@ class DemucsProcessor:
         self.logger.debug("Running demucs command: %s", " ".join(cmd))
 
         try:
-            self._run_checked(cmd, timeout=3600)
+            # Long source videos routinely need more than one hour on CPU,
+            # especially when another media job is active. Use the same
+            # configurable long-audio budget as chunked separation instead of
+            # killing otherwise healthy work at a hard-coded 3600 seconds.
+            self._run_checked(cmd, timeout=self.config.long_audio_timeout_seconds)
 
             # Find separated stem files
             audio_stem = audio_path.stem
@@ -338,8 +387,11 @@ class DemucsProcessor:
             return demucs_output
 
         except subprocess.TimeoutExpired:
-            self.logger.error("Demucs separation timed out (1 hour)")
-            raise RuntimeError("Demucs separation timed out")
+            timeout_hours = self.config.long_audio_timeout_seconds / 3600
+            self.logger.error("Demucs separation timed out after %.2f hours", timeout_hours)
+            raise RuntimeError(
+                f"Demucs separation timed out after {timeout_hours:.2f} hours"
+            )
         except FileNotFoundError as exc:
             self.logger.error("Demucs not found: %s", exc)
             raise RuntimeError("Demucs is not installed or not in PATH. Install with: pip install demucs") from exc

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, List
 import subprocess
 import shutil
+import tempfile
 
 __all__ = [
     "MixerService", "MixerConfig", "AudioMix", "TimedAudioClip",
@@ -107,6 +108,12 @@ class MixerService:
     - Adjust volume levels.
     - Output mixed audio.
     """
+
+    # Keep each FFmpeg invocation comfortably below Windows' 32,767-character
+    # CreateProcess command-line limit. A dubbed clip contributes both an
+    # input path and several filter expressions, so a few thousand clips can
+    # otherwise fail before FFmpeg even starts (WinError 206).
+    _DUBBED_TRACK_BATCH_SIZE = 64
 
     def __init__(self, config: Optional[MixerConfig] = None, logger: Optional[logging.Logger] = None) -> None:
         self.config = config or MixerConfig()
@@ -433,11 +440,18 @@ class MixerService:
             len(clips), total_duration, output_path,
         )
 
+        ordered_clips = sorted(clips, key=lambda item: item.start)
+        if len(ordered_clips) > self._DUBBED_TRACK_BATCH_SIZE:
+            return self._build_dubbed_track_batched(
+                ordered_clips,
+                total_duration=total_duration,
+                output_path=output_path,
+            )
+
         inputs: List[str] = []
         filter_parts: List[str] = []
         mixed_labels: List[str] = []
 
-        ordered_clips = sorted(clips, key=lambda item: item.start)
         for idx, clip in enumerate(ordered_clips):
             slot_end = clip.end
             if idx + 1 < len(ordered_clips):
@@ -523,6 +537,93 @@ class MixerService:
         ]
 
         self._run_ffmpeg(cmd, "build_dubbed_track")
+        return output_path
+
+    def _build_dubbed_track_batched(
+        self,
+        ordered_clips: List[TimedAudioClip],
+        *,
+        total_duration: float,
+        output_path: Path,
+    ) -> Path:
+        """Assemble a large dub through short, timeline-relative batch tracks."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Apply the cross-batch next-clip boundary before slicing. Without
+        # this, the last clip in one batch would not see the first clip in the
+        # next batch and could run across that boundary.
+        bounded_clips: List[TimedAudioClip] = []
+        for idx, clip in enumerate(ordered_clips):
+            slot_end = clip.end
+            if idx + 1 < len(ordered_clips):
+                next_start = ordered_clips[idx + 1].start
+                gap = max(0.0, float(self.config.min_tts_gap_seconds))
+                slot_end = min(slot_end, max(clip.start + 0.05, next_start - gap))
+            bounded_clips.append(
+                TimedAudioClip(start=clip.start, end=slot_end, audio_path=clip.audio_path)
+            )
+
+        batch_size = self._DUBBED_TRACK_BATCH_SIZE
+        batch_count = (len(bounded_clips) + batch_size - 1) // batch_size
+        self.logger.info(
+            "MixerService.build_dubbed_track: splitting %d clips into %d FFmpeg batches",
+            len(bounded_clips),
+            batch_count,
+        )
+
+        with tempfile.TemporaryDirectory(prefix=".dubbed_batches_", dir=output_path.parent) as temp_name:
+            temp_dir = Path(temp_name)
+            batch_tracks: List[tuple[Path, float]] = []
+
+            for batch_index, offset in enumerate(range(0, len(bounded_clips), batch_size)):
+                batch = bounded_clips[offset:offset + batch_size]
+                origin = max(0.0, batch[0].start)
+                local_clips = [
+                    TimedAudioClip(
+                        start=max(0.0, clip.start - origin),
+                        end=max(0.0, clip.end - origin),
+                        audio_path=clip.audio_path,
+                    )
+                    for clip in batch
+                ]
+                batch_duration = max(
+                    0.05,
+                    max(max(clip.end, clip.start + 0.05) for clip in local_clips),
+                )
+                batch_path = temp_dir / f"batch_{batch_index:04d}.wav"
+                self.build_dubbed_track(
+                    local_clips,
+                    total_duration=batch_duration,
+                    output_path=batch_path,
+                )
+                batch_tracks.append((batch_path, origin))
+
+            inputs: List[str] = []
+            filter_parts: List[str] = []
+            delayed_labels: List[str] = []
+            for idx, (batch_path, origin) in enumerate(batch_tracks):
+                inputs.extend(["-i", str(batch_path)])
+                delay_ms = max(0, int(round(origin * 1000)))
+                label = f"[b{idx}]"
+                filter_parts.append(f"[{idx}:a]adelay={delay_ms}|{delay_ms}{label}")
+                delayed_labels.append(label)
+
+            filter_parts.append(
+                f"{''.join(delayed_labels)}amix=inputs={len(delayed_labels)}:"
+                "duration=longest:dropout_transition=0:normalize=0[summed]"
+            )
+            filter_parts.append("[summed]alimiter=limit=0.95:attack=5:release=50[mixed]")
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                *inputs,
+                "-filter_complex", ";".join(filter_parts),
+                "-map", "[mixed]",
+                "-t", str(max(0.01, total_duration)),
+                "-ar", str(self.config.sample_rate),
+                "-y", str(output_path),
+            ]
+            self._run_ffmpeg(cmd, "build_dubbed_track (combine batches)")
+
         return output_path
 
     def _run_ffmpeg(self, cmd: List[str], op_name: str) -> None:

@@ -44,10 +44,13 @@ def _cookiefile_for(platform: Platform) -> str | None:
 
 
 def _cookies_from_browser_for(platform: Platform) -> tuple[str, ...] | None:
-    """Return yt-dlp's opt-in browser-cookie tuple.
+    """Return yt-dlp's browser-cookie tuple.
 
-    Reading a browser profile is never enabled implicitly. Set, for example,
-    ``DOUYIN_COOKIES_FROM_BROWSER=chrome`` when the local operator wants it.
+    Douyin channel scans use a dedicated, app-managed Chromium profile. Once
+    that profile has a cookie database, prefer it over the user's normal
+    Chrome profile so an open Chrome window cannot lock downloads out. An
+    explicitly named/path profile (for example ``chrome:Profile 1``) still
+    takes precedence.
     """
     env_key = f"{platform.name.upper()}_COOKIES_FROM_BROWSER"
     configured = (
@@ -55,6 +58,21 @@ def _cookies_from_browser_for(platform: Platform) -> tuple[str, ...] | None:
         or os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
         or ""
     ).strip()
+
+    if platform == Platform.DOUYIN and (not configured or ":" not in configured):
+        configured_profile = (
+            os.environ.get("DOUYIN_CHANNEL_BROWSER_USER_DATA_DIR") or ""
+        ).strip()
+        if configured_profile:
+            managed_profile = Path(configured_profile).expanduser()
+        else:
+            project_root = Path(__file__).resolve().parents[3]
+            managed_profile = (
+                project_root / "local_data" / "browser_profiles" / "douyin_channel"
+            )
+        if (managed_profile / "Default" / "Network" / "Cookies").is_file():
+            return ("chrome", str(managed_profile.resolve()))
+
     if not configured:
         return None
     browser, _, profile = configured.partition(":")

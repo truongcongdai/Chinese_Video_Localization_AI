@@ -1379,6 +1379,11 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             # session cannot manufacture the fresh cookie the extractor needs.
             "fresh cookies",
             "Douyin yêu cầu cookie mới",
+            # Chromium keeps its cookie SQLite database exclusively locked on
+            # Windows while the browser is running. Repeating the same job
+            # cannot release that lock.
+            "Could not copy Chrome cookie database",
+            "Không thể đọc cookie Douyin từ Chrome",
             # Browser-cookie decryption cannot start until this optional
             # Linux keyring dependency is installed. Waiting and repeating
             # the same yt-dlp invocation cannot change the environment.

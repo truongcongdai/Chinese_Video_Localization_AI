@@ -197,25 +197,48 @@ class TranslatorFactory:
                     self, texts: list[str], src_lang: Optional[str] = None,
                     dest_lang: Optional[str] = None,
                 ) -> list[str]:
-                    """Translate many short segments with a few sequential requests."""
+                    """Translate many short segments with a few sequential requests.
+
+                    Google's unofficial endpoint occasionally rewrites or drops
+                    one separator even though the translation itself succeeds.
+                    A separator mismatch must therefore degrade to smaller
+                    requests, not fail an entire long-running localization job.
+                    """
                     if not texts:
                         return []
                     separator = "\n[[[UVAI_SEG_BREAK]]]\n"
+                    separator_token = "[[[UVAI_SEG_BREAK]]]"
                     results: list[str] = []
                     batch: list[str] = []
                     batch_chars = 0
 
+                    async def translate_group(group: list[str]) -> list[str]:
+                        translated = await self.translate(
+                            separator.join(group), src_lang, dest_lang
+                        )
+                        if len(group) == 1:
+                            return [translated.strip()]
+
+                        parts = translated.split(separator_token)
+                        if len(parts) == len(group):
+                            return [part.strip() for part in parts]
+
+                        # Preserve ordering while recursively isolating the
+                        # request whose marker Google modified. In the worst
+                        # case this reaches safe one-segment requests; normally
+                        # only one extra split is needed.
+                        self.logger.warning(
+                            "Google changed batch separators (%d/%d); retrying as smaller batches",
+                            len(parts), len(group),
+                        )
+                        midpoint = len(group) // 2
+                        left = await translate_group(group[:midpoint])
+                        right = await translate_group(group[midpoint:])
+                        return left + right
+
                     async def flush() -> None:
                         nonlocal batch, batch_chars
-                        translated = await self.translate(
-                            separator.join(batch), src_lang, dest_lang
-                        )
-                        parts = translated.split("[[[UVAI_SEG_BREAK]]]")
-                        if len(parts) != len(batch):
-                            raise TranslationError(
-                                f"Google changed batch separators ({len(parts)}/{len(batch)})"
-                            )
-                        results.extend(part.strip() for part in parts)
+                        results.extend(await translate_group(batch))
                         batch = []
                         batch_chars = 0
 

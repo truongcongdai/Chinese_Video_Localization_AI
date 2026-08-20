@@ -40,11 +40,13 @@ __all__ = [
 
 _logger = logging.getLogger(__name__)
 
-# Pipeline-level concurrency: network download and FFmpeg can overlap with the
-# single CPU-heavy Whisper stage. Running several Whisper-small inferences at
-# once on a 16 GB CPU host causes thread oversubscription and swapping.
+# Pipeline-level concurrency: network download can overlap, but the audio
+# pipeline contains both Demucs and Whisper. Running multiple long Demucs CPU
+# jobs at once slows each one enough to hit timeouts and can oversubscribe RAM;
+# keep audio processing serial by default. Operators with multiple workers or
+# GPUs can explicitly raise TRANSCRIPTION_CONCURRENCY.
 _DOWNLOAD_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "10"))))
-_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "5"))))
+_TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CONCURRENCY", "1"))))
 _OCR_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("OCR_CONCURRENCY", "1"))))
 _RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
 _TTS_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TTS_CONCURRENCY", "8"))))

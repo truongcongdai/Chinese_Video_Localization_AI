@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .backend import SpeechBackend  # type: ignore
 from .exceptions import SpeechBackendUnavailable, TranscriptionError  # type: ignore
@@ -28,6 +28,7 @@ class SpeechService:
     backend: Optional[SpeechBackend] = None
     cache: Optional[object] = None  # RedisCache
     logger: Optional[logging.Logger] = None
+    last_detected_language: Optional[str] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         if self.logger is None:
@@ -95,7 +96,17 @@ class SpeechService:
             cached_result = self.cache.get(cache_key)
             if cached_result is not None:
                 self.logger.debug("SpeechService transcribe_segments cache HIT: audio=%s", audio_path)
-                return [TranscriptSegment(**seg) for seg in cached_result]
+                # New entries retain Whisper's detected language so OCR can
+                # select the same language pack on a retry. Accept legacy list
+                # entries for backward compatibility with Redis/in-memory data
+                # written by older versions.
+                if isinstance(cached_result, dict):
+                    cached_segments = cached_result.get("segments", [])
+                    self.last_detected_language = cached_result.get("detected_language")
+                else:
+                    cached_segments = cached_result
+                    self.last_detected_language = None
+                return [TranscriptSegment(**seg) for seg in cached_segments]
 
         self.logger.info("SpeechService.transcribe_segments: audio=%s language=%s", audio_path, language)
         try:
@@ -110,11 +121,20 @@ class SpeechService:
                 text = self.backend.transcribe(audio_path, language=language)
                 segments = [TranscriptSegment(start=0.0, end=UNKNOWN_TIMING, text=text)] if text else []
 
+            self.last_detected_language = getattr(self.backend, "last_detected_language", None)
+
             if self.cache and cache_key:
                 serializable = [
                     {"start": s.start, "end": s.end, "text": s.text} for s in segments
                 ]
-                self.cache.set(cache_key, serializable, ttl_seconds=86400 * 7)  # 7 days
+                self.cache.set(
+                    cache_key,
+                    {
+                        "segments": serializable,
+                        "detected_language": self.last_detected_language,
+                    },
+                    ttl_seconds=86400 * 7,
+                )  # 7 days
 
             return segments
         except TranscriptionError:

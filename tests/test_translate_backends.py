@@ -97,3 +97,27 @@ def test_translator_config_defaults():
     assert config.api_key is None
     assert config.src_lang is None
     assert config.dest_lang is None
+
+
+def test_google_batch_recovers_when_separator_is_changed(monkeypatch):
+    translator = TranslatorFactory.create(TranslatorConfig(provider="google"))
+    texts = [f"segment {index}" for index in range(25)]
+    original_translate = translator.translate
+    calls = []
+
+    async def fake_translate(text, src_lang=None, dest_lang=None):
+        calls.append(text)
+        # Reproduce the production failure: Google returns 24 markers/parts
+        # for a request containing 25 source segments.
+        if text.count("[[[UVAI_SEG_BREAK]]]") == 24:
+            return text.replace("[[[UVAI_SEG_BREAK]]]", "UVAI SEG BREAK", 1)
+        return text
+
+    monkeypatch.setattr(translator, "translate", fake_translate)
+    try:
+        result = asyncio.run(translator.translate_batch(texts, "zh", "vi"))
+    finally:
+        monkeypatch.setattr(translator, "translate", original_translate)
+
+    assert result == texts
+    assert len(calls) > 1

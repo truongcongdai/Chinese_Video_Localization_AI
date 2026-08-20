@@ -112,6 +112,19 @@ def test_browser_cookie_loading_is_explicit_and_supports_profile(monkeypatch):
     assert _cookies_from_browser_for(Platform.DOUYIN) == ("chrome", "Profile 1")
 
 
+def test_douyin_prefers_unlocked_app_managed_browser_profile(tmp_path, monkeypatch):
+    cookie_database = tmp_path / "Default" / "Network" / "Cookies"
+    cookie_database.parent.mkdir(parents=True)
+    cookie_database.write_bytes(b"sqlite")
+    monkeypatch.setenv("DOUYIN_CHANNEL_BROWSER_USER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DOUYIN_COOKIES_FROM_BROWSER", "chrome")
+
+    assert _cookies_from_browser_for(Platform.DOUYIN) == (
+        "chrome",
+        str(tmp_path.resolve()),
+    )
+
+
 def test_fresh_cookie_error_is_actionable_and_not_hidden(tmp_path, monkeypatch):
     downloader = DouyinDownloader()
     monkeypatch.setattr(downloader, "_resolve_short_url", lambda url: url)
@@ -126,6 +139,25 @@ def test_fresh_cookie_error_is_actionable_and_not_hidden(tmp_path, monkeypatch):
         downloader.download("https://www.douyin.com/video/7638999539815756520", tmp_path)
 
     assert _is_non_retryable_job_error(RuntimeError("Fresh cookies are needed")) is True
+
+
+def test_locked_chrome_cookie_database_is_actionable_and_not_retried(tmp_path, monkeypatch):
+    downloader = DouyinDownloader()
+    monkeypatch.setattr(downloader, "_resolve_short_url", lambda url: url)
+    monkeypatch.setattr(downloader, "_download_douyin_scraping", lambda video_id, output_dir: None)
+    monkeypatch.setattr(
+        downloader._ytdlp_fallback,
+        "download",
+        lambda url, output_dir: (_ for _ in ()).throw(
+            RuntimeError("Could not copy Chrome cookie database")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Không thể đọc cookie Douyin từ Chrome") as error:
+        downloader.download("https://www.douyin.com/video/7390028501182614836", tmp_path)
+
+    assert "đóng hoàn toàn mọi tiến trình Chrome" in str(error.value)
+    assert _is_non_retryable_job_error(error.value) is True
 
 
 def test_missing_secretstorage_is_not_retried():

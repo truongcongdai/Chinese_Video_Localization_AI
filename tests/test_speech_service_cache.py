@@ -7,6 +7,7 @@ import pytest
 from universal_video_ai.speech.service import SpeechService
 from universal_video_ai.speech.exceptions import SpeechBackendUnavailable, TranscriptionError
 from universal_video_ai.cache.redis_cache import RedisCache
+from universal_video_ai.segment import TranscriptSegment
 
 
 @dataclass
@@ -77,3 +78,28 @@ def test_speech_service_backend_error_propagates(tmp_path: Path):
     
     with pytest.raises(TranscriptionError):
         svc.transcribe(audio)
+
+
+def test_segment_cache_reused_across_services_with_detected_language(tmp_path: Path):
+    audio = tmp_path / "long.wav"
+    audio.write_bytes(b"audio")
+    cache = RedisCache(fallback=True)
+
+    class SegmentBackend:
+        def __init__(self, language, fail=False):
+            self.last_detected_language = language
+            self.fail = fail
+
+        def transcribe_segments(self, audio_path, language=None):
+            if self.fail:
+                raise AssertionError("backend should not run on cache hit")
+            return [TranscriptSegment(start=1.0, end=2.0, text="hello")]
+
+    first = SpeechService(backend=SegmentBackend("zh"), cache=cache)
+    assert first.transcribe_segments(audio)[0].text == "hello"
+
+    retry = SpeechService(backend=SegmentBackend(None, fail=True), cache=cache)
+    cached = retry.transcribe_segments(audio)
+
+    assert cached == [TranscriptSegment(start=1.0, end=2.0, text="hello")]
+    assert retry.last_detected_language == "zh"

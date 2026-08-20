@@ -84,6 +84,59 @@ def test_separate_success(tmp_path: Path, monkeypatch):
     assert output.vocals.name == "vocals.wav"
 
 
+def test_separate_reuses_completed_stems(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"dummy audio")
+    stems_dir = tmp_path / "demucs_output" / "htdemucs" / "audio"
+    stems_dir.mkdir(parents=True)
+    for stem in ("vocals", "drums", "bass", "other"):
+        (stems_dir / f"{stem}.wav").write_bytes(b"completed stem")
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("Demucs should not run when all completed stems exist")
+
+    monkeypatch.setattr("subprocess.run", unexpected_run)
+    output = DemucsProcessor().separate(audio_file)
+
+    assert output.vocals == stems_dir / "vocals.wav"
+    assert output.other.stat().st_size > 0
+
+
+def test_separate_uses_short_alias_when_demucs_output_path_is_too_long(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "very_long_source_title.wav"
+    audio_file.write_bytes(b"dummy audio")
+    captured = {}
+
+    def mock_run(*args, **kwargs):
+        cmd = kwargs.get("args", args[0])
+        input_path = Path(cmd[-1])
+        captured["input_path"] = input_path
+        assert input_path.exists()
+
+        output_dir = Path(cmd[cmd.index("-o") + 1])
+        stems_dir = output_dir / "htdemucs" / input_path.stem
+        stems_dir.mkdir(parents=True, exist_ok=True)
+        for stem in ["vocals", "drums", "bass", "other"]:
+            (stems_dir / f"{stem}.wav").write_bytes(b"stem content")
+
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        result.stdout = ""
+        return result
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+    processor = DemucsProcessor()
+    monkeypatch.setattr(processor, "_needs_short_input_alias", lambda audio, output: audio == audio_file.resolve())
+
+    output = processor.separate(audio_file)
+
+    assert captured["input_path"].stem.startswith("demucs_input_")
+    assert not captured["input_path"].exists()
+    assert output.vocals.exists()
+    assert output.vocals.parent.name.startswith("demucs_input_")
+
+
 def test_wav_command_uses_demucs_default_format_and_segment_flag(tmp_path: Path, monkeypatch):
     audio_file = tmp_path / "audio.wav"
     audio_file.write_bytes(b"dummy audio")
@@ -216,6 +269,32 @@ def test_separate_demucs_timeout(tmp_path: Path, monkeypatch):
         processor.separate(audio_file)
 
     assert "timed out" in str(exc_info.value).lower()
+
+
+def test_regular_demucs_uses_configured_long_timeout(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "long.wav"
+    audio_file.write_bytes(b"audio")
+    captured = {}
+
+    def mock_run(cmd, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        output_dir = Path(cmd[cmd.index("-o") + 1])
+        stems_dir = output_dir / "htdemucs" / "long"
+        stems_dir.mkdir(parents=True, exist_ok=True)
+        for stem in ("vocals", "drums", "bass", "other"):
+            (stems_dir / f"{stem}.wav").write_bytes(b"stem")
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        result.stdout = ""
+        return result
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+    processor = DemucsProcessor(DemucsConfig(long_audio_timeout_seconds=12345))
+
+    processor.separate(audio_file)
+
+    assert captured["timeout"] == 12345
 
 
 def test_separate_demucs_not_found(tmp_path: Path, monkeypatch):

@@ -63,7 +63,17 @@ def create_audio_pipeline(
             # Import DemucsProcessor lazily only if available and requested
             try:
                 from .demucs import DemucsProcessor, DemucsConfig
-                demucs_processor = DemucsProcessor(logger=logger)
+                demucs_timeout = max(
+                    60,
+                    int(os.getenv("DEMUCS_TIMEOUT_SECONDS", str(24 * 60 * 60))),
+                )
+                demucs_processor = DemucsProcessor(
+                    config=DemucsConfig(
+                        device=os.getenv("DEMUCS_DEVICE", "cpu").strip().lower() or "cpu",
+                        long_audio_timeout_seconds=demucs_timeout,
+                    ),
+                    logger=logger,
+                )
                 logger.debug("Created DemucsProcessor for pipeline")
             except Exception as exc:
                 logger.warning("Failed to construct DemucsProcessor: %s", exc)
@@ -76,6 +86,7 @@ def create_audio_pipeline(
             from universal_video_ai.speech.backend import WhisperBackend
             from universal_video_ai.speech.whisper import WhisperConfig
             from universal_video_ai.speech.service import SpeechService
+            from universal_video_ai.config import cache as shared_cache
 
             # ``auto`` is portable across GPU workers and CPU-only machines;
             # operators can still force a device for diagnostics.
@@ -89,7 +100,11 @@ def create_audio_pipeline(
                 device=whisper_device,
             )
             backend = WhisperBackend(config=backend_config, logger=logger)
-            speech_service = SpeechService(backend=backend, logger=logger)
+            speech_service = SpeechService(
+                backend=backend,
+                cache=shared_cache,
+                logger=logger,
+            )
             logger.info(
                 "Created SpeechService with Whisper model=%s requested_device=%s",
                 backend_config.model,

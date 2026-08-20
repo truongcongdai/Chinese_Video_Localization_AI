@@ -146,3 +146,35 @@ def test_build_dubbed_track_trims_clip_before_next_start(tmp_path: Path, monkeyp
     assert "atempo=1.2371" in filter_graph
     assert "atrim=duration=0.970" in filter_graph
     assert "adelay=1000|1000" in filter_graph
+
+
+def test_build_dubbed_track_batches_large_clip_lists(tmp_path: Path, monkeypatch) -> None:
+    clip_path = tmp_path / "clip.wav"
+    clip_path.write_bytes(b"clip")
+    output = tmp_path / "dub.wav"
+    clips = [
+        TimedAudioClip(start=float(index), end=float(index) + 0.8, audio_path=clip_path)
+        for index in range(130)
+    ]
+
+    service = MixerService()
+    monkeypatch.setattr(service, "_ffmpeg_available", True)
+    monkeypatch.setattr(service, "_probe_duration", lambda path: 0.5)
+    commands = []
+
+    def fake_run(cmd, op_name):
+        commands.append((cmd, op_name))
+        Path(cmd[-1]).write_bytes(b"audio")
+
+    monkeypatch.setattr(service, "_run_ffmpeg", fake_run)
+
+    result = service.build_dubbed_track(clips, total_duration=130.0, output_path=output)
+
+    assert result == output.resolve()
+    assert len(commands) == 4  # three bounded batches plus the final combination
+    assert max(cmd.count("-i") for cmd, _ in commands[:-1]) <= 64
+    final_cmd, final_op = commands[-1]
+    final_filter = final_cmd[final_cmd.index("-filter_complex") + 1]
+    assert final_op == "build_dubbed_track (combine batches)"
+    assert "amix=inputs=3" in final_filter
+    assert "adelay=64000|64000" in final_filter

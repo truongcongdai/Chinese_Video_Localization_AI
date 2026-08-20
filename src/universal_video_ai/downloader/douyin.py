@@ -444,7 +444,18 @@ class DouyinDownloader(BaseDownloader):
         try:
             return self._ytdlp_fallback.download(fallback_url, output_dir)
         except Exception as exc:
-            if "fresh cookies" in str(exc).lower():
+            error_message = str(exc).lower()
+            if (
+                "could not copy chrome cookie database" in error_message
+                or ("permission denied" in error_message and "network\\cookies" in error_message)
+            ):
+                raise RuntimeError(
+                    "Không thể đọc cookie Douyin từ Chrome vì Chrome đang mở và khóa cơ sở "
+                    "dữ liệu cookie trên Windows. Hãy đóng hoàn toàn mọi tiến trình Chrome rồi "
+                    "thử lại, hoặc xuất cookie Netscape vào "
+                    "local_data/cookies/douyin.com.cookies.txt."
+                ) from exc
+            if "fresh cookies" in error_message:
                 raise RuntimeError(
                     "Douyin yêu cầu cookie mới. Hãy xuất cookie Netscape từ trình duyệt vào "
                     "local_data/cookies/douyin.com.cookies.txt, hoặc cấu hình "
