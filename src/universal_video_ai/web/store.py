@@ -372,6 +372,78 @@ CREATE TABLE IF NOT EXISTS content_brain_runs (
     completed_at REAL
 );
 
+-- CP5 decision cards. Research snapshots deliberately contain normalized
+-- metadata only; production jobs and source media are never created here.
+CREATE TABLE IF NOT EXISTS content_opportunities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    source_type TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    source_candidate_id INTEGER,
+    source_gap_key TEXT,
+    brain_run_id INTEGER,
+    topic TEXT NOT NULL,
+    primary_motif TEXT,
+    evidence_score REAL NOT NULL,
+    evidence_confidence TEXT NOT NULL,
+    opportunity_rank_score REAL NOT NULL,
+    competition_level TEXT NOT NULL,
+    trend_score REAL,
+    niche_relevance_score REAL,
+    candidate_opportunity_score REAL,
+    competitor_strength_score REAL,
+    breakout_support_count INTEGER NOT NULL DEFAULT 0,
+    pattern_quality_score REAL,
+    gap_quality_score REAL,
+    ai_enrichment_status TEXT NOT NULL DEFAULT 'missing',
+    system_recommended_angle TEXT,
+    system_audience_promise TEXT,
+    system_core_conflict TEXT,
+    system_differentiation TEXT,
+    system_suggested_title TEXT,
+    system_suggested_hook TEXT,
+    system_risks_json TEXT NOT NULL DEFAULT '[]',
+    working_title TEXT,
+    selected_angle TEXT,
+    notes TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    target_format TEXT NOT NULL DEFAULT 'long_form',
+    target_duration_min INTEGER,
+    target_duration_max INTEGER,
+    rights_status TEXT NOT NULL DEFAULT 'idea_only',
+    risk_level TEXT NOT NULL DEFAULT 'medium',
+    evidence_hash TEXT NOT NULL,
+    evidence_snapshot_json TEXT NOT NULL,
+    score_breakdown_json TEXT NOT NULL,
+    waiting_for_json TEXT NOT NULL DEFAULT '[]',
+    rejection_reason TEXT,
+    rejection_note TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_refreshed_at REAL NOT NULL,
+    UNIQUE(user_id, dedupe_key)
+);
+
+CREATE TABLE IF NOT EXISTS content_opportunity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_opportunities_user_rank
+    ON content_opportunities(user_id, opportunity_rank_score DESC);
+CREATE INDEX IF NOT EXISTS idx_content_opportunities_user_status
+    ON content_opportunities(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_opportunity_events_owner
+    ON content_opportunity_events(user_id, opportunity_id, created_at DESC);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2811,6 +2883,181 @@ class Store:
             if isinstance(brain_result, dict) else None
         )
         return result
+
+    # ---- Channel Agent CP5 Content Opportunities (per-user, deterministic) ----
+    _OPPORTUNITY_JSON_FIELDS = {
+        "system_risks_json": ("system_risks", []),
+        "evidence_snapshot_json": ("evidence_snapshot", {}),
+        "score_breakdown_json": ("score_breakdown", {}),
+        "waiting_for_json": ("waiting_for", []),
+    }
+
+    @classmethod
+    def _content_opportunity_dict(cls, row: Any, *, include_snapshot: bool = True) -> Dict[str, Any]:
+        result = dict(row)
+        for source, (target, fallback) in cls._OPPORTUNITY_JSON_FIELDS.items():
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else fallback
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = fallback
+        now = time.time()
+        age_days = max(0.0, (now - float(result.get("last_refreshed_at") or now)) / 86400.0)
+        result["freshness_status"] = "fresh" if age_days <= 7 else ("aging" if age_days <= 30 else "stale")
+        result["approved_for_production"] = result.get("status") == "approved"
+        if not include_snapshot:
+            result.pop("evidence_snapshot", None)
+            result.pop("score_breakdown", None)
+            result.pop("system_risks", None)
+            result.pop("waiting_for", None)
+        return result
+
+    def insert_content_opportunity(self, user_id: int, data: Dict[str, Any]) -> int:
+        now = time.time()
+        fields = (
+            "status", "source_type", "source_key", "dedupe_key", "source_candidate_id",
+            "source_gap_key", "brain_run_id", "topic", "primary_motif", "evidence_score",
+            "evidence_confidence", "opportunity_rank_score", "competition_level", "trend_score",
+            "niche_relevance_score", "candidate_opportunity_score", "competitor_strength_score",
+            "breakout_support_count", "pattern_quality_score", "gap_quality_score",
+            "ai_enrichment_status", "system_recommended_angle", "system_audience_promise",
+            "system_core_conflict", "system_differentiation", "system_suggested_title",
+            "system_suggested_hook", "system_risks_json", "working_title", "selected_angle",
+            "notes", "priority", "target_format", "target_duration_min", "target_duration_max",
+            "rights_status", "risk_level", "evidence_hash", "evidence_snapshot_json",
+            "score_breakdown_json", "waiting_for_json", "rejection_reason", "rejection_note",
+        )
+        values = [data.get(field) for field in fields]
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"INSERT INTO content_opportunities (user_id,{','.join(fields)},created_at,updated_at,last_refreshed_at) "
+                f"VALUES ({','.join('?' for _ in range(len(fields) + 4))})",
+                [user_id, *values, now, now, now],
+            )
+            opportunity_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO content_opportunity_events "
+                "(opportunity_id,user_id,event_type,to_status,created_at) VALUES (?,?,'created',?,?)",
+                (opportunity_id, user_id, data.get("status") or "draft", now),
+            )
+            return opportunity_id
+
+    def get_content_opportunity(self, user_id: int, opportunity_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            ).fetchone()
+        return self._content_opportunity_dict(row) if row else None
+
+    def get_content_opportunity_by_dedupe(self, user_id: int, dedupe_key: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_opportunities WHERE user_id=? AND dedupe_key=?",
+                (user_id, dedupe_key),
+            ).fetchone()
+        return self._content_opportunity_dict(row) if row else None
+
+    def list_content_opportunities(
+        self, user_id: int, *, statuses: Optional[List[str]] = None,
+        confidence: Optional[str] = None, competition: Optional[str] = None,
+        source_type: Optional[str] = None, min_score: float = 0.0, limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["user_id=?", "evidence_score>=?"]
+        params: List[Any] = [user_id, max(0.0, min(100.0, float(min_score)))]
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if confidence:
+            clauses.append("evidence_confidence=?")
+            params.append(confidence)
+        if competition:
+            clauses.append("competition_level=?")
+            params.append(competition)
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        params.append(min(100, max(1, int(limit))))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_opportunities WHERE " + " AND ".join(clauses)
+                + " ORDER BY opportunity_rank_score DESC,updated_at DESC,id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._content_opportunity_dict(row, include_snapshot=False) for row in rows]
+
+    def update_content_opportunity(self, user_id: int, opportunity_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            "status", "brain_run_id", "topic", "primary_motif", "evidence_score",
+            "evidence_confidence", "opportunity_rank_score", "competition_level", "trend_score",
+            "niche_relevance_score", "candidate_opportunity_score", "competitor_strength_score",
+            "breakout_support_count", "pattern_quality_score", "gap_quality_score",
+            "ai_enrichment_status", "system_recommended_angle", "system_audience_promise",
+            "system_core_conflict", "system_differentiation", "system_suggested_title",
+            "system_suggested_hook", "system_risks_json", "working_title", "selected_angle",
+            "notes", "priority", "target_format", "target_duration_min", "target_duration_max",
+            "rights_status", "risk_level", "evidence_hash", "evidence_snapshot_json",
+            "score_breakdown_json", "waiting_for_json", "rejection_reason", "rejection_note",
+            "last_refreshed_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_content_opportunity(user_id, opportunity_id))
+        payload["updated_at"] = time.time()
+        assignments = ",".join(f"{key}=?" for key in payload)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE content_opportunities SET {assignments} WHERE id=? AND user_id=?",
+                [*payload.values(), opportunity_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def add_content_opportunity_event(
+        self, user_id: int, opportunity_id: int, *, event_type: str,
+        from_status: Optional[str] = None, to_status: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> int:
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT 1 FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            ).fetchone()
+            if not owner:
+                return 0
+            cur = conn.execute(
+                "INSERT INTO content_opportunity_events "
+                "(opportunity_id,user_id,event_type,from_status,to_status,note,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (opportunity_id, user_id, event_type, from_status, to_status, note, time.time()),
+            )
+            return int(cur.lastrowid)
+
+    def list_content_opportunity_events(self, user_id: int, opportunity_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_opportunity_events WHERE user_id=? AND opportunity_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 100",
+                (user_id, opportunity_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_content_opportunity(self, user_id: int, opportunity_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "DELETE FROM content_opportunity_events WHERE opportunity_id=? AND user_id=?",
+                (opportunity_id, user_id),
+            )
+            conn.execute(
+                "DELETE FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            )
+            return True
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(

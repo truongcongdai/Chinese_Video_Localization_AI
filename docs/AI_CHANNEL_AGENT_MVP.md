@@ -877,6 +877,96 @@ Also verify failure states by stopping Ollama, clearing `OLLAMA_MODEL`, and
 configuring a non-installed model in turn. The UI should report each condition
 without affecting Trend Scanner, Competitor Intelligence, or localization.
 
+## CP5 — Content Opportunity Engine
+
+CP5 converts stored CP2 candidates, CP3 opportunity gaps, and completed CP4
+runs into per-user decision cards. It is deterministic and remains available
+when Ollama is stopped. Creating, refreshing, approving, or archiving a card
+does not call Ollama, download media, create a localization/production job, or
+publish anything.
+
+Cards have explicit `draft`, `watch`, `approved`, `rejected`, and `archived`
+states. Supported transitions are draft → watch/approved/rejected, watch →
+draft/approved/rejected, approved → archived, and rejected → draft. Approval
+means eligible for later production planning only. Each create, refresh, CP4
+link, and status change is recorded in a small per-user event history.
+
+### Deterministic scoring and ranking
+
+The evidence score uses these maximum component weights:
+
+- trend strength: 20;
+- niche relevance: 20;
+- candidate opportunity strength: 15;
+- qualified competitor and breakout evidence: 15;
+- qualified pattern or gap quality: 15; and
+- application-side evidence confidence: 15.
+
+Only stored, available signals participate. Missing signals are marked unknown
+and available weights are normalized to 100; they are never silently converted
+to fabricated zero measurements. The score explanation preserves each signal,
+weight, raw points, normalized points, and total. Model self-ratings never
+enter this score.
+
+Evidence confidence remains a separate low/medium/high value. It considers
+observed versus approximate VPH, candidate count, qualified competitor count,
+distinct breakout evidence, cross-channel support, usable own-channel history,
+and CP4's application-computed evidence confidence. A sparse idea can therefore
+show a high evidence score and low confidence, with explicit “Waiting for”
+signals.
+
+Competition is unknown when the observed sample is too small. Otherwise it is
+low (shown as “limited observed”), medium, or high based on qualified
+competitor count, qualified candidate supply, breakout support, and
+cross-channel support. Rank is:
+
+`evidence score × confidence factor × freshness factor × competition adjustment`
+
+Confidence factors are 0.72/0.88/1.0 for low/medium/high. Competition factors
+are 1.05/1.0/0.95/0.95 for low/medium/high/unknown. This makes confidence
+material while applying only a small penalty to competitive topics that also
+demonstrate demand. Freshness factors are 1.0/0.92/0.82 for fresh/aging/stale
+evidence. Scores and ranks are bounded to 0–100.
+
+### Snapshots, CP4 enrichment, and rights
+
+Each card stores a normalized `cp5-v1` evidence snapshot and deterministic
+SHA-256 hash. It contains bounded candidate, competitor, pattern, gap, breakout,
+own-channel, confidence, and rights metadata already resolved under the logged-
+in user. It excludes OAuth credentials, secrets, raw provider payloads,
+transcripts, and media. Duplicate candidate/gap/evidence keys return the
+existing card.
+
+When matching completed CP4 runs exist, CP5 reuses stored angle, audience
+promise, conflict, differentiation, title, hook, and risks. It never triggers a
+new analysis. Manual evidence refresh recalculates system research fields while
+preserving working title, selected angle, notes, priority, format, and duration.
+
+External sources remain `idea_only` or `unknown` unless separately verified.
+Approving the idea never changes source rights. Production should extract the
+motif/problem, create an original Vietnamese script/commentary and sequence,
+and use owned, licensed, or permitted visuals.
+
+### CP5 manual verification
+
+1. Start the app with `AI_CHANNEL_AGENT_ENABLED=true` and log in.
+2. Open **AI Channel Agent → Trend Scanner** and ensure qualified stored
+   candidates exist; refresh competitor research if opportunity-gap evidence is
+   needed.
+3. Open **Content Opportunities** and click **Generate from top research**.
+   Confirm no more than five deduplicated cards are produced by the default
+   action.
+4. Open a card and inspect evidence score, component explanation, confidence,
+   competition, freshness, evidence links, rights, and optional CP4 enrichment.
+5. Save a working title, selected angle, notes, priority, and target duration;
+   then click **Refresh evidence** and confirm those editorial choices remain.
+6. Exercise draft → watch → approved → archived, and on another card draft →
+   rejected. Confirm each event is visible.
+7. Stop Ollama and reload the board. Listing, filtering, creating, refreshing,
+   and changing card status must continue to work.
+8. Confirm no production/localization job, source download, render, upload, or
+   publish action was created.
+
 ## Next checkpoint
 
-**CP5 — Content Opportunity Engine**
+**CP6 — Production Queue**

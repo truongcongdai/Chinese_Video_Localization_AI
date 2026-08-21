@@ -25,6 +25,15 @@ from universal_video_ai.channel_agent.providers import (
     OllamaProviderError,
     OllamaTimeoutError,
 )
+from universal_video_ai.channel_agent.opportunities import (
+    COMPETITION_LEVELS,
+    CONFIDENCE_LEVELS,
+    SOURCE_TYPES,
+    STATUSES,
+    ContentOpportunityService,
+    OpportunityError,
+    OpportunityNotFound,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -112,6 +121,40 @@ class ContentBrainAnalyzeBody(BaseModel):
     allow_low_confidence: bool = False
 
 
+class OpportunityCreateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: str
+    source_id: str
+    allow_low_confidence: bool = False
+
+
+class OpportunityGenerateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = 5
+
+
+class OpportunityEditBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    working_title: Optional[str] = None
+    selected_angle: Optional[str] = None
+    notes: Optional[str] = None
+    priority: Optional[int] = None
+    target_format: Optional[str] = None
+    target_duration_min: Optional[int] = None
+    target_duration_max: Optional[int] = None
+
+
+class OpportunityStatusBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    rejection_reason: Optional[str] = None
+    note: Optional[str] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -170,6 +213,10 @@ def _brain_service(store: Store) -> ContentBrainService:
         },
         own_context_loader=lambda user_id: _own_channel_context(store, user_id),
     )
+
+
+def _opportunity_service(store: Store) -> ContentOpportunityService:
+    return ContentOpportunityService(store)
 
 
 def _validate_trend_query(data: dict[str, Any]) -> dict[str, Any]:
@@ -314,6 +361,142 @@ def delete_content_brain_run(
     _require_enabled()
     if not store.delete_content_brain_run(user_id, run_id):
         raise HTTPException(404, "Content Brain run not found.")
+
+
+@router.get("/opportunities")
+def content_opportunities(
+    status: Optional[str] = None,
+    confidence: Optional[str] = None,
+    competition: Optional[str] = None,
+    source_type: Optional[str] = None,
+    min_score: float = Query(0.0, ge=0.0, le=100.0),
+    limit: int = Query(20, ge=1, le=100),
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    statuses = (sorted(STATUSES) if status == "all" else
+                ([part.strip() for part in status.split(",") if part.strip()]
+                 if status else ["draft", "watch", "approved"]))
+    if any(value not in STATUSES for value in statuses):
+        raise HTTPException(422, "Unsupported opportunity status filter.")
+    if confidence and confidence not in CONFIDENCE_LEVELS:
+        raise HTTPException(422, "Unsupported evidence confidence filter.")
+    if competition and competition not in COMPETITION_LEVELS:
+        raise HTTPException(422, "Unsupported competition filter.")
+    if source_type and source_type not in SOURCE_TYPES:
+        raise HTTPException(422, "Unsupported opportunity source filter.")
+    return _opportunity_service(store).list(
+        user_id, statuses=statuses, confidence=confidence, competition=competition,
+        source_type=source_type, min_score=min_score, limit=limit,
+    )
+
+
+@router.post("/opportunities")
+def create_content_opportunity(
+    body: OpportunityCreateBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        opportunity, created = _opportunity_service(store).create(
+            user_id, source_type=body.source_type, source_id=body.source_id,
+            allow_low_confidence=body.allow_low_confidence,
+        )
+    except OpportunityError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"created": created, "opportunity": opportunity}
+
+
+@router.post("/opportunities/generate")
+def generate_content_opportunities(
+    body: OpportunityGenerateBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if not 1 <= body.limit <= 20:
+        raise HTTPException(422, "Opportunity generation limit must be between 1 and 20.")
+    return _opportunity_service(store).generate(user_id, limit=body.limit)
+
+
+@router.get("/opportunities/{opportunity_id}")
+def content_opportunity_detail(
+    opportunity_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _opportunity_service(store).get(user_id, opportunity_id)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.patch("/opportunities/{opportunity_id}")
+def edit_content_opportunity(
+    opportunity_id: int,
+    body: OpportunityEditBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _opportunity_service(store).edit(
+            user_id, opportunity_id, **body.model_dump(exclude_unset=True)
+        )
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except OpportunityError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/opportunities/{opportunity_id}/status")
+def change_content_opportunity_status(
+    opportunity_id: int,
+    body: OpportunityStatusBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _opportunity_service(store).change_status(
+            user_id, opportunity_id, status=body.status,
+            rejection_reason=body.rejection_reason, note=body.note,
+        )
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except OpportunityError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/opportunities/{opportunity_id}/refresh")
+def refresh_content_opportunity(
+    opportunity_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _opportunity_service(store).refresh(user_id, opportunity_id)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except OpportunityError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.delete("/opportunities/{opportunity_id}", status_code=204)
+def delete_content_opportunity(
+    opportunity_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> None:
+    _require_enabled()
+    try:
+        _opportunity_service(store).delete(user_id, opportunity_id)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @router.get("/youtube/status")

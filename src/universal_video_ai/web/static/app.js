@@ -3546,6 +3546,11 @@ async function initChannelAgent() {
     $("#content-brain-message").textContent = `Content Brain unavailable: ${brainError.message}`;
   }
   try {
+    await loadContentOpportunities();
+  } catch (opportunityError) {
+    $("#content-opportunity-message").textContent = `Content Opportunities unavailable: ${opportunityError.message}`;
+  }
+  try {
     const status = await api("/api/channel-agent/youtube/status");
     if (!status.connected) {
       connectNode.classList.remove("hidden");
@@ -3712,8 +3717,13 @@ async function showTrendCandidate(id) {
     <p><strong>Matched:</strong> ${escapeHtml((item.match_reasons || []).join(" + ") || "—")}</p>
     <p>${(item.score_explanations || []).map(reason => `• ${escapeHtml(reason)}`).join("<br>")}</p>
     <p class="muted-help">Confidence: ${escapeHtml(item.score_confidence || "low")} · Signals: ${item.available_signal_count || 0}/5 · Rights: ${escapeHtml(item.rights_status || "idea_only")}</p>
+    <button class="btn secondary small" id="trend-candidate-create-opportunity" type="button">Create Content Opportunity</button>
     <h4>Snapshot history</h4>
     ${channelAgentTable(["Captured", "Views", "Likes", "Comments"], (item.snapshots || []).map(snapshot => [new Date(snapshot.captured_at * 1000).toLocaleString(), channelAgentNumber(snapshot.view_count), channelAgentNumber(snapshot.like_count), channelAgentNumber(snapshot.comment_count)]))}`;
+  $("#trend-candidate-create-opportunity").onclick = async () => {
+    try { await createContentOpportunity("candidate", id); }
+    catch (error) { $("#trend-research-message").textContent = error.message; }
+  };
 }
 
 $("#trend-research-add").onclick = async () => {
@@ -3776,16 +3786,22 @@ async function loadCompetitors() {
   ]);
   $("#competitor-list").innerHTML = competitorTable(items);
   $("#competitor-gaps").innerHTML = gaps.length ? channelAgentTable(
-    ["Pattern", "Quality", "Status", "Competitors", "Breakouts", "Median outlier", "Qualified candidates", "Confidence", "Evidence"],
+    ["Pattern", "Quality", "Status", "Competitors", "Breakouts", "Median outlier", "Qualified candidates", "Confidence", "Evidence", "Opportunity"],
     gaps.map(gap => [gap.pattern, gap.gap_quality_score != null ? `${Math.round(gap.gap_quality_score * 100)}%` : "—",
       (gap.gap_quality_status || "unscored").toUpperCase(), gap.supporting_competitor_count, gap.supporting_breakout_count,
       gap.median_outlier != null ? `${gap.median_outlier.toFixed(1)}x` : "—", gap.qualified_candidate_count,
       gap.confidence, (gap.evidence || []).map(video =>
         `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title || video.video_id)}</a>`
-      ).join("<br>")]), [8]
+      ).join("<br>"), `<button class="btn secondary small" data-gap-create-opportunity="${escapeHtml(gap.pattern)}">Create card</button>`]), [8, 9]
   ) : '<div class="muted-help">No evidence-backed opportunity gaps yet.</div>';
   document.querySelectorAll("[data-competitor-id]").forEach(button => {
     button.onclick = () => showCompetitor(Number(button.dataset.competitorId));
+  });
+  document.querySelectorAll("[data-gap-create-opportunity]").forEach(button => {
+    button.onclick = async () => {
+      try { await createContentOpportunity("gap", button.dataset.gapCreateOpportunity); }
+      catch (error) { $("#competitor-message").textContent = error.message; }
+    };
   });
 }
 
@@ -4085,13 +4101,14 @@ async function loadContentBrain() {
     $("#content-brain-selector").value = current;
   }
   $("#content-brain-history").innerHTML = runs.length ? channelAgentTable(
-    ["Date", "Mode", "Model", "Status", "Attempts", "Failure stage", "Context", "Confidence", "Inspect"],
+    ["Date", "Mode", "Model", "Status", "Attempts", "Failure stage", "Context", "Confidence", "Inspect", "Opportunity"],
     runs.map(run => [
       new Date(run.created_at * 1000).toLocaleString(), run.request_type, run.model || "not configured",
       run.status, run.generation_attempt_count ?? "—", run.failure_stage || "—",
       run.context_label || "—", run.confidence || "—",
       `<button class="btn secondary small" data-content-brain-run="${run.id}" data-content-brain-mode="${escapeHtml(run.request_type)}">Inspect</button>`,
-    ]), [8]
+      run.status === "completed" ? `<button class="btn secondary small" data-brain-create-opportunity="${run.id}">Create card</button>` : "—",
+    ]), [8, 9]
   ) : '<div class="muted-help">No Content Brain analyses yet.</div>';
   document.querySelectorAll("[data-content-brain-run]").forEach(button => {
     button.onclick = async () => {
@@ -4125,6 +4142,12 @@ async function loadContentBrain() {
       } finally {
         if (contentBrainRequestState.isCurrent(token)) analyzeButton.disabled = false;
       }
+    };
+  });
+  document.querySelectorAll("[data-brain-create-opportunity]").forEach(button => {
+    button.onclick = async () => {
+      try { await createContentOpportunity("brain_run", button.dataset.brainCreateOpportunity); }
+      catch (error) { $("#content-brain-message").textContent = error.message; }
     };
   });
 }
@@ -4191,6 +4214,182 @@ $("#content-brain-analyze").onclick = async () => {
     if (contentBrainRequestState.isCurrent(token)) button.disabled = false;
   }
 };
+
+// ---------------- Content Opportunities (CP5) ----------------
+function contentOpportunityFilters() {
+  return {
+    status: $("#content-opportunity-status-filter").value,
+    confidence: $("#content-opportunity-confidence-filter").value,
+    competition: $("#content-opportunity-competition-filter").value,
+    sourceType: $("#content-opportunity-source-filter").value,
+    minScore: $("#content-opportunity-min-score").value,
+  };
+}
+
+function contentOpportunityBoard(items) {
+  if (!items.length) return '<div class="muted-help">No opportunities match these filters. Generate a small set from qualified research or create one from a candidate, gap, or completed Content Brain run.</div>';
+  return channelAgentTable(
+    ["Rank", "Status", "Topic", "Evidence", "Confidence", "Competition", "Trend", "Relevance", "Breakouts", "Freshness", "Updated", "View"],
+    items.map(item => [
+      Number(item.opportunity_rank_score || 0).toFixed(1),
+      String(item.status || "draft").toUpperCase(),
+      item.topic || "Research opportunity",
+      Number(item.evidence_score || 0).toFixed(1),
+      String(item.evidence_confidence || "low").toUpperCase(),
+      ContentOpportunityUI.competitionLabel(item.competition_level).toUpperCase(),
+      item.trend_score == null ? "—" : Math.round(item.trend_score * 100),
+      item.niche_relevance_score == null ? "—" : `${Math.round(item.niche_relevance_score * 100)}%`,
+      item.breakout_support_count || 0,
+      String(item.freshness_status || "fresh").toUpperCase(),
+      new Date(item.updated_at * 1000).toLocaleString(),
+      `<button class="btn secondary small" data-content-opportunity-id="${item.id}">View</button>`,
+    ]), [11]
+  );
+}
+
+async function loadContentOpportunities() {
+  const query = ContentOpportunityUI.listQuery(contentOpportunityFilters());
+  const items = await api(`/api/channel-agent/opportunities?${query}`);
+  $("#content-opportunity-board").innerHTML = contentOpportunityBoard(items);
+  $("#content-opportunity-message").textContent = `${items.length} opportunity card${items.length === 1 ? "" : "s"} shown · top 20 maximum.`;
+  document.querySelectorAll("[data-content-opportunity-id]").forEach(button => {
+    button.onclick = () => showContentOpportunity(Number(button.dataset.contentOpportunityId));
+  });
+}
+
+function contentOpportunityEvidenceLinks(snapshot) {
+  const links = [];
+  (snapshot?.trend_candidates || []).forEach(row => {
+    if (row.url) links.push(`<a href="${escapeHtml(row.url)}" target="_blank" rel="noopener">Candidate #${row.candidate_id}: ${escapeHtml(row.title || row.video_id || "source")}</a>`);
+  });
+  (snapshot?.competitors || []).forEach(row => {
+    if (row.channel_url) links.push(`<a href="${escapeHtml(row.channel_url)}" target="_blank" rel="noopener">Competitor #${row.competitor_id}: ${escapeHtml(row.channel_title || "channel")}</a>`);
+  });
+  (snapshot?.breakout_videos || []).forEach(row => {
+    if (row.url) links.push(`<a href="${escapeHtml(row.url)}" target="_blank" rel="noopener">Breakout: ${escapeHtml(row.title || row.video_id)}</a>`);
+  });
+  return links.length ? `<ul>${links.map(link => `<li>${link}</li>`).join("")}</ul>` : '<p class="muted-help">No external evidence links stored.</p>';
+}
+
+function contentOpportunityStatusButtons(item) {
+  return (ContentOpportunityUI.transitions[item.status] || []).map(status =>
+    `<button class="btn secondary small" data-content-opportunity-status="${status}">${status.toUpperCase()}</button>`
+  ).join(" ");
+}
+
+async function showContentOpportunity(id) {
+  const item = await api(`/api/channel-agent/opportunities/${id}`);
+  const detail = $("#content-opportunity-detail");
+  detail.classList.remove("hidden");
+  const rows = ContentOpportunityUI.scoreRows(item.score_breakdown);
+  const recommendation = item.ai_enrichment_status === "available" ? `
+    <h4>CP4 recommendation</h4>
+    <p><strong>Recommended angle:</strong> ${escapeHtml(item.system_recommended_angle || "Not present in linked run")}</p>
+    <p><strong>Audience promise:</strong> ${escapeHtml(item.system_audience_promise || "—")}<br><strong>Core conflict:</strong> ${escapeHtml(item.system_core_conflict || "—")}</p>
+    <p><strong>Differentiation:</strong> ${escapeHtml(item.system_differentiation || "—")}</p>
+    <p><strong>Suggested title:</strong> ${escapeHtml(item.system_suggested_title || "—")}<br><strong>Suggested hook:</strong> ${escapeHtml(item.system_suggested_hook || "—")}</p>
+    ${(item.system_risks || []).length ? `<p><strong>Risks:</strong><br>${item.system_risks.map(value => `• ${escapeHtml(value)}`).join("<br>")}</p>` : ""}
+    ${item.brain_run_id ? `<button class="btn secondary small" data-content-opportunity-brain-run="${item.brain_run_id}">Inspect Content Brain Run #${item.brain_run_id}</button>` : ""}` : '<p class="muted-help">AI enrichment missing. CP5 remains fully usable offline; run Content Brain explicitly if enrichment is wanted.</p>';
+  detail.innerHTML = `
+    <div class="template-library-heading"><h3 class="section-title">${escapeHtml(item.topic)}</h3><span>${escapeHtml(String(item.status).toUpperCase())}</span></div>
+    <p><strong>Why this exists:</strong> ${escapeHtml(item.primary_motif || item.topic)} · source ${escapeHtml(item.source_type)}:${escapeHtml(item.source_key)}</p>
+    <div class="stat-grid" style="margin-top:10px">
+      <div class="stat-box"><div class="num">${Number(item.evidence_score).toFixed(1)}</div><div class="label">Evidence score</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(String(item.evidence_confidence).toUpperCase())}</div><div class="label">Confidence</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(ContentOpportunityUI.competitionLabel(item.competition_level).toUpperCase())}</div><div class="label">Competition</div></div>
+      <div class="stat-box"><div class="num">${Number(item.opportunity_rank_score).toFixed(1)}</div><div class="label">Rank score</div></div>
+      <div class="stat-box"><div class="num">${item.breakout_support_count || 0}</div><div class="label">Breakout support</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(String(item.freshness_status).toUpperCase())}</div><div class="label">Evidence freshness</div></div>
+    </div>
+    <h4>Score explanation</h4>
+    ${channelAgentTable(["Component", "Signal", "Points", "Available"], rows.map(row => [row.label, row.signal == null ? "—" : `${Math.round(row.signal * 100)}%`, row.normalized_points == null ? "—" : `${row.normalized_points}/100`, row.available ? "yes" : "unknown"]))}
+    <p><strong>Total:</strong> ${item.score_breakdown.total}/100 · Missing components are excluded and available weights are normalized; they are not converted to fake zeroes.</p>
+    ${(item.waiting_for || []).length ? `<h4>Waiting for</h4><ul>${item.waiting_for.map(value => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : ""}
+    ${recommendation}
+    <h4>Rights and transformation</h4>
+    <p><strong>Source rights:</strong> ${escapeHtml(item.rights_status)} · <strong>Risk:</strong> ${escapeHtml(item.risk_level)}</p>
+    <p class="muted-help">Approval is approval of the idea only. Create a new Vietnamese angle/script/commentary and use owned, licensed, or permitted visuals; do not copy source media.</p>
+    <h4>Evidence links</h4>${contentOpportunityEvidenceLinks(item.evidence_snapshot)}
+    <h4>Editorial fields</h4>
+    <div class="field"><label>Working title</label><input id="content-opportunity-working-title" maxlength="300" value="${escapeHtml(item.working_title || "")}"></div>
+    <div class="field"><label>Selected angle</label><textarea id="content-opportunity-selected-angle" rows="3" maxlength="1500">${escapeHtml(item.selected_angle || "")}</textarea></div>
+    <div class="field"><label>Notes</label><textarea id="content-opportunity-notes" rows="3" maxlength="5000">${escapeHtml(item.notes || "")}</textarea></div>
+    <div class="row"><div class="field"><label>Priority (0–100)</label><input id="content-opportunity-priority" type="number" min="0" max="100" value="${item.priority || 0}"></div>
+      <div class="field"><label>Format</label><select id="content-opportunity-target-format">${["long_form", "short_form", "all", "unspecified"].map(value => `<option value="${value}" ${item.target_format === value ? "selected" : ""}>${value}</option>`).join("")}</select></div>
+      <div class="field"><label>Min minutes</label><input id="content-opportunity-duration-min" type="number" min="1" max="600" value="${item.target_duration_min || ""}"></div>
+      <div class="field"><label>Max minutes</label><input id="content-opportunity-duration-max" type="number" min="1" max="600" value="${item.target_duration_max || ""}"></div></div>
+    <button class="btn gradient small" id="content-opportunity-save" type="button">Save editorial choices</button>
+    <button class="btn secondary small" id="content-opportunity-refresh-evidence" type="button">Refresh evidence</button>
+    <h4>Status actions</h4><div id="content-opportunity-status-actions">${contentOpportunityStatusButtons(item)}</div>
+    <h4>History</h4>${channelAgentTable(["Date", "Event", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
+  $("#content-opportunity-save").onclick = async () => {
+    try {
+      const updated = await api(`/api/channel-agent/opportunities/${id}`, {method: "PATCH", body: JSON.stringify({
+        working_title: $("#content-opportunity-working-title").value,
+        selected_angle: $("#content-opportunity-selected-angle").value,
+        notes: $("#content-opportunity-notes").value,
+        priority: Number($("#content-opportunity-priority").value),
+        target_format: $("#content-opportunity-target-format").value,
+        target_duration_min: Number($("#content-opportunity-duration-min").value),
+        target_duration_max: Number($("#content-opportunity-duration-max").value),
+      })});
+      $("#content-opportunity-message").textContent = "Editorial choices saved; evidence refresh will preserve them.";
+      await showContentOpportunity(updated.id);
+      await loadContentOpportunities();
+    } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  };
+  $("#content-opportunity-refresh-evidence").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/opportunities/${id}/refresh`, {method: "POST"});
+      $("#content-opportunity-message").textContent = "Stored research evidence and deterministic scores refreshed. Ollama was not called.";
+      await showContentOpportunity(id);
+      await loadContentOpportunities();
+    } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  };
+  document.querySelectorAll("[data-content-opportunity-status]").forEach(button => {
+    button.onclick = async () => {
+      const status = button.dataset.contentOpportunityStatus;
+      const rejectionReason = status === "rejected" ? (window.prompt("Reject reason: low_evidence, wrong_niche, too_competitive, rights_concern, duplicate_idea, weak_differentiation, other", "low_evidence") || "low_evidence") : null;
+      try {
+        await api(`/api/channel-agent/opportunities/${id}/status`, {method: "POST", body: JSON.stringify({status, rejection_reason: rejectionReason})});
+        await showContentOpportunity(id);
+        await loadContentOpportunities();
+      } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+    };
+  });
+  document.querySelector("[data-content-opportunity-brain-run]")?.addEventListener("click", async event => {
+    const runId = Number(event.currentTarget.dataset.contentOpportunityBrainRun);
+    const run = await api(`/api/channel-agent/brain/runs/${runId}`);
+    if (run.result) renderContentBrainResult({...run.result, request_type: run.request_type, analysis_id: run.id}, run.evidence, run.request_type);
+    $("#content-brain-message").textContent = `Viewing stored run #${runId}. No Ollama request was made.`;
+    $("#content-brain").scrollIntoView({behavior: "smooth"});
+  });
+}
+
+async function createContentOpportunity(sourceType, sourceId) {
+  const response = await api("/api/channel-agent/opportunities", {method: "POST", body: JSON.stringify({source_type: sourceType, source_id: String(sourceId)})});
+  $("#content-opportunity-message").textContent = response.created ? "Content opportunity created." : `Duplicate research resolved to existing opportunity #${response.opportunity.id}.`;
+  await loadContentOpportunities();
+  await showContentOpportunity(response.opportunity.id);
+  $("#content-opportunities").scrollIntoView({behavior: "smooth"});
+}
+
+$("#content-opportunity-generate").onclick = async () => {
+  const button = $("#content-opportunity-generate");
+  button.disabled = true;
+  try {
+    const result = await api("/api/channel-agent/opportunities/generate", {method: "POST", body: JSON.stringify({limit: 5})});
+    $("#content-opportunity-message").textContent = `${result.created.length} created · ${result.existing.length} deduplicated existing · no local AI call.`;
+    await loadContentOpportunities();
+  } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  finally { button.disabled = false; }
+};
+
+$("#content-opportunity-refresh-list").onclick = loadContentOpportunities;
+["status", "confidence", "competition", "source"].forEach(name => {
+  $(`#content-opportunity-${name}-filter`).onchange = loadContentOpportunities;
+});
+$("#content-opportunity-min-score").onchange = loadContentOpportunities;
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

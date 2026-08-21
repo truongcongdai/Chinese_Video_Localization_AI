@@ -1566,6 +1566,26 @@
         </div>
         <div id="content-brain-history" class="muted-help">No Content Brain runs loaded.</div>
       </div>
+      <div id="content-opportunities" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+        <div class="template-library-heading">
+          <h3 class="section-title">📌 Content Opportunities</h3>
+          <div>
+            <button class="btn secondary small" id="content-opportunity-refresh-list" type="button">Refresh board</button>
+            <button class="btn gradient small" id="content-opportunity-generate" type="button">Generate from top research</button>
+          </div>
+        </div>
+        <p class="muted-help">Deterministic decision cards from stored CP2–CP4 evidence. Approval means ready for later planning; it never creates, downloads, renders, or publishes content.</p>
+        <div class="row" style="align-items:end;margin-top:12px">
+          <div class="field"><label>Status</label><select id="content-opportunity-status-filter"><option value="draft,watch,approved">Active</option><option value="draft">Draft</option><option value="watch">Watch</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="archived">Archived</option><option value="all">All</option></select></div>
+          <div class="field"><label>Confidence</label><select id="content-opportunity-confidence-filter"><option value="">All</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></div>
+          <div class="field"><label>Competition</label><select id="content-opportunity-competition-filter"><option value="">All</option><option value="low">Limited observed</option><option value="medium">Medium</option><option value="high">High</option><option value="unknown">Unknown</option></select></div>
+          <div class="field"><label>Source</label><select id="content-opportunity-source-filter"><option value="">All</option><option value="candidate">Trend candidate</option><option value="gap">Opportunity gap</option><option value="brain_run">Content Brain run</option></select></div>
+          <div class="field"><label>Min score</label><input id="content-opportunity-min-score" type="number" min="0" max="100" value="0" style="width:90px"></div>
+        </div>
+        <div id="content-opportunity-message" class="muted-help"></div>
+        <div id="content-opportunity-board" class="muted-help" style="margin-top:12px">No opportunities loaded.</div>
+        <div id="content-opportunity-detail" class="hidden" style="margin-top:18px"></div>
+      </div>
     </div>
   </div>
 
@@ -1968,6 +1988,7 @@
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
 <script src="/assets/content_brain_ui.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
-<script src="/assets/app.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
+<script src="/assets/content_opportunity_ui.js?v=20260821-channel-agent-cp5-opportunities1" defer></script>
+<script src="/assets/app.js?v=20260821-channel-agent-cp5-opportunities1" defer></script>
 </body>
 </html>
