@@ -4534,6 +4534,10 @@ async function showProductionItem(id) {
     <button class="btn secondary small" id="production-open-opportunity" type="button">Open source opportunity</button>
     <h4>Status actions</h4><div>${productionItemActions(item)}</div>
     ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
+    <div id="production-execution" style="border-top:1px solid var(--border);margin-top:22px;padding-top:18px">
+      <h3 class="section-title">⚙️ Production Execution</h3>
+      <p class="muted-help">Loading versioned text and structured assets…</p>
+    </div>
     <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
 
   $("#production-item-save").onclick = async () => {
@@ -4591,6 +4595,198 @@ async function showProductionItem(id) {
       } catch (error) { $("#production-message").textContent = error.message; }
     };
   });
+  try {
+    await loadProductionExecution(id);
+  } catch (error) {
+    $("#production-execution").innerHTML = `<h3 class="section-title">⚙️ Production Execution</h3><p class="muted-help">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+let activeExecutionItemId = null;
+let productionExecutionPollToken = 0;
+
+function executionAssetActions(asset) {
+  return (ContentExecutionUI.statusActions[asset.status] || []).map(status =>
+    `<button class="btn secondary small" data-execution-asset-status="${status}" data-execution-asset-id="${asset.id}">${status.toUpperCase()}</button>`
+  ).join(" ");
+}
+
+function executionAssetCard(asset, label) {
+  if (!asset) return `<div class="muted-help">${escapeHtml(label)} not generated.</div>`;
+  return `<div style="border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0">
+    <div class="template-library-heading"><strong>${escapeHtml(label)} v${asset.version}</strong><span>${escapeHtml(asset.status.toUpperCase())}</span></div>
+    <p class="muted-help">${asset.model_name ? `Local model: ${escapeHtml(asset.model_name)} · ` : ""}${asset.generation_metadata?.elapsed_seconds != null ? `${asset.generation_metadata.elapsed_seconds}s · ` : ""}attempts ${asset.generation_metadata?.attempt_count || 0}</p>
+    <pre style="white-space:pre-wrap;max-height:280px;overflow:auto">${escapeHtml(JSON.stringify(asset.content, null, 2))}</pre>
+    <div>${executionAssetActions(asset)} <button class="btn secondary small" data-execution-versions="${asset.id}">Versions</button></div>
+  </div>`;
+}
+
+function executionSectionCards(bundle) {
+  if (!bundle.blueprint) return '<p class="muted-help">Generate a blueprint before generating sections.</p>';
+  return (bundle.sections || []).map(({plan, latest_asset: asset, versions}) => {
+    const wordCount = asset?.content?.word_count || 0;
+    const target = plan.target_word_budget || 0;
+    const duration = asset?.content?.estimated_duration_minutes || 0;
+    return `<div style="border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0">
+      <div class="template-library-heading"><strong>${String(plan.order_index || "").padStart(2, "0")} — ${escapeHtml(plan.title)}</strong><span>${asset ? escapeHtml(asset.status.toUpperCase()) : "NOT GENERATED"}</span></div>
+      <p>${escapeHtml(plan.purpose)} · target ${target} words / ${plan.target_duration_minutes || "—"} min</p>
+      ${asset ? `<p class="muted-help">${wordCount} words · estimated ${duration} min · v${asset.version} of ${versions}</p>
+        <textarea data-execution-section-text="${asset.id}" rows="10" maxlength="25000">${escapeHtml(asset.content_text || asset.content?.section_text || "")}</textarea>
+        <button class="btn secondary small" data-execution-save-section="${asset.id}">Save manual edit as new version</button>
+        ${executionAssetActions(asset)} <button class="btn secondary small" data-execution-versions="${asset.id}">Versions</button>` : ""}
+      <button class="btn gradient small" data-execution-generate="script_section" data-execution-section-id="${escapeHtml(plan.section_id)}">${asset ? "Regenerate section" : "Generate section"}</button>
+    </div>`;
+  }).join("");
+}
+
+function executionJobs(jobs) {
+  if (!(jobs || []).length) return '<p class="muted-help">No generation history.</p>';
+  return channelAgentTable(
+    ["Created", "Type", "Section", "Model", "Status", "Progress", "Elapsed", "Attempts", "Error", "Action"],
+    jobs.slice(0, 20).map(job => [
+      new Date(job.created_at * 1000).toLocaleString(), job.asset_type,
+      job.section_id || "—", job.model_name || "—", job.status,
+      ContentExecutionUI.jobProgress(job), job.elapsed_seconds == null ? "—" : `${job.elapsed_seconds}s`,
+      job.attempt_count, job.error_message || "—",
+      ["queued", "running"].includes(job.status) ? `<button class="btn secondary small" data-execution-cancel-job="${job.id}">Cancel</button>` : "—",
+    ]), [9]
+  );
+}
+
+async function loadProductionExecution(itemId) {
+  activeExecutionItemId = itemId;
+  const bundle = await api(`/api/channel-agent/production/${itemId}/assets`);
+  if (activeExecutionItemId !== itemId) return;
+  const node = $("#production-execution");
+  const blueprint = bundle.blueprint;
+  const scriptDraft = ContentExecutionUI.latestByType(bundle.assets, "script_draft");
+  const visual = ContentExecutionUI.latestByType(bundle.assets, "visual_plan");
+  const voice = ContentExecutionUI.latestByType(bundle.assets, "voice_plan");
+  const thumbnail = ContentExecutionUI.latestByType(bundle.assets, "thumbnail_brief");
+  const metadata = ContentExecutionUI.latestByType(bundle.assets, "metadata_package");
+  const qa = ContentExecutionUI.latestByType(bundle.assets, "qa_report");
+  const nextSection = ContentExecutionUI.nextMissingSection(bundle.sections);
+  const packageStatus = bundle.package || {};
+  node.innerHTML = `
+    <h3 class="section-title">⚙️ Production Execution</h3>
+    <p class="muted-help">Local, original Vietnamese text/structured asset generation. Generation is human-reviewed, sectioned, versioned, CPU concurrency 1, and never downloads, voices, renders, uploads, or publishes media.</p>
+    <div id="production-execution-message" class="muted-help"></div>
+    <div class="stat-grid" style="margin:10px 0">
+      <div class="stat-box"><div class="num">${packageStatus.asset_ready ? "YES" : "NO"}</div><div class="label">Asset ready</div></div>
+      <div class="stat-box"><div class="num">${packageStatus.rights_ready ? "YES" : "NO"}</div><div class="label">Rights ready</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(String(packageStatus.qa_status || "missing").toUpperCase())}</div><div class="label">QA status</div></div>
+      <div class="stat-box"><div class="num">${bundle.words_per_minute}</div><div class="label">Estimated words/min</div></div>
+    </div>
+    <h4>Script Blueprint</h4>
+    <button class="btn gradient small" data-execution-generate="script_blueprint">${blueprint ? "Regenerate Blueprint" : "Generate Blueprint"}</button>
+    ${executionAssetCard(blueprint, "Script Blueprint")}
+    <h4>Script Sections</h4>
+    <div><button class="btn gradient small" data-execution-generate="script_resume">Resume / Generate all remaining</button>
+      ${nextSection ? `<button class="btn secondary small" data-execution-generate="script_section" data-execution-section-id="${escapeHtml(nextSection)}">Generate next section (${escapeHtml(nextSection)})</button>` : ""}
+      <button class="btn secondary small" id="execution-assemble-script" type="button">Assemble deterministic Script Draft</button></div>
+    ${executionSectionCards(bundle)}
+    <h4>Assembled Script Draft</h4>${scriptDraft ? `<p><strong>${scriptDraft.content.word_count || 0}</strong> words · estimated <strong>${scriptDraft.content.estimated_duration_minutes || 0}</strong> min · target ${scriptDraft.content.target_duration_minutes || "—"} min · ${scriptDraft.content.completion_percentage || 0}% word target</p>` : ""}
+    ${executionAssetCard(scriptDraft, "Script Draft")}
+    <h4>Visual Plan</h4><button class="btn gradient small" data-execution-generate="visual_plan">${visual ? "Regenerate Visual Plan" : "Generate Visual Plan"}</button>${executionAssetCard(visual, "Visual Plan")}
+    <h4>Voice Plan</h4><button class="btn gradient small" data-execution-generate="voice_plan">${voice ? "Regenerate Voice Plan" : "Generate Voice Plan"}</button>${executionAssetCard(voice, "Voice Plan")}
+    <h4>Thumbnail Brief</h4><button class="btn gradient small" data-execution-generate="thumbnail_brief">${thumbnail ? "Regenerate Thumbnail Brief" : "Generate Thumbnail Brief"}</button>${executionAssetCard(thumbnail, "Thumbnail Brief")}
+    <h4>Metadata Package</h4><button class="btn gradient small" data-execution-generate="metadata_package">${metadata ? "Regenerate Metadata Package" : "Generate Metadata Package"}</button>${executionAssetCard(metadata, "Metadata Package")}
+    <h4>QA / Asset Package</h4><button class="btn gradient small" id="execution-run-qa" type="button">Run deterministic CP7A QA</button>${executionAssetCard(qa, "QA Report")}
+    <p><strong>Planning ready:</strong> ${packageStatus.planning_ready ? "yes" : "no"} · <strong>Asset ready:</strong> ${packageStatus.asset_ready ? "yes" : "no"} · <strong>Rights ready:</strong> ${packageStatus.rights_ready ? "yes" : "no"} (${escapeHtml(packageStatus.rights_gate_status || "unknown")})</p>
+    <h4>Generation Progress / History</h4>${executionJobs(bundle.jobs)}
+    <div id="production-version-history"></div>`;
+
+  node.querySelectorAll("[data-execution-generate]").forEach(button => {
+    button.onclick = () => startProductionGeneration(
+      itemId, button.dataset.executionGenerate, button.dataset.executionSectionId || null
+    );
+  });
+  node.querySelectorAll("[data-execution-asset-status]").forEach(button => {
+    button.onclick = async () => {
+      const status = button.dataset.executionAssetStatus;
+      const rejectionReason = status === "rejected" ? (window.prompt("Rejection reason", "Needs revision") || "Needs revision") : null;
+      try {
+        await api(`/api/channel-agent/assets/${button.dataset.executionAssetId}/status`, {
+          method: "POST", body: JSON.stringify({status, rejection_reason: rejectionReason}),
+        });
+        await showProductionItem(itemId); await loadProductionQueue();
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+  node.querySelectorAll("[data-execution-save-section]").forEach(button => {
+    button.onclick = async () => {
+      const assetId = Number(button.dataset.executionSaveSection);
+      const text = node.querySelector(`[data-execution-section-text="${assetId}"]`).value;
+      try {
+        await api(`/api/channel-agent/assets/${assetId}`, {method: "PATCH", body: JSON.stringify({content_text: text, manual_notes: "Manual section edit"})});
+        await loadProductionExecution(itemId);
+      } catch (error) { $("#production-execution-message").textContent = error.message; }
+    };
+  });
+  node.querySelectorAll("[data-execution-versions]").forEach(button => {
+    button.onclick = () => showProductionAssetVersions(Number(button.dataset.executionVersions));
+  });
+  node.querySelectorAll("[data-execution-cancel-job]").forEach(button => {
+    button.onclick = async () => {
+      await api(`/api/channel-agent/production-generation/jobs/${button.dataset.executionCancelJob}/cancel`, {method: "POST"});
+      $("#production-execution-message").textContent = "Cancellation requested. Completed section versions are preserved.";
+    };
+  });
+  $("#execution-assemble-script").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/production/${itemId}/script/assemble`, {method: "POST"});
+      await loadProductionExecution(itemId);
+    } catch (error) { $("#production-execution-message").textContent = error.message; }
+  };
+  $("#execution-run-qa").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/production/${itemId}/qa`, {method: "POST"});
+      await loadProductionExecution(itemId);
+    } catch (error) { $("#production-execution-message").textContent = error.message; }
+  };
+
+  const activeJob = (bundle.jobs || []).find(job => ["queued", "running"].includes(job.status));
+  if (activeJob) scheduleProductionJobPoll(itemId, activeJob.id);
+}
+
+async function startProductionGeneration(itemId, type, sectionId) {
+  const node = $("#production-execution-message");
+  try {
+    const path = ContentExecutionUI.generationPath(itemId, type, sectionId);
+    const job = await api(path, {method: "POST"});
+    node.textContent = `Local generation queued: ${type}${sectionId ? ` / ${sectionId}` : ""}. Progress ${ContentExecutionUI.jobProgress(job)}.`;
+    await loadProductionExecution(itemId);
+    scheduleProductionJobPoll(itemId, job.id);
+  } catch (error) { node.textContent = error.message; }
+}
+
+function scheduleProductionJobPoll(itemId, jobId) {
+  const token = ++productionExecutionPollToken;
+  window.setTimeout(async () => {
+    if (token !== productionExecutionPollToken || activeExecutionItemId !== itemId) return;
+    try {
+      const job = await api(`/api/channel-agent/production-generation/jobs/${jobId}`);
+      const message = $("#production-execution-message");
+      if (message) message.textContent = `${job.asset_type}${job.section_id ? ` / ${job.section_id}` : ""}: ${job.status} · ${ContentExecutionUI.jobProgress(job)}${job.error_message ? ` · ${job.error_message}` : ""}`;
+      if (["queued", "running"].includes(job.status)) scheduleProductionJobPoll(itemId, jobId);
+      else await loadProductionExecution(itemId);
+    } catch (error) {
+      const message = $("#production-execution-message");
+      if (message) message.textContent = error.message;
+    }
+  }, 1000);
+}
+
+async function showProductionAssetVersions(assetId) {
+  try {
+    const versions = await api(`/api/channel-agent/assets/${assetId}/versions`);
+    const node = $("#production-version-history");
+    node.innerHTML = `<h4>Version history</h4>${channelAgentTable(
+      ["Version", "Status", "Created", "Provider", "Model", "Words", "Notes"],
+      versions.map(asset => [asset.version, asset.status, new Date(asset.created_at * 1000).toLocaleString(), asset.model_provider || "manual", asset.model_name || "—", asset.content?.word_count || "—", asset.manual_notes || "—"])
+    )}`;
+    node.scrollIntoView({behavior: "smooth"});
+  } catch (error) { $("#production-message").textContent = error.message; }
 }
 
 $("#production-refresh-list").onclick = loadProductionQueue;

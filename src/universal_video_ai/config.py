@@ -164,6 +164,57 @@ def channel_agent_brain_settings() -> dict[str, object]:
         },
     }
 
+
+def channel_agent_production_generation_settings() -> dict[str, object]:
+    """Bounded local-only CP7A text/structured generation settings."""
+
+    def bounded_predict(name: str, default: int, maximum: int) -> int:
+        return min(maximum, _env_int(name, default, minimum=256))
+
+    def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        return min(maximum, _env_int(name, default, minimum=minimum))
+
+    return {
+        "words_per_minute": bounded_int(
+            "CHANNEL_AGENT_SCRIPT_WORDS_PER_MINUTE", 145, 80, 220
+        ),
+        "default_section_count": bounded_int(
+            "CHANNEL_AGENT_SCRIPT_SECTION_COUNT", 8, 4, 12
+        ),
+        "max_prompt_chars": bounded_int(
+            "CHANNEL_AGENT_PRODUCTION_MAX_PROMPT_CHARS", 24_000, 8_000, 60_000,
+        ),
+        "temperature": _env_float(
+            "CHANNEL_AGENT_PRODUCTION_TEMPERATURE", 0.25, 0.0, 0.8
+        ),
+        "repair_temperature": _env_float(
+            "CHANNEL_AGENT_PRODUCTION_REPAIR_TEMPERATURE", 0.0, 0.0, 0.2
+        ),
+        "top_p": _env_float(
+            "CHANNEL_AGENT_PRODUCTION_TOP_P", 0.85, 0.1, 1.0
+        ),
+        "num_predict_by_asset": {
+            "script_blueprint": bounded_predict(
+                "CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_BLUEPRINT", 1_200, 1_600
+            ),
+            "script_section": bounded_predict(
+                "CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_SECTION", 1_800, 2_400
+            ),
+            "visual_plan": bounded_predict(
+                "CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_VISUAL", 1_200, 1_400
+            ),
+            "voice_plan": bounded_predict(
+                "CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_VOICE", 700, 1_000
+            ),
+            "thumbnail_brief": bounded_predict(
+                "CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_THUMBNAIL", 800, 1_100
+            ),
+            "metadata_package": bounded_predict(
+                "CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_METADATA", 1_100, 1_500
+            ),
+        },
+    }
+
 # AI Content OS Feature Flag
 CONTENT_OS_ENABLED = _env_bool("CONTENT_OS_ENABLED", False)
 CONTENT_OS_MAX_AUTO_REVISIONS = _env_int("CONTENT_OS_MAX_AUTO_REVISIONS", 1, minimum=0)

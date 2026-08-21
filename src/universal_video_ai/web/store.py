@@ -511,6 +511,71 @@ CREATE INDEX IF NOT EXISTS idx_production_tasks_item_order
 CREATE INDEX IF NOT EXISTS idx_production_events_owner
     ON production_events(user_id, production_item_id, created_at DESC);
 
+-- CP7A versioned text/structured assets. Binary media is intentionally absent.
+CREATE TABLE IF NOT EXISTS production_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    task_id INTEGER,
+    asset_type TEXT NOT NULL,
+    asset_key TEXT NOT NULL,
+    section_id TEXT,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    content_json TEXT NOT NULL DEFAULT '{}',
+    content_text TEXT,
+    model_provider TEXT,
+    model_name TEXT,
+    generation_metadata_json TEXT NOT NULL DEFAULT '{}',
+    manual_notes TEXT,
+    rejection_reason TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    approved_at REAL,
+    UNIQUE(user_id, production_item_id, asset_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS production_asset_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS production_generation_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    job_type TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    section_id TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total INTEGER NOT NULL DEFAULT 1,
+    model_provider TEXT,
+    model_name TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    failure_stage TEXT,
+    elapsed_seconds REAL,
+    error_message TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_assets_owner
+    ON production_assets(user_id, production_item_id, asset_key, version DESC);
+CREATE INDEX IF NOT EXISTS idx_production_asset_events_owner
+    ON production_asset_events(user_id, production_item_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_production_generation_jobs_owner
+    ON production_generation_jobs(user_id, production_item_id, created_at DESC);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -950,6 +1015,8 @@ _MIGRATIONS = [
     ("content_brain_runs", "failure_stage", "ALTER TABLE content_brain_runs ADD COLUMN failure_stage TEXT"),
     ("content_brain_runs", "created_at", "ALTER TABLE content_brain_runs ADD COLUMN created_at REAL"),
     ("content_brain_runs", "completed_at", "ALTER TABLE content_brain_runs ADD COLUMN completed_at REAL"),
+    ("production_generation_jobs", "failure_stage",
+     "ALTER TABLE production_generation_jobs ADD COLUMN failure_stage TEXT"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -1198,7 +1265,7 @@ class Store:
                  "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts",
                  "trend_scans", "trend_items", "trend_queries", "trend_item_queries",
                  "trend_snapshots", "competitor_channels", "competitor_snapshots",
-                 "competitor_videos", "content_brain_runs")
+                 "competitor_videos", "content_brain_runs", "production_generation_jobs")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -3330,6 +3397,266 @@ class Store:
                 "ORDER BY created_at DESC,id DESC LIMIT 200", (user_id, item_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ---- Channel Agent CP7A versioned production assets (text/JSON only) ----
+    @staticmethod
+    def _production_asset_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target in (
+            ("content_json", "content"),
+            ("generation_metadata_json", "generation_metadata"),
+        ):
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = {}
+        return result
+
+    def insert_production_asset(self, user_id: int, data: Dict[str, Any]) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner = conn.execute(
+                "SELECT 1 FROM production_items WHERE id=? AND user_id=?",
+                (data["production_item_id"], user_id),
+            ).fetchone()
+            if not owner:
+                return 0
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version),0)+1 FROM production_assets "
+                "WHERE user_id=? AND production_item_id=? AND asset_key=?",
+                (user_id, data["production_item_id"], data["asset_key"]),
+            ).fetchone()
+            version = int(row[0])
+            cur = conn.execute(
+                """INSERT INTO production_assets
+                (user_id,production_item_id,task_id,asset_type,asset_key,section_id,version,
+                 status,content_json,content_text,model_provider,model_name,
+                 generation_metadata_json,manual_notes,rejection_reason,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    user_id, data["production_item_id"], data.get("task_id"),
+                    data["asset_type"], data["asset_key"], data.get("section_id"),
+                    version, data.get("status", "draft"),
+                    json.dumps(data.get("content") or {}, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")),
+                    data.get("content_text"), data.get("model_provider"),
+                    data.get("model_name"),
+                    json.dumps(data.get("generation_metadata") or {}, ensure_ascii=False,
+                               sort_keys=True, separators=(",", ":")),
+                    data.get("manual_notes"), data.get("rejection_reason"), now, now,
+                ),
+            )
+            asset_id = int(cur.lastrowid)
+            conn.execute(
+                """INSERT INTO production_asset_events
+                (asset_id,user_id,production_item_id,event_type,to_status,created_at)
+                VALUES (?,?,?,'asset_created','draft',?)""",
+                (asset_id, user_id, data["production_item_id"], now),
+            )
+            return asset_id
+
+    def get_production_asset(self, user_id: int, asset_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_assets WHERE id=? AND user_id=?",
+                (asset_id, user_id),
+            ).fetchone()
+        return self._production_asset_dict(row) if row else None
+
+    def list_production_assets(
+        self, user_id: int, item_id: int, *, asset_type: Optional[str] = None,
+        asset_key: Optional[str] = None, status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["user_id=?", "production_item_id=?"]
+        params: List[Any] = [user_id, item_id]
+        if asset_type:
+            clauses.append("asset_type=?")
+            params.append(asset_type)
+        if asset_key:
+            clauses.append("asset_key=?")
+            params.append(asset_key)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_assets WHERE " + " AND ".join(clauses)
+                + " ORDER BY asset_key,version DESC,id DESC LIMIT 500",
+                params,
+            ).fetchall()
+        return [self._production_asset_dict(row) for row in rows]
+
+    def latest_production_asset(
+        self, user_id: int, item_id: int, asset_key: str,
+        *, status: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        clauses = ["user_id=?", "production_item_id=?", "asset_key=?"]
+        params: List[Any] = [user_id, item_id, asset_key]
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_assets WHERE " + " AND ".join(clauses)
+                + " ORDER BY version DESC,id DESC LIMIT 1", params,
+            ).fetchone()
+        return self._production_asset_dict(row) if row else None
+
+    def update_production_asset(
+        self, user_id: int, asset_id: int, data: Dict[str, Any],
+    ) -> bool:
+        allowed = {
+            "status", "content_json", "content_text", "generation_metadata_json",
+            "manual_notes", "rejection_reason", "approved_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_production_asset(user_id, asset_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_assets SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND user_id=?",
+                [*payload.values(), asset_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def change_production_asset_status(
+        self, user_id: int, asset_id: int, *, status: str,
+        note: Optional[str] = None, rejection_reason: Optional[str] = None,
+    ) -> bool:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM production_assets WHERE id=? AND user_id=?",
+                (asset_id, user_id),
+            ).fetchone()
+            if not row:
+                return False
+            current = str(row["status"])
+            if status == "approved":
+                conn.execute(
+                    "UPDATE production_assets SET status='superseded',updated_at=? "
+                    "WHERE user_id=? AND production_item_id=? AND asset_key=? "
+                    "AND status='approved' AND id<>?",
+                    (now, user_id, row["production_item_id"], row["asset_key"], asset_id),
+                )
+            conn.execute(
+                "UPDATE production_assets SET status=?,rejection_reason=?,approved_at=?,updated_at=? "
+                "WHERE id=? AND user_id=?",
+                (
+                    status, rejection_reason if status == "rejected" else None,
+                    now if status == "approved" else None, now, asset_id, user_id,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO production_asset_events
+                (asset_id,user_id,production_item_id,event_type,from_status,to_status,note,created_at)
+                VALUES (?,?,?,'asset_status_changed',?,?,?,?)""",
+                (asset_id, user_id, row["production_item_id"], current, status, note, now),
+            )
+            return True
+
+    def list_production_asset_events(
+        self, user_id: int, item_id: int, *, asset_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["user_id=?", "production_item_id=?"]
+        params: List[Any] = [user_id, item_id]
+        if asset_id is not None:
+            clauses.append("asset_id=?")
+            params.append(asset_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_asset_events WHERE " + " AND ".join(clauses)
+                + " ORDER BY created_at DESC,id DESC LIMIT 500", params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _production_generation_job_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["cancel_requested"] = bool(result.get("cancel_requested"))
+        return result
+
+    def create_production_generation_job(
+        self, user_id: int, data: Dict[str, Any],
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT 1 FROM production_items WHERE id=? AND user_id=?",
+                (data["production_item_id"], user_id),
+            ).fetchone()
+            if not owner:
+                return 0
+            cur = conn.execute(
+                """INSERT INTO production_generation_jobs
+                (user_id,production_item_id,job_type,asset_type,section_id,status,
+                 progress_current,progress_total,model_provider,model_name,created_at)
+                VALUES (?,?,?,?,?,'queued',0,?,?,?,?)""",
+                (
+                    user_id, data["production_item_id"], data["job_type"],
+                    data["asset_type"], data.get("section_id"),
+                    max(1, int(data.get("progress_total") or 1)),
+                    data.get("model_provider"), data.get("model_name"), now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_production_generation_job(
+        self, user_id: int, job_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_generation_jobs WHERE id=? AND user_id=?",
+                (job_id, user_id),
+            ).fetchone()
+        return self._production_generation_job_dict(row) if row else None
+
+    def list_production_generation_jobs(
+        self, user_id: int, item_id: int, *, limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_generation_jobs WHERE user_id=? AND production_item_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT ?",
+                (user_id, item_id, min(200, max(1, int(limit)))),
+            ).fetchall()
+        return [self._production_generation_job_dict(row) for row in rows]
+
+    def update_production_generation_job(
+        self, user_id: int, job_id: int, data: Dict[str, Any],
+    ) -> bool:
+        allowed = {
+            "status", "progress_current", "progress_total", "attempt_count",
+            "failure_stage", "elapsed_seconds", "error_message", "cancel_requested", "started_at",
+            "completed_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_production_generation_job(user_id, job_id))
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_generation_jobs SET "
+                + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND user_id=?",
+                [*payload.values(), job_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def active_production_generation_job(
+        self, user_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_generation_jobs WHERE user_id=? "
+                "AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return self._production_generation_job_dict(row) if row else None
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(

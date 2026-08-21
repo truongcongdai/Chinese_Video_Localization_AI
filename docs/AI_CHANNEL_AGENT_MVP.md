@@ -1026,6 +1026,85 @@ script/commentary and sequence using owned, licensed, or permitted visuals.
 8. Verify no source download, legacy localization job, render, upload, or
    publishing action occurs anywhere in the flow.
 
+## CP7A — Script & Asset Production Execution
+
+CP7A executes only the text and structured planning assets attached to an
+existing CP6 Production Item. It reuses the configured local Ollama provider
+with `think=false`, `format=json`, and `stream=false`; no paid provider is
+required. The Production Queue and all saved assets remain readable and
+editable when Ollama is stopped.
+
+Long-form scripts are never requested as one giant completion. The workflow is:
+
+`blueprint → independently versioned sections → deterministic assembly → human approval`
+
+The default narration estimate is 145 words/minute and the default blueprint
+requests eight sections. Both are configurable. The target total word count is
+the target duration multiplied by the configured narration rate, and each
+section receives a deterministic allocation based on its blueprint weight.
+Word count, estimated duration, target duration, and word-budget tolerance are
+displayed as estimates rather than performance guarantees.
+
+```dotenv
+CHANNEL_AGENT_SCRIPT_WORDS_PER_MINUTE=145
+CHANNEL_AGENT_SCRIPT_SECTION_COUNT=8
+CHANNEL_AGENT_PRODUCTION_MAX_PROMPT_CHARS=24000
+CHANNEL_AGENT_PRODUCTION_TEMPERATURE=0.25
+CHANNEL_AGENT_PRODUCTION_REPAIR_TEMPERATURE=0.0
+CHANNEL_AGENT_PRODUCTION_TOP_P=0.85
+CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_BLUEPRINT=1200
+CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_SECTION=1800
+CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_VISUAL=1200
+CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_VOICE=700
+CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_THUMBNAIL=800
+CHANNEL_AGENT_PRODUCTION_NUM_PREDICT_METADATA=1100
+```
+
+Each generation uses a minimal asset-specific JSON schema and exactly one
+repair retry for repairable JSON/schema failures. Evidence-ID, rights, and
+policy failures are not repaired into invented facts. Prompts and model output
+are not logged; diagnostics contain only asset type, section ID, model,
+prompt/output bounds, attempt number, and elapsed time.
+
+Assets are immutable versions with `draft`, `review`, `approved`, `rejected`,
+and `superseded` states. Regeneration creates a new version and never deletes
+or overwrites an approved one. SCRIPT and the four downstream CP6 tasks only
+complete when their corresponding assembled/package asset is approved. QA is
+deterministic and its approval marks the CP7A asset package ready. Asset
+readiness and rights readiness remain separate.
+
+Visual plans accept only original generation, owned assets, licensed stock,
+public domain, manual creation, diagrams, maps, or text cards. Every scene has
+a rights requirement and begins planned/needs-review unless separately
+cleared. CP7A does not download sources, invoke TTS, create subtitle/audio
+files, render, upload, schedule, or publish.
+
+### CP7A manual verification
+
+1. Configure an already-installed local Ollama model through `OLLAMA_MODEL`,
+   start Ollama, and start the app with `AI_CHANNEL_AGENT_ENABLED=true`.
+2. Open an existing Production Item and find **Production Execution**.
+3. Generate a Script Blueprint and verify multiple bounded sections, target
+   word allocations, Vietnamese audience-facing guidance, and research-only
+   originality/rights constraints.
+4. Generate only the first section, record elapsed time, then generate the
+   second. Restart the app and confirm both versions remain visible.
+5. Use **Resume / Generate all remaining**. Confirm completed sections are not
+   regenerated and progress advances sequentially with concurrency one.
+6. Manually edit one section and save it as a new version. Inspect version
+   history; confirm the earlier version remains available.
+7. Assemble the Script Draft. Submit/approve it and verify SCRIPT completes
+   only at approval, unlocking the four dependent CP6 tasks.
+8. Generate and approve Visual Plan, Voice Plan, Thumbnail Brief, and Metadata
+   Package. Confirm the visual plan contains no source download/reuse strategy.
+9. Run deterministic QA and approve its report. Confirm `asset_ready=true`
+   while `rights_ready` may remain false.
+10. Stop Ollama. Confirm existing assets remain viewable, manually editable,
+    versionable, approvable/rejectable, and the queue still works; a new
+    generation should fail cleanly without affecting saved work.
+11. Confirm no legacy job, source download, TTS/audio/subtitle artifact,
+    FFmpeg render, upload, or publishing action was created.
+
 ## Next checkpoint
 
-**CP7 — Production Execution**
+**CP7B — Render Pipeline Integration**
