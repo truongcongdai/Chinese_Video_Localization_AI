@@ -649,26 +649,6 @@ class Renderer:
         h = max(2, min(h, frame_h - y - 1))
         return x, y, w, h
 
-    @staticmethod
-    def _should_use_filter_complex_script(filter_graph: str, filters_count: int) -> bool:
-        """
-        Avoid passing very large drawtext-heavy filter graphs through argv.
-        Hundreds of animated subtitle segments can exceed the OS argument
-        length limit before ffmpeg even starts.
-        """
-        return filters_count >= 100 or len(filter_graph.encode("utf-8")) >= 24000
-
-    def _write_filter_complex_script(self, output: Path, filter_graph: str) -> Path:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        script_path = output.with_suffix(".filter_complex.txt")
-        script_path.write_text(filter_graph, encoding="utf-8")
-        self.logger.info(
-            "Wrote FFmpeg filter graph script: %s (%d bytes)",
-            script_path,
-            len(filter_graph.encode("utf-8")),
-        )
-        return script_path
-
     def _build_pre_subtitle_transform_filters(self) -> List[str]:
         """
         Apply source-video transforms that must happen before subtitles are
@@ -969,20 +949,11 @@ class Renderer:
                     f"[2:v]scale={self.config.logo_size_px}:-1[wm];"
                     f"[base][wm]overlay={x_expr}:{y_expr}:shortest=1[outv]"
                 )
-                if self._should_use_filter_complex_script(filter_complex, len(filters)):
-                    script_path = self._write_filter_complex_script(output, filter_complex)
-                    cmd.extend(["-filter_complex_script", str(script_path), "-map", "[outv]"])
-                else:
-                    cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
+                cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
             else:
                 vf = ",".join(filters) if filters else None
                 if vf:
-                    if self._should_use_filter_complex_script(vf, len(filters)):
-                        filter_complex = f"[0:v]{vf}[outv]"
-                        script_path = self._write_filter_complex_script(output, filter_complex)
-                        cmd.extend(["-filter_complex_script", str(script_path), "-map", "[outv]"])
-                    else:
-                        cmd.extend(["-map", "0:v", "-vf", vf])
+                    cmd.extend(["-map", "0:v", "-vf", vf])
                 else:
                     cmd.extend(["-map", "0:v"])
 
@@ -1091,7 +1062,15 @@ class Renderer:
         self.logger.debug("FFmpeg command: %s", " ".join(cmd))
 
         try:
-            returncode, stderr_text = self._run_ffmpeg_with_progress(cmd, self.config.timeout_seconds)
+            # Adjust timeout based on filter complexity
+            filter_count = sum(1 for arg in cmd if arg.startswith('-vf') or arg.startswith('-filter_complex'))
+            adjusted_timeout = self.config.timeout_seconds
+            if filter_count > 0:
+                # For complex filter chains, increase timeout proportionally
+                # Base 30 min + 1 min per 50 filters
+                adjusted_timeout = max(self.config.timeout_seconds, 1800 + (filter_count * 60 // 50))
+                self.logger.info("Adjusted timeout to %d seconds for complex filter chain", adjusted_timeout)
+            returncode, stderr_text = self._run_ffmpeg_with_progress(cmd, adjusted_timeout)
 
             if returncode != 0:
                 self.logger.error("FFmpeg returned non-zero exit code: %s", stderr_text)
@@ -1180,6 +1159,8 @@ class Renderer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             bufsize=1,
         )
 

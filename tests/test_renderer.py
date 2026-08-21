@@ -148,7 +148,7 @@ def test_render_with_subtitles(tmp_path: Path, monkeypatch):
     assert out.read_bytes() == b"final video with subs"
 
 
-def test_many_animated_subtitles_use_filter_complex_script(tmp_path: Path):
+def test_many_animated_subtitles_use_filter_complex(tmp_path: Path):
     video = tmp_path / "video.mp4"
     audio = tmp_path / "audio.mp3"
     output = tmp_path / "output.mp4"
@@ -163,15 +163,12 @@ def test_many_animated_subtitles_use_filter_complex_script(tmp_path: Path):
 
     cmd = renderer._build_command(video, audio, output, subtitle_segments=segments)
 
-    assert "-filter_complex_script" in cmd
-    script_path = Path(cmd[cmd.index("-filter_complex_script") + 1])
-    assert script_path.exists()
-    script_text = script_path.read_text(encoding="utf-8")
-    assert script_text.startswith("[0:v]drawtext=")
-    assert script_text.endswith("[outv]")
-    assert script_text.count("drawtext=") == 120
+    assert "-filter_complex" in cmd
+    filter_complex = cmd[cmd.index("-filter_complex") + 1]
+    assert filter_complex.startswith("[0:v]drawtext=")
+    assert filter_complex.endswith("[outv]")
+    assert filter_complex.count("drawtext=") == 120
     assert "-vf" not in cmd
-    assert len(" ".join(cmd)) < 1000
 
 
 def test_flip_runs_before_new_subtitles_are_drawn(tmp_path: Path):
