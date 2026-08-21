@@ -13,6 +13,8 @@ from universal_video_ai.channel_agent.analytics import (
     view_velocity,
 )
 from universal_video_ai.channel_agent.models import RightsStatus, SourceMetadata
+from universal_video_ai.channel_agent.providers import ProviderStatus
+from universal_video_ai.web import channel_agent_router as channel_agent_router_module
 from universal_video_ai.web.channel_agent_router import channel_agent_status, router
 
 
@@ -115,13 +117,18 @@ def test_channel_agent_status_api_when_disabled(monkeypatch: pytest.MonkeyPatch)
         "youtube_credential_present": False,
         "youtube_connection_verified": None,
         "ollama_available": None,
+        "ollama": None,
     }
 
 
-def test_channel_agent_status_api_when_enabled_has_no_external_dependency(
+def test_channel_agent_status_api_when_enabled_reports_real_ollama_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AI_CHANNEL_AGENT_ENABLED", "true")
+    class FakeOllama:
+        def status(self) -> ProviderStatus:
+            return ProviderStatus(True, True, "local-model", True, "ready")
+    monkeypatch.setattr(channel_agent_router_module, "_brain_provider", lambda: FakeOllama())
 
     response = channel_agent_status(user_id=1, store=_NoOAuthStore())
 
@@ -131,7 +138,14 @@ def test_channel_agent_status_api_when_enabled_has_no_external_dependency(
         "youtube_connected": False,
         "youtube_credential_present": False,
         "youtube_connection_verified": None,
-        "ollama_available": None,
+        "ollama_available": True,
+        "ollama": {
+            "enabled": True,
+            "reachable": True,
+            "configured_model": "local-model",
+            "model_available": True,
+            "message": "ready",
+        },
     }
     assert "/api/channel-agent/status" in {route.path for route in router.routes}
 
@@ -146,6 +160,7 @@ def test_channel_agent_ui_is_hidden_until_bootstrap_enables_it() -> None:
     )
     html = (static_dir / "index.html").read_text(encoding="utf-8")
     javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+    brain_ui = (static_dir / "content_brain_ui.js").read_text(encoding="utf-8")
 
     assert 'class="feature-tab hidden" data-feature="channel-agent"' in html
     assert 'data-feature="channel-agent"' in html
@@ -153,4 +168,24 @@ def test_channel_agent_ui_is_hidden_until_bootstrap_enables_it() -> None:
     assert "boot.features.ai_channel_agent" in javascript
     assert 'api("/api/channel-agent/youtube/status")' in javascript
     assert 'id="channel-agent-connect-btn"' in html
-    assert "channel-agent-cp31" in html
+    assert "channel-agent-cp4" in html
+    assert 'id="content-brain-analyze"' in html
+    assert 'api("/api/channel-agent/brain/status")' in javascript
+    assert html.index("content_brain_ui.js") < html.index("app.js")
+    assert 'mode = ContentBrainUI.normalizeMode($("#content-brain-mode").value)' in javascript
+    assert "request_type: normalizeMode(mode)" in brain_ui
+    assert 'data-content-brain-state="loading"' in javascript
+    assert 'data-content-brain-state="error"' in javascript
+    assert "contentBrainRequestState.isCurrent(token)" in javascript
+    assert "ContentBrainUI.modeView(result, storedRequestType)" in javascript
+    assert "result?.angles || result?.recommended_angles" in javascript
+    assert "result?.titles || result?.recommended_titles" in javascript
+    assert "result?.runtime_allocation" in javascript
+    assert "run.generation_attempt_count" in javascript
+    assert "run.failure_stage" in javascript
+    history_handler = javascript[
+        javascript.index('document.querySelectorAll("[data-content-brain-run]")'):
+        javascript.index('$("#content-brain-status-refresh")')
+    ]
+    assert 'api(`/api/channel-agent/brain/runs/${runId}`)' in history_handler
+    assert 'api("/api/channel-agent/brain/analyze"' not in history_handler

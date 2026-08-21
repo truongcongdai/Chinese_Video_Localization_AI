@@ -1533,6 +1533,39 @@
           <div id="competitor-gaps" class="muted-help">Refresh competitors to calculate evidence-backed gaps.</div>
         </div>
       </div>
+      <div id="content-brain" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+        <div class="template-library-heading">
+          <h3 class="section-title">🧠 Content Brain</h3>
+          <button class="btn secondary small" id="content-brain-status-refresh" type="button">Refresh status</button>
+        </div>
+        <p class="muted-help">Local Ollama interpretation of qualified CP1–CP3 metadata evidence. No source media or transcript is downloaded.</p>
+        <div id="content-brain-status" class="muted-help">Ollama status not checked yet.</div>
+        <div class="row" style="align-items:end;margin-top:14px">
+          <div class="field" style="flex:1">
+            <label>Analyze</label>
+            <select id="content-brain-selector"><option value="top_opportunity|">Top qualified opportunity</option></select>
+          </div>
+          <div class="field" style="flex:1">
+            <label>Mode</label>
+            <select id="content-brain-mode">
+              <option value="opportunity_analysis">Opportunity Analysis</option>
+              <option value="content_angles">Content Angles</option>
+              <option value="title_hooks">Titles &amp; Hooks</option>
+              <option value="longform_outline">Long-form Outline</option>
+            </select>
+          </div>
+          <button class="btn gradient small" id="content-brain-analyze" type="button">Analyze with Local AI</button>
+        </div>
+        <label class="muted-help" style="display:inline-flex;align-items:center;gap:6px;margin-top:8px">
+          <input id="content-brain-low-confidence" type="checkbox" style="width:auto"> Allow explicitly low-confidence brainstorming
+        </label>
+        <div id="content-brain-message" class="muted-help" style="margin-top:8px"></div>
+        <div id="content-brain-result" class="hidden" style="margin-top:18px"></div>
+        <div class="template-library-heading" style="margin-top:24px">
+          <h3 class="section-title">Previous analyses</h3>
+        </div>
+        <div id="content-brain-history" class="muted-help">No Content Brain runs loaded.</div>
+      </div>
     </div>
   </div>
 
@@ -1934,6 +1967,7 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260820-channel-agent-cp31" defer></script>
+<script src="/assets/content_brain_ui.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
+<script src="/assets/app.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
 </body>
 </html>

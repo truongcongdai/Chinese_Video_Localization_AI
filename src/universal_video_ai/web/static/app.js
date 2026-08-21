@@ -3541,6 +3541,11 @@ async function initChannelAgent() {
   connectNode.classList.add("hidden");
   dashboardNode.classList.add("hidden");
   try {
+    await loadContentBrain();
+  } catch (brainError) {
+    $("#content-brain-message").textContent = `Content Brain unavailable: ${brainError.message}`;
+  }
+  try {
     const status = await api("/api/channel-agent/youtube/status");
     if (!status.connected) {
       connectNode.classList.remove("hidden");
@@ -3866,6 +3871,326 @@ $("#competitor-refresh").onclick = async () => {
 
 $("#competitor-show-filtered").onchange = loadCompetitors;
 $("#competitor-show-filtered-patterns").onchange = loadCompetitors;
+
+// ---------------- Content Brain (CP4) ----------------
+const contentBrainRequestState = ContentBrainUI.createRequestState();
+let contentBrainModelName = "local model";
+
+function contentBrainStatusText(status) {
+  if (!status.enabled) return "Local Content Brain is disabled.";
+  if (!status.reachable) return `● Disconnected · ${status.message}`;
+  if (!status.configured_model) return `● Ollama connected · ${status.message}`;
+  return `${status.model_available ? "● Ready" : "● Model unavailable"} · Model: ${status.configured_model} · ${status.message}`;
+}
+
+function contentBrainEvidenceMap(evidence) {
+  const rows = [];
+  if (evidence?.own_channel?.evidence_id) rows.push(evidence.own_channel);
+  ["trend_candidates", "competitors", "opportunity_gaps", "patterns", "breakout_videos"].forEach(section => {
+    (evidence?.[section] || []).forEach(item => rows.push(item));
+  });
+  return new Map(rows.map(item => [item.evidence_id, item]));
+}
+
+function contentBrainEvidenceRef(id, evidenceMap) {
+  const item = evidenceMap.get(id);
+  const url = item?.url || item?.channel_url;
+  const label = escapeHtml(id);
+  return url
+    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${label}</a>`
+    : `<span>${label}</span>`;
+}
+
+function contentBrainRefs(ids, evidenceMap) {
+  return (ids || []).map(id => contentBrainEvidenceRef(id, evidenceMap)).join(" · ") || "—";
+}
+
+function renderContentBrainEvidence(evidence) {
+  if (!evidence) return '<div class="muted-help">Stored evidence is unavailable.</div>';
+  const candidateRows = (evidence.trend_candidates || []).map(item => [
+    contentBrainEvidenceRef(item.evidence_id, contentBrainEvidenceMap(evidence)),
+    item.title || item.video_id || "—", Math.round((item.trend_score || 0) * 100),
+    item.niche_relevance_score != null ? `${Math.round(item.niche_relevance_score * 100)}%` : "—",
+    item.opportunity_score != null ? Math.round(item.opportunity_score * 100) : "—",
+    item.observed_vph != null ? channelAgentNumber(item.observed_vph) : (item.approx_vph != null ? `~${channelAgentNumber(item.approx_vph)}` : "—"),
+  ]);
+  const competitorRows = (evidence.competitors || []).map(item => [
+    contentBrainEvidenceRef(item.evidence_id, contentBrainEvidenceMap(evidence)), item.channel_title || "—",
+    item.competitor_relevance_score != null ? `${Math.round(item.competitor_relevance_score * 100)}%` : "—",
+    item.niche_hit_rate != null ? `${Math.round(item.niche_hit_rate * 100)}%` : "—",
+    channelAgentNumber(item.median_views), item.breakout_frequency != null ? `${Math.round(item.breakout_frequency * 100)}%` : "—",
+  ]);
+  const patternRows = (evidence.patterns || []).map(item => [
+    item.pattern, item.pattern_quality_score != null ? `${Math.round(item.pattern_quality_score * 100)}%` : "—",
+    item.support_count, item.breakout_support,
+  ]);
+  const gapRows = (evidence.opportunity_gaps || []).map(item => [
+    item.pattern, item.gap_quality_score != null ? `${Math.round(item.gap_quality_score * 100)}%` : "—",
+    item.supporting_competitor_count, item.supporting_breakout_count, item.qualified_candidate_supply,
+    item.confidence || "—",
+  ]);
+  const videoRows = (evidence.breakout_videos || []).map(item => [
+    contentBrainEvidenceRef(item.evidence_id, contentBrainEvidenceMap(evidence)), item.title || item.video_id,
+    channelAgentNumber(item.views), item.outlier_ratio != null ? `${Number(item.outlier_ratio).toFixed(1)}x` : "—",
+    channelAgentDuration(item.duration_seconds), item.rights_status || "idea_only",
+  ]);
+  return `
+    <h4>Evidence used (application data)</h4>
+    ${channelAgentTable(["ID", "Candidate", "Trend", "Relevance", "Opportunity", "VPH"], candidateRows, [0])}
+    ${channelAgentTable(["ID", "Competitor", "Relevance", "Niche hit", "Median views", "Breakout"], competitorRows, [0])}
+    ${channelAgentTable(["Pattern", "Quality", "Support", "Breakouts"], patternRows)}
+    ${channelAgentTable(["Gap", "Quality", "Competitors", "Breakouts", "Candidate supply", "Confidence"], gapRows)}
+    ${channelAgentTable(["ID", "Breakout video", "Views", "Outlier", "Duration", "Rights"], videoRows, [0])}`;
+}
+
+function contentBrainRunMeta(result, view) {
+  const runId = Number(result?.analysis_id || result?.run_id);
+  return `<p class="muted-help" data-content-brain-active-run="${Number.isSafeInteger(runId) ? runId : ""}">Mode: ${escapeHtml(view.mode)}${Number.isSafeInteger(runId) ? ` · Run #${runId}` : ""}</p>`;
+}
+
+function showContentBrainLoading(mode, token) {
+  const view = ContentBrainUI.modeView({ request_type: mode });
+  const node = $("#content-brain-result");
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <div data-content-brain-state="loading" data-content-brain-mode="${escapeHtml(view.mode)}" data-content-brain-sequence="${token.sequence}">
+      <h3 class="section-title">${escapeHtml(view.label)}</h3>
+      <p>Generating ${escapeHtml(view.label)} with ${escapeHtml(contentBrainModelName)}...</p>
+    </div>`;
+}
+
+function showContentBrainError(mode, message, runId = null) {
+  const view = ContentBrainUI.modeView({ request_type: mode });
+  const node = $("#content-brain-result");
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <div data-content-brain-state="error" data-content-brain-mode="${escapeHtml(view.mode)}">
+      <h3 class="section-title">${escapeHtml(view.label)} failed</h3>
+      ${runId ? `<p class="muted-help">Run #${Number(runId)}</p>` : ""}
+      <p>${escapeHtml(message || "Content Brain analysis failed.")}</p>
+    </div>`;
+}
+
+function renderContentBrainResult(result, storedEvidence = null, storedRequestType = null) {
+  const node = $("#content-brain-result");
+  const view = ContentBrainUI.modeView(result, storedRequestType);
+  node.classList.remove("hidden");
+  const evidence = storedEvidence || result?.evidence_summary || null;
+  const evidenceMap = contentBrainEvidenceMap(evidence);
+  const confidence = result?.evidence_confidence || evidence?.evidence_confidence || {};
+  if (result?.insufficient_evidence) {
+    node.innerHTML = `
+      <div data-content-brain-state="result" data-content-brain-mode="${escapeHtml(view.mode)}">
+        <h3 class="section-title">${escapeHtml(view.label)} · Insufficient evidence</h3>
+        ${contentBrainRunMeta(result, view)}
+        <p>${escapeHtml(result.summary || "Insufficient evidence for a high-confidence recommendation.")}</p>
+        <p><strong>Missing signals:</strong> ${escapeHtml((result.missing_signals || []).join(" · ") || "—")}</p>
+        <p><strong>Evidence confidence:</strong> ${escapeHtml((confidence.label || "low").toUpperCase())} (${Math.round((confidence.score || 0) * 100)}%)</p>
+        <p class="muted-help">${escapeHtml(result.rights_warning || "")}</p>
+        ${renderContentBrainEvidence(evidence)}
+      </div>`;
+    return;
+  }
+  const signals = (result?.supporting_signals || []).map(item => item.text ? `
+    <li><strong>${escapeHtml(item.type === "observed" ? "Observed" : "Inference")}:</strong> ${escapeHtml(item.text)}<br><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></li>` : `
+    <li><strong>Observed:</strong> ${escapeHtml(item.observation)}<br><strong>Inference:</strong> ${escapeHtml(item.inference)}<br><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></li>`).join("");
+  const angles = (result?.angles || result?.recommended_angles || []).map(item => `
+    <div style="margin:10px 0;padding:12px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+      <h4>${escapeHtml(item.angle_name)}</h4>
+      <p><strong>Audience promise:</strong> ${escapeHtml(item.audience_promise)}</p>
+      <p><strong>Core conflict:</strong> ${escapeHtml(item.core_conflict)}</p>
+      <p><strong>Difference:</strong> ${escapeHtml(item.differentiation)}</p>
+      <p><strong>Why supported:</strong> ${escapeHtml(item.why_supported)}</p>
+      <p><strong>Risk:</strong> ${escapeHtml(item.risk)}</p>
+      <p class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</p>
+    </div>`).join("");
+  const titles = (result?.titles || result?.recommended_titles || []).map(item => [
+    item.title, item.primary_motif || item.primary_keyword_or_motif, item.reason, contentBrainRefs(item.evidence_ids, evidenceMap),
+  ]);
+  const hooks = (result?.hooks || result?.recommended_hooks || []).map(item => item.hook ? `
+    <div style="margin-bottom:10px"><p>${escapeHtml(item.hook)}</p><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></div>` : `
+    <div style="margin-bottom:10px"><strong>${escapeHtml(item.angle_name)}</strong><ol>${(item.hooks || []).map(hook => `<li>${escapeHtml(hook)}</li>`).join("")}</ol><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></div>`).join("");
+  let outline = [];
+  if (Array.isArray(result?.outline)) {
+    outline = result.outline.map(item => [
+      item.section_name, item.purpose, (item.key_points || []).join(" · "), `${item.estimated_share_of_runtime}%`,
+      contentBrainRefs(item.evidence_ids, evidenceMap),
+    ]);
+  } else if (view.showOutline) {
+    const runtime = result?.runtime_allocation || {};
+    const sectionNames = [
+      "opening_hook", "setup", "inciting_problem", "progression", "escalation",
+      "midpoint", "climax", "resolution", "ending_open_loop",
+    ];
+    sectionNames.forEach(sectionName => {
+      const blocks = Array.isArray(result?.[sectionName]) ? result[sectionName] : [result?.[sectionName]];
+      blocks.filter(Boolean).forEach((item, index) => outline.push([
+        blocks.length > 1 ? `${sectionName}_${index + 1}` : sectionName,
+        item.purpose, (item.key_points || []).join(" · "),
+        runtime[sectionName] != null ? `${runtime[sectionName]}%` : "—",
+        contentBrainRefs(item.evidence_ids, evidenceMap),
+      ]));
+    });
+  }
+  let modeSections = "";
+  if (view.showOpportunity) {
+    modeSections = `
+      <h4>Why now</h4><p>${escapeHtml(result.why_now || "")}</p>
+      <h4>Why it fits the niche</h4><p>${escapeHtml(result.why_niche_fit || "")}</p>
+      <h4>Supporting signals</h4><ul>${signals}</ul>
+      <h4>Competitive context</h4><p>${escapeHtml(result.competitive_context || "")}</p>`;
+  } else if (view.showAngles) {
+    modeSections = `<h4>Three Vietnamese content angles</h4>${angles}`;
+  } else if (view.showTitlesHooks) {
+    modeSections = `
+      <h4>Vietnamese titles</h4>
+      ${channelAgentTable(["Title", "Motif", "Reason", "Evidence"], titles, [3])}
+      <h4>Opening hooks</h4>${hooks}`;
+  } else if (view.showOutline) {
+    modeSections = `
+      <h4>Original long-form structure</h4>
+      ${channelAgentTable(["Section", "Purpose", "Key points", "Runtime", "Evidence"], outline, [4])}`;
+  }
+  node.innerHTML = `
+    <div data-content-brain-state="result" data-content-brain-mode="${escapeHtml(view.mode)}">
+      <h3 class="section-title">${escapeHtml(view.label)}</h3>
+      ${contentBrainRunMeta(result, view)}
+      ${result?.summary ? `<p>${escapeHtml(result.summary)}</p>` : ""}
+      ${modeSections}
+      ${result?.differentiation ? `<h4>Differentiation</h4><p>${escapeHtml(result.differentiation)}</p>` : ""}
+      ${(result?.risks || []).length ? `<h4>Risks</h4><ul>${result.risks.map(risk => `<li>${escapeHtml(risk)}</li>`).join("")}</ul>` : ""}
+      <p><strong>Evidence confidence (authoritative):</strong> ${escapeHtml((confidence.label || "low").toUpperCase())} (${Math.round((confidence.score || 0) * 100)}%)${result?.ai_confidence || result?.ai_interpretation_confidence ? ` · <strong>AI interpretation confidence:</strong> ${escapeHtml((result.ai_confidence || result.ai_interpretation_confidence).toUpperCase())}` : ""}</p>
+      <p class="muted-help">${escapeHtml(result?.rights_warning || "")}</p>
+      ${renderContentBrainEvidence(evidence)}
+    </div>`;
+}
+
+async function loadContentBrain() {
+  const current = $("#content-brain-selector")?.value || "top_opportunity|";
+  const [status, candidates, competitors, gaps, runs] = await Promise.all([
+    api("/api/channel-agent/brain/status"),
+    api("/api/channel-agent/trends/candidates?limit=20&include_filtered=false"),
+    api("/api/channel-agent/competitors?include_filtered=false"),
+    api("/api/channel-agent/competitors/gaps?include_filtered=false"),
+    api("/api/channel-agent/brain/runs?limit=30"),
+  ]);
+  contentBrainModelName = status.configured_model || "local model";
+  $("#content-brain-status").textContent = contentBrainStatusText(status);
+  const options = ['<option value="top_opportunity|">Top qualified opportunity</option>'];
+  candidates.forEach(item => options.push(`<option value="candidate|${item.id}">Candidate #${item.id} · ${escapeHtml(item.title || item.source_id)}</option>`));
+  competitors.forEach(item => options.push(`<option value="competitor|${item.id}">Competitor #${item.id} · ${escapeHtml(item.channel_title)}</option>`));
+  gaps.forEach(item => options.push(`<option value="gap|${encodeURIComponent(item.pattern)}">Gap · ${escapeHtml(item.pattern)}</option>`));
+  $("#content-brain-selector").innerHTML = options.join("");
+  if ([...$("#content-brain-selector").options].some(option => option.value === current)) {
+    $("#content-brain-selector").value = current;
+  }
+  $("#content-brain-history").innerHTML = runs.length ? channelAgentTable(
+    ["Date", "Mode", "Model", "Status", "Attempts", "Failure stage", "Context", "Confidence", "Inspect"],
+    runs.map(run => [
+      new Date(run.created_at * 1000).toLocaleString(), run.request_type, run.model || "not configured",
+      run.status, run.generation_attempt_count ?? "—", run.failure_stage || "—",
+      run.context_label || "—", run.confidence || "—",
+      `<button class="btn secondary small" data-content-brain-run="${run.id}" data-content-brain-mode="${escapeHtml(run.request_type)}">Inspect</button>`,
+    ]), [8]
+  ) : '<div class="muted-help">No Content Brain analyses yet.</div>';
+  document.querySelectorAll("[data-content-brain-run]").forEach(button => {
+    button.onclick = async () => {
+      const runId = Number(button.dataset.contentBrainRun);
+      const token = contentBrainRequestState.beginHistory(runId);
+      const mode = ContentBrainUI.normalizeMode(button.dataset.contentBrainMode);
+      const analyzeButton = $("#content-brain-analyze");
+      analyzeButton.disabled = true;
+      showContentBrainLoading(mode, token);
+      $("#content-brain-message").textContent = `Loading stored ${ContentBrainUI.MODES[mode].label} run #${runId}...`;
+      try {
+        const run = await api(`/api/channel-agent/brain/runs/${runId}`);
+        if (!contentBrainRequestState.isCurrent(token)) return;
+        if (run.result) {
+          const storedResult = {
+            ...run.result,
+            request_type: run.result.request_type || run.request_type,
+            analysis_id: run.result.analysis_id || run.id,
+          };
+          contentBrainRequestState.accept(token, storedResult, run.request_type);
+          renderContentBrainResult(storedResult, run.evidence, run.request_type);
+          $("#content-brain-message").textContent = `Viewing stored ${ContentBrainUI.MODES[run.request_type].label} run #${run.id}. No local AI request was made.`;
+        } else {
+          showContentBrainError(run.request_type, run.error_message || "No result was stored.", run.id);
+          $("#content-brain-message").textContent = `Stored run #${run.id} did not complete.`;
+        }
+      } catch (error) {
+        if (!contentBrainRequestState.isCurrent(token)) return;
+        showContentBrainError(mode, error.message, runId);
+        $("#content-brain-message").textContent = error.message;
+      } finally {
+        if (contentBrainRequestState.isCurrent(token)) analyzeButton.disabled = false;
+      }
+    };
+  });
+}
+
+$("#content-brain-status-refresh").onclick = async () => {
+  try { await loadContentBrain(); }
+  catch (e) { $("#content-brain-message").textContent = e.message; }
+};
+
+$("#content-brain-analyze").onclick = async () => {
+  const button = $("#content-brain-analyze");
+  let mode;
+  try {
+    mode = ContentBrainUI.normalizeMode($("#content-brain-mode").value);
+  } catch (error) {
+    $("#content-brain-result").classList.add("hidden");
+    $("#content-brain-result").innerHTML = "";
+    $("#content-brain-message").textContent = error.message;
+    return;
+  }
+  const value = $("#content-brain-selector").value;
+  const separator = value.indexOf("|");
+  const selectorType = value.slice(0, separator);
+  let selectorId = value.slice(separator + 1) || null;
+  if (selectorType === "gap" && selectorId) selectorId = decodeURIComponent(selectorId);
+  const token = contentBrainRequestState.begin(mode);
+  const payload = ContentBrainUI.buildAnalyzePayload({
+    mode,
+    selectorType,
+    selectorId,
+    allowLowConfidence: $("#content-brain-low-confidence").checked,
+  });
+  button.disabled = true;
+  showContentBrainLoading(mode, token);
+  $("#content-brain-message").textContent = `Generating ${ContentBrainUI.MODES[mode].label} with ${contentBrainModelName}...`;
+  try {
+    const result = await api("/api/channel-agent/brain/analyze", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (!contentBrainRequestState.isCurrent(token)) return;
+    contentBrainRequestState.accept(token, result);
+    renderContentBrainResult(result);
+    $("#content-brain-message").textContent = result.local_ai_used
+      ? `${ContentBrainUI.MODES[mode].label} completed as run #${result.analysis_id}.`
+      : `${ContentBrainUI.MODES[mode].label} run #${result.analysis_id} used the deterministic low-evidence response.`;
+    try {
+      await loadContentBrain();
+    } catch (historyError) {
+      if (contentBrainRequestState.isCurrent(token)) {
+        $("#content-brain-message").textContent += ` History refresh failed: ${historyError.message}`;
+      }
+    }
+  } catch (e) {
+    if (!contentBrainRequestState.isCurrent(token)) return;
+    showContentBrainError(mode, e.message);
+    $("#content-brain-message").textContent = e.message;
+    try {
+      await loadContentBrain();
+    } catch (_) {
+      // Preserve the mode-specific generation error; history can be refreshed later.
+    }
+  } finally {
+    if (contentBrainRequestState.isCurrent(token)) button.disabled = false;
+  }
+};
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

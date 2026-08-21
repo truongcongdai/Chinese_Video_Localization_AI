@@ -700,6 +700,183 @@ Existing competitor rows migrate additively to `unscored` and become scored
 on the next explicit Refresh. **Show low relevance** retrieves filtered rows
 for audit. No competitor, video, pattern evidence, or snapshot is deleted.
 
+## CP4 — Local Ollama Content Brain
+
+CP4 is an interpretation layer over the existing CP1–CP3 evidence. It does not
+collect a second copy of research data, download source media, read source
+transcripts, create full production scripts, or enqueue production. The only
+AI provider implemented for this checkpoint is a locally running Ollama HTTP
+server. No paid-provider SDK or cloud fallback is installed.
+
+The backend resolves an authenticated selector (`top_opportunity`, `candidate`,
+`competitor`, or qualified gap) against SQLite. Browser-submitted metrics and
+arbitrary evidence JSON are rejected. By default the deterministic evidence
+assembler includes only:
+
+- up to five qualified CP2 candidates ranked by opportunity score;
+- up to five CP3 competitors that passed the competitor relevance gate;
+- qualified patterns and qualified opportunity gaps;
+- canonical, deduplicated breakout video metadata selected across different
+  qualified channels;
+- optional CP1 own-channel identity and 28-day overview, when connected; and
+- application-computed evidence confidence plus missing-signal explanations.
+
+Descriptions, transcripts, subtitles, scripts, media bytes, OAuth tokens, and
+local file paths are excluded. Item count and serialized evidence size are
+bounded before prompting. The normalized JSON is hashed with deterministic
+key ordering and persisted with the request type and configured model.
+
+The system prompt, quoted evidence block, request mode, and JSON schema are
+separate. YouTube titles, channel names, and all metadata are explicitly marked
+as untrusted data; instructions embedded in them must not be followed. Model
+JSON is validated by the application. Markdown fences and harmless text outside
+the first complete JSON object are removed, unknown extra fields are ignored,
+optional arrays receive empty defaults, and confidence casing is normalized.
+Unknown evidence IDs, unsupported factual claims, and viral guarantees are
+rejected rather than repaired. Quantitative evidence displayed in the dashboard is
+read from the stored evidence bundle, not copied from model prose.
+
+The four explicit modes are `opportunity_analysis`, `content_angles`,
+`title_hooks`, and `longform_outline`. Each mode receives a strict, smaller
+mode-specific schema: analysis does not generate angles/titles/outline, angles
+does not generate titles/hooks/outline, title/hooks does not generate an
+outline, and outline does not generate the other creative sections. This keeps
+local generation bounded while retaining the same evidence-ID validation.
+Results are Vietnamese and include competitive differentiation, risks,
+evidence references, and an AI interpretation confidence when that mode needs
+them. Content Angles prefers three distinct items while accepting two supported
+items; Titles & Hooks accepts 2-8 titles and 3-9 individual hooks. The dashboard separately
+treats deterministic evidence confidence as authoritative. When evidence
+confidence is low, the default response is a non-AI insufficient-evidence
+summary; the user must explicitly opt into low-confidence brainstorming to
+invoke Ollama.
+
+The active result panel is keyed by the returned run ID and request type. A new
+Analyze click immediately replaces the prior result with a mode-specific loading
+panel; failures replace it with a mode-specific error instead of leaving stale
+content visible. A monotonically increasing browser request token prevents an
+older response from overwriting a newer mode selection. History inspection uses
+the stored request type and result through a GET request and never invokes Ollama.
+
+Structured requests send `think: false` to supported Ollama versions so Qwen3
+and similar models do not spend the local generation budget on hidden reasoning.
+An older server that explicitly rejects the field is retried once without that
+field; `format: "json"`, output bounds, and application validation remain in
+force. Logs contain only model, mode, evidence-item count, prompt length,
+generation settings, retry number, response character count, classified failure
+stage, outcome, and elapsed time—not prompt or response contents or secrets.
+
+Each mode prompt contains one compact required JSON shape, one compact valid
+example, and the explicit allowed evidence-ID list. If parsing or a repairable
+schema/count/runtime check fails, Content Brain makes exactly one JSON-only
+repair request at low temperature. The repair request contains the validation
+error metadata and prior response as untrusted quoted data. Network failures,
+timeouts, unknown evidence IDs, policy failures, authorization failures, and
+selector failures are never automatically retried. Runtime allocations totaling
+95-105 are normalized to exactly 100; totals outside that tolerance fail or use
+the single bounded repair attempt.
+
+Content Brain runs are stored in the additive `content_brain_runs` table with
+per-user ownership, status, provider/model, context label, evidence hash,
+normalized evidence, validated result, timestamps, sanitized error,
+`generation_attempt_count`, and `failure_stage`.
+History inspection never reruns AI. A process-local per-user guard permits only
+one generation at a time.
+
+### Local configuration
+
+```env
+AI_CHANNEL_AGENT_ENABLED=true
+CHANNEL_AGENT_OLLAMA_ENABLED=true
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=
+CHANNEL_AGENT_BRAIN_TIMEOUT_SECONDS=120
+CHANNEL_AGENT_BRAIN_MAX_EVIDENCE_ITEMS=18
+CHANNEL_AGENT_BRAIN_MAX_PROMPT_CHARS=30000
+CHANNEL_AGENT_BRAIN_TEMPERATURE_ANALYSIS=0.15
+CHANNEL_AGENT_BRAIN_TEMPERATURE_CREATIVE=0.35
+CHANNEL_AGENT_BRAIN_REPAIR_TEMPERATURE=0.0
+CHANNEL_AGENT_BRAIN_TOP_P=0.85
+CHANNEL_AGENT_BRAIN_NUM_PREDICT_OPPORTUNITY_ANALYSIS=900
+CHANNEL_AGENT_BRAIN_NUM_PREDICT_CONTENT_ANGLES=1100
+CHANNEL_AGENT_BRAIN_NUM_PREDICT_TITLE_HOOKS=900
+CHANNEL_AGENT_BRAIN_NUM_PREDICT_LONGFORM_OUTLINE=1600
+```
+
+`OLLAMA_MODEL` has no CP4 default. Select a model that is already installed
+locally. The application never runs `ollama pull` and never guesses a model.
+Any compatible instruction-capable multilingual Ollama model may be used; a
+good choice should understand Chinese evidence, produce Vietnamese, and follow
+a structured JSON schema. Model names in Ollama documentation or community
+examples are examples, not mandatory dependencies.
+
+### Windows manual setup
+
+1. Install Ollama from its official Windows distribution.
+2. Start Ollama using the normal Ollama application/service for that install.
+3. In PowerShell, manually install or confirm the local model you chose using
+   Ollama's own CLI. CP4 does not do this for you.
+4. Put the exact installed model name in `OLLAMA_MODEL` in `.env`; keep
+   `OLLAMA_BASE_URL=http://127.0.0.1:11434` unless you intentionally changed it.
+5. Start the app:
+
+   ```powershell
+   $env:AI_CHANNEL_AGENT_ENABLED='true'
+   .\venv\Scripts\python.exe .\scripts\run_web.py
+   ```
+
+6. Log in and open **AI Channel Agent → Content Brain**.
+7. Click **Refresh status** and confirm Ollama is reachable and the configured
+   model is available.
+8. Select qualified stored evidence and run **Opportunity Analysis** once.
+
+### Ubuntu manual setup
+
+1. Install Ollama from its official Ubuntu/Linux distribution.
+2. Start Ollama using the normal command or service documented for that install.
+3. Manually install or confirm the local model you chose with the Ollama CLI.
+4. Set the exact model name and local endpoint in `.env` as shown above.
+5. Start the app:
+
+   ```bash
+   AI_CHANNEL_AGENT_ENABLED=true python scripts/run_web.py
+   ```
+
+6. Log in, open **AI Channel Agent → Content Brain**, refresh status, and run
+   one analysis against a real qualified opportunity.
+
+### CP4 live verification
+
+With Ollama running and an installed model selected, open Content Brain and
+confirm **Ollama connected**, the exact configured model, and **Ready**. Select
+a real qualified candidate or gap and run **Opportunity Analysis**. Verify that:
+
+- the evidence panel shows stored trend, relevance, opportunity, competitor,
+  pattern, gap, and breakout values;
+- the returned recommendation is Vietnamese and every displayed evidence
+  reference resolves to the supplied bundle;
+- video evidence links open the original YouTube page without embedding or
+  downloading it;
+- no invented metric appears and no tracebacks reach the browser; and
+- a new history row opens the same persisted result without another generation.
+
+Then run **Content Angles**, **Titles & Hooks**, and **Long-form Outline**. For
+the current cultivation research profile, confirm the Vietnamese ideas use
+observed motifs such as family cultivation or longevity only when those motifs
+actually exist in the selected evidence. Confirm the output proposes a new
+Vietnamese perspective and structure instead of translating or reproducing a
+competitor title or plot.
+
+For the CP4.2 reliability smoke test, enable low-confidence brainstorming and
+run each of the four modes three times with the selected local model (12 runs).
+Target at least 11 completed runs. Inspect any failed history row for its
+sanitized failure stage and attempt count; confirm no stale result remains and
+every displayed evidence ID exists in the evidence panel.
+
+Also verify failure states by stopping Ollama, clearing `OLLAMA_MODEL`, and
+configuring a non-installed model in turn. The UI should report each condition
+without affecting Trend Scanner, Competitor Intelligence, or localization.
+
 ## Next checkpoint
 
-**CP4 — Local Ollama Content Brain**
+**CP5 — Content Opportunity Engine**

@@ -70,6 +70,23 @@ def _env_int(name: str, default: int, minimum: int | None = None) -> int:
     return value
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
 YOUTUBE_RESEARCH_ENABLED = _env_bool("YOUTUBE_RESEARCH_ENABLED", False)
 YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS = _env_int(
     "YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS", 1, minimum=1,
@@ -95,6 +112,57 @@ def is_ai_channel_agent_enabled() -> bool:
 
 
 AI_CHANNEL_AGENT_ENABLED = is_ai_channel_agent_enabled()
+
+
+def channel_agent_brain_settings() -> dict[str, object]:
+    """Read bounded CP4 local-AI settings without contacting Ollama."""
+
+    legacy_num_predict = os.getenv("CHANNEL_AGENT_BRAIN_NUM_PREDICT", "").strip()
+
+    def mode_num_predict(name: str, default: int, hard_cap: int) -> int:
+        raw = os.getenv(name, "").strip() or legacy_num_predict
+        try:
+            value = int(raw) if raw else default
+        except (TypeError, ValueError):
+            value = default
+        return min(hard_cap, max(256, value))
+
+    return {
+        "enabled": _env_bool("CHANNEL_AGENT_OLLAMA_ENABLED", True),
+        "base_url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/"),
+        "model": os.getenv("OLLAMA_MODEL", "").strip(),
+        "timeout_seconds": _env_int("CHANNEL_AGENT_BRAIN_TIMEOUT_SECONDS", 120, minimum=5),
+        "max_evidence_items": min(
+            40, _env_int("CHANNEL_AGENT_BRAIN_MAX_EVIDENCE_ITEMS", 18, minimum=5)
+        ),
+        "max_prompt_chars": min(
+            100_000, _env_int("CHANNEL_AGENT_BRAIN_MAX_PROMPT_CHARS", 30_000, minimum=15_000)
+        ),
+        "temperature_analysis": _env_float(
+            "CHANNEL_AGENT_BRAIN_TEMPERATURE_ANALYSIS", 0.15, 0.0, 1.0
+        ),
+        "temperature_creative": _env_float(
+            "CHANNEL_AGENT_BRAIN_TEMPERATURE_CREATIVE", 0.35, 0.0, 1.0
+        ),
+        "repair_temperature": _env_float(
+            "CHANNEL_AGENT_BRAIN_REPAIR_TEMPERATURE", 0.0, 0.0, 0.2
+        ),
+        "top_p": _env_float("CHANNEL_AGENT_BRAIN_TOP_P", 0.85, 0.1, 1.0),
+        "num_predict_by_mode": {
+            "opportunity_analysis": mode_num_predict(
+                "CHANNEL_AGENT_BRAIN_NUM_PREDICT_OPPORTUNITY_ANALYSIS", 900, 1_200
+            ),
+            "content_angles": mode_num_predict(
+                "CHANNEL_AGENT_BRAIN_NUM_PREDICT_CONTENT_ANGLES", 1_100, 1_400
+            ),
+            "title_hooks": mode_num_predict(
+                "CHANNEL_AGENT_BRAIN_NUM_PREDICT_TITLE_HOOKS", 900, 1_200
+            ),
+            "longform_outline": mode_num_predict(
+                "CHANNEL_AGENT_BRAIN_NUM_PREDICT_LONGFORM_OUTLINE", 1_600, 2_000
+            ),
+        },
+    }
 
 # AI Content OS Feature Flag
 CONTENT_OS_ENABLED = _env_bool("CONTENT_OS_ENABLED", False)

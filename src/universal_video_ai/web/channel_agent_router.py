@@ -7,10 +7,24 @@ import sqlite3
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from universal_video_ai import config
 from universal_video_ai.channel_agent.service import ChannelAgentService
+from universal_video_ai.channel_agent.brain import (
+    ContentBrainAlreadyRunning,
+    ContentBrainError,
+    ContentBrainInvalidResponse,
+    ContentBrainService,
+    EvidenceSelectionError,
+    REQUEST_TYPES,
+    SELECTOR_TYPES,
+)
+from universal_video_ai.channel_agent.providers import (
+    OllamaProvider,
+    OllamaProviderError,
+    OllamaTimeoutError,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -50,6 +64,7 @@ class ChannelAgentStatusResponse(BaseModel):
     youtube_credential_present: bool
     youtube_connection_verified: Optional[bool]
     ollama_available: Optional[bool]
+    ollama: Optional[dict[str, Any]] = None
 
 
 class TrendQueryBody(BaseModel):
@@ -88,6 +103,15 @@ class CompetitorRefreshBody(BaseModel):
     mode: str = "long"
 
 
+class ContentBrainAnalyzeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_type: str
+    selector_type: str = "top_opportunity"
+    selector_id: Optional[str] = None
+    allow_low_confidence: bool = False
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -107,6 +131,45 @@ def _trend_service(store: Store) -> YouTubeTrendScanner:
 def _competitor_service(store: Store) -> CompetitorIntelligenceService:
     youtube = _service(store)
     return CompetitorIntelligenceService(store, YouTubeCompetitorProvider(youtube))
+
+
+def _brain_provider() -> OllamaProvider:
+    settings = config.channel_agent_brain_settings()
+    return OllamaProvider(
+        enabled=bool(settings["enabled"]),
+        base_url=str(settings["base_url"]),
+        model=str(settings["model"]),
+        timeout_seconds=float(settings["timeout_seconds"]),
+    )
+
+
+def _own_channel_context(store: Store, user_id: int) -> dict[str, Any]:
+    youtube = _service(store)
+    if not youtube.connection_status(user_id).connected:
+        return {}
+    start, end = default_date_range(28)
+    channel = youtube.get_own_channel(user_id).to_dict()
+    channel["last_28_days"] = youtube.get_overview(user_id, start, end).to_dict()
+    return channel
+
+
+def _brain_service(store: Store) -> ContentBrainService:
+    settings = config.channel_agent_brain_settings()
+    return ContentBrainService(
+        store,
+        _brain_provider(),
+        max_evidence_items=int(settings["max_evidence_items"]),
+        max_prompt_chars=int(settings["max_prompt_chars"]),
+        temperature_analysis=float(settings["temperature_analysis"]),
+        temperature_creative=float(settings["temperature_creative"]),
+        repair_temperature=float(settings["repair_temperature"]),
+        top_p=float(settings["top_p"]),
+        num_predict_by_mode={
+            str(mode): int(value)
+            for mode, value in dict(settings["num_predict_by_mode"]).items()
+        },
+        own_context_loader=lambda user_id: _own_channel_context(store, user_id),
+    )
 
 
 def _validate_trend_query(data: dict[str, Any]) -> dict[str, Any]:
@@ -164,14 +227,93 @@ def channel_agent_status(
 
     enabled = config.is_ai_channel_agent_enabled()
     youtube = _service(store).connection_status(user_id) if enabled else None
+    ollama = _brain_provider().status() if enabled else None
     status = ChannelAgentService(
         enabled=enabled,
         youtube_connected=bool(youtube and youtube.connected),
         youtube_credential_present=bool(youtube and youtube.credential_present),
         youtube_connection_verified=(youtube.connection_verified if youtube else None),
-        ollama_available=None,
+        ollama_available=(ollama.reachable and ollama.model_available) if ollama else None,
     ).status()
-    return ChannelAgentStatusResponse(**status.to_dict())
+    return ChannelAgentStatusResponse(
+        **status.to_dict(), ollama=ollama.to_dict() if ollama else None
+    )
+
+
+@router.get("/brain/status")
+def content_brain_status(
+    user_id: int = Depends(get_current_user_id),
+) -> dict[str, Any]:
+    del user_id
+    _require_enabled()
+    return _brain_provider().status().to_dict()
+
+
+@router.post("/brain/analyze")
+def analyze_content_brain(
+    body: ContentBrainAnalyzeBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if body.request_type not in REQUEST_TYPES:
+        raise HTTPException(422, "Unsupported Content Brain request type.")
+    if body.selector_type not in SELECTOR_TYPES:
+        raise HTTPException(422, "Unsupported Content Brain selector.")
+    if body.selector_id is not None and len(body.selector_id) > 240:
+        raise HTTPException(422, "Content Brain selector is too long.")
+    try:
+        return _brain_service(store).analyze(
+            user_id,
+            request_type=body.request_type,
+            selector_type=body.selector_type,
+            selector_id=body.selector_id,
+            allow_low_confidence=body.allow_low_confidence,
+        )
+    except ContentBrainAlreadyRunning as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except EvidenceSelectionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except OllamaTimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except (OllamaProviderError, ContentBrainInvalidResponse) as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ContentBrainError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/brain/runs")
+def content_brain_runs(
+    limit: int = Query(30, ge=1, le=100),
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return store.list_content_brain_runs(user_id, limit)
+
+
+@router.get("/brain/runs/{run_id}")
+def content_brain_run(
+    run_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    run = store.get_content_brain_run(user_id, run_id)
+    if not run:
+        raise HTTPException(404, "Content Brain run not found.")
+    return run
+
+
+@router.delete("/brain/runs/{run_id}", status_code=204)
+def delete_content_brain_run(
+    run_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> None:
+    _require_enabled()
+    if not store.delete_content_brain_run(user_id, run_id):
+        raise HTTPException(404, "Content Brain run not found.")
 
 
 @router.get("/youtube/status")

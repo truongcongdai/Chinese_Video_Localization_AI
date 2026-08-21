@@ -354,6 +354,24 @@ CREATE TABLE IF NOT EXISTS competitor_videos (
     UNIQUE(competitor_id, video_id)
 );
 
+CREATE TABLE IF NOT EXISTS content_brain_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    request_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    context_label TEXT,
+    evidence_hash TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    result_json TEXT,
+    error_message TEXT,
+    generation_attempt_count INTEGER NOT NULL DEFAULT 0,
+    failure_stage TEXT,
+    created_at REAL NOT NULL,
+    completed_at REAL
+);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -778,6 +796,21 @@ _MIGRATIONS = [
     ("competitor_videos", "rights_status", "ALTER TABLE competitor_videos ADD COLUMN rights_status TEXT DEFAULT 'idea_only'"),
     ("competitor_videos", "first_seen_at", "ALTER TABLE competitor_videos ADD COLUMN first_seen_at REAL"),
     ("competitor_videos", "last_seen_at", "ALTER TABLE competitor_videos ADD COLUMN last_seen_at REAL"),
+    ("content_brain_runs", "id", "ALTER TABLE content_brain_runs ADD COLUMN id INTEGER"),
+    ("content_brain_runs", "user_id", "ALTER TABLE content_brain_runs ADD COLUMN user_id INTEGER"),
+    ("content_brain_runs", "request_type", "ALTER TABLE content_brain_runs ADD COLUMN request_type TEXT"),
+    ("content_brain_runs", "status", "ALTER TABLE content_brain_runs ADD COLUMN status TEXT DEFAULT 'running'"),
+    ("content_brain_runs", "provider", "ALTER TABLE content_brain_runs ADD COLUMN provider TEXT DEFAULT 'ollama'"),
+    ("content_brain_runs", "model", "ALTER TABLE content_brain_runs ADD COLUMN model TEXT DEFAULT ''"),
+    ("content_brain_runs", "context_label", "ALTER TABLE content_brain_runs ADD COLUMN context_label TEXT"),
+    ("content_brain_runs", "evidence_hash", "ALTER TABLE content_brain_runs ADD COLUMN evidence_hash TEXT"),
+    ("content_brain_runs", "evidence_json", "ALTER TABLE content_brain_runs ADD COLUMN evidence_json TEXT DEFAULT '{}'"),
+    ("content_brain_runs", "result_json", "ALTER TABLE content_brain_runs ADD COLUMN result_json TEXT"),
+    ("content_brain_runs", "error_message", "ALTER TABLE content_brain_runs ADD COLUMN error_message TEXT"),
+    ("content_brain_runs", "generation_attempt_count", "ALTER TABLE content_brain_runs ADD COLUMN generation_attempt_count INTEGER DEFAULT 0"),
+    ("content_brain_runs", "failure_stage", "ALTER TABLE content_brain_runs ADD COLUMN failure_stage TEXT"),
+    ("content_brain_runs", "created_at", "ALTER TABLE content_brain_runs ADD COLUMN created_at REAL"),
+    ("content_brain_runs", "completed_at", "ALTER TABLE content_brain_runs ADD COLUMN completed_at REAL"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -1026,7 +1059,7 @@ class Store:
                  "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts",
                  "trend_scans", "trend_items", "trend_queries", "trend_item_queries",
                  "trend_snapshots", "competitor_channels", "competitor_snapshots",
-                 "competitor_videos")
+                 "competitor_videos", "content_brain_runs")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -1043,7 +1076,7 @@ class Store:
             # Preserve its rows and give null compatibility ids their stable
             # SQLite rowid; current inserts also set ids explicitly below.
             for table in ("trend_items", "trend_queries", "trend_snapshots", "competitor_channels",
-                          "competitor_snapshots", "competitor_videos"):
+                          "competitor_snapshots", "competitor_videos", "content_brain_runs"):
                 conn.execute(f"UPDATE {table} SET id = rowid WHERE id IS NULL")
 
             # CP2 uses UUID scan identifiers, while the original Trend Scanner
@@ -1072,6 +1105,8 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS idx_competitor_snapshots_time ON competitor_snapshots(competitor_id, captured_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_competitor_videos_identity ON competitor_videos(competitor_id, video_id)",
                 "CREATE INDEX IF NOT EXISTS idx_competitor_videos_outlier ON competitor_videos(competitor_id, outlier_ratio DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_content_brain_runs_user_time ON content_brain_runs(user_id, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_content_brain_runs_evidence ON content_brain_runs(user_id, evidence_hash, request_type, model)",
             ):
                 conn.execute(ddl)
 
@@ -2646,6 +2681,135 @@ class Store:
                 result[target] = json.loads(result.pop(source) or "[]")
             except (TypeError, ValueError, json.JSONDecodeError):
                 result[target] = []
+        return result
+
+    # ---- Channel Agent CP4 Content Brain runs (per-user, no credentials) ----
+    def create_content_brain_run(
+        self,
+        user_id: int,
+        *,
+        request_type: str,
+        provider: str,
+        model: str,
+        evidence_hash: str,
+        evidence: Dict[str, Any],
+        context_label: Optional[str] = None,
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO content_brain_runs
+                (user_id,request_type,status,provider,model,context_label,evidence_hash,
+                 evidence_json,created_at)
+                VALUES (?,?, 'running',?,?,?,?,?,?)""",
+                (
+                    user_id,
+                    request_type,
+                    provider,
+                    model,
+                    context_label,
+                    evidence_hash,
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def complete_content_brain_run(
+        self,
+        run_id: int,
+        user_id: int,
+        result: Dict[str, Any],
+        *,
+        generation_attempt_count: int = 0,
+    ) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE content_brain_runs SET status='completed',result_json=?,
+                error_message=NULL,generation_attempt_count=?,failure_stage=NULL,completed_at=?
+                WHERE id=? AND user_id=?""",
+                (
+                    json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    max(0, min(2, int(generation_attempt_count))),
+                    time.time(),
+                    run_id,
+                    user_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def fail_content_brain_run(
+        self,
+        run_id: int,
+        user_id: int,
+        message: str,
+        *,
+        generation_attempt_count: int = 1,
+        failure_stage: Optional[str] = None,
+    ) -> bool:
+        sanitized = " ".join(str(message or "Content Brain failed.").split())[:500]
+        sanitized_stage = "".join(
+            char for char in str(failure_stage or "") if char.isalnum() or char == "_"
+        )[:80] or None
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE content_brain_runs SET status='failed',error_message=?,
+                generation_attempt_count=?,failure_stage=?,completed_at=?
+                WHERE id=? AND user_id=?""",
+                (
+                    sanitized,
+                    max(0, min(2, int(generation_attempt_count))),
+                    sanitized_stage,
+                    time.time(),
+                    run_id,
+                    user_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def list_content_brain_runs(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_brain_runs WHERE user_id=?
+                ORDER BY created_at DESC,id DESC LIMIT ?""",
+                (user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [self._content_brain_run_dict(row, include_evidence=False) for row in rows]
+
+    def get_content_brain_run(self, user_id: int, run_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_brain_runs WHERE id=? AND user_id=?",
+                (run_id, user_id),
+            ).fetchone()
+        return self._content_brain_run_dict(row, include_evidence=True) if row else None
+
+    def delete_content_brain_run(self, user_id: int, run_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM content_brain_runs WHERE id=? AND user_id=?", (run_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    @staticmethod
+    def _content_brain_run_dict(row: Any, *, include_evidence: bool) -> Dict[str, Any]:
+        result = dict(row)
+        raw_result = result.pop("result_json", None)
+        try:
+            brain_result = json.loads(raw_result) if raw_result else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            brain_result = None
+        raw_evidence = result.pop("evidence_json", None)
+        if include_evidence:
+            try:
+                result["evidence"] = json.loads(raw_evidence) if raw_evidence else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["evidence"] = {}
+            result["result"] = brain_result
+        result["confidence"] = (
+            (brain_result.get("evidence_confidence") or {}).get("label")
+            if isinstance(brain_result, dict) else None
+        )
         return result
 
     # ---- social accounts (per-user OAuth connections) ----

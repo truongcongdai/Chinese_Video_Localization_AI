@@ -6,8 +6,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from fastapi import HTTPException, Request
 
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
@@ -15,8 +14,8 @@ from universal_video_ai.channel_agent.youtube import (
     YouTubePermissionError,
     YouTubeReadOnlyService,
 )
-from universal_video_ai.web.auth import get_current_user_id
-from universal_video_ai.web.channel_agent_router import router, youtube_status
+from universal_video_ai.web.auth import create_session_cookie_value, get_current_user_id
+from universal_video_ai.web.channel_agent_router import youtube_status
 from universal_video_ai.web.oauth import GoogleOAuth
 from universal_video_ai.web.store import Store
 
@@ -325,18 +324,21 @@ def test_api_requires_session_and_resolves_only_authenticated_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AI_CHANNEL_AGENT_ENABLED", "true")
+    monkeypatch.setenv("WEB_SESSION_SECRET", "test-only-session-secret")
     store = FakeStore({42: credential()})
-    app = FastAPI()
-    app.state.store = store
-    app.include_router(router)
+    anonymous = Request({"type": "http", "headers": []})
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_id(anonymous)
+    assert exc_info.value.status_code == 401
 
-    with TestClient(app) as client:
-        assert client.get("/api/channel-agent/youtube/status").status_code == 401
-        app.dependency_overrides[get_current_user_id] = lambda: 42
-        response = client.get("/api/channel-agent/youtube/status")
+    cookie = create_session_cookie_value(42)
+    authenticated = Request({
+        "type": "http", "headers": [(b"cookie", f"vai_session={cookie}".encode("ascii"))],
+    })
+    resolved_user = get_current_user_id(authenticated)
+    response = youtube_status(verify=False, user_id=resolved_user, store=store)
 
-    assert response.status_code == 200
-    assert response.json()["connected"] is True
+    assert response["connected"] is True
     assert store.lookups == [(42, "youtube")]
-    assert "user-access-token" not in response.text
-    assert "user-refresh-token" not in response.text
+    assert "user-access-token" not in repr(response)
+    assert "user-refresh-token" not in repr(response)

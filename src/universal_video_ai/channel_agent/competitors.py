@@ -711,6 +711,7 @@ def opportunity_gaps(competitors: list[dict[str, Any]], candidates: list[dict[st
             quality_status = "filtered"
         results.append({
             "pattern": pattern, "supporting_competitor_count": competitor_count,
+            "supporting_competitor_ids": sorted(int(item) for item in data["competitors"]),
             "supporting_breakout_count": len(breakout_evidence),
             "median_outlier": median(ratios) if ratios else None,
             "qualified_candidate_count": candidate_count,
