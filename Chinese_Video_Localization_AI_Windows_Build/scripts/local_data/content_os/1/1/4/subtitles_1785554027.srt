@@ -1,7 +1,0 @@
-1
-00:00:00,000 --> 00:00:02,796
-Want to cook like a pro?
-
-2
-00:00:02,796 --> 00:00:05,592
-Here's the secret technique...
