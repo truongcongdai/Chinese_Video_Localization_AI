@@ -3551,6 +3551,11 @@ async function initChannelAgent() {
     $("#content-opportunity-message").textContent = `Content Opportunities unavailable: ${opportunityError.message}`;
   }
   try {
+    await loadProductionQueue();
+  } catch (productionError) {
+    $("#production-message").textContent = `Production Queue unavailable: ${productionError.message}`;
+  }
+  try {
     const status = await api("/api/channel-agent/youtube/status");
     if (!status.connected) {
       connectNode.classList.remove("hidden");
@@ -4279,6 +4284,8 @@ function contentOpportunityStatusButtons(item) {
 
 async function showContentOpportunity(id) {
   const item = await api(`/api/channel-agent/opportunities/${id}`);
+  const linkedProductionRows = await api(`/api/channel-agent/production?status=all&opportunity_id=${id}&limit=1`);
+  const linkedProduction = linkedProductionRows[0] || null;
   const detail = $("#content-opportunity-detail");
   detail.classList.remove("hidden");
   const rows = ContentOpportunityUI.scoreRows(item.score_breakdown);
@@ -4320,6 +4327,11 @@ async function showContentOpportunity(id) {
       <div class="field"><label>Max minutes</label><input id="content-opportunity-duration-max" type="number" min="1" max="600" value="${item.target_duration_max || ""}"></div></div>
     <button class="btn gradient small" id="content-opportunity-save" type="button">Save editorial choices</button>
     <button class="btn secondary small" id="content-opportunity-refresh-evidence" type="button">Refresh evidence</button>
+    ${linkedProduction
+      ? `<button class="btn gradient small" id="content-opportunity-open-production" type="button">Open Production Item #${linkedProduction.id}</button>`
+      : item.status === "approved"
+        ? '<button class="btn gradient small" id="content-opportunity-create-production" type="button">Create Production Item</button>'
+        : '<p class="muted-help">Approve this opportunity before creating a production planning item.</p>'}
     <h4>Status actions</h4><div id="content-opportunity-status-actions">${contentOpportunityStatusButtons(item)}</div>
     <h4>History</h4>${channelAgentTable(["Date", "Event", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
   $("#content-opportunity-save").onclick = async () => {
@@ -4346,6 +4358,23 @@ async function showContentOpportunity(id) {
       await loadContentOpportunities();
     } catch (error) { $("#content-opportunity-message").textContent = error.message; }
   };
+  $("#content-opportunity-create-production")?.addEventListener("click", async () => {
+    try {
+      const response = await api("/api/channel-agent/production", {
+        method: "POST", body: JSON.stringify({opportunity_id: id}),
+      });
+      $("#production-message").textContent = response.created
+        ? "Production planning item created. No media or legacy job was created."
+        : `Existing production item #${response.production_item.id} opened.`;
+      await loadProductionQueue();
+      await showProductionItem(response.production_item.id);
+      $("#production-queue").scrollIntoView({behavior: "smooth"});
+    } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  });
+  $("#content-opportunity-open-production")?.addEventListener("click", async () => {
+    await showProductionItem(linkedProduction.id);
+    $("#production-queue").scrollIntoView({behavior: "smooth"});
+  });
   document.querySelectorAll("[data-content-opportunity-status]").forEach(button => {
     button.onclick = async () => {
       const status = button.dataset.contentOpportunityStatus;
@@ -4390,6 +4419,185 @@ $("#content-opportunity-refresh-list").onclick = loadContentOpportunities;
   $(`#content-opportunity-${name}-filter`).onchange = loadContentOpportunities;
 });
 $("#content-opportunity-min-score").onchange = loadContentOpportunities;
+
+// ---------------- Production Queue (CP6 planning only) ----------------
+function productionFilters() {
+  return {
+    status: $("#production-status-filter").value,
+    minPriority: $("#production-min-priority").value,
+    rights: $("#production-rights-filter").value,
+    targetFormat: $("#production-format-filter").value,
+  };
+}
+
+function productionDuration(item) {
+  if (item.target_duration_min && item.target_duration_max) return `${item.target_duration_min}–${item.target_duration_max} min`;
+  if (item.target_duration_min || item.target_duration_max) return `${item.target_duration_min || item.target_duration_max} min`;
+  return "—";
+}
+
+function productionBoard(items) {
+  if (!items.length) return '<div class="muted-help">No production planning items match these filters. Approve a Content Opportunity, then create one from its detail view.</div>';
+  return channelAgentTable(
+    ["Priority", "Status", "Title", "Format", "Duration", "Opportunity rank", "Rights", "Planning", "Progress", "Updated", "View"],
+    items.map(item => [
+      item.priority || 0,
+      String(item.status).toUpperCase(),
+      item.working_title,
+      item.target_format,
+      productionDuration(item),
+      Number(item.opportunity_rank_score || 0).toFixed(1),
+      String(item.rights_gate_status).toUpperCase(),
+      item.planning_ready ? "READY" : "NOT READY",
+      ContentProductionUI.progressLabel(item.progress),
+      new Date(item.updated_at * 1000).toLocaleString(),
+      `<button class="btn secondary small" data-production-id="${item.id}">View</button>`,
+    ]), [10]
+  );
+}
+
+async function loadProductionQueue() {
+  const query = ContentProductionUI.listQuery(productionFilters());
+  const items = await api(`/api/channel-agent/production?${query}`);
+  $("#production-board").innerHTML = productionBoard(items);
+  $("#production-message").textContent = `${items.length} planning item${items.length === 1 ? "" : "s"} shown · top 50 maximum · Ollama not required.`;
+  document.querySelectorAll("[data-production-id]").forEach(button => {
+    button.onclick = () => showProductionItem(Number(button.dataset.productionId));
+  });
+}
+
+function productionItemActions(item) {
+  return (ContentProductionUI.itemTransitions[item.status] || []).map(status =>
+    `<button class="btn secondary small" data-production-status="${status}">${status.replace("_", " ").toUpperCase()}</button>`
+  ).join(" ");
+}
+
+function productionTaskTable(item) {
+  return channelAgentTable(
+    ["Order", "Task", "Required", "Status", "Dependencies", "Notes", "Actions"],
+    item.tasks.map(task => [
+      task.order_index,
+      `${task.task_type}<br><span class="muted-help">${escapeHtml(task.description)}</span>`,
+      task.required ? "yes" : "optional",
+      String(task.status).toUpperCase(),
+      (task.depends_on || []).join(", ") || "none",
+      task.manual_notes || "—",
+      `${ContentProductionUI.taskActions(task).map(status => `<button class="btn secondary small" data-production-task-id="${task.id}" data-production-task-status="${status}">${status.replace("_", " ")}</button>`).join(" ")}
+       <button class="btn secondary small" data-production-task-notes="${task.id}">notes</button>`,
+    ]), [1, 6]
+  );
+}
+
+function productionBriefView(brief) {
+  const refs = brief.evidence_summary?.references || [];
+  return `
+    <p><strong>Topic:</strong> ${escapeHtml(brief.topic || "—")}<br>
+    <strong>Approved angle:</strong> ${escapeHtml(brief.selected_angle || "—")}<br>
+    <strong>Audience promise:</strong> ${escapeHtml(brief.audience_promise || "—")}<br>
+    <strong>Core conflict:</strong> ${escapeHtml(brief.core_conflict || "—")}<br>
+    <strong>Differentiation:</strong> ${escapeHtml(brief.differentiation || "—")}<br>
+    <strong>Hook direction:</strong> ${escapeHtml(brief.hook_direction || "—")}</p>
+    <p><strong>Motif:</strong> ${escapeHtml(brief.primary_motif || "—")} · <strong>Target:</strong> ${escapeHtml(brief.target_duration || "—")}</p>
+    <p><strong>Script:</strong> ${escapeHtml(brief.script_direction?.instruction || "—")}<br>
+    <strong>Visuals:</strong> ${escapeHtml(brief.visual_direction?.instruction || "—")}<br>
+    <strong>Voice:</strong> ${escapeHtml(`${brief.voice_direction?.language || "Vietnamese"} · ${brief.voice_direction?.tone || "editorial decision"}`)}<br>
+    <strong>Thumbnail:</strong> ${escapeHtml(brief.thumbnail_direction?.text_concept || "—")}<br>
+    <strong>Metadata:</strong> ${escapeHtml(brief.metadata_direction?.description || "—")}</p>
+    <p><strong>Rights guidance:</strong> ${escapeHtml(brief.rights_guidance || "Missing")}</p>
+    <h4>Research evidence references</h4>
+    ${refs.length ? `<ul>${refs.map(ref => `<li>${ref.url ? `<a href="${escapeHtml(ref.url)}" target="_blank" rel="noopener">${escapeHtml(ref.evidence_id)}</a>` : escapeHtml(ref.evidence_id)} · ${escapeHtml(ref.label || ref.type)}</li>`).join("")}</ul>` : '<p class="muted-help">No linkable references; brief uses stored evidence-only context.</p>'}`;
+}
+
+async function showProductionItem(id) {
+  const item = await api(`/api/channel-agent/production/${id}`);
+  const detail = $("#production-detail");
+  detail.classList.remove("hidden");
+  detail.innerHTML = `
+    <div class="template-library-heading"><h3 class="section-title">${escapeHtml(item.working_title)}</h3><span>${escapeHtml(String(item.status).toUpperCase())}</span></div>
+    <p><strong>Source opportunity:</strong> #${item.opportunity_id} · ${escapeHtml(item.source_opportunity?.topic || "stored opportunity")} · rank ${Number(item.opportunity_rank_score || 0).toFixed(1)}</p>
+    <div class="stat-grid" style="margin-top:10px">
+      <div class="stat-box"><div class="num">${item.priority || 0}</div><div class="label">User priority</div></div>
+      <div class="stat-box"><div class="num">${item.planning_ready ? "YES" : "NO"}</div><div class="label">Planning ready</div></div>
+      <div class="stat-box"><div class="num">${item.rights_ready ? "YES" : "NO"}</div><div class="label">Rights ready</div></div>
+      <div class="stat-box"><div class="num">${ContentProductionUI.progressLabel(item.progress)}</div><div class="label">Required-task progress</div></div>
+    </div>
+    <h4>Production brief</h4>${productionBriefView(item.production_brief)}
+    <h4>Rights gate</h4><p><strong>Source:</strong> ${escapeHtml(item.rights_status)} · <strong>Gate:</strong> ${escapeHtml(item.rights_gate_status)}</p>
+    <p class="muted-help">Idea approval is not source-media permission. Planning may continue while the separate rights gate remains visible.</p>
+    <h4>Tasks and dependencies</h4>${productionTaskTable(item)}
+    <h4>Production controls</h4>
+    <div class="row"><div class="field"><label>User priority</label><input id="production-item-priority" type="number" min="0" max="100" value="${item.priority || 0}"></div>
+      <div class="field"><label>Rights gate</label><select id="production-item-rights-gate">${["research_only", "needs_review", "cleared"].map(value => `<option value="${value}" ${item.rights_gate_status === value ? "selected" : ""}>${value}</option>`).join("")}</select></div></div>
+    <div class="field"><label>Production notes</label><textarea id="production-item-notes" rows="3" maxlength="5000">${escapeHtml(item.manual_notes || "")}</textarea></div>
+    <button class="btn gradient small" id="production-item-save" type="button">Save production decisions</button>
+    <button class="btn secondary small" id="production-item-sync" type="button">Sync from Opportunity</button>
+    <button class="btn secondary small" id="production-open-opportunity" type="button">Open source opportunity</button>
+    <h4>Status actions</h4><div>${productionItemActions(item)}</div>
+    ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
+    <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
+
+  $("#production-item-save").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/production/${id}`, {method: "PATCH", body: JSON.stringify({
+        priority: Number($("#production-item-priority").value),
+        rights_gate_status: $("#production-item-rights-gate").value,
+        manual_notes: $("#production-item-notes").value,
+      })});
+      $("#production-message").textContent = "Production decisions saved separately from research fields.";
+      await showProductionItem(id); await loadProductionQueue();
+    } catch (error) { $("#production-message").textContent = error.message; }
+  };
+  $("#production-item-sync").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/production/${id}/sync`, {method: "POST"});
+      $("#production-message").textContent = "Brief synced from stored CP5/CP4 data; task states, blockers, and production notes were preserved.";
+      await showProductionItem(id); await loadProductionQueue();
+    } catch (error) { $("#production-message").textContent = error.message; }
+  };
+  $("#production-open-opportunity").onclick = async () => {
+    await showContentOpportunity(item.opportunity_id);
+    $("#content-opportunities").scrollIntoView({behavior: "smooth"});
+  };
+  document.querySelectorAll("[data-production-status]").forEach(button => {
+    button.onclick = async () => {
+      const status = button.dataset.productionStatus;
+      const blockerReason = status === "blocked" ? (window.prompt("Blocker: missing_angle, missing_title, missing_target_duration, rights_review_needed, insufficient_brief, manual_review_requested, other", "manual_review_requested") || "manual_review_requested") : null;
+      try {
+        await api(`/api/channel-agent/production/${id}/status`, {method: "POST", body: JSON.stringify({status, blocker_reason: blockerReason})});
+        await showProductionItem(id); await loadProductionQueue();
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+  document.querySelectorAll("[data-production-task-status]").forEach(button => {
+    button.onclick = async () => {
+      const taskId = Number(button.dataset.productionTaskId);
+      const status = button.dataset.productionTaskStatus;
+      const note = status === "blocked" ? (window.prompt("Task blocker note", "Manual review required") || "Manual review required") : null;
+      try {
+        await api(`/api/channel-agent/production/${id}/tasks/${taskId}/status`, {method: "POST", body: JSON.stringify({status, note})});
+        await showProductionItem(id); await loadProductionQueue();
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+  document.querySelectorAll("[data-production-task-notes]").forEach(button => {
+    button.onclick = async () => {
+      const taskId = Number(button.dataset.productionTaskNotes);
+      const current = item.tasks.find(task => task.id === taskId)?.manual_notes || "";
+      const notes = window.prompt("Manual planning notes", current);
+      if (notes == null) return;
+      try {
+        await api(`/api/channel-agent/production/${id}/tasks/${taskId}`, {method: "PATCH", body: JSON.stringify({manual_notes: notes})});
+        await showProductionItem(id);
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+}
+
+$("#production-refresh-list").onclick = loadProductionQueue;
+["status", "rights", "format"].forEach(name => {
+  $(`#production-${name}-filter`).onchange = loadProductionQueue;
+});
+$("#production-min-priority").onchange = loadProductionQueue;
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

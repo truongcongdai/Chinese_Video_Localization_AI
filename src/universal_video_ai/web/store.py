@@ -444,6 +444,73 @@ CREATE INDEX IF NOT EXISTS idx_content_opportunities_user_status
 CREATE INDEX IF NOT EXISTS idx_content_opportunity_events_owner
     ON content_opportunity_events(user_id, opportunity_id, created_at DESC);
 
+-- CP6 planning queue. These records never execute the legacy localization,
+-- rendering, TTS, download, upload, or publishing pipelines.
+CREATE TABLE IF NOT EXISTS production_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    opportunity_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    priority INTEGER NOT NULL DEFAULT 0,
+    opportunity_rank_score REAL NOT NULL DEFAULT 0,
+    working_title TEXT NOT NULL,
+    selected_angle TEXT,
+    target_format TEXT NOT NULL,
+    target_duration_min INTEGER,
+    target_duration_max INTEGER,
+    production_brief_json TEXT NOT NULL,
+    rights_status TEXT NOT NULL,
+    rights_gate_status TEXT NOT NULL,
+    planning_ready INTEGER NOT NULL DEFAULT 0,
+    rights_ready INTEGER NOT NULL DEFAULT 0,
+    blocker_reason TEXT,
+    manual_notes TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    UNIQUE(user_id, opportunity_id)
+);
+
+CREATE TABLE IF NOT EXISTS production_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    required INTEGER NOT NULL DEFAULT 1,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
+    order_index INTEGER NOT NULL,
+    assignee_type TEXT NOT NULL DEFAULT 'manual',
+    manual_notes TEXT,
+    output_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    UNIQUE(production_item_id, task_type)
+);
+
+CREATE TABLE IF NOT EXISTS production_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_item_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    task_id INTEGER,
+    from_status TEXT,
+    to_status TEXT,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_items_user_queue
+    ON production_items(user_id, status, priority DESC, opportunity_rank_score DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_production_tasks_item_order
+    ON production_tasks(user_id, production_item_id, order_index);
+CREATE INDEX IF NOT EXISTS idx_production_events_owner
+    ON production_events(user_id, production_item_id, created_at DESC);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3058,6 +3125,211 @@ class Store:
                 (opportunity_id, user_id),
             )
             return True
+
+    # ---- Channel Agent CP6 Production Queue (planning only) ----
+    @staticmethod
+    def _production_item_dict(row: Any, *, include_brief: bool = True) -> Dict[str, Any]:
+        result = dict(row)
+        raw = result.pop("production_brief_json", None)
+        if include_brief:
+            try:
+                result["production_brief"] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["production_brief"] = {}
+        result["planning_ready"] = bool(result.get("planning_ready"))
+        result["rights_ready"] = bool(result.get("rights_ready"))
+        return result
+
+    @staticmethod
+    def _production_task_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target, fallback in (
+            ("depends_on_json", "depends_on", []),
+            ("output_json", "output", {}),
+        ):
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else fallback
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = fallback
+        result["required"] = bool(result.get("required"))
+        return result
+
+    def insert_production_item_with_tasks(
+        self, user_id: int, data: Dict[str, Any], tasks: List[Dict[str, Any]],
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO production_items
+                (user_id,opportunity_id,status,priority,opportunity_rank_score,working_title,
+                 selected_angle,target_format,target_duration_min,target_duration_max,
+                 production_brief_json,rights_status,rights_gate_status,planning_ready,
+                 rights_ready,blocker_reason,manual_notes,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    user_id, data["opportunity_id"], data.get("status", "queued"),
+                    data.get("priority", 0), data.get("opportunity_rank_score", 0),
+                    data["working_title"], data.get("selected_angle"), data["target_format"],
+                    data.get("target_duration_min"), data.get("target_duration_max"),
+                    json.dumps(data["production_brief"], ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")),
+                    data["rights_status"], data["rights_gate_status"],
+                    int(bool(data.get("planning_ready"))), int(bool(data.get("rights_ready"))),
+                    data.get("blocker_reason"), data.get("manual_notes"), now, now,
+                ),
+            )
+            item_id = int(cur.lastrowid)
+            for task in tasks:
+                conn.execute(
+                    """INSERT INTO production_tasks
+                    (user_id,production_item_id,task_type,status,required,title,description,
+                     depends_on_json,order_index,assignee_type,manual_notes,output_json,
+                     created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        user_id, item_id, task["task_type"], task["status"],
+                        int(bool(task.get("required", True))), task["title"], task["description"],
+                        json.dumps(task.get("depends_on", []), ensure_ascii=False),
+                        task["order_index"], task.get("assignee_type", "manual"), None,
+                        "{}", now, now,
+                    ),
+                )
+            conn.execute(
+                """INSERT INTO production_events
+                (production_item_id,user_id,event_type,to_status,created_at)
+                VALUES (?,?,'item_created','queued',?)""",
+                (item_id, user_id, now),
+            )
+            return item_id
+
+    def get_production_item(self, user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_items WHERE id=? AND user_id=?", (item_id, user_id)
+            ).fetchone()
+        return self._production_item_dict(row) if row else None
+
+    def get_production_item_by_opportunity(
+        self, user_id: int, opportunity_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_items WHERE user_id=? AND opportunity_id=?",
+                (user_id, opportunity_id),
+            ).fetchone()
+        return self._production_item_dict(row) if row else None
+
+    def list_production_items(
+        self, user_id: int, *, statuses: Optional[List[str]] = None,
+        min_priority: int = 0, rights: Optional[str] = None,
+        target_format: Optional[str] = None, opportunity_id: Optional[int] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["user_id=?", "priority>=?"]
+        params: List[Any] = [user_id, min(100, max(0, int(min_priority)))]
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if rights:
+            clauses.append("rights_gate_status=?")
+            params.append(rights)
+        if target_format:
+            clauses.append("target_format=?")
+            params.append(target_format)
+        if opportunity_id is not None:
+            clauses.append("opportunity_id=?")
+            params.append(opportunity_id)
+        params.append(min(100, max(1, int(limit))))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_items WHERE " + " AND ".join(clauses)
+                + " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'planning' THEN 1 "
+                  "WHEN 'ready' THEN 2 WHEN 'queued' THEN 3 WHEN 'blocked' THEN 4 ELSE 5 END,"
+                  "priority DESC,opportunity_rank_score DESC,created_at ASC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._production_item_dict(row, include_brief=False) for row in rows]
+
+    def update_production_item(self, user_id: int, item_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            "status", "priority", "opportunity_rank_score", "working_title", "selected_angle",
+            "target_format", "target_duration_min", "target_duration_max",
+            "production_brief_json", "rights_status", "rights_gate_status", "planning_ready",
+            "rights_ready", "blocker_reason", "manual_notes", "started_at", "completed_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_production_item(user_id, item_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_items SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND user_id=?",
+                [*payload.values(), item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def list_production_tasks(self, user_id: int, item_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_tasks WHERE user_id=? AND production_item_id=? "
+                "ORDER BY order_index,id", (user_id, item_id),
+            ).fetchall()
+        return [self._production_task_dict(row) for row in rows]
+
+    def get_production_task(
+        self, user_id: int, item_id: int, task_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_tasks WHERE id=? AND production_item_id=? AND user_id=?",
+                (task_id, item_id, user_id),
+            ).fetchone()
+        return self._production_task_dict(row) if row else None
+
+    def update_production_task(
+        self, user_id: int, item_id: int, task_id: int, data: Dict[str, Any],
+    ) -> bool:
+        allowed = {"status", "manual_notes", "output_json", "completed_at"}
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_production_task(user_id, item_id, task_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_tasks SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND production_item_id=? AND user_id=?",
+                [*payload.values(), task_id, item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def add_production_event(
+        self, user_id: int, item_id: int, *, event_type: str,
+        task_id: Optional[int] = None, from_status: Optional[str] = None,
+        to_status: Optional[str] = None, note: Optional[str] = None,
+    ) -> int:
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT 1 FROM production_items WHERE id=? AND user_id=?", (item_id, user_id)
+            ).fetchone()
+            if not owner:
+                return 0
+            cur = conn.execute(
+                """INSERT INTO production_events
+                (production_item_id,user_id,event_type,task_id,from_status,to_status,note,created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (item_id, user_id, event_type, task_id, from_status, to_status, note, time.time()),
+            )
+            return int(cur.lastrowid)
+
+    def list_production_events(self, user_id: int, item_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_events WHERE user_id=? AND production_item_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 200", (user_id, item_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(

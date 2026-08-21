@@ -967,6 +967,65 @@ and use owned, licensed, or permitted visuals.
 8. Confirm no production/localization job, source download, render, upload, or
    publish action was created.
 
+## CP6 — Production Queue
+
+CP6 creates one per-user production planning item from an explicitly approved
+CP5 opportunity. The database uniqueness rule on `(user_id, opportunity_id)`
+makes repeated clicks and competing requests resolve to the same queue item.
+Draft, watch, rejected, and archived opportunities are rejected server-side.
+No arbitrary queue item can be created without that traceable approved source.
+
+The deterministic `cp6-v1` brief copies the current CP5 editorial choices and
+reuses CP4-derived angle, audience promise, conflict, differentiation, title,
+hook, and risk fields already stored on the opportunity. If CP4 enrichment is
+missing, an evidence-only brief is still created. CP6 never calls Ollama. The
+brief retains a bounded list of evidence references and the source evidence
+hash, but excludes prompts, provider payloads, tokens, transcripts, and media.
+
+Every item receives six planning tasks: SCRIPT; VISUAL_PLAN, VOICE_PLAN,
+THUMBNAIL, and METADATA after SCRIPT; then QA after those planning tasks. Task
+readiness is derived from persisted dependencies. Required-task progress is
+`completed required tasks / total required tasks`; optional skipped tasks do
+not create fake progress. Task actions record manual start, completion, block,
+skip (optional only), and notes. They do not execute script generation, TTS,
+image generation, rendering, upload, or publishing.
+
+Item states are `queued`, `planning`, `ready`, `in_progress`, `blocked`,
+`completed`, and `cancelled`, with explicit server-side transitions. Item and
+task changes create a bounded audit timeline. User priority remains separate
+from the inherited CP5 opportunity rank. Manual **Sync from Opportunity**
+updates the brief, title, angle, target, rank, and source-rights context while
+preserving production notes, priority, blocker, and all task states.
+
+Planning readiness and rights readiness are deliberately separate. External
+evidence keeps its `idea_only`/`unknown` source status; the initial gate is
+`research_only` or `needs_review`. Approval of an idea never clears media
+rights. Production guidance continues to require an original Vietnamese
+script/commentary and sequence using owned, licensed, or permitted visuals.
+
+### CP6 manual verification
+
+1. Start the app with `AI_CHANNEL_AGENT_ENABLED=true`, log in, and open
+   **AI Channel Agent → Content Opportunities**.
+2. Open an approved opportunity and click **Create Production Item**. Repeat
+   the action and confirm the existing item is returned rather than duplicated.
+3. Open **Production Queue** and verify the queued item, deterministic brief,
+   separate planning/rights readiness, six tasks, dependencies, zero progress,
+   and event history.
+4. Move queued → planning. Start and complete SCRIPT; confirm VISUAL_PLAN,
+   VOICE_PLAN, THUMBNAIL, and METADATA become ready. Complete them and confirm
+   QA becomes ready. Complete QA and confirm the planning item completes.
+5. On a second approved item, block a required task and confirm the item is
+   visibly blocked. Add task/production notes, edit the CP5 title or angle,
+   then use **Sync from Opportunity** and verify task states, notes, and the
+   blocker remain unchanged.
+6. Confirm the rights gate remains research-only/needs-review for external
+   evidence even though planning can proceed.
+7. Stop Ollama and repeat listing, creation, sync, task updates, and history.
+   Confirm they still work.
+8. Verify no source download, legacy localization job, render, upload, or
+   publishing action occurs anywhere in the flow.
+
 ## Next checkpoint
 
-**CP6 — Production Queue**
+**CP7 — Production Execution**

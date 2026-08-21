@@ -34,6 +34,16 @@ from universal_video_ai.channel_agent.opportunities import (
     OpportunityError,
     OpportunityNotFound,
 )
+from universal_video_ai.channel_agent.production import (
+    ACTIVE_ITEM_STATUSES,
+    BLOCKER_REASONS,
+    ITEM_STATUSES,
+    RIGHTS_GATES,
+    TASK_STATUSES,
+    ProductionError,
+    ProductionNotFound,
+    ProductionQueueService,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -155,6 +165,43 @@ class OpportunityStatusBody(BaseModel):
     note: Optional[str] = None
 
 
+class ProductionCreateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    opportunity_id: int
+
+
+class ProductionEditBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    priority: Optional[int] = None
+    manual_notes: Optional[str] = None
+    rights_gate_status: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ProductionStatusBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    blocker_reason: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ProductionTaskEditBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manual_notes: Optional[str] = None
+    output: Optional[dict[str, Any]] = None
+
+
+class ProductionTaskStatusBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    note: Optional[str] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -217,6 +264,10 @@ def _brain_service(store: Store) -> ContentBrainService:
 
 def _opportunity_service(store: Store) -> ContentOpportunityService:
     return ContentOpportunityService(store)
+
+
+def _production_service(store: Store) -> ProductionQueueService:
+    return ProductionQueueService(store)
 
 
 def _validate_trend_query(data: dict[str, Any]) -> dict[str, Any]:
@@ -497,6 +548,178 @@ def delete_content_opportunity(
         _opportunity_service(store).delete(user_id, opportunity_id)
     except OpportunityNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/production")
+def production_queue(
+    status: Optional[str] = None,
+    min_priority: int = Query(0, ge=0, le=100),
+    rights: Optional[str] = None,
+    target_format: Optional[str] = None,
+    opportunity_id: Optional[int] = None,
+    limit: int = Query(50, ge=1, le=50),
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    statuses = (
+        sorted(ITEM_STATUSES) if status == "all"
+        else [part.strip() for part in status.split(",") if part.strip()]
+        if status else sorted(ACTIVE_ITEM_STATUSES)
+    )
+    if any(value not in ITEM_STATUSES for value in statuses):
+        raise HTTPException(422, "Unsupported production status filter.")
+    if rights and rights not in RIGHTS_GATES:
+        raise HTTPException(422, "Unsupported rights gate filter.")
+    if target_format and target_format not in {"long_form", "short_form", "all", "unspecified"}:
+        raise HTTPException(422, "Unsupported production format filter.")
+    return _production_service(store).list(
+        user_id, statuses=statuses, min_priority=min_priority, rights=rights,
+        target_format=target_format, opportunity_id=opportunity_id, limit=limit,
+    )
+
+
+@router.post("/production")
+def create_production_item(
+    body: ProductionCreateBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        item, created = _production_service(store).create(user_id, body.opportunity_id)
+    except ProductionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"created": created, "production_item": item}
+
+
+@router.get("/production/{item_id}")
+def production_item_detail(
+    item_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _production_service(store).get(user_id, item_id)
+    except ProductionNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.patch("/production/{item_id}")
+def edit_production_item(
+    item_id: int,
+    body: ProductionEditBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _production_service(store).edit(
+            user_id, item_id, **body.model_dump(exclude_unset=True)
+        )
+    except ProductionNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/production/{item_id}/sync")
+def sync_production_item(
+    item_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _production_service(store).sync(user_id, item_id)
+    except ProductionNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/production/{item_id}/status")
+def change_production_item_status(
+    item_id: int,
+    body: ProductionStatusBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if body.status not in ITEM_STATUSES:
+        raise HTTPException(422, "Unsupported production status.")
+    if body.blocker_reason and body.blocker_reason not in BLOCKER_REASONS:
+        raise HTTPException(422, "Unsupported blocker reason.")
+    try:
+        return _production_service(store).change_status(
+            user_id, item_id, status=body.status,
+            blocker_reason=body.blocker_reason, note=body.note,
+        )
+    except ProductionNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/production/{item_id}/tasks")
+def production_tasks(
+    item_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return production_item_detail(item_id, user_id, store)["tasks"]
+
+
+@router.patch("/production/{item_id}/tasks/{task_id}")
+def edit_production_task(
+    item_id: int,
+    task_id: int,
+    body: ProductionTaskEditBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    try:
+        return _production_service(store).edit_task(
+            user_id, item_id, task_id, **body.model_dump(exclude_unset=True)
+        )
+    except ProductionNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/production/{item_id}/tasks/{task_id}/status")
+def change_production_task_status(
+    item_id: int,
+    task_id: int,
+    body: ProductionTaskStatusBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if body.status not in TASK_STATUSES:
+        raise HTTPException(422, "Unsupported production task status.")
+    try:
+        return _production_service(store).change_task_status(
+            user_id, item_id, task_id, status=body.status, note=body.note,
+        )
+    except ProductionNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/production/{item_id}/events")
+def production_events(
+    item_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return production_item_detail(item_id, user_id, store)["events"]
 
 
 @router.get("/youtube/status")
