@@ -177,6 +177,72 @@ def test_default_account_and_trial_balances_are_fifteen(tmp_path):
     assert web_app.DEFAULT_TRIAL_TOKENS == 15
 
 
+def test_central_registration_accepts_cross_device_referral_result(monkeypatch, tmp_path):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "success": True,
+                "user_id": 82,
+                "credits": 20,
+                "is_admin": False,
+                "referral_code": "CENTRAL7",
+            }
+
+    isolated_store = Store(tmp_path / "central-referral.sqlite3")
+    verification_code = isolated_store.create_verification_code(
+        "invitee@example.com", "register",
+    )
+    posted = []
+    monkeypatch.setattr(web_app, "store", isolated_store)
+    monkeypatch.setattr(web_app, "OPEN_REGISTRATION", True)
+    monkeypatch.setattr(web_app, "USE_USER_MANAGEMENT_SERVER", True)
+    monkeypatch.setattr(web_app, "USE_LICENSE_SERVER", False)
+    monkeypatch.setattr(
+        web_app.requests, "post",
+        lambda *args, **kwargs: posted.append((args, kwargs)) or FakeResponse(),
+    )
+    monkeypatch.setattr(web_app, "_login_response", lambda user_id: {"user_id": user_id})
+
+    result = web_app.register(web_app.RegisterBody(
+        username="invitee",
+        contact_identifier="invitee@example.com",
+        password="password123",
+        verification_code=verification_code,
+        device_id="browser-device-token-referral",
+        referral_code="FRIEND5",
+    ))
+
+    invitee = isolated_store.get_user_by_id(result["user_id"])
+    assert invitee["central_user_id"] == 82
+    assert invitee["referral_code"] == "CENTRAL7"
+    assert invitee["credits"] == 20
+    assert invitee["is_admin"] == 0
+    assert posted[0][1]["json"]["referral_code"] == "FRIEND5"
+
+
+def test_default_payment_account_is_bidv():
+    payment = web_app._payment_config()
+
+    assert payment["configured"] is True
+    assert payment["bank_id"] == "BIDV"
+    assert payment["bank_name"] == "BIDV"
+    assert payment["account_number"] == "1222480305"
+    assert payment["account_name"] == "Truong Cong Dai"
+    assert "1222480305" in payment["qr_url"]
+
+
+def test_compiled_svd_worker_fails_fast_to_safe_scene_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app.sys, "frozen", True, raising=False)
+
+    with pytest.raises(RuntimeError, match="chuyển sang hiệu ứng chuyển động ảnh an toàn"):
+        web_app._generate_svd_video_isolated(
+            tmp_path / "frame.png", tmp_path / "video.mp4", "9:16", 3.0, 7,
+        )
+
+
 def test_license_admin_uses_authenticated_same_origin_facade():
     html = (web_app._REPO_ROOT / "license_server" / "static" / "admin.html").read_text(encoding="utf-8")
 

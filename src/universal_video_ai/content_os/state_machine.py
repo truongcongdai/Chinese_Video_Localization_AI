@@ -353,8 +353,12 @@ class StateMachine:
     
     @classmethod
     def is_terminal(cls, stage: WorkflowStage) -> bool:
-        """Check if a stage is terminal (no outgoing transitions)."""
-        return not cls._TRANSITIONS.get(stage, set())
+        """Check if a run has ended, even when a new run may restart it."""
+        return stage in {
+            WorkflowStage.COMPLETED,
+            WorkflowStage.CANCELLED,
+            WorkflowStage.FAILED,
+        }
     
     @classmethod
     def is_control_state(cls, stage: WorkflowStage) -> bool:

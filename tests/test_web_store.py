@@ -131,3 +131,19 @@ def test_local_user_keeps_stable_central_account_id(tmp_path: Path) -> None:
 
     store.set_central_user_id(local_id, 912)
     assert store.central_user_id(local_id) == 912
+
+
+def test_referral_bonus_is_atomic_and_only_awarded_once(tmp_path: Path) -> None:
+    store = Store(tmp_path / "referrals.sqlite3")
+    referrer_id = store.create_user("referrer", "hash", credits=15)
+    invitee_id = store.create_user(
+        "invitee", "hash", credits=15, referred_by_user_id=referrer_id,
+    )
+
+    assert store.award_referral_bonus(invitee_id, referrer_id, 5) is True
+    assert store.get_user_by_id(referrer_id)["credits"] == 20
+    assert store.get_user_by_id(invitee_id)["credits"] == 20
+
+    assert store.award_referral_bonus(invitee_id, referrer_id, 5) is False
+    assert store.get_user_by_id(referrer_id)["credits"] == 20
+    assert store.get_user_by_id(invitee_id)["credits"] == 20

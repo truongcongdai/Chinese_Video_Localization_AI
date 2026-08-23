@@ -1,6 +1,7 @@
 yt-dlp>=2026.6.9
 playwright>=1.40.0
 python-dotenv>=1.0.1
+google-genai
 demucs
 # NumPy 2.4 lazy dtype loading recurses inside Accelerate under concurrent
 # web workers. Use the CUDA wheel explicitly: installing these packages from

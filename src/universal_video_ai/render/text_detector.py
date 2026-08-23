@@ -257,7 +257,9 @@ class OnScreenTextDetector:
         """Run OCR on one frame; return list of (x0, y0, x1, y1) axis-aligned boxes."""
         reader = self._get_reader()
         try:
-            results = reader.readtext(str(frame_path))
+            # Pass in-memory bytes so image backends cannot keep a Windows file
+            # handle open and block TemporaryDirectory cleanup.
+            results = reader.readtext(frame_path.read_bytes())
         except Exception as exc:
             self.logger.warning("OCR failed on frame %s: %s", frame_path, exc)
             return []
@@ -311,7 +313,7 @@ class OnScreenTextDetector:
 
         reader = self._get_reader()
         try:
-            results = reader.readtext(str(frame_for_ocr))
+            results = reader.readtext(frame_for_ocr.read_bytes())
         except Exception as exc:
             self.logger.warning("OCR failed on frame %s: %s", frame_for_ocr, exc)
             return ""
@@ -911,9 +913,9 @@ class OnScreenTextDetector:
                 for idx in range(1, component_count):
                     cx, cy = centroids[idx]
                     x, y, box_w, box_h, area = stats[idx]
-                    if area < 10 or area > 1600:
+                    if area < 4 or area > 1600:
                         continue
-                    if box_w < 2 or box_w > 100 or box_h < 8 or box_h > 70:
+                    if box_w < 1 or box_w > 100 or box_h < 3 or box_h > 70:
                         continue
                     if (box_w / max(1, box_h)) > 6.0:
                         continue
@@ -941,12 +943,40 @@ class OnScreenTextDetector:
                         return 0.0
                     xs = [item[5] for item in line]
                     span = max(xs) - min(xs)
-                    if span < max(60.0, w * 0.12):
+                    if span < max(45.0, w * 0.06):
                         return 0.0
                     area = sum(item[4] for item in line)
-                    return (area / max(1, w * h)) * (span / max(1, w)) * len(line)
+                    crop_h, crop_w = crop.shape[:2]
+                    pixel_score = (
+                        (area / max(1, crop_w * crop_h))
+                        * (span / max(1, crop_w))
+                        * len(line)
+                    )
+                    structural_score = min(
+                        0.10, len(line) * (span / max(1, crop_w)) * 0.01,
+                    )
+                    return max(pixel_score, structural_score)
 
-                return max((subtitle_line_score(line) for line in bins.values()), default=0.0)
+                line_score = max((subtitle_line_score(line) for line in bins.values()), default=0.0)
+                if line_score > 0.0:
+                    return line_score
+
+                # Fonts with separated accents/dots can split one visual line
+                # across adjacent centroid bins. Recover only when several
+                # glyph-like components still form a wide horizontal run;
+                # a lamp or solid white rectangle remains a single component.
+                if len(components) >= 3:
+                    xs = [component[5] for component in components]
+                    span = max(xs) - min(xs)
+                    crop_h, crop_w = crop.shape[:2]
+                    if span >= max(45.0, crop_w * 0.06):
+                        area = sum(component[4] for component in components)
+                        return (
+                            (area / max(1, crop_w * crop_h))
+                            * (span / max(1, crop_w))
+                            * min(4.0, len(components) / 3.0)
+                        )
+                return 0.0
         except Exception:
             try:
                 from PIL import Image

@@ -1519,8 +1519,18 @@ class LocalizationService:
         for idx, seg, clip_path in synthesized:
             duration = self._wav_duration(clip_path)
             if duration <= 0.0:
-                self.logger.warning("Could not measure TTS segment %s; skipping it", clip_path)
-                continue
+                # A backend may return valid-but-unprobeable media in tests or
+                # on a machine with a transient ffprobe issue. Preserve the
+                # spoken segment using its source window instead of silently
+                # dropping the entire line from the dubbed track.
+                duration = seg.duration if seg.has_timing else 0.0
+                if duration <= 0.0:
+                    self.logger.warning("Could not measure TTS segment %s; skipping it", clip_path)
+                    continue
+                self.logger.warning(
+                    "Could not measure TTS segment %s; using nominal %.3fs window",
+                    clip_path, duration,
+                )
             items.append((idx, seg, clip_path, duration))
 
         clips: List[TimedAudioClip] = []

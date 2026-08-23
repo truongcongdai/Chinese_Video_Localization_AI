@@ -21,6 +21,7 @@ import bcrypt
 # Database setup
 DB_PATH = "users.db"
 DEFAULT_USER_CREDITS = 15
+REFERRAL_BONUS_CREDITS = max(0, int(os.environ.get("REFERRAL_BONUS_CREDITS", "5")))
 
 
 @dataclass
@@ -35,12 +36,16 @@ class User:
     updated_at: float
     reset_token: Optional[str] = None
     reset_token_expiry: Optional[float] = None
+    referral_code: Optional[str] = None
+    referred_by_user_id: Optional[int] = None
+    referral_rewarded_at: Optional[float] = None
 
 
 class UserRegister(BaseModel):
     username: str
     email: str
     password: str
+    referral_code: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -110,6 +115,26 @@ def init_db():
         )
     """)
 
+    existing_columns = {
+        row["name"] for row in cursor.execute("PRAGMA table_info(users)").fetchall()
+    }
+    for column, ddl in (
+        ("referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
+        ("referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
+        ("referral_rewarded_at", "ALTER TABLE users ADD COLUMN referral_rewarded_at REAL"),
+    ):
+        if column not in existing_columns:
+            cursor.execute(ddl)
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code "
+        "ON users(referral_code) WHERE referral_code IS NOT NULL"
+    )
+    for row in cursor.execute("SELECT id FROM users WHERE referral_code IS NULL").fetchall():
+        cursor.execute(
+            "UPDATE users SET referral_code = ? WHERE id = ?",
+            (_new_referral_code(conn), row["id"]),
+        )
+
     # Preserve a recoverable admin account across upgrades. Fresh central
     # installs previously created every account as a regular user even though
     # the local EXE promoted its first account.
@@ -138,6 +163,18 @@ def generate_reset_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _new_referral_code(conn: sqlite3.Connection) -> str:
+    """Generate a short global referral code without ambiguous characters."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    for _ in range(20):
+        code = "".join(secrets.choice(alphabet) for _ in range(7))
+        if not conn.execute(
+            "SELECT 1 FROM users WHERE referral_code = ?", (code,)
+        ).fetchone():
+            return code
+    return secrets.token_hex(6).upper()
+
+
 def user_from_row(row) -> User:
     """Convert database row to User dataclass"""
     return User(
@@ -150,7 +187,10 @@ def user_from_row(row) -> User:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         reset_token=row["reset_token"],
-        reset_token_expiry=row["reset_token_expiry"]
+        reset_token_expiry=row["reset_token_expiry"],
+        referral_code=row["referral_code"],
+        referred_by_user_id=row["referred_by_user_id"],
+        referral_rewarded_at=row["referral_rewarded_at"],
     )
 
 
@@ -180,31 +220,58 @@ async def register_user(user_data: UserRegister):
     if cursor.fetchone():
         conn.close()
         raise HTTPException(status_code=400, detail="Username or email already exists")
+
+    referrer_id = None
+    submitted_code = (user_data.referral_code or "").strip().upper()
+    if submitted_code:
+        referrer = cursor.execute(
+            "SELECT id FROM users WHERE referral_code = ?", (submitted_code,)
+        ).fetchone()
+        if referrer is None:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Invalid referral code")
+        referrer_id = int(referrer["id"])
     
     # Hash password
     password_hash = hash_password(user_data.password)
     
     now = datetime.now().timestamp()
+    referral_code = _new_referral_code(conn)
+    starting_credits = DEFAULT_USER_CREDITS + (
+        REFERRAL_BONUS_CREDITS if referrer_id is not None else 0
+    )
     
     try:
         cursor.execute("""
-            INSERT INTO users (username, email, password_hash, credits, is_admin, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (
+                username, email, password_hash, credits, is_admin,
+                referral_code, referred_by_user_id, referral_rewarded_at,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_data.username, user_data.email, password_hash,
-            DEFAULT_USER_CREDITS, is_first_user, now, now,
+            starting_credits, is_first_user, referral_code, referrer_id,
+            now if referrer_id is not None else None, now, now,
         ))
-        
-        conn.commit()
         user_id = cursor.lastrowid
+        if referrer_id is not None and REFERRAL_BONUS_CREDITS:
+            cursor.execute(
+                "UPDATE users SET credits = credits + ?, updated_at = ? WHERE id = ?",
+                (REFERRAL_BONUS_CREDITS, now, referrer_id),
+            )
+        conn.commit()
         conn.close()
         
         return {
             "success": True,
             "user_id": user_id,
             "message": "User registered successfully",
-            "credits": DEFAULT_USER_CREDITS,
+            "credits": starting_credits,
             "is_admin": is_first_user,
+            "referral_code": referral_code,
+            "referred_by_user_id": referrer_id,
+            "referral_bonus_credits": REFERRAL_BONUS_CREDITS if referrer_id is not None else 0,
         }
     except sqlite3.IntegrityError:
         conn.close()
@@ -235,7 +302,8 @@ async def login_user(user_data: UserLogin):
         "username": user.username,
         "email": user.email,
         "credits": user.credits,
-        "is_admin": user.is_admin
+        "is_admin": user.is_admin,
+        "referral_code": user.referral_code,
     }
 
 

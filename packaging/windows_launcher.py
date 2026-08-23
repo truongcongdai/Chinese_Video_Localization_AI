@@ -45,6 +45,9 @@ os.environ.setdefault("LOGS_DIR", str(APP_DIR / "local_data" / "logs"))
 os.environ.setdefault("COOKIE_DIR", str(APP_DIR / "local_data" / "cookies"))
 os.environ.setdefault("WEB_DB_PATH", str(APP_DIR / "local_data" / "database.sqlite3"))
 os.environ.setdefault("LICENSED_MUSIC_DIR", str(APP_DIR / "local_data" / "music"))
+bundled_browsers = APP_DIR / "playwright-browsers"
+if bundled_browsers.is_dir():
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundled_browsers))
 
 
 def main() -> None:

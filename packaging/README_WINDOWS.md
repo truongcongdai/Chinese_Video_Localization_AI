@@ -9,6 +9,8 @@
 - FFmpeg Windows 64-bit đặt tại:
   - `vendor/ffmpeg/bin/ffmpeg.exe`
   - `vendor/ffmpeg/bin/ffprobe.exe`
+- Có Internet trong lúc build để cài dependency và tải Chromium cho luồng
+  Douyin/browser. Chromium được đóng kèm vào ZIP; máy khách không cần cài riêng.
 
 Không copy `.env`, `cookies`, `local_data`, database hoặc video từ máy phát triển.
 
@@ -20,6 +22,8 @@ Mở PowerShell tại thư mục dự án:
 Set-ExecutionPolicy -Scope Process Bypass
 .\packaging\build_windows.ps1
 ```
+
+Hoặc chạy `build_nuitka.bat` ở thư mục gốc; file này gọi đúng cùng pipeline.
 
 Kết quả:
 

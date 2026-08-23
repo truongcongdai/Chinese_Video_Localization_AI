@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS users (
     oauth_id TEXT,
     referral_code TEXT,
     referred_by_user_id INTEGER,
+    referral_rewarded_at REAL,
     created_at REAL NOT NULL
 );
 
@@ -607,6 +608,7 @@ _MIGRATIONS = [
     # time, in the /api/register handler — this table just tracks the link.
     ("users", "referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
     ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
+    ("users", "referral_rewarded_at", "ALTER TABLE users ADD COLUMN referral_rewarded_at REAL"),
     # Local ids are unrelated to ids on the centralized license server.
     ("licenses", "remote_license_id", "ALTER TABLE licenses ADD COLUMN remote_license_id INTEGER"),
     ("licenses", "quota_type", "ALTER TABLE licenses ADD COLUMN quota_type TEXT NOT NULL DEFAULT 'credit'"),
@@ -1012,13 +1014,18 @@ class Store:
             self, username: str, password_hash: str, is_admin: bool = False,
             credits: int = 15, email: Optional[str] = None, phone: Optional[str] = None,
             referred_by_user_id: Optional[int] = None, central_user_id: Optional[int] = None,
+            referral_code: Optional[str] = None,
     ) -> int:
         with self._connect() as conn:
+            canonical_referral_code = (
+                referral_code.strip().upper() if referral_code and referral_code.strip()
+                else self._new_referral_code(conn)
+            )
             cur = conn.execute(
                 "INSERT INTO users (central_user_id, username, password_hash, credits, is_admin, email, phone, "
                 "referral_code, referred_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (central_user_id, username, password_hash, credits, int(is_admin), email, phone,
-                 self._new_referral_code(conn), referred_by_user_id, time.time()),
+                 canonical_referral_code, referred_by_user_id, time.time()),
             )
             return cur.lastrowid
 
@@ -1037,6 +1044,51 @@ class Store:
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM users WHERE referral_code = ?", (code.strip().upper(),))
             return cur.fetchone()
+
+    def set_referral_code(self, user_id: int, referral_code: str) -> None:
+        canonical = str(referral_code or "").strip().upper()
+        if not canonical:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET referral_code = ? WHERE id = ?",
+                (canonical, int(user_id)),
+            )
+
+    def award_referral_bonus(self, invitee_id: int, referrer_id: int, bonus: int) -> bool:
+        """Atomically grant a referral bonus to both users exactly once.
+
+        The marker lives on the invitee because one account can only be
+        referred once, while a referrer can legitimately invite many users.
+        """
+        if bonus <= 0 or int(invitee_id) == int(referrer_id):
+            return False
+        with self._connect() as conn:
+            # Serialize competing registrations before inspecting the marker.
+            conn.execute("BEGIN IMMEDIATE")
+            invitee = conn.execute(
+                "SELECT referred_by_user_id, referral_rewarded_at FROM users WHERE id = ?",
+                (int(invitee_id),),
+            ).fetchone()
+            referrer = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (int(referrer_id),)
+            ).fetchone()
+            if (
+                invitee is None
+                or referrer is None
+                or invitee["referred_by_user_id"] != int(referrer_id)
+                or invitee["referral_rewarded_at"] is not None
+            ):
+                return False
+            conn.execute(
+                "UPDATE users SET credits = credits + ?, referral_rewarded_at = ? WHERE id = ?",
+                (int(bonus), time.time(), int(invitee_id)),
+            )
+            conn.execute(
+                "UPDATE users SET credits = credits + ? WHERE id = ?",
+                (int(bonus), int(referrer_id)),
+            )
+            return True
 
     def create_user_oauth(
             self, username: str, oauth_provider: str, oauth_id: str,

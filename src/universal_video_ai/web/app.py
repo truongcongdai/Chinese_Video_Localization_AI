@@ -523,6 +523,8 @@ def _sync_central_account(user_id: int, *, force: bool = False) -> None:
             store.set_credits(user_id, max(0, int(account["credits"])))
         if account.get("is_admin") is not None:
             store.set_admin(user_id, bool(account["is_admin"]))
+        if account.get("referral_code"):
+            store.set_referral_code(user_id, str(account["referral_code"]))
     except (requests.RequestException, TypeError, ValueError) as exc:
         logger.debug("Central account refresh deferred for user %s: %s", user_id, exc)
 
@@ -531,6 +533,18 @@ def _adjust_user_credits(user_id: int, delta: int) -> int:
     new_balance = store.adjust_credits(user_id, delta)
     _mirror_user_credit_delta(user_id, delta)
     return new_balance
+
+
+def _award_referral_bonus(invitee_id: int, referrer_id: int) -> bool:
+    """Grant the configured bonus to both accounts exactly once locally."""
+    awarded = store.award_referral_bonus(
+        invitee_id, referrer_id, REFERRAL_BONUS_CREDITS,
+    )
+    if awarded:
+        # Mirror only after the local idempotency transaction commits.
+        _mirror_user_credit_delta(invitee_id, REFERRAL_BONUS_CREDITS)
+        _mirror_user_credit_delta(referrer_id, REFERRAL_BONUS_CREDITS)
+    return awarded
 
 
 def _set_user_credits(user_id: int, value: int) -> None:
@@ -815,7 +829,7 @@ ALLOW_SHARED_SOCIAL_CREDENTIALS = os.environ.get(
 # Credits granted to BOTH the new user and whoever invited them, when
 # registering with a valid ?ref= referral code. Set to 0 to disable bonuses
 # while keeping the referral tracking itself.
-REFERRAL_BONUS_CREDITS = int(os.environ.get("REFERRAL_BONUS_CREDITS", "20"))
+REFERRAL_BONUS_CREDITS = max(0, int(os.environ.get("REFERRAL_BONUS_CREDITS", "5")))
 
 _LOGO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "logos"
 _LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1203,10 +1217,10 @@ def _parse_fractional_boxes_env(name: str) -> Tuple[Tuple[float, float, float, f
 
 
 def _payment_config(amount_vnd: int = 0, transfer_content: str = "") -> Dict[str, Any]:
-    bank_id = _env_first("PAYMENT_BANK_ID", "BANK_ID", "BANK_BIN")
-    account_number = _env_first("PAYMENT_ACCOUNT_NUMBER", "BANK_ACCOUNT_NUMBER")
-    account_name = _env_first("PAYMENT_ACCOUNT_NAME", "BANK_ACCOUNT_NAME")
-    bank_name = _env_first("PAYMENT_BANK_NAME", "BANK_NAME") or bank_id
+    bank_id = _env_first("PAYMENT_BANK_ID", "BANK_ID", "BANK_BIN") or "BIDV"
+    account_number = _env_first("PAYMENT_ACCOUNT_NUMBER", "BANK_ACCOUNT_NUMBER") or "1222480305"
+    account_name = _env_first("PAYMENT_ACCOUNT_NAME", "BANK_ACCOUNT_NAME") or "Truong Cong Dai"
+    bank_name = _env_first("PAYMENT_BANK_NAME", "BANK_NAME") or "BIDV"
     explicit_qr = _env_first("PAYMENT_QR_URL")
     qr_url = explicit_qr
     if not qr_url and bank_id and account_number:
@@ -1559,6 +1573,13 @@ def register(body: RegisterBody, request: Request = None):
             "Thiết bị này đã nhận tài khoản dùng thử. Hãy đăng nhập tài khoản cũ hoặc liên hệ admin.",
         )
 
+    submitted_referral_code = (body.referral_code or "").strip().upper()
+    referrer = None
+    if submitted_referral_code and not USE_USER_MANAGEMENT_SERVER:
+        referrer = store.get_user_by_referral_code(submitted_referral_code)
+        if referrer is None:
+            raise HTTPException(400, "Mã giới thiệu không hợp lệ")
+
     success, error = store.verify_code(value, body.verification_code, "register")
     if not success:
         raise HTTPException(400, error or "Mã xác minh không hợp lệ")
@@ -1571,7 +1592,8 @@ def register(body: RegisterBody, request: Request = None):
                 json={
                     "username": body.username.strip(),
                     "email": value,
-                    "password": body.password
+                    "password": body.password,
+                    "referral_code": submitted_referral_code or None,
                 },
                 timeout=10
             )
@@ -1583,12 +1605,16 @@ def register(body: RegisterBody, request: Request = None):
                 user_id = store.create_user(
                     username,
                     hash_password(body.password),
-                    is_admin=is_first_user or bool(data.get("is_admin", False)),
-                    credits=10_000 if is_first_user else data.get("credits", DEFAULT_USER_CREDITS),
+                    # In central-account mode the server is authoritative.
+                    # A fresh EXE database must not turn its first cached user
+                    # into an admin or grant 10,000 local credits.
+                    is_admin=bool(data.get("is_admin", False)),
+                    credits=data.get("credits", DEFAULT_USER_CREDITS),
                     email=value,
                     phone=None,
                     referred_by_user_id=None,
                     central_user_id=data.get("user_id"),
+                    referral_code=data.get("referral_code"),
                 )
                 if not store.claim_registration_device(user_id, device_hash, fingerprint_hash):
                     raise HTTPException(409, "Thiết bị này đã được dùng để đăng ký tài khoản khác")
@@ -1604,12 +1630,6 @@ def register(body: RegisterBody, request: Request = None):
     email = value if kind == "email" else None
     phone = value if kind == "phone" else None
 
-    referrer = None
-    if body.referral_code and body.referral_code.strip():
-        referrer = store.get_user_by_referral_code(body.referral_code.strip())
-        if referrer is None:
-            raise HTTPException(400, "Mã giới thiệu không hợp lệ")
-
     user_id = store.create_user(
         username, hash_password(body.password),
         is_admin=is_first_user, credits=10_000 if is_first_user else DEFAULT_USER_CREDITS,
@@ -1619,12 +1639,7 @@ def register(body: RegisterBody, request: Request = None):
     if not store.claim_registration_device(user_id, device_hash, fingerprint_hash):
         raise HTTPException(409, "Thiết bị này đã được dùng để đăng ký tài khoản khác")
     if referrer is not None:
-        # Both sides get a bonus — the invitee starts with extra credit
-        # instead of the usual 10, and the person who invited them gets
-        # rewarded too, same moment their friend actually signs up (not
-        # requiring the friend to do anything further first).
-        _adjust_user_credits(user_id, REFERRAL_BONUS_CREDITS)
-        _adjust_user_credits(referrer["id"], REFERRAL_BONUS_CREDITS)
+        _award_referral_bonus(user_id, int(referrer["id"]))
     
     # Create the standard free trial when using the license server.
     _ensure_registration_trial(user_id)
@@ -1641,6 +1656,7 @@ def bootstrap():
         "needs_registration": not store.any_users_exist(),
         "open_registration": OPEN_REGISTRATION,
         "job_cost_credits": JOB_COST_CREDITS,
+        "referral_bonus_credits": REFERRAL_BONUS_CREDITS,
         "use_license_server": USE_LICENSE_SERVER,
         "license_server_url": LICENSE_SERVER_URL if USE_LICENSE_SERVER else None,
         "use_user_management_server": USE_USER_MANAGEMENT_SERVER,
@@ -1688,6 +1704,7 @@ def login(body: LoginBody, request: Request = None):
                         phone=None,
                         referred_by_user_id=None,
                         central_user_id=data.get("user_id"),
+                        referral_code=data.get("referral_code"),
                     )
                 else:
                     user_id = local_user["id"]
@@ -1700,6 +1717,8 @@ def login(body: LoginBody, request: Request = None):
                 store.set_admin(user_id, bool(data.get("is_admin", False)))
                 if data.get("credits") is not None:
                     store.set_credits(user_id, int(data["credits"]))
+                if data.get("referral_code"):
+                    store.set_referral_code(user_id, str(data["referral_code"]))
                 _ensure_registration_trial(user_id)
                 _record_login_device(user_id, body.device_id, request)
                 
@@ -2034,12 +2053,11 @@ def _build_service_for_job(job):
         translation_model = getattr(job, "translation_model", None) or ""
         translation_base_url = None
 
-    # Contextual adaptation is a quality pass, not a hard prerequisite for a
-    # usable localization. Keep fallback enabled by default even for Gemini;
-    # strict failure remains opt-in for debugging/QA.
+    # An explicitly selected paid Gemini mode must not silently downgrade to
+    # another translation path. Other contextual modes retain their fallback.
     strict_translation_adapter = (
         translation_provider == "gemini"
-        and _env_bool("STRICT_TRANSLATION_ADAPTER", False)
+        and _env_bool("STRICT_TRANSLATION_ADAPTER", True)
     )
     translation_adaptation = AdaptationConfig(
         enabled=use_contextual_translation,
@@ -4247,7 +4265,18 @@ def _generate_svd_video_isolated(
         story_seed: int,
 ) -> Path:
     """Run low-VRAM SVD out-of-process so a CUDA/native crash cannot kill web."""
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        # A standalone executable cannot execute a loose Python worker via
+        # ``sys.executable worker.py``: it would launch a second web server and
+        # wait until timeout. Fail fast so the caller's existing keyframe
+        # fallback completes the scene instead of hanging the EXE.
+        raise RuntimeError(
+            "SVD worker tách tiến trình chưa khả dụng trong bản EXE; "
+            "đang chuyển sang hiệu ứng chuyển động ảnh an toàn"
+        )
     worker = _REPO_ROOT / "scripts" / "svd_worker.py"
+    if not worker.is_file():
+        raise RuntimeError(f"Không tìm thấy SVD worker: {worker}")
     timeout = max(180, int(_env_first("SVD_WORKER_TIMEOUT_SECONDS") or "1800"))
     command = [
         sys.executable, str(worker),

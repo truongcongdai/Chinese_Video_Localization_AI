@@ -404,6 +404,18 @@ class Renderer:
                 else:
                     cleanup_end = max(cleanup_end, overlay.end)
 
+            # For a continuous learned subtitle band, bridge only the inner
+            # cue boundary. Do not let the first/last cue's cleanup leak into
+            # unrelated footage outside the band.
+            if previous is None and following is not None:
+                _next_overlay, next_region = following
+                if next_region.cluster_id == region.cluster_id and region.cluster_id >= 0:
+                    cleanup_start = overlay.start
+            if following is None and previous is not None:
+                _previous_overlay, previous_region = previous
+                if previous_region.cluster_id == region.cluster_id and region.cluster_id >= 0:
+                    cleanup_end = overlay.end
+
             cleanup_enable_expr = f"between(t\\,{cleanup_start:.3f}\\,{cleanup_end:.3f})"
             font_path = overlay.font_path or self.config.default_overlay_font_path
             font_clause = f"fontfile='{font_path}':" if font_path else ""
@@ -445,7 +457,10 @@ class Renderer:
                     # dark rectangles seen when cleanup padding is substantial.
                     if (
                             veil_opacity > 0.0
-                            and region.confidence >= self.config.adaptive_text_residual_veil_min_confidence
+                            and (
+                                region.confidence >= self.config.adaptive_text_residual_veil_min_confidence
+                                or veil_opacity >= 0.50
+                            )
                             and veil_area_ratio <= self.config.adaptive_text_residual_veil_max_frame_area_ratio
                     ):
                         filters.append(
@@ -485,7 +500,10 @@ class Renderer:
                 box_width = min(box_width, frame_w)
                 box_x = max(0, min(box_x, frame_w - box_width))
 
-            if self.config.adaptive_text_drawbox_enabled:
+            if self.config.adaptive_text_drawbox_enabled or not (frame_w and frame_h):
+                # Without frame dimensions adaptive delogo cannot be built;
+                # retain the opaque cover so the original subtitle does not
+                # remain visible underneath the translation.
                 filters.append(
                     f"drawbox=x={box_x}:y={region.y}:w={box_width}:h={region.height}"
                     f":color={overlay.box_color}@1.0:t=fill:enable='{cleanup_enable_expr}'"

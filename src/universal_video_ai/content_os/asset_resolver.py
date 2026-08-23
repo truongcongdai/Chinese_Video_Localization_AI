@@ -225,6 +225,7 @@ class AssetResolver:
     def _video_prompt(self, description: str) -> str:
         text = clean_text(description) or "A human using an AI learning tool on a smartphone"
         return (
+            f"SEMANTIC ANCHOR — preserve exactly: {text}; do not replace them with different subjects, objects, counts, or actions.\n"
             f"{text}\n"
             "Create a coherent portrait 9:16 cinematic video scene. Show a real human subject performing a clear action, "
             "with natural micro-expressions, hand movement, eye movement, breathing, and believable interaction with objects. "

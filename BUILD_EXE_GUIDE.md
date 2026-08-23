@@ -91,15 +91,13 @@ Project này có thể đóng gói thành file .exe để chạy trên Windows m
    build_nuitka.bat
    ```
 4. Chờ quá trình build (20-60 phút, lâu hơn PyInstaller)
-5. File exe sẽ là `ChineseVideoLocalizationAI.exe` trong thư mục hiện tại
+5. Bản phát hành sẽ là `build\windows\ChineseVideoAI-Windows-x64.zip`
 
 #### Bước 3: Cấu hình
 
-1. Rename file env:
-   ```cmd
-   ren ChineseVideoLocalizationAI.env .env
-   ```
-2. Mở file .env và cấu hình:
+1. Giải nén ZIP và chạy `Start ChineseVideoAI.bat`.
+2. Lần đầu chạy, ứng dụng tự tạo `.env` cùng session secret an toàn. Có thể mở
+   file này để bổ sung API key nếu cần:
    ```env
    WEB_SESSION_SECRET=your-secret-key-here
    WEB_HOST=127.0.0.1

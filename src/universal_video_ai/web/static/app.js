@@ -84,6 +84,7 @@ function registrationDeviceId() {
 async function initAuth() {
   const boot = await api("/api/bootstrap");
   bootstrapConfig = boot;
+  $("#referral-bonus-amount").textContent = String(boot.referral_bonus_credits ?? 5);
   needsRegistrationGlobal = boot.needs_registration;
 
   if (needsRegistrationGlobal) {

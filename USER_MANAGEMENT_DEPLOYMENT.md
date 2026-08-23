@@ -37,7 +37,7 @@ sudo cp /tmp/user_management_server.service /etc/systemd/system/
 # Enable và start service
 sudo systemctl daemon-reload
 sudo systemctl enable user-management-server
-sudo systemctl start user-management-server
+sudo systemctl restart user-management-server
 
 # Check status
 sudo systemctl status user-management-server
@@ -63,9 +63,14 @@ Content-Type: application/json
 {
   "username": "testuser",
   "email": "test@example.com",
-  "password": "password123"
+  "password": "password123",
+  "referral_code": "ABCDEFG"
 }
 ```
+
+`referral_code` là tùy chọn. Khi hợp lệ, server cộng mặc định 5 credit cho cả
+người mời và người đăng ký trong cùng một transaction. Có thể cấu hình bằng
+`REFERRAL_BONUS_CREDITS`; nên giữ giá trị này là `5` trên cả server và EXE.
 
 ### User Login
 ```http
