@@ -2176,6 +2176,9 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             "not enough disk space",
             "Douyin yêu cầu cookie mới",
             "Fresh cookies (not necessarily logged in) are needed",
+            # Request-level translation retries already use provider-aware
+            # backoff. Retrying the whole job repeats Demucs/Whisper/OCR.
+            "Translation backend batch failed",
         )
     )
 

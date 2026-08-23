@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+import email.utils
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Protocol
 
 __all__ = [
@@ -153,9 +155,12 @@ class TranslatorFactory:
                         timeout = httpx.Timeout(30.0, connect=12.0)
                         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
                         self._direct_client = httpx.AsyncClient(timeout=timeout, limits=limits)
-                    response = await self._direct_client.get(
+                    # POST keeps long subtitle batches out of the URL.  The
+                    # previous GET requests were several KB long and were
+                    # much more likely to be throttled by Google/proxies.
+                    response = await self._direct_client.post(
                         "https://translate.googleapis.com/translate_a/single",
-                        params={
+                        data={
                             "client": "gtx",
                             "sl": src or "auto",
                             "tl": dest,
@@ -174,23 +179,44 @@ class TranslatorFactory:
                         raise TranslationError("Google returned an empty translation")
                     return translated
 
+                @staticmethod
+                def _retry_delay(exc: Exception, attempt: int) -> float:
+                    """Return a provider-friendly delay, honoring Retry-After."""
+                    response = getattr(exc, "response", None)
+                    value = response.headers.get("Retry-After") if response is not None else None
+                    if value:
+                        try:
+                            return max(0.0, min(float(value), 60.0))
+                        except (TypeError, ValueError, OverflowError):
+                            try:
+                                retry_at = email.utils.parsedate_to_datetime(value)
+                                if retry_at.tzinfo is None:
+                                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                                return max(0.0, min((retry_at - datetime.now(timezone.utc)).total_seconds(), 60.0))
+                            except (TypeError, ValueError, OverflowError):
+                                pass
+                    # A sub-second retry loop only reinforces HTTP 429.  Use
+                    # a bounded exponential delay for all transient failures.
+                    return min(2.0 * (2 ** attempt), 30.0)
+
                 async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
                     dest = dest_lang or self.cfg.dest_lang or "en"
                     src = src_lang or self.cfg.src_lang or None
                     last_error: Optional[Exception] = None
-                    for attempt in range(3):
+                    attempts = 4
+                    for attempt in range(attempts):
                         try:
                             return await self._translate_direct(text, src, dest)
                         except Exception as exc:  # pragma: no cover - external service
                             last_error = exc
                             self.logger.warning(
-                                "Google translation attempt %d/3 failed: %s",
-                                attempt + 1, type(exc).__name__,
+                                "Google translation attempt %d/%d failed: %s",
+                                attempt + 1, attempts, type(exc).__name__,
                             )
-                            if attempt < 2:
-                                await asyncio.sleep(0.5 * (2 ** attempt))
+                            if attempt < attempts - 1:
+                                await asyncio.sleep(self._retry_delay(exc, attempt))
                     raise TranslationError(
-                        f"Google translation failed after 3 attempts: {last_error}"
+                        f"Google translation failed after {attempts} attempts: {last_error}"
                     ) from last_error
 
                 async def translate_batch(
@@ -221,7 +247,9 @@ class TranslatorFactory:
 
                     for text in texts:
                         extra = len(text) + (len(separator) if batch else 0)
-                        if batch and (len(batch) >= 25 or batch_chars + extra > 3000):
+                        # Conservative batches are less likely to trip the
+                        # unauthenticated endpoint's URL/content heuristics.
+                        if batch and (len(batch) >= 10 or batch_chars + extra > 1000):
                             await flush()
                         batch.append(text)
                         batch_chars += extra

@@ -1,6 +1,8 @@
 # tests/test_translate.py
 import asyncio
 
+import httpx
+
 from universal_video_ai.translate import (
     TranslatorConfig,
     TranslatorFactory,
@@ -39,3 +41,39 @@ def test_factory_unknown_provider_raises():
         assert False, "Expected ValueError for unknown provider"
     except ValueError:
         pass
+
+
+def test_google_retry_delay_honors_retry_after():
+    translator = TranslatorFactory.create(TranslatorConfig(provider="google"))
+    request = httpx.Request("POST", "https://translate.googleapis.com")
+    response = httpx.Response(429, headers={"Retry-After": "7"}, request=request)
+    error = httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    assert translator._retry_delay(error, 0) == 7.0
+
+
+def test_google_translation_uses_post_and_small_batches():
+    translator = TranslatorFactory.create(TranslatorConfig(provider="google"))
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, data):
+            self.calls.append((url, data))
+            separator = "\n[[[UVAI_SEG_BREAK]]]\n"
+            translated = separator.join(f"vi:{part}" for part in data["q"].split(separator))
+            return httpx.Response(
+                200,
+                json=[[[translated, None, None, None]]],
+                request=httpx.Request("POST", url),
+            )
+
+    client = FakeClient()
+    translator._direct_client = client
+    result = asyncio.run(translator.translate_batch([f"line {i}" for i in range(21)], "zh", "vi"))
+
+    assert result == [f"vi:line {i}" for i in range(21)]
+    sizes = [len(call[1]["q"].split("[[[UVAI_SEG_BREAK]]]")) for call in client.calls]
+    assert sizes == [10, 10, 1]
+    assert all(len(call[1]["q"]) <= 1000 for call in client.calls)
