@@ -168,6 +168,16 @@ def test_missing_secretstorage_is_not_retried():
     assert _is_non_retryable_job_error(error) is True
 
 
+def test_nested_translation_rate_limit_does_not_retry_full_job():
+    try:
+        try:
+            raise RuntimeError("Google translation rate limited (HTTP 429). Retry later")
+        except RuntimeError as provider_error:
+            raise RuntimeError("Translation backend batch failed") from provider_error
+    except RuntimeError as error:
+        assert _is_non_retryable_job_error(error) is True
+
+
 def test_extract_video_url_from_douyin_share_text():
     share_text = (
         "3.07 04/08 :9pm t@r.EH qRk:/ 《狂飙》深度解析78：笑着倒醋，转身开枪！"

@@ -20,6 +20,7 @@ from .translator import (
     TranslatorFactory,
     NoOpTranslator,
     TranslationError,
+    TranslationRateLimitError,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "TranslatorFactory",
     "NoOpTranslator",
     "TranslationError",
+    "TranslationRateLimitError",
 ]

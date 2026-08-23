@@ -591,3 +591,84 @@ def test_ass_karaoke_can_be_centered_in_ocr_box_with_one_font_size():
     assert r"\an5\pos(540,920)" in ass
     assert r"\an5\pos(540,930)" in ass
     assert r"\kf" in ass
+
+
+def test_direct_gemini_translation_preserves_source_timing(monkeypatch):
+    source = [
+        TranscriptSegment(start=0.0, end=1.2, text="source one"),
+        TranscriptSegment(start=1.2, end=2.8, text="source two"),
+        TranscriptSegment(start=2.8, end=4.0, text="source three"),
+    ]
+    captured = {}
+    adapter = SegmentAdapter(AdaptationConfig(
+        enabled=True,
+        provider="gemini",
+        api_key="test-key",
+        mode="gemini",
+    ))
+
+    def fake_gemini(source_segments, draft_segments, source_lang, target_lang):
+        captured["drafts"] = [segment.text for segment in draft_segments]
+        captured["languages"] = (source_lang, target_lang)
+        return ["ban mot", "ban hai", "ban ba"]
+
+    monkeypatch.setattr(adapter, "_adapt_with_gemini", fake_gemini)
+    result = asyncio.run(adapter.translate_source_segments(source, "auto", "vi"))
+
+    assert captured["drafts"] == ["", "", ""]
+    assert captured["languages"] == ("auto", "vi")
+    assert [(segment.start, segment.end) for segment in result] == [
+        (0.0, 1.2), (1.2, 2.8), (2.8, 4.0)
+    ]
+    assert [segment.text for segment in result] == ["ban mot", "ban hai", "ban ba"]
+
+
+def test_gemini_batches_resume_from_persistent_checkpoint(monkeypatch):
+    class FakeCache:
+        def __init__(self):
+            self.values = {}
+
+        def make_key(self, prefix, *parts):
+            return "|".join((prefix, *parts))
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, ttl_seconds=0):
+            self.values[key] = value
+            return True
+
+    source = [
+        TranscriptSegment(start=float(index), end=float(index + 1), text=f"source {index}")
+        for index in range(49)
+    ]
+    drafts = [
+        TranscriptSegment(start=segment.start, end=segment.end, text="")
+        for segment in source
+    ]
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test-key",
+            mode="gemini",
+            gemini_batch_size=24,
+            fallback_on_error=False,
+        ),
+        cache=FakeCache(),
+    )
+    calls = []
+
+    def fake_request(source_batch, draft_batch, source_lang, target_lang, *, label):
+        calls.append(label)
+        return [f"vi {segment.text}" for segment in source_batch]
+
+    monkeypatch.setattr(adapter, "_request_gemini_with_retries", fake_request)
+    first = adapter._adapt_with_gemini(source, drafts, "auto", "vi")
+    assert len(calls) == 3
+
+    calls.clear()
+    second = adapter._adapt_with_gemini(source, drafts, "auto", "vi")
+
+    assert calls == []
+    assert second == first

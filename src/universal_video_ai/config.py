@@ -25,7 +25,7 @@ except ImportError:
     # crashing the whole import.
     pass
 
-from universal_video_ai.cache import RedisCache
+from universal_video_ai.cache import RedisCache, SQLiteCache
 
 def _local_path_from_env(name: str, default: str) -> Path:
     """Resolve local storage settings consistently for Docker and local runs.
@@ -51,6 +51,19 @@ for directory in (
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 cache = RedisCache(url=REDIS_URL, fallback=True)
+TRANSLATION_CACHE_PATH = _local_path_from_env(
+    "TRANSLATION_CACHE_PATH", "local_data/temp/translation_cache.sqlite3"
+)
+translation_cache = SQLiteCache(TRANSLATION_CACHE_PATH)
+SPEECH_CACHE_PATH = _local_path_from_env(
+    "SPEECH_CACHE_PATH", "local_data/temp/speech_cache.sqlite3"
+)
+speech_cache = SQLiteCache(SPEECH_CACHE_PATH)
+DEMUCS_CACHE_DIR = _local_path_from_env(
+    "DEMUCS_CACHE_DIR", "local_data/temp/demucs_cache"
+)
+DEMUCS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

@@ -20,15 +20,24 @@ class TranslateService:
     """Service layer for translation operations."""
 
     backend: Optional[TranslateBackend] = None
-    cache: Optional[object] = None  # RedisCache
+    cache: Optional[object] = None
     logger: Optional[logging.Logger] = None
     max_concurrency: int = 5
+    batch_checkpoint_size: int = 80
 
     def __post_init__(self) -> None:
         if self.logger is None:
             self.logger = _logger
         self.logger.debug("TranslateService initialized backend=%s",
                           type(self.backend).__name__ if self.backend else None)
+
+    def _cache_key(self, source_lang: str, target_lang: str, text: str) -> str:
+        provider = getattr(self.backend, "provider", type(self.backend).__name__)
+        if self.cache is None:
+            return "\0".join((str(provider), source_lang, target_lang, text))
+        return self.cache.make_key(
+            "translate-v2", str(provider), source_lang, target_lang, text
+        )
 
     async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """
@@ -43,7 +52,7 @@ class TranslateService:
 
         # Check cache first
         if self.cache:
-            cache_key = self.cache.make_key("translate", source_lang, target_lang, text[:50])
+            cache_key = self._cache_key(source_lang, target_lang, text)
             cached_result = self.cache.get(cache_key)
             if cached_result is not None:
                 self.logger.debug("Translation cache HIT for %s->%s", source_lang, target_lang)
@@ -55,7 +64,7 @@ class TranslateService:
 
             # Cache result
             if self.cache:
-                cache_key = self.cache.make_key("translate", source_lang, target_lang, text[:50])
+                cache_key = self._cache_key(source_lang, target_lang, text)
                 self.cache.set(cache_key, result, ttl_seconds=86400 * 7)  # 7 days
 
             return result
@@ -103,13 +112,53 @@ class TranslateService:
             self.logger.info(
                 "TranslateService: using batched translation for %d segments", len(segments)
             )
-            translated_texts = await batch_method(
-                [segment.text for segment in segments], source_lang, target_lang
-            )
-            if len(translated_texts) != len(segments):
-                raise TranslationFailed(
-                    f"Translation backend returned {len(translated_texts)} results for {len(segments)} segments"
+            translated_texts: list[Optional[str]] = [None] * len(segments)
+            pending: dict[str, tuple[str, list[int]]] = {}
+            cache_hits = 0
+
+            for index, segment in enumerate(segments):
+                key = self._cache_key(source_lang, target_lang, segment.text)
+                cached = self.cache.get(key) if self.cache else None
+                if isinstance(cached, str):
+                    translated_texts[index] = cached
+                    cache_hits += 1
+                    continue
+                if key not in pending:
+                    pending[key] = (segment.text, [])
+                pending[key][1].append(index)
+
+            if cache_hits:
+                self.logger.info(
+                    "TranslateService: resumed %d/%d segment(s) from persistent cache",
+                    cache_hits, len(segments),
                 )
+
+            pending_items = list(pending.items())
+            checkpoint_size = max(1, int(self.batch_checkpoint_size or 1))
+            for start in range(0, len(pending_items), checkpoint_size):
+                checkpoint = pending_items[start:start + checkpoint_size]
+                checkpoint_texts = [item[1][0] for item in checkpoint]
+                checkpoint_results = await batch_method(
+                    checkpoint_texts, source_lang, target_lang
+                )
+                if len(checkpoint_results) != len(checkpoint):
+                    raise TranslationFailed(
+                        "Translation backend returned "
+                        f"{len(checkpoint_results)} results for {len(checkpoint)} segments"
+                    )
+                for (key, (_, indexes)), translated in zip(checkpoint, checkpoint_results):
+                    for index in indexes:
+                        translated_texts[index] = translated
+                    if self.cache:
+                        self.cache.set(key, translated, ttl_seconds=86400 * 30)
+                self.logger.info(
+                    "TranslateService: translation checkpoint %d/%d saved",
+                    min(start + len(checkpoint), len(pending_items)),
+                    len(pending_items),
+                )
+
+            if any(text is None for text in translated_texts):
+                raise TranslationFailed("Translation backend left one or more segments untranslated")
             return [
                 TranscriptSegment(start=seg.start, end=seg.end, text=translated_text)
                 for seg, translated_text in zip(segments, translated_texts)

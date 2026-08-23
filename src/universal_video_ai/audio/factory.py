@@ -86,7 +86,7 @@ def create_audio_pipeline(
             from universal_video_ai.speech.backend import WhisperBackend
             from universal_video_ai.speech.whisper import WhisperConfig
             from universal_video_ai.speech.service import SpeechService
-            from universal_video_ai.config import cache as shared_cache
+            from universal_video_ai.config import speech_cache
 
             # ``auto`` is portable across GPU workers and CPU-only machines;
             # operators can still force a device for diagnostics.
@@ -102,7 +102,7 @@ def create_audio_pipeline(
             backend = WhisperBackend(config=backend_config, logger=logger)
             speech_service = SpeechService(
                 backend=backend,
-                cache=shared_cache,
+                cache=speech_cache,
                 logger=logger,
             )
             logger.info(
@@ -112,6 +112,10 @@ def create_audio_pipeline(
             )
         except Exception as exc:
             logger.warning("Failed to construct SpeechService with WhisperBackend: %s", exc)
+
+    if run_demucs and demucs_output_dir is None:
+        from universal_video_ai.config import DEMUCS_CACHE_DIR
+        demucs_output_dir = DEMUCS_CACHE_DIR
 
     # Create pipeline config
     config = AudioPipelineConfig(

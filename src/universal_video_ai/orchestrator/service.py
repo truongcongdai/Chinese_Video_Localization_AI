@@ -600,14 +600,33 @@ class LocalizationService:
                 target_lang = effective_target_language
                 try:
                     if audio_source_segments:
-                        self.logger.info(
-                            "LocalizationService: translating %d timed segments to %s",
-                            len(audio_source_segments), target_lang,
+                        adapter_config = getattr(self.segment_adapter, "config", None)
+                        adapter_provider = str(getattr(adapter_config, "provider", "")).strip().lower()
+                        adapter_mode = str(getattr(adapter_config, "mode", "")).strip().lower()
+                        direct_llm_translation = (
+                            self.segment_adapter is not None
+                            and adapter_mode == "gemini"
+                            and adapter_provider == "gemini"
                         )
-                        translated_segments = await self.translate_service.translate_segments(
-                            audio_source_segments, source_lang=source_lang, target_lang=target_lang
-                        )
-                        if self.segment_adapter is not None:
+                        if direct_llm_translation:
+                            self.logger.info(
+                                "LocalizationService: translating %d timed segments directly with Gemini to %s",
+                                len(audio_source_segments), target_lang,
+                            )
+                            translated_segments = await self.segment_adapter.translate_source_segments(
+                                audio_source_segments,
+                                source_lang=source_lang,
+                                target_lang=target_lang,
+                            )
+                        else:
+                            self.logger.info(
+                                "LocalizationService: translating %d timed segments to %s",
+                                len(audio_source_segments), target_lang,
+                            )
+                            translated_segments = await self.translate_service.translate_segments(
+                                audio_source_segments, source_lang=source_lang, target_lang=target_lang
+                            )
+                        if self.segment_adapter is not None and not direct_llm_translation:
                             adapter_config = getattr(self.segment_adapter, "config", None)
                             adapter_provider = getattr(adapter_config, "provider", "LLM")
                             adapter_model = getattr(adapter_config, "model", "")

@@ -33,8 +33,10 @@ class AdaptationConfig:
     request_timeout_seconds: int = 90
     ollama_num_ctx: int = 8192
     ollama_num_predict: int = 0
-    gemini_retry_count: int = 2
-    gemini_batch_size: int = 24
+    gemini_retry_count: int = 4
+    gemini_batch_size: int = 48
+    gemini_min_interval_seconds: int = 4
+    gemini_rate_limit_retry_seconds: int = 15
     gemini_debug_dir: Optional[str] = None
 
 
@@ -45,11 +47,14 @@ class SegmentAdapter:
         logger: Optional[logging.Logger] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
+        cache: Optional[object] = None,
     ) -> None:
         self.config = config
         self.logger = logger or _logger
         self.progress_callback = progress_callback
         self.cancellation_checker = cancellation_checker
+        self.cache = cache
+        self._last_gemini_request_at = 0.0
 
     def _raise_if_cancelled(self) -> None:
         if self.cancellation_checker and self.cancellation_checker():
@@ -58,6 +63,60 @@ class SegmentAdapter:
     def _report_progress(self, done: int, total: int, label: str) -> None:
         if self.progress_callback:
             self.progress_callback(done, total, label)
+
+    async def translate_source_segments(
+        self,
+        source_segments: list[TranscriptSegment],
+        source_lang: str,
+        target_lang: str,
+    ) -> list[TranscriptSegment]:
+        """Translate source cues directly with the configured LLM provider."""
+        if not self.config.enabled or not source_segments:
+            return source_segments
+
+        draft_segments = [
+            TranscriptSegment(start=segment.start, end=segment.end, text="")
+            for segment in source_segments
+        ]
+        provider = (self.config.provider or "").strip().lower()
+        try:
+            if provider == "openai" and self.config.api_key:
+                translated_texts = await asyncio.to_thread(
+                    self._adapt_with_openai,
+                    source_segments, draft_segments, source_lang, target_lang,
+                )
+            elif provider == "gemini" and self.config.api_key:
+                translated_texts = await asyncio.to_thread(
+                    self._adapt_with_gemini,
+                    source_segments, draft_segments, source_lang, target_lang,
+                )
+            elif provider == "ollama":
+                translated_texts = await asyncio.to_thread(
+                    self._adapt_with_ollama,
+                    source_segments, draft_segments, source_lang, target_lang,
+                )
+            else:
+                raise RuntimeError(f"Direct LLM translation provider is unavailable: {provider or 'unknown'}")
+        except Exception as exc:
+            self._raise_if_cancelled()
+            raise RuntimeError(f"Direct {provider or 'LLM'} translation failed: {exc}") from exc
+
+        if len(translated_texts) != len(source_segments):
+            raise RuntimeError(
+                f"Direct translator returned {len(translated_texts)} segments "
+                f"for {len(source_segments)} inputs"
+            )
+        quality_issue = _adaptation_quality_issue(translated_texts, source_segments)
+        if quality_issue:
+            raise RuntimeError(f"Direct translator output failed quality gate: {quality_issue}")
+        return [
+            TranscriptSegment(
+                start=source.start,
+                end=source.end,
+                text=text.strip(),
+            )
+            for source, text in zip(source_segments, translated_texts)
+        ]
 
     async def adapt_segments(
         self,
@@ -216,6 +275,31 @@ class SegmentAdapter:
         parsed = _parse_json_object(content)
         return _extract_segment_texts(parsed, len(translated_segments))
 
+    def _batch_cache_key(
+        self,
+        source_segments: list[TranscriptSegment],
+        translated_segments: list[TranscriptSegment],
+        source_lang: str,
+        target_lang: str,
+    ) -> Optional[str]:
+        if self.cache is None:
+            return None
+        payload = {
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "mode": self.config.mode,
+            "tone": self.config.tone,
+            "audience": self.config.audience,
+            "glossary": self.config.glossary,
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "rows": [
+                [round(src.duration, 2), src.text, draft.text]
+                for src, draft in zip(source_segments, translated_segments)
+            ],
+        }
+        return self.cache.make_key("llm-translation-v1", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
     def _adapt_with_gemini(
         self,
         source_segments: list[TranscriptSegment],
@@ -276,6 +360,23 @@ class SegmentAdapter:
             source_batch = source_segments[start_index:start_index + batch_size]
             translated_batch = translated_segments[start_index:start_index + batch_size]
             label = f"batch-{start_index}-{start_index + len(translated_batch) - 1}"
+            cache_key = self._batch_cache_key(
+                source_batch,
+                translated_batch,
+                source_lang,
+                target_lang,
+            )
+            if cache_key and self.cache is not None:
+                cached_batch = self.cache.get(cache_key)
+                if (
+                    isinstance(cached_batch, list)
+                    and len(cached_batch) == len(translated_batch)
+                    and all(isinstance(text, str) and text.strip() for text in cached_batch)
+                ):
+                    results.extend(cached_batch)
+                    self.logger.info("Gemini resumed %s from persistent checkpoint", label)
+                    self._report_progress(batch_index, total_batches, f"{label}-cached")
+                    continue
             try:
                 batch_texts = self._request_gemini_with_retries(
                     source_batch,
@@ -316,6 +417,8 @@ class SegmentAdapter:
                     break
             else:
                 consecutive_failures = 0
+                if cache_key and self.cache is not None:
+                    self.cache.set(cache_key, batch_texts, ttl_seconds=86400 * 30)
             results.extend(batch_texts)
             self._report_progress(batch_index, total_batches, label)
 
@@ -368,14 +471,17 @@ class SegmentAdapter:
                 last_error = exc
                 if attempt >= attempts:
                     break
-                self.logger.warning(
-                    "Gemini adaptation %s attempt %d/%d failed: %s",
-                    label,
-                    attempt,
-                    attempts,
-                    exc,
+                is_rate_limit = "429" in str(exc)
+                retry_delay = (
+                    min(120, max(1, self.config.gemini_rate_limit_retry_seconds) * attempt)
+                    if is_rate_limit
+                    else min(4.0, 0.75 * attempt)
                 )
-                time.sleep(min(1.5, 0.35 * attempt))
+                self.logger.warning(
+                    "Gemini adaptation %s attempt %d/%d failed; retrying in %.1fs: %s",
+                    label, attempt, attempts, retry_delay, exc,
+                )
+                time.sleep(retry_delay)
         assert last_error is not None
         raise last_error
 
@@ -462,12 +568,21 @@ class SegmentAdapter:
                 f"Gemini {reason} for {label} (finishReason={finish_reason or 'unknown'}): {exc}"
             ) from exc
 
+    def _wait_for_gemini_request_slot(self) -> None:
+        interval = max(0.0, float(self.config.gemini_min_interval_seconds or 0))
+        elapsed = time.monotonic() - self._last_gemini_request_at
+        wait_seconds = interval - elapsed
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        self._last_gemini_request_at = time.monotonic()
+
     def _post_gemini_request(self, model: str, payload: dict, timeout_seconds: int):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         headers = {"x-goog-api-key": self.config.api_key, "Content-Type": "application/json"}
         current_payload = json.loads(json.dumps(payload))
         response = None
         for _ in range(3):
+            self._wait_for_gemini_request_slot()
             response = requests.post(
                 url,
                 headers=headers,

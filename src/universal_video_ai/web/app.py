@@ -1278,8 +1278,14 @@ def _build_service_for_job(job):
         ),
         ollama_num_ctx=_env_int("OLLAMA_TRANSLATION_NUM_CTX", 8192, minimum=2048, maximum=131072),
         ollama_num_predict=_env_int("OLLAMA_TRANSLATION_NUM_PREDICT", 0, minimum=0, maximum=32768),
-        gemini_retry_count=_env_int("GEMINI_TRANSLATION_RETRIES", 2, minimum=0, maximum=5),
-        gemini_batch_size=_env_int("GEMINI_TRANSLATION_BATCH_SIZE", 24, minimum=2, maximum=100),
+        gemini_retry_count=_env_int("GEMINI_TRANSLATION_RETRIES", 4, minimum=0, maximum=8),
+        gemini_batch_size=_env_int("GEMINI_TRANSLATION_BATCH_SIZE", 48, minimum=2, maximum=100),
+        gemini_min_interval_seconds=_env_int(
+            "GEMINI_TRANSLATION_MIN_INTERVAL_SECONDS", 4, minimum=0, maximum=120
+        ),
+        gemini_rate_limit_retry_seconds=_env_int(
+            "GEMINI_TRANSLATION_RATE_LIMIT_RETRY_SECONDS", 15, minimum=1, maximum=300
+        ),
         gemini_debug_dir=(
             _env_first("GEMINI_TRANSLATION_DEBUG_DIR")
             or str(Path(TEMP_DIR) / "translation_adaptation_debug")
@@ -1361,7 +1367,17 @@ def _is_content_os_job(job) -> bool:
 
 
 def _is_non_retryable_job_error(exc: Exception) -> bool:
-    message = str(exc).lower()
+    # Translation/provider failures are wrapped by the service and backend.
+    # Inspect their cause chain so a confirmed quota block is not mistaken for
+    # a fresh transient error and followed by another full download/OCR pass.
+    messages: list[str] = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(str(current).lower())
+        current = current.__cause__ or current.__context__
+    message = "\n".join(messages)
     return any(
         marker.lower() in message
         for marker in (
@@ -1388,6 +1404,9 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             # Linux keyring dependency is installed. Waiting and repeating
             # the same yt-dlp invocation cannot change the environment.
             "secretstorage not available",
+            # The translator already honored Retry-After/backoff. Repeating
+            # minutes of preprocessing cannot change a provider/IP quota.
+            "translation rate limited",
         )
     )
 

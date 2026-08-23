@@ -7,5 +7,6 @@ Fallback to in-memory if Redis unavailable.
 from __future__ import annotations
 
 from .redis_cache import RedisCache, CacheEntry
+from .sqlite_cache import SQLiteCache
 
-__all__ = ["RedisCache", "CacheEntry"]
+__all__ = ["RedisCache", "SQLiteCache", "CacheEntry"]

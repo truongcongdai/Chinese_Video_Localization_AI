@@ -17,6 +17,7 @@ from universal_video_ai.mixer.service import MixerService, MixerConfig
 from universal_video_ai.render.renderer import Renderer, RenderConfig
 from universal_video_ai.render.text_detector import OnScreenTextDetector
 from universal_video_ai.render import ocr_language_map
+from universal_video_ai.config import translation_cache
 from universal_video_ai.audio.background_music import BackgroundMusicConfig, BackgroundMusicLibrary
 from .service import LocalizationService, LocalizationConfig
 
@@ -116,7 +117,11 @@ def create_localization_service(
     if run_translation:
         try:
             translate_backend = TranslatorBackend()
-            translate_service = TranslateService(backend=translate_backend, logger=logger)
+            translate_service = TranslateService(
+                backend=translate_backend,
+                cache=translation_cache,
+                logger=logger,
+            )
             logger.info("TranslatorBackend available; translation enabled")
         except Exception as exc:
             logger.warning("TranslatorBackend not available; translation disabled: %s", exc)
@@ -134,6 +139,7 @@ def create_localization_service(
                 logger=logger,
                 progress_callback=adaptation_progress,
                 cancellation_checker=cancellation_checker,
+                cache=translation_cache,
             )
 
     # TTS service (optional)

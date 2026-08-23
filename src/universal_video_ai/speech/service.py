@@ -1,6 +1,7 @@
 # src/universal_video_ai/speech/service.py
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import List, Optional
 import logging
@@ -35,6 +36,33 @@ class SpeechService:
             self.logger = _logger
         self.logger.debug("SpeechService initialized backend=%s", type(self.backend).__name__ if self.backend is not None else None)
 
+    def _cache_key(self, prefix: str, audio_path: Path, language: Optional[str]) -> str:
+        """Build a stable key across job directories for the same audio."""
+        try:
+            file_size = audio_path.stat().st_size
+            digest = hashlib.sha256()
+            digest.update(str(file_size).encode("ascii"))
+            with audio_path.open("rb") as stream:
+                digest.update(stream.read(1024 * 1024))
+                if file_size > 1024 * 1024:
+                    stream.seek(max(0, file_size - 1024 * 1024))
+                    digest.update(stream.read(1024 * 1024))
+            audio_identity = digest.hexdigest()
+        except OSError:
+            audio_identity = audio_path.name
+
+        transcriber = getattr(self.backend, "_transcriber", None)
+        backend_config = getattr(transcriber, "config", None)
+        model = str(getattr(backend_config, "model", "default"))
+        backend_name = type(self.backend).__name__ if self.backend is not None else "none"
+        return self.cache.make_key(
+            prefix,
+            backend_name,
+            model,
+            language or "auto",
+            audio_identity,
+        )
+
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> str:
         """Transcribe `audio_path` using the configured backend with caching.
 
@@ -47,7 +75,7 @@ class SpeechService:
 
         # Check cache first
         if self.cache:
-            cache_key = self.cache.make_key("transcribe", str(audio_path), language or "auto")
+            cache_key = self._cache_key("transcribe-v2", audio_path, language)
             cached_result = self.cache.get(cache_key)
             if cached_result is not None:
                 self.logger.debug("SpeechService transcribe cache HIT: audio=%s", audio_path)
@@ -59,8 +87,8 @@ class SpeechService:
 
             # Cache result
             if self.cache:
-                cache_key = self.cache.make_key("transcribe", str(audio_path), language or "auto")
-                self.cache.set(cache_key, result, ttl_seconds=86400 * 7)  # 7 days
+                cache_key = self._cache_key("transcribe-v2", audio_path, language)
+                self.cache.set(cache_key, result, ttl_seconds=86400 * 30)
 
             return result
         except TranscriptionError:
@@ -92,7 +120,7 @@ class SpeechService:
 
         cache_key = None
         if self.cache:
-            cache_key = self.cache.make_key("transcribe_segments", str(audio_path), language or "auto")
+            cache_key = self._cache_key("transcribe-segments-v2", audio_path, language)
             cached_result = self.cache.get(cache_key)
             if cached_result is not None:
                 self.logger.debug("SpeechService transcribe_segments cache HIT: audio=%s", audio_path)
@@ -133,8 +161,8 @@ class SpeechService:
                         "segments": serializable,
                         "detected_language": self.last_detected_language,
                     },
-                    ttl_seconds=86400 * 7,
-                )  # 7 days
+                    ttl_seconds=86400 * 30,
+                )
 
             return segments
         except TranscriptionError:

@@ -11,6 +11,7 @@ from universal_video_ai.downloader.download_result import DownloadResult
 from universal_video_ai.audio.pipeline import AudioPipelineResult, AudioResult
 from universal_video_ai.audio.demucs import DemucsOutput
 from universal_video_ai.translate.service import TranslateService
+from universal_video_ai.translate.adapt import AdaptationConfig
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.timeline.service import TimelineService, TimelineSegment
 from universal_video_ai.mixer.service import MixerService
@@ -1110,3 +1111,60 @@ def test_long_video_alignment_scans_only_bounded_anchors(tmp_path: Path):
     assert len(scanned) == 5
     assert len(aligned) == len(source)
     assert all(item.start == pytest.approx(original.start + 0.2) for item, original in zip(aligned, source))
+
+
+def test_gemini_mode_translates_directly_without_base_google_backend(tmp_path: Path):
+    downloader = MagicMock(spec=DownloadService)
+    download_result = MagicMock(spec=DownloadResult)
+    download_result.success = True
+    download_result.video_path = tmp_path / "video.mp4"
+    downloader.download.return_value = download_result
+
+    translate_service = MagicMock(spec=TranslateService)
+    segment_adapter = MagicMock()
+    segment_adapter.config = AdaptationConfig(
+        enabled=True,
+        provider="gemini",
+        api_key="test-key",
+        model="gemini-test",
+        mode="gemini",
+    )
+    segment_adapter.translate_source_segments = AsyncMock(return_value=[
+        TranscriptSegment(start=0.0, end=1.0, text="Xin chao")
+    ])
+
+    service = LocalizationService(
+        downloader=downloader,
+        translate_service=translate_service,
+        segment_adapter=segment_adapter,
+        config=LocalizationConfig(
+            run_transcription=True,
+            run_translation=True,
+            target_language="vi",
+            render_video=False,
+        ),
+    )
+
+    with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as pipeline_factory:
+        audio_file = MagicMock()
+        audio_file.audio_path = tmp_path / "audio.wav"
+        audio_file.duration = 2.0
+        audio_result = MagicMock(spec=AudioPipelineResult)
+        audio_result.transcript = "ni hao"
+        audio_result.detected_language = "zh"
+        audio_result.audio_result = audio_file
+        audio_result.segments = [
+            TranscriptSegment(start=0.0, end=1.0, text="ni hao")
+        ]
+        pipeline = MagicMock()
+        pipeline.process.return_value = audio_result
+        pipeline_factory.return_value = pipeline
+
+        result = asyncio.run(service.localize(str(tmp_path), tmp_path))
+
+    translate_service.translate_segments.assert_not_called()
+    segment_adapter.translate_source_segments.assert_awaited_once()
+    assert result.translated_text == "Xin chao"
+    assert result.translated_segments == [
+        TranscriptSegment(start=0.0, end=1.0, text="Xin chao")
+    ]
