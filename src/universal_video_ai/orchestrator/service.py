@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -32,6 +34,7 @@ from universal_video_ai.render.animated_subtitles import SubtitleEffect
 from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverlay
 from universal_video_ai.render.text_detector import OnScreenTextDetector, TextRegion
 from universal_video_ai.render import ocr_language_map
+from universal_video_ai.render.watermark_cleaner import SourceWatermarkCleaner
 
 __all__ = [
     "LocalizationService", "LocalizationConfig", "LocalizationResult",
@@ -178,6 +181,9 @@ class LocalizationConfig:
     global_subtitle_offset: float = 0.0
     auto_blur_static_text: bool = True
     static_text_blur_samples: int = 6
+    # Remove automatically detected source watermarks before rendering and
+    # before applying user branding. This uses inpainting, never blur.
+    inpaint_source_watermarks: bool = True
     # Duration-aware subtitle/dub guardrail. This runs after base translation
     # and optional LLM adaptation so every segment is checked against its
     # original timestamp before subtitles and TTS are generated.
@@ -867,13 +873,35 @@ class LocalizationService:
             detect_windows = getattr(type(detector), "detect_subtitle_windows_for_segments", None)
             if callable(detect_windows):
                 try:
-                    windows = detector.detect_subtitle_windows_for_segments(
-                        video_path,
-                        [(s.start, s.end, s.text) for s in source_segments],
-                        audio_duration=audio_duration,
-                        search_radius=self.config.source_subtitle_timing_search_radius,
-                        step=self.config.source_subtitle_timing_step,
-                    )
+                    cache_identity = None
+                    cache_path = None
+                    windows = None
+                    if video_path.is_file():
+                        try:
+                            cache_identity = self._subtitle_window_cache_identity(
+                                video_path, source_segments, detected_language, audio_duration,
+                            )
+                            cache_path = video_path.parent / ".uvai_subtitle_windows_cache.json"
+                            windows = self._load_subtitle_window_cache(cache_path, cache_identity)
+                        except Exception as exc:
+                            self.logger.debug("OCR timing cache unavailable; continuing without cache: %s", exc)
+                    if windows is not None:
+                        self.logger.info(
+                            "LocalizationService: OCR timing cache hit (%d segments)", len(windows)
+                        )
+                    else:
+                        windows = detector.detect_subtitle_windows_for_segments(
+                            video_path,
+                            [(s.start, s.end, s.text) for s in source_segments],
+                            audio_duration=audio_duration,
+                            search_radius=self.config.source_subtitle_timing_search_radius,
+                            step=self.config.source_subtitle_timing_step,
+                        )
+                        if cache_path is not None and cache_identity is not None:
+                            try:
+                                self._save_subtitle_window_cache(cache_path, cache_identity, windows)
+                            except Exception as exc:
+                                self.logger.debug("Could not save OCR timing cache: %s", exc)
                 except Exception as exc:
                     self.logger.warning(
                         "Per-cue burned-subtitle timing detection failed; falling back to global offset: %s",
@@ -979,6 +1007,70 @@ class LocalizationService:
             )
             for s in source_segments
         ]
+
+    def _subtitle_window_cache_identity(
+        self,
+        video_path: Path,
+        source_segments: List[TranscriptSegment],
+        detected_language: Optional[str],
+        audio_duration: float,
+    ) -> dict:
+        digest = hashlib.sha256()
+        with video_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "version": 1,
+            "video_sha256": digest.hexdigest(),
+            "detected_language": detected_language,
+            "audio_duration": round(float(audio_duration), 3),
+            "search_radius": self.config.source_subtitle_timing_search_radius,
+            "step": self.config.source_subtitle_timing_step,
+            "segments": [
+                [round(item.start, 3), round(item.end, 3), item.text]
+                for item in source_segments
+            ],
+        }
+
+    @staticmethod
+    def _load_subtitle_window_cache(path: Path, identity: dict) -> Optional[List[Optional[Any]]]:
+        try:
+            from universal_video_ai.render.text_detector import SubtitleTimingWindow
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("identity") != identity or not isinstance(payload.get("windows"), list):
+                return None
+            return [
+                SubtitleTimingWindow(**item) if isinstance(item, dict) else None
+                for item in payload["windows"]
+            ]
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+    def _save_subtitle_window_cache(
+        self,
+        path: Path,
+        identity: dict,
+        windows: List[Optional[Any]],
+    ) -> None:
+        payload = {
+            "identity": identity,
+            "windows": [
+                ({"start": item.start, "end": item.end, "confidence": item.confidence}
+                 if item is not None else None)
+                for item in windows
+            ],
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+        except OSError as exc:
+            self.logger.warning("Could not save OCR timing cache %s: %s", path, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _segment_alignment_offset(segment: TranscriptSegment, estimate) -> float:
@@ -1276,7 +1368,28 @@ class LocalizationService:
                         detected_language=audio_result.detected_language,
                         duration=audio_result.audio_result.duration,
                     )
-                    if static_text_boxes:
+                    source_video_for_render = download_result.video_path
+                    if static_text_boxes and self.config.inpaint_source_watermarks:
+                        cleaned_source = output_dir / "source_watermarks_inpainted.mp4"
+                        try:
+                            source_video_for_render = await asyncio.to_thread(
+                                SourceWatermarkCleaner(self.logger).clean,
+                                download_result.video_path,
+                                cleaned_source,
+                                static_text_boxes,
+                            )
+                            self.logger.info(
+                                "Source watermark inpainting complete before output branding: %s",
+                                source_video_for_render,
+                            )
+                        except Exception as exc:
+                            # Never silently fall back to blur: preserving the
+                            # source is less deceptive than a smeared region.
+                            self.logger.warning(
+                                "Source watermark inpainting failed; preserving source without blur: %s", exc
+                            )
+                            source_video_for_render = download_result.video_path
+                    elif static_text_boxes:
                         existing_boxes = tuple(self.renderer.config.watermark_boxes_fractional or ())
                         self.renderer.config = replace(
                             self.renderer.config,
@@ -1382,7 +1495,7 @@ class LocalizationService:
                     async with _RENDER_SLOTS:
                         await asyncio.to_thread(
                             self.renderer.render,
-                            video_path=download_result.video_path,
+                            video_path=source_video_for_render,
                             audio_path=audio_for_render,
                             subtitles=subtitles_for_render,
                             output_path=final_video_path,
@@ -1775,6 +1888,16 @@ class LocalizationService:
                 duration=duration,
                 sample_count=self.config.static_text_blur_samples,
             )
+            # Add fixed corner regions for platform logos (Douyin, TikTok, etc.)
+            corner_logo_regions = [
+                (0.0, 0.0, 0.15, 0.10), (0.85, 0.0, 1.0, 0.10),
+                (0.0, 0.90, 0.15, 1.0), (0.85, 0.90, 1.0, 1.0),
+            ]
+            boxes_list = list(boxes)
+            for cx0, cy0, cx1, cy1 in corner_logo_regions:
+                if not any(max(0, min(cx1, rx1) - max(cx0, rx0)) * max(0, min(cy1, ry1) - max(cy0, ry0)) > (cx1-cx0)*(cy1-cy0)*0.3 for rx0, ry0, rx1, ry1 in boxes_list):
+                    boxes_list.append((cx0, cy0, cx1, cy1))
+            boxes = tuple(boxes_list)
         except Exception as exc:
             self.logger.warning("Persistent text/watermark detection failed; skipping static blur: %s", exc)
             return ()
