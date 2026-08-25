@@ -210,8 +210,8 @@ class RenderConfig:
     """
 
     video_codec: str = "libx264"
-    crf: int = 23
-    preset: str = "medium"
+    crf: int = 25
+    preset: str = "fast"
     audio_codec: str = "aac"
     audio_bitrate: str = "192k"
     overwrite: bool = True

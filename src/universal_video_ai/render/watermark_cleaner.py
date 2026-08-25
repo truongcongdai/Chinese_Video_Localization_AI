@@ -42,8 +42,8 @@ class SourceWatermarkCleaner:
         boxes_fractional: Iterable[Tuple[float, float, float, float]],
         *,
         radius: float = 12.0,
-        crf: int = 12,
-        inpaint_passes: int = 2,
+        crf: int = 18,
+        inpaint_passes: int = 1,
         post_blur: bool = True,
         blur_kernel_size: int = 5,
     ) -> Path:
@@ -83,7 +83,7 @@ class SourceWatermarkCleaner:
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "-",
-            "-an", "-c:v", "libx264", "-preset", "medium", "-crf", str(int(crf)),
+            "-an", "-c:v", "libx264", "-preset", "fast", "-crf", str(int(crf)),
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(destination),
         ]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
