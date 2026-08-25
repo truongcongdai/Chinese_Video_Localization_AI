@@ -1401,9 +1401,9 @@ class OnScreenTextDetector:
         self,
         video_path: Path,
         duration: float,
-        sample_count: int = 8,
-        min_seen_ratio: float = 0.40,
-        ignore_region_fractional: Tuple[float, float, float, float] = (0.08, 0.55, 0.92, 0.96),
+        sample_count: int = 12,
+        min_seen_ratio: float = 0.30,
+        ignore_region_fractional: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
         padding_fractional: float = 0.010,
     ) -> List[Tuple[float, float, float, float]]:
         """Detect static non-subtitle text/watermarks that persist across a video.

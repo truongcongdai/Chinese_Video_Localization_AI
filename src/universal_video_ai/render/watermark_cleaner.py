@@ -41,7 +41,7 @@ class SourceWatermarkCleaner:
         output_path: Path,
         boxes_fractional: Iterable[Tuple[float, float, float, float]],
         *,
-        radius: float = 8.0,
+        radius: float = 12.0,
         crf: int = 12,
         inpaint_passes: int = 2,
         post_blur: bool = True,
@@ -74,7 +74,7 @@ class SourceWatermarkCleaner:
         for left, top, right, bottom in self._pixel_boxes(boxes, width, height):
             mask[top:bottom, left:right] = 255
         # Moderate dilation to cover anti-aliased edges without over-expanding
-        mask = cv2.dilate(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        mask = cv2.dilate(mask, np.ones((3, 3), dtype=np.uint8), iterations=2)
         # Light morphological closing to fill small gaps without over-expansion
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
 
