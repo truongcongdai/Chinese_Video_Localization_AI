@@ -1401,10 +1401,10 @@ class OnScreenTextDetector:
         self,
         video_path: Path,
         duration: float,
-        sample_count: int = 12,
-        min_seen_ratio: float = 0.35,
+        sample_count: int = 8,
+        min_seen_ratio: float = 0.40,
         ignore_region_fractional: Tuple[float, float, float, float] = (0.08, 0.55, 0.92, 0.96),
-        padding_fractional: float = 0.015,
+        padding_fractional: float = 0.010,
     ) -> List[Tuple[float, float, float, float]]:
         """Detect static non-subtitle text/watermarks that persist across a video.
 
@@ -1435,7 +1435,7 @@ class OnScreenTextDetector:
             cx = (box[0] + box[2]) / 2.0
             cy = (box[1] + box[3]) / 2.0
             ccx, ccy = cluster["center"]  # type: ignore[misc]
-            return abs(cx - ccx) <= frame_w * 0.12 and abs(cy - ccy) <= frame_h * 0.12
+            return abs(cx - ccx) <= frame_w * 0.10 and abs(cy - ccy) <= frame_h * 0.10
 
         with tempfile.TemporaryDirectory(prefix="persistent_text_") as tmp:
             tmp_dir = Path(tmp)
@@ -1448,8 +1448,8 @@ class OnScreenTextDetector:
                     boxes,
                     frame_w,
                     frame_h,
-                    max_single_box_width_ratio=0.65,
-                    max_single_box_height_ratio=0.25,
+                    max_single_box_width_ratio=0.55,
+                    max_single_box_height_ratio=0.20,
                 )
                 boxes = [box for box in boxes if outside_ignored_region(box)]
                 for box in boxes:

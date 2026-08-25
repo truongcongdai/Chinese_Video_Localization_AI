@@ -41,11 +41,11 @@ class SourceWatermarkCleaner:
         output_path: Path,
         boxes_fractional: Iterable[Tuple[float, float, float, float]],
         *,
-        radius: float = 15.0,
+        radius: float = 8.0,
         crf: int = 12,
-        inpaint_passes: int = 3,
+        inpaint_passes: int = 2,
         post_blur: bool = True,
-        blur_kernel_size: int = 7,
+        blur_kernel_size: int = 5,
     ) -> Path:
         try:
             import cv2
@@ -73,10 +73,10 @@ class SourceWatermarkCleaner:
         mask = np.zeros((height, width), dtype=np.uint8)
         for left, top, right, bottom in self._pixel_boxes(boxes, width, height):
             mask[top:bottom, left:right] = 255
-        # Larger dilation to better cover anti-aliased/transparent watermark edges and glow effects.
-        mask = cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=3)
-        # Additional morphological closing to fill gaps in the mask
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), dtype=np.uint8))
+        # Moderate dilation to cover anti-aliased edges without over-expanding
+        mask = cv2.dilate(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        # Light morphological closing to fill small gaps without over-expansion
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         command = [
