@@ -253,6 +253,58 @@ class OnScreenTextDetector:
             self.logger.warning("Frame extraction failed at t=%.2f: %s", at_seconds, exc)
             return False
 
+    def _extract_frame_grid(
+        self,
+        video_path: Path,
+        output_dir: Path,
+        duration: float,
+        fps: float,
+    ) -> Optional[Tuple[Path, float]]:
+        """Decode a regular frame grid in one FFmpeg process.
+
+        Per-cue OCR previously launched FFmpeg once per timestamp (often
+        thousands of processes). A single sequential decode produces the
+        same sampling grid much faster. Callers retain the old per-frame path
+        as a fallback when this optional optimization fails.
+        """
+        fps = max(1.0, min(float(fps), 30.0))
+        grid_dir = output_dir / "frame_grid"
+        grid_dir.mkdir(parents=True, exist_ok=True)
+        pattern = grid_dir / "frame_%08d.jpg"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_path),
+            "-vf", f"fps={fps:.6f}:start_time=0",
+            "-q:v", "3", "-start_number", "0",
+            "-y", str(pattern),
+        ]
+        try:
+            timeout = max(120, min(3600, int(max(0.0, duration) * 3) + 60))
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            first_frame = grid_dir / "frame_00000000.jpg"
+            if result.returncode == 0 and first_frame.exists():
+                self.logger.info(
+                    "OnScreenTextDetector: decoded %.2f fps OCR frame grid in one pass",
+                    fps,
+                )
+                return grid_dir, fps
+            self.logger.warning(
+                "OCR frame-grid extraction failed; using per-frame fallback: %s",
+                (result.stderr or result.stdout or "unknown FFmpeg error").strip(),
+            )
+        except Exception as exc:
+            self.logger.warning("OCR frame-grid extraction failed; using per-frame fallback: %s", exc)
+        return None
+
+    @staticmethod
+    def _frame_from_grid(grid: Optional[Tuple[Path, float]], at_seconds: float) -> Optional[Path]:
+        if grid is None:
+            return None
+        grid_dir, fps = grid
+        frame_index = max(0, int(round(max(0.0, at_seconds) * fps)))
+        path = grid_dir / f"frame_{frame_index:08d}.jpg"
+        return path if path.exists() else None
+
     def _detect_boxes_in_frame(self, frame_path: Path) -> List[Tuple[int, int, int, int]]:
         """Run OCR on one frame; return list of (x0, y0, x1, y1) axis-aligned boxes."""
         reader = self._get_reader()
@@ -544,8 +596,8 @@ class OnScreenTextDetector:
             key = round(max(0.0, min(audio_duration, t)), 2)
             if key in frame_cache:
                 return frame_cache[key]
-            frame_path = tmp_dir / f"subtitle_window_{len(frame_cache)}.jpg"
-            if not self._extract_frame(video_path, key, frame_path):
+            frame_path = frame_at(key, f"subtitle_window_{len(frame_cache)}")
+            if frame_path is None:
                 frame_cache[key] = 0.0
                 return 0.0
             frame_cache[key] = self._subtitle_presence_score_for_region(
@@ -555,8 +607,8 @@ class OnScreenTextDetector:
             return frame_cache[key]
 
         def has_ocr_subtitle_at(t: float, tmp_dir: Path) -> bool:
-            frame_path = tmp_dir / f"subtitle_boundary_{len(frame_cache)}_{int(t * 1000)}.jpg"
-            if not self._extract_frame(video_path, t, frame_path):
+            frame_path = frame_at(t, f"subtitle_boundary_{len(frame_cache)}")
+            if frame_path is None:
                 return False
             boxes = self._detect_boxes_in_frame(frame_path)
             boxes = self._drop_implausible_boxes(boxes, frame_w, frame_h, 0.92, 0.3)
@@ -574,6 +626,21 @@ class OnScreenTextDetector:
 
         with tempfile.TemporaryDirectory(prefix="subtitle_windows_") as tmp:
             tmp_dir = Path(tmp)
+            # All presence samples use a regular `step` grid. Decode it once
+            # and reuse the JPEGs for presence scoring and OCR refinement.
+            # If FFmpeg cannot build the grid, frame_at transparently falls
+            # back to the original exact-timestamp extraction behavior.
+            frame_grid = self._extract_frame_grid(
+                video_path, tmp_dir, audio_duration, fps=(1.0 / step),
+            )
+
+            def frame_at(t: float, purpose: str) -> Optional[Path]:
+                cached = self._frame_from_grid(frame_grid, t)
+                if cached is not None:
+                    return cached
+                frame_path = tmp_dir / f"{purpose}_{int(max(0.0, t) * 1000)}.jpg"
+                return frame_path if self._extract_frame(video_path, t, frame_path) else None
+
             for start, end, source_text in source_segments:
                 if end <= start or audio_duration <= 0:
                     results.append(None)
@@ -598,8 +665,8 @@ class OnScreenTextDetector:
                     key = round(max(0.0, min(audio_duration, t)), 2)
                     if key in text_cache:
                         return text_cache[key]
-                    frame_path = tmp_dir / f"subtitle_text_{len(frame_cache)}_{int(key * 1000)}.jpg"
-                    if not self._extract_frame(video_path, key, frame_path):
+                    frame_path = frame_at(key, f"subtitle_text_{len(frame_cache)}")
+                    if frame_path is None:
                         text_cache[key] = ""
                     else:
                         text_cache[key] = self._read_text_in_frame(
@@ -1334,10 +1401,10 @@ class OnScreenTextDetector:
         self,
         video_path: Path,
         duration: float,
-        sample_count: int = 6,
-        min_seen_ratio: float = 0.45,
+        sample_count: int = 12,
+        min_seen_ratio: float = 0.35,
         ignore_region_fractional: Tuple[float, float, float, float] = (0.08, 0.55, 0.92, 0.96),
-        padding_fractional: float = 0.012,
+        padding_fractional: float = 0.015,
     ) -> List[Tuple[float, float, float, float]]:
         """Detect static non-subtitle text/watermarks that persist across a video.
 
@@ -1368,7 +1435,7 @@ class OnScreenTextDetector:
             cx = (box[0] + box[2]) / 2.0
             cy = (box[1] + box[3]) / 2.0
             ccx, ccy = cluster["center"]  # type: ignore[misc]
-            return abs(cx - ccx) <= frame_w * 0.08 and abs(cy - ccy) <= frame_h * 0.08
+            return abs(cx - ccx) <= frame_w * 0.12 and abs(cy - ccy) <= frame_h * 0.12
 
         with tempfile.TemporaryDirectory(prefix="persistent_text_") as tmp:
             tmp_dir = Path(tmp)
@@ -1381,8 +1448,8 @@ class OnScreenTextDetector:
                     boxes,
                     frame_w,
                     frame_h,
-                    max_single_box_width_ratio=0.55,
-                    max_single_box_height_ratio=0.18,
+                    max_single_box_width_ratio=0.65,
+                    max_single_box_height_ratio=0.25,
                 )
                 boxes = [box for box in boxes if outside_ignored_region(box)]
                 for box in boxes:
