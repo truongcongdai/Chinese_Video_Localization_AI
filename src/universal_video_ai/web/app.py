@@ -833,6 +833,8 @@ REFERRAL_BONUS_CREDITS = max(0, int(os.environ.get("REFERRAL_BONUS_CREDITS", "5"
 
 _LOGO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "logos"
 _LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_SPLIT_IMAGE_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "split_images"
+_SPLIT_IMAGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _PRODUCT_MEDIA_UPLOAD_DIR = _REPO_ROOT / "local_data" / "web_uploads" / "product_media"
 _PRODUCT_MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _VIDEO_UPLOAD_DIR = TEMP_DIR / "web_uploads" / "videos"
@@ -1652,6 +1654,8 @@ def bootstrap():
     """Tells the frontend whether to show 'register first admin' or 'login',
     and which identity providers are configured (so it only shows working
     'Sign in with ...' buttons)."""
+    # Get base URL from environment variable for proper domain configuration
+    base_url = os.environ.get("PUBLIC_URL", "")
     return {
         "needs_registration": not store.any_users_exist(),
         "open_registration": OPEN_REGISTRATION,
@@ -1661,6 +1665,7 @@ def bootstrap():
         "license_server_url": LICENSE_SERVER_URL if USE_LICENSE_SERVER else None,
         "use_user_management_server": USE_USER_MANAGEMENT_SERVER,
         "user_management_server_url": USER_MANAGEMENT_SERVER_URL if USE_USER_MANAGEMENT_SERVER else None,
+        "public_url": base_url,
         "top_up_packages": [
             {"credits": credits, "amount_vnd": amount}
             for credits, amount in sorted(TOP_UP_PACKAGES.items())
@@ -2179,6 +2184,10 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             # Request-level translation retries already use provider-aware
             # backoff. Retrying the whole job repeats Demucs/Whisper/OCR.
             "Translation backend batch failed",
+            # A packaged executable missing static Whisper data cannot repair
+            # itself by repeating the entire job.
+            "whisper\\assets\\mel_filters.npz",
+            "whisper/assets/mel_filters.npz",
         )
     )
 
@@ -5390,6 +5399,14 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         elif candidate.exists():
             logo_path = str(candidate)
 
+    if body.transform_config and body.transform_config.get("enable_split_screen"):
+        split_image_id = str(body.transform_config.get("overlay_image_id") or "").strip()
+        matches = list(_SPLIT_IMAGE_UPLOAD_DIR.glob(f"{user_id}_{split_image_id}.*")) if split_image_id else []
+        if not matches:
+            raise HTTPException(400, "Hãy chọn và tải ảnh split screen lên trước khi tạo video")
+        body.transform_config["overlay_image_path"] = str(matches[0])
+        body.transform_config.pop("overlay_image_id", None)
+
     normalized_url = body.url
     job = _store_create_job(
         user_id, normalized_url, body.target_language,
@@ -6701,6 +6718,30 @@ async def upload_logo(file: UploadFile = File(...), user_id: int = Depends(get_c
     return {"ok": True, "logo_path": logo_id, "preview_url": f"/api/logo-preview/{logo_id}"}
 
 
+@app.post("/api/upload-split-image")
+async def upload_split_image(file: UploadFile = File(...), user_id: int = Depends(get_current_user_id)):
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        raise HTTPException(400, "Chỉ hỗ trợ ảnh PNG, JPG hoặc WEBP")
+    image_id = uuid.uuid4().hex[:12]
+    dest = _SPLIT_IMAGE_UPLOAD_DIR / f"{user_id}_{image_id}{ext}"
+    with dest.open("wb") as output:
+        shutil.copyfileobj(file.file, output)
+    return {
+        "ok": True,
+        "image_id": image_id,
+        "preview_url": f"/api/split-image-preview/{image_id}",
+    }
+
+
+@app.get("/api/split-image-preview/{image_id}")
+def split_image_preview(image_id: str, user_id: int = Depends(get_current_user_id)):
+    matches = list(_SPLIT_IMAGE_UPLOAD_DIR.glob(f"{user_id}_{image_id}.*"))
+    if not matches:
+        raise HTTPException(404, "Không tìm thấy ảnh split screen")
+    return FileResponse(matches[0])
+
+
 @app.get("/api/logo-preview/{logo_id}")
 def logo_preview(logo_id: str, user_id: int = Depends(get_current_user_id)):
     matches = list(_LOGO_UPLOAD_DIR.glob(f"{user_id}_{logo_id}.*"))
@@ -7306,7 +7347,7 @@ def _schedule_retried_job(old_job, new_job) -> None:
 
 @app.post("/api/jobs/bulk-retry")
 async def bulk_retry_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_user_id)):
-    """Clone selected completed/failed/cancelled jobs with their original settings."""
+    """Retry selected failed/cancelled jobs by resetting them to queued status."""
     if not body.job_ids:
         raise HTTPException(400, "Chưa chọn video cần chạy lại")
 
@@ -7317,38 +7358,26 @@ async def bulk_retry_jobs(body: BulkDeleteBody, user_id: int = Depends(get_curre
         if (
             job
             and job.user_id == user_id
-            and job.status in {"done", "error", "cancelled"}
+            and job.status in {"error", "cancelled"}
             and not _is_content_os_job(job)
         ):
             eligible.append(job)
     if not eligible:
         raise HTTPException(400, "Không có video đã chọn nào có thể chạy lại")
 
-    credit_cost = _job_credit_cost(user_id)
-    user = store.get_user_by_id(user_id)
-    total_credit_cost = credit_cost * len(eligible)
-    if credit_cost > 0 and (not user or int(user["credits"]) < total_credit_cost):
-        current = int(user["credits"]) if user else 0
-        raise HTTPException(
-            402,
-            f"Không đủ credit để chạy lại {len(eligible)} video "
-            f"(còn {current}, cần {total_credit_cost})",
-        )
-
-    created_jobs = []
+    # No credit deduction since reusing existing jobs
+    retried_jobs = []
     for old_job in eligible:
-        new_job = store.retry_job(old_job.id, user_id)
-        if new_job is None:
+        retried_job = store.retry_job(old_job.id, user_id)
+        if retried_job is None:
             continue
-        _schedule_retried_job(old_job, new_job)
-        created_jobs.append(new_job)
-    if credit_cost > 0 and created_jobs:
-        _adjust_user_credits(user_id, -(credit_cost * len(created_jobs)))
+        _schedule_retried_job(old_job, retried_job)
+        retried_jobs.append(retried_job)
     return {
         "ok": True,
-        "created": len(created_jobs),
-        "skipped": len(requested_ids) - len(created_jobs),
-        "job_ids": [job.id for job in created_jobs],
+        "retried": len(retried_jobs),
+        "skipped": len(requested_ids) - len(retried_jobs),
+        "job_ids": [job.id for job in retried_jobs],
     }
 
 
@@ -7770,11 +7799,10 @@ def get_quality_review(job_id: str, user_id: int = Depends(get_current_user_id))
 
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
-    """Re-submit a failed job with identical settings, as a brand-new job
-    (the failed attempt stays in history too, for reference)."""
+    """Retry a failed job by resetting it to queued status (reuses the same job)."""
     old_job = _get_owned_job(job_id, user_id)
-    if old_job.status != "error":
-        raise HTTPException(400, "Chỉ có thể thử lại job bị lỗi")
+    if old_job.status not in {"error", "cancelled"}:
+        raise HTTPException(400, "Chỉ có thể thử lại job bị lỗi hoặc đã hủy")
 
     if _is_content_os_job(old_job):
         raise HTTPException(
@@ -7783,18 +7811,14 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
             "khong the retry bang pipeline tai video thong thuong.",
         )
 
-    user = store.get_user_by_id(user_id)
-    credit_cost = _job_credit_cost(user_id)
-    if credit_cost > 0 and user["credits"] < credit_cost:
-        raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {credit_cost})")
-
-    new_job = store.retry_job(job_id, user_id)
-    if new_job is None:
+    # Reset the existing job to queued status (no credit deduction since reusing job)
+    retried_job = store.retry_job(job_id, user_id)
+    if retried_job is None:
         raise HTTPException(404, "Không tìm thấy job")
-    if credit_cost > 0:
-        _adjust_user_credits(user_id, -credit_cost)
-    _schedule_retried_job(old_job, new_job)
-    return new_job.to_dict()
+
+    _schedule_retried_job(old_job, retried_job)
+
+    return retried_job.to_dict()
 
 
 @app.get("/api/jobs/{job_id}/segments")

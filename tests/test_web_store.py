@@ -16,6 +16,30 @@ def test_search_jobs_for_user_filters_by_status(tmp_path: Path) -> None:
     assert [job.id for job in result] == [done.id]
 
 
+def test_job_history_pins_active_jobs_before_completed_jobs(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    user_id = store.create_user("user", "hash")
+    active = store.create_job(user_id, "https://example.com/active", "vi")
+    newest_done = store.create_job(user_id, "https://example.com/newest", "vi")
+    store.update_job(active.id, status="running")
+    store.update_job(newest_done.id, status="done")
+
+    assert [job.id for job in store.list_jobs_for_user(user_id)][:2] == [active.id, newest_done.id]
+    assert [job.id for job in store.search_jobs_for_user(user_id)][:2] == [active.id, newest_done.id]
+
+
+def test_completed_job_history_uses_most_recent_update_time(tmp_path: Path) -> None:
+    store = Store(tmp_path / "web.sqlite3")
+    user_id = store.create_user("user", "hash")
+    older = store.create_job(user_id, "https://example.com/older", "vi")
+    newer = store.create_job(user_id, "https://example.com/newer", "vi")
+    store.update_job(newer.id, status="done")
+    store.update_job(older.id, status="done")
+
+    assert [job.id for job in store.list_jobs_for_user(user_id)][:2] == [older.id, newer.id]
+    assert [job.id for job in store.search_jobs_for_user(user_id)][:2] == [older.id, newer.id]
+
+
 def test_create_job_accepts_and_persists_remix_settings(tmp_path: Path) -> None:
     store = Store(tmp_path / "web.sqlite3")
     user_id = store.create_user("user", "hash")

@@ -18,6 +18,7 @@ dist/ChineseVideoLocalizationAI.zip
 dist/ChineseVideoLocalizationAI/
 dist.rar
 build/
+.venv-build
 
 
 logs/*

@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 from universal_video_ai.render.text_detector import OnScreenTextDetector
@@ -69,3 +70,26 @@ def test_easyocr_auto_retries_cpu_when_cuda_initialization_fails(monkeypatch):
 
     assert reader.device == "cpu"
     assert calls == ["cuda", False]
+
+
+def test_frame_grid_uses_one_sequential_ffmpeg_decode(tmp_path, monkeypatch):
+    detector = OnScreenTextDetector()
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(cmd)
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+        (pattern.parent / "frame_00000000.jpg").write_bytes(b"frame")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    grid = detector._extract_frame_grid(video, tmp_path, duration=10.0, fps=10.0)
+
+    assert grid is not None
+    assert len(captured) == 1
+    assert "fps=10.000000:start_time=0" in captured[0]
+    assert detector._frame_from_grid(grid, 0.0).name == "frame_00000000.jpg"

@@ -78,18 +78,20 @@ def test_history_bulk_download_and_status_filter_are_available() -> None:
     assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
     assert 'data-cancel="${job.id}"' in app_js
     assert '/cancel`' in app_js
-    assert 'app.js?v=20260819-history-retry' in html
+    assert 'app.js?v=20260826-split-upload' in html
 
 
 def test_workbench_visual_system_is_loaded() -> None:
     html = _read_static_file("index.html")
     css = _read_static_file("app.css")
 
-    assert "app.css?v=20260819-history-polish" in html
+    assert "app.css?v=20260826-language-size" in html
     assert 'class="app-identity"' in html
     assert "Workbench UI" in css
     assert "--accent:#c84a30" in css
     assert "backdrop-filter:none" in css
+    assert "bottom:82px; left:auto; right:24px; width:112px; height:46px" in css
+    assert "#feedback-fab { width:112px; height:46px" in css
 
 
 def test_desktop_launchers_bind_loopback_by_default() -> None:
@@ -119,7 +121,26 @@ def test_remix_panel_is_toggleable_and_cache_busted() -> None:
     assert "function syncRemixPanel()" in app_js
     assert '$("#remix-panel").classList.toggle("hidden", !ev.target.checked);' not in app_js
     assert 'subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0' in app_js
-    assert 'app.js?v=20260819-history-retry' in html
+    assert 'app.js?v=20260826-split-upload' in html
+
+
+def test_history_does_not_render_redundant_statistics_dashboard() -> None:
+    html = _read_static_file("index.html")
+    app_js = _read_static_file("app.js")
+
+    assert 'id="stats-grid"' not in html
+    assert "updateStats(jobs);" not in app_js
+
+
+def test_split_screen_uses_uploaded_image_instead_of_server_path() -> None:
+    html = _read_static_file("index.html")
+    app_js = _read_static_file("app.js")
+
+    assert 'id="transform-overlay-file"' in html
+    assert 'id="transform-overlay-path"' not in html
+    assert 'fetch("/api/upload-split-image"' in app_js
+    assert "config.overlay_image_id = uploadedSplitImageId" in app_js
+    assert "config.overlay_path" not in app_js
 
 
 def test_subtitle_time_display_keeps_tenths() -> None:

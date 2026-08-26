@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import logging
 import shutil
 from pathlib import Path
+import hashlib
+import json
 from typing import List, Optional
 
 from universal_video_ai.downloader.download_result import DownloadResult
@@ -153,14 +155,37 @@ class AudioPipeline:
                 raise RuntimeError("Transcription requested but no SpeechService was injected")
             self.logger.info("AudioPipeline: running transcription for %s (lang=%s)",
                              audio_result.audio_path, self.config.transcription_language)
-            segments = self.speech_service.transcribe_segments(
-                audio_result.audio_path, language=self.config.transcription_language
-            )
+            transcript_cache = audio_result.audio_path.parent / ".uvai_transcript_cache.json"
+            fingerprint = self._audio_fingerprint(audio_result.audio_path)
+            cache_identity = {
+                "fingerprint": fingerprint,
+                "language": self.config.transcription_language or "auto",
+                "model": self.config.transcription_model or "base",
+            }
+            cached_payload = self._load_transcript_cache(transcript_cache, cache_identity)
+            if cached_payload is not None:
+                segments = [TranscriptSegment(**item) for item in cached_payload["segments"]]
+                detected_language = cached_payload.get("detected_language")
+                self.logger.info(
+                    "AudioPipeline: transcript cache hit (%d segments)", len(segments)
+                )
+            else:
+                segments = self.speech_service.transcribe_segments(
+                    audio_result.audio_path, language=self.config.transcription_language
+                )
+                detected_language = getattr(self.speech_service.backend, "last_detected_language", None)
+                self._save_transcript_cache(
+                    transcript_cache,
+                    cache_identity,
+                    segments,
+                    detected_language,
+                )
             transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip()) or None
             # Best-effort: only populated when the backend actually ran (not
             # a cache hit) and exposes `last_detected_language` (WhisperBackend
             # does; NoOp/other backends simply won't have the attribute).
-            detected_language = getattr(self.speech_service.backend, "last_detected_language", None)
+            if detected_language is None:
+                detected_language = getattr(self.speech_service.backend, "last_detected_language", None)
             self.logger.debug(
                 "AudioPipeline: transcript length=%d segments=%d detected_language=%s",
                 len(transcript) if transcript else 0,
@@ -175,3 +200,46 @@ class AudioPipeline:
             segments=segments,
             detected_language=detected_language,
         )
+
+    @staticmethod
+    def _audio_fingerprint(audio_path: Path) -> str:
+        digest = hashlib.sha256()
+        with audio_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _load_transcript_cache(self, path: Path, identity: dict) -> Optional[dict]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("identity") != identity or not isinstance(payload.get("segments"), list):
+                return None
+            return payload
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _save_transcript_cache(
+        self,
+        path: Path,
+        identity: dict,
+        segments: List[TranscriptSegment],
+        detected_language: Optional[str],
+    ) -> None:
+        payload = {
+            "identity": identity,
+            "detected_language": detected_language,
+            "segments": [
+                {"start": item.start, "end": item.end, "text": item.text}
+                for item in segments
+            ],
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+        except OSError as exc:
+            self.logger.warning("Could not save transcript cache %s: %s", path, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass

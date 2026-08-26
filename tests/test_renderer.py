@@ -44,7 +44,7 @@ def _make_fake_popen(returncode: int, stderr_text: str, output_writer=None):
     """Build a fake Popen-like object matching what _run_ffmpeg_with_progress expects."""
 
     class FakePopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=None, bufsize=None):
+        def __init__(self, cmd, stdout=None, stderr=None, text=None, encoding=None, errors=None, bufsize=None):
             self.cmd = cmd
             self.stderr = iter(stderr_text.splitlines(keepends=True))
             self._returncode = returncode
@@ -148,7 +148,7 @@ def test_render_with_subtitles(tmp_path: Path, monkeypatch):
     assert out.read_bytes() == b"final video with subs"
 
 
-def test_many_animated_subtitles_use_filter_complex(tmp_path: Path):
+def test_many_animated_subtitles_use_video_filter_chain(tmp_path: Path):
     video = tmp_path / "video.mp4"
     audio = tmp_path / "audio.mp3"
     output = tmp_path / "output.mp4"
@@ -163,12 +163,11 @@ def test_many_animated_subtitles_use_filter_complex(tmp_path: Path):
 
     cmd = renderer._build_command(video, audio, output, subtitle_segments=segments)
 
-    assert "-filter_complex" in cmd
-    filter_complex = cmd[cmd.index("-filter_complex") + 1]
-    assert filter_complex.startswith("[0:v]drawtext=")
-    assert filter_complex.endswith("[outv]")
-    assert filter_complex.count("drawtext=") == 120
-    assert "-vf" not in cmd
+    assert "-vf" in cmd
+    video_filter = cmd[cmd.index("-vf") + 1]
+    assert video_filter.startswith("drawtext=")
+    assert video_filter.count("drawtext=") == 120
+    assert "-filter_complex" not in cmd
 
 
 def test_flip_runs_before_new_subtitles_are_drawn(tmp_path: Path):
@@ -211,6 +210,8 @@ def test_flip_mirrors_text_cover_overlay_coordinates(tmp_path: Path, monkeypatch
 
     renderer = Renderer(
         RenderConfig(
+            watermark_boxes_fractional=(),
+            watermark_box_fractional=None,
             transform_config=TransformConfig(
                 enable_flip=True,
                 flip_mode=FlipMode.HORIZONTAL,
@@ -222,7 +223,10 @@ def test_flip_mirrors_text_cover_overlay_coordinates(tmp_path: Path, monkeypatch
     cmd = renderer._build_command(video, audio, output, text_overlays=[overlay])
 
     vf = cmd[cmd.index("-vf") + 1]
-    assert vf.startswith("hflip,drawbox=x=490:y=20:w=100:h=40")
+    transformed = renderer._transform_text_overlays_for_pre_filters([overlay], 640, 360)
+    assert transformed[0].x == 490
+    assert vf.startswith("hflip,")
+    assert "x=468+(144-text_w)/2:y=11+(58-ascent+descent)/2" in vf
 
 
 def test_text_overlay_drawtext_uses_baseline_vertical_center(tmp_path: Path, monkeypatch):
@@ -239,13 +243,13 @@ def test_text_overlay_drawtext_uses_baseline_vertical_center(tmp_path: Path, mon
         text="Xin chào",
     )
 
-    renderer = Renderer()
+    renderer = Renderer(RenderConfig(watermark_boxes_fractional=(), watermark_box_fractional=None))
     monkeypatch.setattr(renderer, "_get_video_dimensions", lambda path: (640, 360))
 
     cmd = renderer._build_command(video, audio, output, text_overlays=[overlay])
 
     vf = cmd[cmd.index("-vf") + 1]
-    assert "y=20+(80-ascent+descent)/2" in vf
+    assert "y=11+(98-ascent+descent)/2" in vf
 
 
 def test_multiple_fractional_watermark_boxes_are_blurred(tmp_path: Path, monkeypatch):
@@ -306,7 +310,7 @@ def test_render_ffmpeg_error(tmp_path: Path, monkeypatch):
 
 def test_ffmpeg_timeout_allows_active_progress(monkeypatch):
     class ActiveFakePopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=None, bufsize=None):
+        def __init__(self, cmd, stdout=None, stderr=None, text=None, encoding=None, errors=None, bufsize=None):
             self.started_at = time.monotonic()
             self.killed = False
             self.stderr = self._stderr()

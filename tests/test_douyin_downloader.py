@@ -2,7 +2,7 @@ import requests
 import pytest
 from yt_dlp.utils import DownloadError
 
-from universal_video_ai.downloader.douyin import DouyinDownloader, _safe_video_filename
+from universal_video_ai.downloader.douyin import DouyinDownloader, _clean_playback_url, _safe_video_filename
 from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.downloader.platform_detector import PlatformDetector
 from universal_video_ai.downloader.ytdlp_downloader import (
@@ -25,6 +25,19 @@ def test_safe_video_filename_removes_path_separators():
 
     assert "/" not in filename
     assert "\\" not in filename
+
+
+def test_clean_playback_url_prefers_playback_and_refuses_download_addr():
+    url, field = _clean_playback_url({
+        "download_addr": {"url_list": ["https://cdn/watermarked.mp4"]},
+        "play_addr": {"url_list": ["https://cdn/aweme/v1/playwm/?id=123"]},
+    })
+
+    assert url == "https://cdn/aweme/v1/play/?id=123"
+    assert field == "play_addr"
+    assert _clean_playback_url({
+        "download_addr": {"url_list": ["https://cdn/watermarked.mp4"]},
+    }) == (None, None)
 
 
 def test_extract_video_id_from_full_video_url():

@@ -1,6 +1,7 @@
 yt-dlp>=2026.6.9
 playwright>=1.40.0
 python-dotenv>=1.0.1
+google-genai
 demucs
 numpy<2.3,>=1.26
 torch==2.11.0+cu128

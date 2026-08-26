@@ -11,6 +11,15 @@ from .tiktok import TikTokDownloader
 from .reddit import RedditDownloader
 from .bilibili import BilibiliDownloader
 from .generic import GenericDownloader
+from .social import (
+    DailymotionDownloader,
+    TwitchDownloader,
+    TwitterDownloader,
+    VimeoDownloader,
+    VKDownloader,
+    WeiboDownloader,
+    XiaohongshuDownloader,
+)
 
 from .base import BaseDownloader
 
@@ -39,6 +48,20 @@ class DownloaderFactory:
         Platform.BILIBILI: BilibiliDownloader,
 
         Platform.REDDIT: RedditDownloader,
+
+        Platform.TWITTER: TwitterDownloader,
+
+        Platform.VIMEO: VimeoDownloader,
+
+        Platform.DAILYMOTION: DailymotionDownloader,
+
+        Platform.TWITCH: TwitchDownloader,
+
+        Platform.VK: VKDownloader,
+
+        Platform.WEIBO: WeiboDownloader,
+
+        Platform.XIAOHONGSHU: XiaohongshuDownloader,
 
         Platform.GENERIC: GenericDownloader,
 

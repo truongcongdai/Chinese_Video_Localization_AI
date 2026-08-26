@@ -1496,6 +1496,125 @@ class OnScreenTextDetector:
         self.logger.info("OnScreenTextDetector: detected %d persistent text/watermark region(s)", len(regions))
         return regions
 
+    def detect_corner_watermark_region(
+        self,
+        video_path: Path,
+        duration: float,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Find a bright platform-logo cluster in either upper corner.
+
+        This is deliberately visual rather than hardcoded to left or right:
+        later flip transforms change the output side, while cleanup happens
+        against source-frame coordinates.
+        """
+        dims = self._get_video_dimensions(video_path)
+        if not dims or duration <= 0:
+            return None
+        frame_w, frame_h = dims
+        with tempfile.TemporaryDirectory(prefix="corner_watermark_") as tmp:
+            frame_path = Path(tmp) / "frame.jpg"
+            if not self._extract_frame(video_path, min(duration * 0.20, 3.0), frame_path):
+                return None
+            try:
+                import cv2  # type: ignore
+                import numpy as np
+
+                frame = cv2.imread(str(frame_path))
+                if frame is None:
+                    return None
+                candidates = []
+                for side, (x0, x1) in enumerate(((0, int(frame_w * 0.36)), (int(frame_w * 0.64), frame_w))):
+                    y0, y1 = 0, int(frame_h * 0.34)
+                    roi = frame[y0:y1, x0:x1]
+                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    binary = (gray >= 205).astype("uint8") * 255
+                    count, _labels, stats, _centers = cv2.connectedComponentsWithStats(binary, 8)
+                    boxes = []
+                    score = 0.0
+                    for idx in range(1, count):
+                        x, y, width, height, area = stats[idx]
+                        if area < 5 or area > roi.shape[0] * roi.shape[1] * 0.08:
+                            continue
+                        if width > roi.shape[1] * 0.70 or height > roi.shape[0] * 0.55:
+                            continue
+                        boxes.append((x, y, x + width, y + height))
+                        score += float(area)
+                    if len(boxes) >= 4:
+                        bx0 = min(box[0] for box in boxes)
+                        by0 = min(box[1] for box in boxes)
+                        bx1 = max(box[2] for box in boxes)
+                        by1 = max(box[3] for box in boxes)
+                        candidates.append((score, side, bx0 + x0, by0, bx1 + x0, by1))
+                if not candidates:
+                    return None
+                _score, _side, x0, y0, x1, y1 = max(candidates)
+                pad_x, pad_y = frame_w * 0.012, frame_h * 0.012
+                return (
+                    max(0.0, (x0 - pad_x) / frame_w),
+                    max(0.0, (y0 - pad_y) / frame_h),
+                    min(1.0, (x1 + pad_x) / frame_w),
+                    min(0.42, (y1 + pad_y) / frame_h),
+                )
+            except Exception as exc:
+                self.logger.warning("Corner watermark detection failed: %s", exc)
+                return None
+
+    def detect_corner_watermark_regions(
+        self, video_path: Path, duration: float
+    ) -> List[Tuple[float, float, float, float]]:
+        """Return tight OCR boxes for a moving upper-corner platform mark.
+
+        Douyin moves its save-watermark between corners, so it often fails a
+        whole-video persistence threshold. Tight per-line boxes avoid masking
+        the ceiling/window content between the logo and account text.
+        """
+        dims = self._get_video_dimensions(video_path)
+        if not dims or duration <= 0:
+            return []
+        frame_w, frame_h = dims
+        with tempfile.TemporaryDirectory(prefix="corner_watermark_ocr_") as tmp:
+            frame_path = Path(tmp) / "frame.jpg"
+            if not self._extract_frame(video_path, min(duration * 0.20, 3.0), frame_path):
+                return []
+            boxes = self._detect_boxes_in_frame(frame_path)
+        corner_boxes = [
+            box for box in boxes
+            if ((box[0] + box[2]) / 2.0 < frame_w * 0.38 or (box[0] + box[2]) / 2.0 > frame_w * 0.62)
+            and ((box[1] + box[3]) / 2.0) < frame_h * 0.36
+        ]
+        if not corner_boxes:
+            return []
+        left_score = sum((x1 - x0) for x0, _y0, x1, _y1 in corner_boxes if (x0 + x1) / 2 < frame_w / 2)
+        right_score = sum((x1 - x0) for x0, _y0, x1, _y1 in corner_boxes if (x0 + x1) / 2 >= frame_w / 2)
+        use_left = left_score >= right_score
+        selected = [box for box in corner_boxes if (((box[0] + box[2]) / 2 < frame_w / 2) == use_left)]
+        pad_x, pad_y = frame_w * 0.008, frame_h * 0.008
+        min_x = min(box[0] for box in selected)
+        max_x = max(box[2] for box in selected)
+        min_y = min(box[1] for box in selected)
+        max_y = max(box[3] for box in selected)
+        regions = [(
+            max(0.0, (min_x - pad_x) / frame_w), max(0.0, (min_y - pad_y) / frame_h),
+            min(1.0, (max_x + pad_x) / frame_w), min(1.0, (max_y + pad_y) / frame_h),
+        )]
+        # EasyOCR commonly reads the account/title lines but misses the
+        # stylised musical-note glyph above them. Add only the compact area
+        # immediately above the first line, not a whole corner rectangle.
+        top_y = min_y
+        logo_width = max(24, int((max_x - min_x) * 0.55))
+        if top_y > frame_h * 0.035:
+            if use_left:
+                logo_x0, logo_x1 = min_x, min(frame_w, min_x + logo_width)
+            else:
+                logo_x0, logo_x1 = max(0, max_x - logo_width), max_x
+            regions.append((
+                max(0.0, (logo_x0 - pad_x) / frame_w),
+                max(0.0, (top_y - frame_h * 0.11) / frame_h),
+                min(1.0, (logo_x1 + pad_x) / frame_w),
+                min(1.0, (top_y + pad_y) / frame_h),
+            ))
+        return regions
+
     def _drop_implausible_boxes(
         self,
         boxes: List[Tuple[int, int, int, int]],

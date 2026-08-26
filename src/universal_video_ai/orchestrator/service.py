@@ -140,7 +140,11 @@ class LocalizationConfig:
         # Common Douyin/TikTok watermark/account area.
         (0.80, 0.72, 1.0, 1.0),
     )
-    text_cover_samples_per_segment: int = 4  # Increased from 2 for better OCR detection
+    # Learn one conservative subtitle cleanup box from a small set of the
+    # longest cues, then reuse it for every cue. OCR-ing every frame of every
+    # sentence was the largest avoidable CPU cost in the render path.
+    text_cover_samples_per_segment: int = 1
+    text_cover_learning_windows: int = 6
     # If the source video has burned-in subtitles whose visual timing differs
     # from ASR/audio timing, estimate a single OCR-based offset and shift the
     # per-segment timeline before translation/TTS/render. This keeps dubbed
@@ -181,9 +185,13 @@ class LocalizationConfig:
     global_subtitle_offset: float = 0.0
     auto_blur_static_text: bool = True
     static_text_blur_samples: int = 6
+    # Candidate source-frame areas for Douyin's moving save watermark. The
+    # cleaner activates one only when the cyan/red logo pixels are present in
+    # that frame, so inactive corners remain untouched.
+    moving_platform_watermark_candidates: Tuple[Tuple[float, float, float, float], ...] = ()
     # Remove automatically detected source watermarks before rendering and
     # before applying user branding. This uses inpainting, never blur.
-    inpaint_source_watermarks: bool = True
+    inpaint_source_watermarks: bool = False
     # Duration-aware subtitle/dub guardrail. This runs after base translation
     # and optional LLM adaptation so every segment is checked against its
     # original timestamp before subtitles and TTS are generated.
@@ -1377,11 +1385,22 @@ class LocalizationService:
                                 download_result.video_path,
                                 cleaned_source,
                                 static_text_boxes,
+                                inpaint_passes=2,
+                                post_blur=False,
+                                progress_callback=lambda frame, total: self._progress(
+                                    91 + (3 * frame // max(1, total)),
+                                    (
+                                        f"Đang xoá watermark nguồn: {frame * 100 // total}%"
+                                        if total
+                                        else f"Đang xoá watermark nguồn: {frame} khung hình"
+                                    ),
+                                ),
                             )
                             self.logger.info(
                                 "Source watermark inpainting complete before output branding: %s",
                                 source_video_for_render,
                             )
+                            self._progress(95, "Đã xoá watermark nguồn; đang ghép video...")
                         except Exception as exc:
                             # Never silently fall back to blur: preserving the
                             # source is less deceptive than a smeared region.
@@ -1390,10 +1409,8 @@ class LocalizationService:
                             )
                             source_video_for_render = download_result.video_path
                     elif static_text_boxes:
-                        existing_boxes = tuple(self.renderer.config.watermark_boxes_fractional or ())
-                        self.renderer.config = replace(
-                            self.renderer.config,
-                            watermark_boxes_fractional=existing_boxes + tuple(static_text_boxes),
+                        self.logger.info(
+                            "Source watermark cleanup is disabled; preserving the original pixels"
                         )
 
                     # Avoid double-showing the translation: where an
@@ -1870,7 +1887,6 @@ class LocalizationService:
     ) -> Tuple[Tuple[float, float, float, float], ...]:
         if (
             not self.config.auto_blur_static_text
-            or not self.config.enable_text_cover
             or not video_path
             or duration <= 0
         ):
@@ -1887,16 +1903,32 @@ class LocalizationService:
                 video_path,
                 duration=duration,
                 sample_count=self.config.static_text_blur_samples,
+                # Dialogue subtitles frequently occupy the same lower band
+                # for most frames. They are cue-timed elsewhere and must not
+                # be mistaken for a permanent watermark rectangle.
+                ignore_region_fractional=(0.04, 0.52, 0.96, 1.0),
             )
-            # Add fixed corner regions for platform logos (Douyin, TikTok, etc.)
-            corner_logo_regions = [
-                (0.0, 0.0, 0.15, 0.10), (0.85, 0.0, 1.0, 0.10),
-                (0.0, 0.90, 0.15, 1.0), (0.85, 0.90, 1.0, 1.0),
-            ]
             boxes_list = list(boxes)
-            for cx0, cy0, cx1, cy1 in corner_logo_regions:
-                if not any(max(0, min(cx1, rx1) - max(cx0, rx0)) * max(0, min(cy1, ry1) - max(cy0, ry0)) > (cx1-cx0)*(cy1-cy0)*0.3 for rx0, ry0, rx1, ry1 in boxes_list):
-                    boxes_list.append((cx0, cy0, cx1, cy1))
+            corner_detector = getattr(detector, "detect_corner_watermark_regions", None)
+            if callable(corner_detector):
+                corner_regions = corner_detector(video_path, duration=duration)
+                for corner in corner_regions if isinstance(corner_regions, (list, tuple)) else ():
+                    if not (
+                        isinstance(corner, tuple)
+                        and len(corner) == 4
+                        and all(isinstance(value, (int, float)) for value in corner)
+                    ):
+                        continue
+                    if not any(
+                        max(0.0, min(corner[2], bx1) - max(corner[0], bx0))
+                        * max(0.0, min(corner[3], by1) - max(corner[1], by0))
+                        > 0.0
+                        for bx0, by0, bx1, by1 in boxes_list
+                    ):
+                        boxes_list.append(corner)
+            for candidate in self.config.moving_platform_watermark_candidates:
+                if candidate not in boxes_list:
+                    boxes_list.append(candidate)
             boxes = tuple(boxes_list)
         except Exception as exc:
             self.logger.warning("Persistent text/watermark detection failed; skipping static blur: %s", exc)
@@ -2010,33 +2042,42 @@ class LocalizationService:
             )
             detector = OnScreenTextDetector(languages=resolved_ocr_languages)
         windows = [(s.start, s.end) for s in source_segments]
+        learning_count = max(1, int(self.config.text_cover_learning_windows))
+        learning_windows = sorted(
+            windows, key=lambda item: item[1] - item[0], reverse=True
+        )[:learning_count]
 
         try:
-            regions = detector.detect_regions_for_windows(
-                video_path, windows,
+            learned_regions = tuple(detector.detect_regions_for_windows(
+                video_path, learning_windows,
                 samples_per_window=self.config.text_cover_samples_per_segment,
                 exclude_regions_fractional=self.config.watermark_exclude_regions_fractional,
-            )
+                fill_undetected_windows=False,
+            ))
         except Exception as exc:
             self.logger.warning(
                 "On-screen text detection unavailable/failed; skipping text-cover overlays: %s", exc
             )
             return None
 
-        if not regions:
+        if not learned_regions:
             self.logger.info("LocalizationService: no on-screen text detected; skipping text-cover overlays")
             return None
 
-        detected_count = len(regions)
-        regions = self._fill_missing_text_regions(
-            windows, regions, detector.last_typical_line_height
-        )
-        if len(regions) > detected_count:
-            self.logger.info(
-                "LocalizationService: filled %d OCR-missed subtitle window(s) "
-                "from neighboring adaptive regions",
-                len(regions) - detected_count,
+        largest = max(learned_regions, key=lambda region: region.width * region.height)
+        regions = [
+            TextRegion(
+                start=start, end=end,
+                x=largest.x, y=largest.y,
+                width=largest.width, height=largest.height,
             )
+            for start, end in windows
+        ]
+        self.logger.info(
+            "LocalizationService: learned one %dx%d subtitle cover from %d cue(s); "
+            "reusing it across %d cue(s)",
+            largest.width, largest.height, len(learning_windows), len(windows),
+        )
 
         # Match detected regions back to the translated sentence at the same
         # (start, end) window. Both lists were built from the same

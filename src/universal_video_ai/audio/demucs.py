@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -156,6 +157,24 @@ class DemucsProcessor:
             other=stem_files["other"],
         )
 
+    @staticmethod
+    def _source_fingerprint(audio_path: Path) -> str:
+        digest = hashlib.sha256()
+        with audio_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _cache_manifest_path(self, output_dir: Path, audio_stem: str) -> Path:
+        return output_dir / self.config.model / audio_stem / ".uvai_source.sha256"
+
+    def _record_cache_manifest(self, output_dir: Path, audio_path: Path, fingerprint: str) -> None:
+        manifest = self._cache_manifest_path(output_dir, audio_path.stem)
+        try:
+            manifest.write_text(fingerprint, encoding="ascii")
+        except OSError as exc:
+            self.logger.warning("Could not save Demucs cache manifest %s: %s", manifest, exc)
+
     def _build_demucs_command(self, audio_paths: list[Path], output_dir: Path) -> list[str]:
         cmd = [
             "demucs",
@@ -302,9 +321,27 @@ class DemucsProcessor:
 
         self.logger.info("Separating audio %s using Demucs model=%s", audio_path, self.config.model)
 
+        # A job-level retry uses the same output directory. Reuse a complete
+        # stem set instead of spending minutes running the identical model
+        # again. _find_stem_files validates every expected artifact first, so
+        # an interrupted/partial run still falls through to normal processing.
+        source_fingerprint = self._source_fingerprint(audio_path)
+        cached_output = self._find_stem_files(output_dir, audio_path.stem)
+        manifest = self._cache_manifest_path(output_dir, audio_path.stem)
+        cached_fingerprint = None
+        try:
+            cached_fingerprint = manifest.read_text(encoding="ascii").strip()
+        except OSError:
+            pass
+        if cached_output is not None and cached_fingerprint == source_fingerprint:
+            self.logger.info("Demucs cache hit: reusing stems for %s", audio_path)
+            return cached_output
+
         if audio_path.stat().st_size > self.config.chunk_threshold_bytes:
             try:
-                return self._separate_chunked(audio_path, output_dir)
+                result = self._separate_chunked(audio_path, output_dir)
+                self._record_cache_manifest(output_dir, audio_path, source_fingerprint)
+                return result
             except subprocess.TimeoutExpired:
                 self.logger.error("Chunked Demucs separation timed out")
                 raise RuntimeError("Chunked Demucs separation timed out")
@@ -335,6 +372,7 @@ class DemucsProcessor:
 
             self.logger.info("Audio separation successful. Stems: vocals=%s, drums=%s, bass=%s, other=%s",
                              demucs_output.vocals, demucs_output.drums, demucs_output.bass, demucs_output.other)
+            self._record_cache_manifest(output_dir, audio_path, source_fingerprint)
             return demucs_output
 
         except subprocess.TimeoutExpired:

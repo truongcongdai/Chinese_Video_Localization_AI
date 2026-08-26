@@ -6,7 +6,7 @@ import requests
 from pydantic import BaseModel
 
 from .platform import Platform
-from .ytdlp_downloader import YTDLPDownloader
+from .ytdlp_downloader import YTDLPDownloader, _downloaded_filepath
 
 
 class YoutubeDownloader(YTDLPDownloader):
@@ -56,8 +56,10 @@ class YouTubeTools:
         downloads_dir = self._get_downloads_dir("videos")
         downloads_dir.mkdir(parents=True, exist_ok=True)
         
+        requested_format = 'bv*+ba/b' if format == 'best' else format
         ydl_opts = {
-            'format': format,
+            'format': requested_format,
+            'merge_output_format': 'mp4',
             'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
@@ -66,8 +68,7 @@ class YouTubeTools:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                downloaded_file = Path(filename)
+                downloaded_file = _downloaded_filepath(ydl, info)
                 
                 if downloaded_file.exists():
                     return {

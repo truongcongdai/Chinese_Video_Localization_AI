@@ -36,6 +36,11 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [3/5] Building executable with PyInstaller...
+python -c "import pathlib, whisper; p=pathlib.Path(whisper.__file__).parent/'assets'/'mel_filters.npz'; assert p.is_file(), 'Missing required Whisper asset: '+str(p); print('Whisper asset verified:', p)"
+if %errorlevel% neq 0 (
+    echo ERROR: openai-whisper assets are incomplete in the build environment
+    exit /b 1
+)
 pyinstaller build_exe.spec --clean
 if %errorlevel% neq 0 (
     echo ERROR: PyInstaller build failed

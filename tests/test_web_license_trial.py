@@ -26,13 +26,17 @@ def test_central_license_mode_accepts_active_free_trial(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("trial", "message"),
+    ("tokens", "expires_in", "message"),
     [
-        (_trial(tokens=0), "Đã hết token trial"),
-        (_trial(expires_in=-1), "Trial đã hết hạn"),
+        (0, 3600, "Đã hết token trial"),
+        (25, -1, "Trial đã hết hạn"),
     ],
 )
-def test_central_license_mode_rejects_unusable_trial(monkeypatch, trial, message):
+def test_central_license_mode_rejects_unusable_trial(monkeypatch, tokens, expires_in, message):
+    # Construct time-sensitive data when the test executes. A release suite can
+    # legitimately run for hours on a CPU-only OCR machine; creating this at
+    # collection time made the nominally active trial expire mid-suite.
+    trial = _trial(tokens=tokens, expires_in=expires_in)
     monkeypatch.setattr(web_app, "USE_LICENSE_SERVER", True)
     monkeypatch.setattr(web_app.store, "get_machine_id", lambda: "machine-1")
     monkeypatch.setattr(web_app.store, "get_license_by_user", lambda user_id: None)
@@ -301,7 +305,7 @@ def test_active_license_hides_activation_and_trial_actions():
     assert 'value="15"' in html
 
 
-def test_bulk_retry_clones_eligible_selected_jobs_and_charges_once(monkeypatch):
+def test_bulk_retry_reuses_failed_selected_jobs_without_charging(monkeypatch):
     jobs = {
         "done-1": SimpleNamespace(id="done-1", user_id=7, status="done"),
         "error-1": SimpleNamespace(id="error-1", user_id=7, status="error"),
@@ -326,10 +330,10 @@ def test_bulk_retry_clones_eligible_selected_jobs_and_charges_once(monkeypatch):
         web_app.BulkDeleteBody(job_ids=list(jobs)), user_id=7,
     ))
 
-    assert result["created"] == 2
-    assert result["skipped"] == 1
-    assert charged == [(7, -2)]
-    assert scheduled == [("done-1", "new-done-1"), ("error-1", "new-error-1")]
+    assert result["retried"] == 1
+    assert result["skipped"] == 2
+    assert charged == []
+    assert scheduled == [("error-1", "new-error-1")]
 
 
 def test_windows_build_embeds_public_license_server_default():

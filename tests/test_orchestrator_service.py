@@ -16,7 +16,7 @@ from universal_video_ai.timeline.service import TimelineService, TimelineSegment
 from universal_video_ai.mixer.service import MixerService
 from universal_video_ai.render.animated_subtitles import SubtitleEffect
 from universal_video_ai.render.renderer import Renderer, RenderConfig, AnimatedSubtitleConfig, TextOverlay
-from universal_video_ai.render.text_detector import OnScreenTextDetector, SubtitleOffsetEstimate, SubtitleTimingWindow
+from universal_video_ai.render.text_detector import OnScreenTextDetector, SubtitleOffsetEstimate, SubtitleTimingWindow, TextRegion
 from universal_video_ai.downloader.service import DownloadService
 from universal_video_ai.segment import TranscriptSegment
 
@@ -1039,7 +1039,65 @@ def test_static_text_watermark_boxes_are_added_to_render_config(tmp_path: Path):
         (0.0, 0.02, 0.25, 0.12),
         (0.14, 0.18, 0.34, 0.31),
     )
+    assert all(not (x0 < 0.5 and y0 > 0.5) for x0, y0, _x1, _y1 in boxes)
     detector.detect_persistent_text_regions.assert_called_once()
+    assert detector.detect_persistent_text_regions.call_args.kwargs["ignore_region_fractional"] == (
+        0.04, 0.52, 0.96, 1.0,
+    )
+
+
+def test_static_watermarks_are_detected_even_when_subtitle_cover_is_disabled(tmp_path: Path):
+    detector = MagicMock()
+    detector.detect_persistent_text_regions.return_value = ((0.8, 0.0, 1.0, 0.2),)
+    service = LocalizationService(
+        text_detector=detector,
+        config=LocalizationConfig(
+            enable_text_cover=False,
+            auto_blur_static_text=True,
+            inpaint_source_watermarks=True,
+        ),
+    )
+
+    boxes = service._detect_static_text_watermark_boxes(
+        video_path=tmp_path / "video.mp4",
+        detected_language="zh",
+        duration=30.0,
+    )
+
+    assert boxes == (
+        (0.8, 0.0, 1.0, 0.2),
+    )
+    detector.detect_persistent_text_regions.assert_called_once()
+
+
+def test_text_cover_learns_largest_box_once_and_reuses_it(tmp_path: Path):
+    detector = MagicMock()
+    detector.last_typical_line_height = 30
+    detector.detect_regions_for_windows.return_value = [
+        TextRegion(start=0.0, end=2.0, x=100, y=600, width=300, height=50),
+        TextRegion(start=4.0, end=8.0, x=80, y=590, width=500, height=70),
+    ]
+    detector._get_video_dimensions.return_value = (1080, 1920)
+    service = LocalizationService(
+        text_detector=detector,
+        config=LocalizationConfig(text_cover_learning_windows=2),
+    )
+    source = [
+        TranscriptSegment(start=0.0, end=2.0, text="a"),
+        TranscriptSegment(start=2.0, end=3.0, text="b"),
+        TranscriptSegment(start=4.0, end=8.0, text="c"),
+    ]
+    translated = [
+        TranscriptSegment(start=item.start, end=item.end, text=f"vi-{item.text}")
+        for item in source
+    ]
+
+    overlays = service._build_text_overlays(tmp_path / "video.mp4", source, translated, "zh")
+
+    assert overlays is not None and len(overlays) == 3
+    assert {(item.x, item.y, item.width, item.height) for item in overlays} == {(80, 590, 500, 70)}
+    detector.detect_regions_for_windows.assert_called_once()
+    assert detector.detect_regions_for_windows.call_args.args[1] == [(4.0, 8.0), (0.0, 2.0)]
 
 
 def test_missing_visual_windows_are_interpolated_into_one_canonical_clock():

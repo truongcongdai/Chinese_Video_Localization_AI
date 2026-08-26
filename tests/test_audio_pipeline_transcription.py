@@ -95,3 +95,37 @@ def test_pipeline_transcription_no_service_raises(tmp_path: Path, monkeypatch):
     dr = make_download_result(tmp_path)
     with pytest.raises(RuntimeError):
         pipeline.process(dr, output_dir=tmp_path)
+
+
+def test_pipeline_reuses_content_validated_transcript_cache(tmp_path: Path, monkeypatch):
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"stable audio bytes")
+
+    def fake_extract(video_path, output_dir=None):
+        return AudioResult(
+            success=True, audio_path=audio_path, duration=1.0, sample_rate=44100,
+            channels=1, bitrate=None, format="wav", filesize=audio_path.stat().st_size,
+        )
+
+    from universal_video_ai.audio.extractor import AudioExtractor
+    monkeypatch.setattr(AudioExtractor, "extract", staticmethod(fake_extract))
+
+    class CountingBackend:
+        calls = 0
+
+        def transcribe(self, audio_path, language=None):
+            self.calls += 1
+            return "cached transcript"
+
+    backend = CountingBackend()
+    pipeline = AudioPipeline(
+        config=AudioPipelineConfig(run_transcription=True, transcription_language="zh"),
+        extractor=AudioExtractor(), speech_service=SpeechService(backend=backend),
+    )
+    download = make_download_result(tmp_path)
+
+    first = pipeline.process(download, output_dir=tmp_path)
+    second = pipeline.process(download, output_dir=tmp_path)
+
+    assert first.transcript == second.transcript == "cached transcript"
+    assert backend.calls == 1

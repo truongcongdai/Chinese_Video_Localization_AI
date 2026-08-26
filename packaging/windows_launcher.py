@@ -26,6 +26,10 @@ if ffmpeg_dir.is_dir():
 
 # Fix Windows console encoding for subprocess calls (demucs, etc.)
 os.environ["PYTHONIOENCODING"] = "utf-8"
+# yt-dlp's generated lazy registry is enormous and offers only startup-time
+# optimization. The normal extractor registry has identical capabilities and
+# avoids a single 200k+ line C translation unit that MSVC cannot compile.
+os.environ.setdefault("YTDLP_NO_LAZY_EXTRACTORS", "1")
 
 env_path = APP_DIR / ".env"
 if not env_path.exists():

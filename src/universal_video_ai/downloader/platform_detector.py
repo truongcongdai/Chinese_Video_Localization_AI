@@ -35,6 +35,21 @@ class PlatformDetector:
 
         "reddit.com": Platform.REDDIT,
         "redd.it": Platform.REDDIT,
+
+        "twitter.com": Platform.TWITTER,
+        "x.com": Platform.TWITTER,
+
+        "vimeo.com": Platform.VIMEO,
+        "dailymotion.com": Platform.DAILYMOTION,
+        "dai.ly": Platform.DAILYMOTION,
+        "twitch.tv": Platform.TWITCH,
+        "clips.twitch.tv": Platform.TWITCH,
+        "vk.com": Platform.VK,
+        "vkvideo.ru": Platform.VK,
+        "weibo.com": Platform.WEIBO,
+        "weibo.cn": Platform.WEIBO,
+        "xiaohongshu.com": Platform.XIAOHONGSHU,
+        "xhslink.com": Platform.XIAOHONGSHU,
     }
 
     def detect(self, url: str) -> Platform:

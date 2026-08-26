@@ -14,6 +14,28 @@ from .platform import Platform
 logger = logging.getLogger(__name__)
 
 
+def _downloaded_filepath(ydl, info: dict) -> Path:
+    """Resolve the file yt-dlp actually produced after merge/remux."""
+    candidates = []
+    if info.get("filepath"):
+        candidates.append(Path(info["filepath"]))
+    if info.get("_filename"):
+        candidates.append(Path(info["_filename"]))
+
+    prepared = Path(ydl.prepare_filename(info))
+    candidates.extend((prepared.with_suffix(".mp4"), prepared))
+    # Component paths are last: for split DASH downloads these can be the
+    # video-only/audio-only inputs rather than the final merged output.
+    for item in info.get("requested_downloads") or ():
+        if isinstance(item, dict) and item.get("filepath"):
+            candidates.append(Path(item["filepath"]))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    # Unit-test/dry-run fallback; normal downloads return an existing path.
+    return prepared.with_suffix(".mp4")
+
+
 class DouyinCookiesRequiredError(RuntimeError):
     """Raised after every safe automatic Douyin cookie source was exhausted."""
 
@@ -118,7 +140,7 @@ class YTDLPDownloader(BaseDownloader):
                 "bestvideo[format_id!*=watermark][format_id!*=download_addr]"
                 "+bestaudio[format_id!*=watermark][format_id!*=download_addr]"
                 "/best[format_id!*=watermark][format_id!*=download_addr]"
-                "/bv*+ba/b"
+                + ("" if self.platform in {Platform.TIKTOK, Platform.DOUYIN} else "/bv*+ba/b")
             ),
 
             "merge_output_format": "mp4",
@@ -160,7 +182,7 @@ class YTDLPDownloader(BaseDownloader):
             try:
                 with yt_dlp.YoutubeDL(attempt_options) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    filepath = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+                    filepath = _downloaded_filepath(ydl, info)
                 return DownloadResult(
                     success=True,
                     platform=self.platform,
@@ -173,7 +195,7 @@ class YTDLPDownloader(BaseDownloader):
                     width=info.get("width", 0),
                     height=info.get("height", 0),
                     filesize=info.get("filesize", 0),
-                    extension="mp4",
+                    extension=filepath.suffix.lstrip(".") or "mp4",
                     description=info.get("description", "") or "",
                     thumbnail_url=info.get("thumbnail", "") or "",
                     tags=[str(item) for item in (info.get("tags") or []) if str(item).strip()],

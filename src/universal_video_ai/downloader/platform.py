@@ -18,5 +18,10 @@ class Platform(str, Enum):
     GENERIC = "generic"
 
     VIMEO = "vimeo"
+    DAILYMOTION = "dailymotion"
+    TWITCH = "twitch"
+    VK = "vk"
+    WEIBO = "weibo"
+    XIAOHONGSHU = "xiaohongshu"
 
     OTHER = "other"

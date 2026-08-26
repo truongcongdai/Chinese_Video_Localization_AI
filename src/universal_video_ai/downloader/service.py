@@ -40,9 +40,21 @@ class DownloadService:
         output_dir: Path,
 
     ) -> DownloadResult:
-        # Check cache first
+        platform = self.detector.detect(url)
+
+        # Watermarked TikTok/Douyin files cached by the old permissive format
+        # policy must never be recycled into a new render. Force one fresh
+        # clean-stream download, then cache it with an explicit policy marker.
         if self.cache:
             cached_entry = self.cache.get_entry(url)
+            cached_metadata = dict((cached_entry or {}).get("source_metadata") or {})
+            if (
+                cached_entry
+                and platform.value in {"tiktok", "douyin"}
+                and int(cached_metadata.get("download_policy_version") or 0) < 3
+            ):
+                self.cache.remove(url)
+                cached_entry = None
             if cached_entry:
                 # Materialize the cached video as a hard link whenever the
                 # cache and job directory share a volume. This avoids another
@@ -94,8 +106,6 @@ class DownloadService:
         
         # Rate limiting is handled at the caller level (async)
         # This sync method just performs the download
-        platform = self.detector.detect(url)
-
         downloader = DownloaderFactory.create(
             platform
         )
@@ -125,6 +135,7 @@ class DownloadService:
                     "thumbnail_url": result.thumbnail_url,
                     "tags": list(result.tags or []),
                     "raw_metadata": dict(result.raw_metadata or {}),
+                    "download_policy_version": 3,
                 },
             )
         

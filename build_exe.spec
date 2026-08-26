@@ -7,6 +7,7 @@ Usage: pyinstaller build_exe.spec
 import sys
 import os
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # Get the repository root
 REPO_ROOT = Path(os.getcwd()).resolve()
@@ -27,6 +28,17 @@ datas = [
     # (str(REPO_ROOT / "database.sqlite3"), "."),
 ]
 
+# openai-whisper imports its Python package as ``whisper`` and loads the mel
+# filter bank from package data at runtime. Hidden imports alone do not copy
+# ``whisper/assets/mel_filters.npz`` into PyInstaller's temporary _MEI folder.
+whisper_datas = collect_data_files("whisper", includes=["assets/*"])
+if not any(Path(source).name == "mel_filters.npz" for source, _destination in whisper_datas):
+    raise RuntimeError(
+        "PyInstaller cannot find whisper/assets/mel_filters.npz. "
+        "Install openai-whisper in the build environment before packaging."
+    )
+datas += whisper_datas
+
 # Collect hidden imports for heavy dependencies
 hiddenimports = [
     # PyTorch
@@ -44,7 +56,7 @@ hiddenimports = [
     # Audio processing
     'librosa',
     'demucs',
-    'openai.whisper',
+    'whisper',
     'edge_tts',
 
     # OCR
@@ -76,6 +88,7 @@ hiddenimports = [
     'universal_video_ai.web.auth',
     'universal_video_ai.web.static',
 ]
+hiddenimports += collect_submodules("whisper")
 
 a = Analysis(
     ['scripts/run_web_wrapper.py'],

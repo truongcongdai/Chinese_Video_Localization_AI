@@ -34,7 +34,11 @@ class DownloaderAdapter(TrendProvider):
     
     @property
     def supported_platforms(self) -> List[str]:
-        return ["youtube", "tiktok", "douyin", "kuaishou", "facebook"]
+        return [
+            "youtube", "tiktok", "douyin", "kuaishou", "facebook",
+            "instagram", "bilibili", "reddit", "twitter", "vimeo",
+            "dailymotion", "twitch", "vk", "weibo", "xiaohongshu",
+        ]
     
     def search_trends(
         self,

@@ -84,6 +84,23 @@ def test_separate_success(tmp_path: Path, monkeypatch):
     assert output.vocals.name == "vocals.wav"
 
 
+def test_separate_reuses_complete_existing_stems(tmp_path: Path, monkeypatch):
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"audio")
+    stems_dir = tmp_path / "demucs_output" / "htdemucs" / "audio"
+    stems_dir.mkdir(parents=True)
+    for stem in ("vocals", "drums", "bass", "other"):
+        (stems_dir / f"{stem}.wav").write_bytes(b"cached")
+    fingerprint = DemucsProcessor._source_fingerprint(audio_file)
+    (stems_dir / ".uvai_source.sha256").write_text(fingerprint, encoding="ascii")
+
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: pytest.fail("Demucs must not run"))
+
+    result = DemucsProcessor().separate(audio_file)
+
+    assert result.vocals == stems_dir / "vocals.wav"
+
+
 def test_wav_command_uses_demucs_default_format_and_segment_flag(tmp_path: Path, monkeypatch):
     audio_file = tmp_path / "audio.wav"
     audio_file.write_bytes(b"dummy audio")

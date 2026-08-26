@@ -71,7 +71,8 @@ class VideoTransformer:
         # Build FFmpeg filter chain
         filters = self._build_filter_chain()
         
-        if not filters:
+        split_ready = bool(self.config.enable_split_screen and self.config.overlay_image_path)
+        if not filters and not split_ready:
             # No transformations needed, just copy
             self.logger.info("No transformations configured, copying video directly")
             self._copy_video(input_path, output_path)
@@ -103,12 +104,6 @@ class VideoTransformer:
             if border_filter:
                 filters.append(border_filter)
         
-        # Split-screen
-        if self.config.enable_split_screen and self.config.overlay_image_path:
-            split_filter = self._build_split_screen_filter()
-            if split_filter:
-                filters.append(split_filter)
-        
         # Randomization
         if self.config.enable_randomization:
             random_filters = self._build_randomization_filters()
@@ -125,27 +120,6 @@ class VideoTransformer:
             # Add border on left and right
             return f"pad=width=iw+{self.config.border_px * 2}:height=ih:x={self.config.border_px}:y=0:color={self.config.border_color}"
         return ""
-    
-    def _build_split_screen_filter(self) -> str:
-        """Build FFmpeg filter_complex for split-screen overlay."""
-        if not self.config.overlay_image_path or not self.config.overlay_image_path.exists():
-            self.logger.warning(f"Overlay image not found: {self.config.overlay_image_path}")
-            return ""
-        
-        if self.config.split_mode == "vertical":
-            # Top/bottom split
-            return (
-                f"[1:v]scale=iw:ih/2[top];"
-                f"[0:v]scale=iw:ih/2[bottom];"
-                f"[top][bottom]vstack=inputs=2"
-            )
-        else:
-            # Left/right split
-            return (
-                f"[1:v]scale=iw/2:ih[left];"
-                f"[0:v]scale=iw/2:ih[right];"
-                f"[left][right]hstack=inputs=2"
-            )
     
     def _build_randomization_filters(self) -> list:
         """Build filters for randomization effects."""
@@ -175,28 +149,39 @@ class VideoTransformer:
     
     def _apply_ffmpeg_filters(self, input_path: Path, output_path: Path, filters: str) -> bool:
         """Apply FFmpeg filters to video."""
-        cmd = [
-            "ffmpeg",
-            "-i", str(input_path),
-            "-vf", filters,
-            "-c:a", "copy",  # Copy audio without re-encoding
-            "-y",  # Overwrite output file
-            str(output_path),
-        ]
-        
-        # Add overlay image input if split-screen is enabled
         if self.config.enable_split_screen and self.config.overlay_image_path:
-            cmd.insert(2, "-i")
-            cmd.insert(3, str(self.config.overlay_image_path))
-            cmd.insert(4, "-filter_complex")
-            cmd.insert(5, filters)
-            cmd.insert(6, "-map")
-            cmd.insert(7, "[out]")
-            cmd.insert(8, "-map")
-            cmd.insert(9, "0:a")
-            # Remove -vf since we're using -filter_complex
-            cmd.remove("-vf")
-            cmd.remove(filters)
+            image_path = self.config.overlay_image_path
+            if not image_path.exists():
+                self.logger.error("Split-screen image not found: %s", image_path)
+                return False
+            width = self.config.target_width
+            height = self.config.target_height
+            if not width or not height:
+                width, height = self._probe_dimensions(input_path)
+            width = max(4, int(width) // 2 * 2)
+            height = max(4, int(height) // 2 * 2)
+            base_prefix = f"{filters}," if filters else ""
+            if self.config.split_mode == "vertical":
+                pane_w, pane_h, stack = width // 2, height, "hstack=inputs=2"
+            else:
+                pane_w, pane_h, stack = width, height // 2, "vstack=inputs=2"
+            fit = (
+                f"scale={pane_w}:{pane_h}:force_original_aspect_ratio=decrease,"
+                f"pad={pane_w}:{pane_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+            )
+            complex_filter = f"[0:v]{base_prefix}{fit}[main];[1:v]{fit}[still];[main][still]{stack}[out]"
+            cmd = [
+                "ffmpeg", "-y", "-i", str(input_path), "-loop", "1", "-i", str(image_path),
+                "-filter_complex", complex_filter,
+                "-map", "[out]", "-map", "0:a?", "-shortest",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy",
+                str(output_path),
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-i", str(input_path), "-vf", filters,
+                "-c:a", "copy", "-y", str(output_path),
+            ]
         
         self.logger.info(f"Applying FFmpeg filters: {filters}")
         self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
@@ -226,6 +211,19 @@ class VideoTransformer:
         except Exception as e:
             self.logger.error(f"FFmpeg transformation failed: {e}")
             return False
+
+    @staticmethod
+    def _probe_dimensions(input_path: Path) -> Tuple[int, int]:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0",
+                str(input_path),
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        width, height = result.stdout.strip().split("x", 1)
+        return int(width), int(height)
     
     def _copy_video(self, input_path: Path, output_path: Path) -> bool:
         """Copy video without transformations."""

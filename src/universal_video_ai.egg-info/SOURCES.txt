@@ -106,6 +106,7 @@ src/universal_video_ai/downloader/rate_limiter.py
 src/universal_video_ai/downloader/reddit.py
 src/universal_video_ai/downloader/retry.py
 src/universal_video_ai/downloader/service.py
+src/universal_video_ai/downloader/social.py
 src/universal_video_ai/downloader/strategy.py
 src/universal_video_ai/downloader/tiktok.py
 src/universal_video_ai/downloader/validator.py
@@ -150,6 +151,7 @@ src/universal_video_ai/render/video_modifier.py
 src/universal_video_ai/render/video_review.py
 src/universal_video_ai/render/visual_director.py
 src/universal_video_ai/render/voice_director.py
+src/universal_video_ai/render/watermark_cleaner.py
 src/universal_video_ai/social/__init__.py
 src/universal_video_ai/social/base.py
 src/universal_video_ai/social/facebook.py
@@ -212,15 +214,18 @@ tests/test_database.py
 tests/test_demucs.py
 tests/test_douyin_deep_scan.py
 tests/test_douyin_downloader.py
+tests/test_downloader_platform_support.py
 tests/test_gemini_video.py
 tests/test_job_queue.py
 tests/test_jobs_service.py
 tests/test_mixer_service.py
 tests/test_model_manager.py
 tests/test_monitoring.py
+tests/test_nuitka_release_security.py
 tests/test_orchestrator_factory.py
 tests/test_orchestrator_service.py
 tests/test_prepublish.py
+tests/test_pyinstaller_whisper_assets.py
 tests/test_redis_cache.py
 tests/test_redis_job_queue.py
 tests/test_redis_job_worker.py
@@ -249,9 +254,12 @@ tests/test_translation_adaptation_resilience.py
 tests/test_tts.py
 tests/test_tts_backends.py
 tests/test_tts_service.py
+tests/test_user_management_referral.py
 tests/test_validator.py
 tests/test_video_review.py
+tests/test_video_transform_split.py
 tests/test_voice_karaoke_no_truncation.py
+tests/test_watermark_cleaner.py
 tests/test_web_license_trial.py
 tests/test_web_preflight.py
 tests/test_web_static_ui.py

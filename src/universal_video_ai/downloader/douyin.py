@@ -22,6 +22,18 @@ _DOWNLOAD_MAX_ATTEMPTS = 6
 _DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 
 
+def _clean_playback_url(video_data: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return a playback stream and never Douyin's watermarked save stream."""
+    for field_name in ("play_addr_h264", "play_addr", "play_addr_265"):
+        address = video_data.get(field_name)
+        if not isinstance(address, dict):
+            continue
+        for candidate in address.get("url_list") or ():
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                return candidate.replace("/playwm/", "/play/"), field_name
+    return None, None
+
+
 def _safe_video_filename(title: str, video_id: str, max_bytes: int = 200) -> str:
     """Return a portable, byte-bounded filename for a Douyin video."""
     cleaned = re.sub(r'[\\/\x00-\x1f\x7f]+', "_", title).strip(" .")
@@ -237,8 +249,10 @@ class DouyinDownloader(BaseDownloader):
                 return None
 
             # Try to get video URL from different fields
-            video_url = None
-            for field_name in ['download_addr', 'play_addr', 'play_addr_h264']:
+            video_url, field_name = _clean_playback_url(video_data)
+            # Never fall back to download_addr: it is commonly the app's
+            # watermarked "save video" rendition.
+            for field_name in (() if video_url else ('play_addr_h264', 'play_addr', 'play_addr_265')):
                 addr_data = video_data.get(field_name)
                 if addr_data and isinstance(addr_data, dict):
                     url_list = addr_data.get('url_list', [])
@@ -246,6 +260,9 @@ class DouyinDownloader(BaseDownloader):
                         video_url = url_list[0]
                         logger.info(f"🎥 Found video URL in {field_name}: {video_url[:100]}...")
                         break
+
+            if video_url:
+                video_url = video_url.replace('/playwm/', '/play/')
 
             if not video_url:
                 logger.error("❌ Cannot find video URL in API response")

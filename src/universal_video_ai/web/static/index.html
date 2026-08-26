@@ -6,7 +6,7 @@
 <title>Video Studio</title>
 <meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/assets/app.css?v=20260819-history-polish">
+<link rel="stylesheet" href="/assets/app.css?v=20260826-language-size">
 </head>
 <body>
 
@@ -311,8 +311,8 @@
 
     <section class="localization-step-panel active" data-localization-panel="1">
       <div class="field">
-        <label>Dán link video — YouTube / Douyin / TikTok / Facebook / Instagram (mỗi dòng một link)</label>
-        <textarea id="url-input" rows="2" placeholder="https://www.youtube.com/watch?v=...&#10;https://v.douyin.com/...&#10;https://www.tiktok.com/@user/video/..."></textarea>
+        <label>Dán link video — YouTube / Bilibili / Douyin / TikTok / Facebook / Instagram / mạng xã hội khác (mỗi dòng một link)</label>
+        <textarea id="url-input" rows="2" placeholder="https://www.youtube.com/watch?v=...&#10;https://www.bilibili.com/video/BV...&#10;https://v.douyin.com/..."></textarea>
         <div id="url-count-help" style="font-size:12px;color:var(--text-dim);margin-top:6px">Chưa có link nào.</div>
       </div>
       <div class="field" style="margin-top:12px">
@@ -1053,8 +1053,10 @@
           </select>
         </div>
         <div class="field">
-          <label>Ảnh overlay (đường dẫn file)</label>
-          <input type="text" id="transform-overlay-path" placeholder="/path/to/overlay.png">
+          <label for="transform-overlay-file">Ảnh dùng cho nửa màn hình</label>
+          <input type="file" id="transform-overlay-file" accept="image/png,image/jpeg,image/webp">
+          <div id="transform-overlay-status" class="hint">Chọn PNG, JPG hoặc WEBP.</div>
+          <img id="transform-overlay-preview" class="hidden" alt="Xem trước ảnh split screen" style="max-width:180px;max-height:120px;margin-top:8px;border-radius:6px;object-fit:cover">
         </div>
       </div>
 
@@ -1587,51 +1589,6 @@
     <button class="btn gradient small" id="latest-improve-btn" type="button" style="margin-top:10px">Improve this video</button>
   </div>
 
-  <div class="card">
-    <h3 class="section-title">📊 Thống kê</h3>
-    <div class="stat-grid" id="stats-grid">
-      <div class="stat-box">
-        <div class="num" id="stat-total">0</div>
-        <div class="label">Tổng video</div>
-      </div>
-      <div class="stat-box">
-        <div class="num" id="stat-completed">0</div>
-        <div class="label">Hoàn thành</div>
-      </div>
-      <div class="stat-box">
-        <div class="num" id="stat-processing">0</div>
-        <div class="label">Đang xử lý</div>
-      </div>
-      <div class="stat-box">
-        <div class="num" id="stat-error">0</div>
-        <div class="label">Lỗi</div>
-      </div>
-      <div class="stat-box">
-        <div class="num" id="stat-duration">0</div>
-        <div class="label">Tổng thời lượng (phút)</div>
-      </div>
-      <div class="stat-box">
-        <div class="num" id="stat-credits">0</div>
-        <div class="label" id="stat-quota-label">Credit còn lại</div>
-      </div>
-    </div>
-    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
-      <div style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;">Phân bố theo trạng thái</div>
-      <div style="display: flex; gap: 8px; height: 8px; border-radius: 4px; overflow: hidden;">
-        <div id="bar-done" style="flex: 1; background: var(--ok); transition: flex 0.3s;"></div>
-        <div id="bar-running" style="flex: 1; background: var(--accent); transition: flex 0.3s;"></div>
-        <div id="bar-queued" style="flex: 1; background: var(--warn); transition: flex 0.3s;"></div>
-        <div id="bar-error" style="flex: 1; background: var(--err); transition: flex 0.3s;"></div>
-      </div>
-      <div style="display: flex; gap: 12px; margin-top: 8px; font-size: 11px; color: var(--text-dim);">
-        <span>✓ Hoàn thành: <strong id="label-done">0</strong></span>
-        <span>▶ Đang chạy: <strong id="label-running">0</strong></span>
-        <span>⏳ Đợi: <strong id="label-queued">0</strong></span>
-        <span>✗ Lỗi: <strong id="label-error">0</strong></span>
-      </div>
-    </div>
-  </div>
-
   <div class="card history-card">
     <div class="history-heading">
       <div><span class="history-kicker">Thư viện công việc</span><h3>Lịch sử video</h3></div>
@@ -1953,6 +1910,6 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260819-history-retry" defer></script>
+<script src="/assets/app.js?v=20260826-split-upload" defer></script>
 </body>
 </html>

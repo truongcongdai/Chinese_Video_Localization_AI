@@ -1433,51 +1433,21 @@ class Store:
         return job
 
     def retry_job(self, job_id: str, user_id: int) -> Optional[Job]:
-        """Create a brand-new job with the exact same settings as a
-        previously failed one — used by the history panel's "Thử lại"
-        button. Deliberately creates a NEW job row rather than resetting
-        the old one in place, so the failed attempt stays visible in
-        history alongside the retry."""
+        """Reset an existing job to queued status for retry — used by the
+        history panel's "Thử lại" button. Reuses the same job row instead
+        of creating a duplicate."""
         old = self.get_job(job_id)
         if old is None or old.user_id != user_id:
             return None
-        retried = self.create_job(
-            user_id, old.source_url, old.target_language,
-            source_language=old.source_language, logo_path=old.logo_path,
-            logo_corner=old.logo_corner, logo_size_px=old.logo_size_px,
-            branding_config=old.branding_config,
-            publishing_config=old.publishing_config,
-            tts_voice=old.tts_voice, review_mode=bool(old.review_mode),
-            animated_subtitle_config=old.animated_subtitle_config,
-            video_template_config=old.video_template_config,
-            transform_config=old.transform_config,
-            processing_mode=old.processing_mode,
-            tts_provider=old.tts_provider,
-            tts_style=old.tts_style,
-            tts_model=old.tts_model,
-            translation_mode=old.translation_mode,
-            translation_model=old.translation_model,
-            translation_tone=old.translation_tone,
-            translation_audience=old.translation_audience,
-            translation_glossary=old.translation_glossary,
-            remix_enabled=bool(old.remix_enabled),
-            remix_platforms=json.loads(old.remix_platforms_json or "[]"),
-            remix_goal=old.remix_goal,
-            remix_strength=old.remix_strength,
-            subtitle_offset_seconds=old.subtitle_offset_seconds,
-            keep_original_audio=old.keep_original_audio,
-            background_music_strategy=old.background_music_strategy,
+        # Reset the job to queued status, clearing error state
+        self.update_job(
+            job_id,
+            status="queued",
+            progress_note="Đang chờ xử lý lại...",
+            error=None,
+            updated_at=time.time(),
         )
-        if any((old.source_channel_url, old.source_channel_title, old.source_channel_id, old.source_uploader)):
-            self.set_job_source_channel(
-                retried.id, user_id,
-                channel_url=old.source_channel_url or "",
-                channel_title=old.source_channel_title or "",
-                channel_id=old.source_channel_id or "",
-                uploader=old.source_uploader or "",
-            )
-            retried = self.get_job(retried.id) or retried
-        return retried
+        return old
 
     # ---- publishing channel profiles ----
     def list_publishing_profiles(self, user_id: int) -> List[Dict[str, Any]]:
@@ -2158,7 +2128,9 @@ class Store:
     def list_jobs_for_user(self, user_id: int, limit: int = 100) -> List[Job]:
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM jobs WHERE user_id = ? "
+                "ORDER BY CASE WHEN status IN ('running', 'queued', 'review') THEN 0 ELSE 1 END, "
+                "updated_at DESC, created_at DESC LIMIT ?",
                 (user_id, limit),
             )
             return [self._row_to_job(row) for row in cur.fetchall()]
@@ -2200,7 +2172,9 @@ class Store:
         params.append(limit)
         with self._connect() as conn:
             cur = conn.execute(
-                f"SELECT * FROM jobs WHERE {where} ORDER BY created_at DESC LIMIT ?",
+                f"SELECT * FROM jobs WHERE {where} "
+                "ORDER BY CASE WHEN status IN ('running', 'queued', 'review') THEN 0 ELSE 1 END, "
+                "updated_at DESC, created_at DESC LIMIT ?",
                 params,
             )
             return [self._row_to_job(row) for row in cur.fetchall()]

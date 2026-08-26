@@ -285,7 +285,8 @@ function showApp(me) {
   $("#feedback-fab").classList.remove("hidden");
   $("#feedback-header-btn").classList.remove("hidden");
 
-  $("#referral-link").textContent = `${location.origin}/?ref=${me.referral_code}`;
+  const baseUrl = bootstrapConfig.public_url || location.origin;
+  $("#referral-link").textContent = `${baseUrl}/?ref=${me.referral_code}`;
   loadLanguages().then(() => {
     const restoredDraft = restoreLocalizationDraft();
     if (!restoredDraft) applyRecommendedLocalizationDefaults();
@@ -1636,8 +1637,34 @@ function getVideoTemplateConfig() {
 }
 
 // ---------------- video transformations ----------------
+let uploadedSplitImageId = null;
+
 $("#video-transform-checkbox").onchange = (ev) => {
   $("#video-transform-panel").classList.toggle("hidden", !ev.target.checked);
+};
+
+$("#transform-overlay-file").onchange = async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  uploadedSplitImageId = null;
+  $("#transform-overlay-preview").classList.add("hidden");
+  if (!file) {
+    $("#transform-overlay-status").textContent = "Chọn PNG, JPG hoặc WEBP.";
+    return;
+  }
+  $("#transform-overlay-status").textContent = "Đang tải ảnh lên...";
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const response = await fetch("/api/upload-split-image", { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Tải ảnh thất bại");
+    uploadedSplitImageId = data.image_id;
+    $("#transform-overlay-preview").src = data.preview_url;
+    $("#transform-overlay-preview").classList.remove("hidden");
+    $("#transform-overlay-status").textContent = "Đã tải ảnh lên ✓";
+  } catch (error) {
+    $("#transform-overlay-status").textContent = error.message;
+  }
 };
 
 function getTransformConfig() {
@@ -1672,9 +1699,8 @@ function getTransformConfig() {
     [config.target_width, config.target_height] = dimensions;
   }
   
-  // Only include overlay path if split screen is enabled
-  if (config.enable_split_screen && $("#transform-overlay-path").value.trim()) {
-    config.overlay_path = $("#transform-overlay-path").value.trim();
+  if (config.enable_split_screen && uploadedSplitImageId) {
+    config.overlay_image_id = uploadedSplitImageId;
   }
   
   return config;
@@ -1767,7 +1793,7 @@ function updateChannelModeUI() {
   $("#url-input").rows = enabled ? 1 : 2;
   $("#url-input").placeholder = enabled
     ? "https://www.youtube.com/@kenh/videos hoặc https://www.tiktok.com/@user hoặc https://www.douyin.com/user/..."
-    : "https://www.youtube.com/watch?v=...\nhttps://v.douyin.com/...\nhttps://www.tiktok.com/@user/video/...";
+    : "https://www.youtube.com/watch?v=...\nhttps://www.bilibili.com/video/BV...\nhttps://v.douyin.com/...";
   $("#channel-analysis-status").textContent = enabled ? "Chưa quét." : "Chưa quét.";
   updateLocalizationSummary();
 }
@@ -2529,6 +2555,7 @@ function setCreatorSubmitLoading(loading, label = "Đang tạo video...") {
 
 function jobProgress(job) {
   if (!job) return 0;
+  // Priority: explicit status check overrides progress note parsing
   if (job.status === "done") return 100;
   if (job.status === "error") return 0;
   if (job.status === "cancelled") return 0;
@@ -2546,6 +2573,8 @@ function jobProgress(job) {
   if (note.includes("dịch phụ đề")) return 45;
   if (note.includes("dịch, lồng tiếng, render")) return 20;
   if (note.includes("lồng tiếng") && note.includes("render")) return 70;
+  if (note.includes("render complete") || note.includes("render completed")) return 100;
+  if (note.includes("hoàn tất") || note.includes("complete")) return 100;
   return job.status === "running" ? 5 : 0;
 }
 
@@ -2874,8 +2903,6 @@ async function refreshJobs() {
 
   const jobs = await api("/api/jobs" + (qs ? `?${qs}` : ""));
 
-  // Update statistics
-  updateStats(jobs);
   refreshJobQueueStatus();
   if (!activeCreatorJobId) {
     const runningCreator = jobs.find(job =>

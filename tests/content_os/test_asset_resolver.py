@@ -37,6 +37,9 @@ class TestAssetResolver:
             user_id=1,
             asset_type=AssetType.IMAGE,
             description="A beautiful sunset",
+            # Keep this unit test deterministic even when the build machine
+            # has Pexels/Pixabay credentials configured.
+            preferred_sources=[AssetSource.GENERATED],
         )
         
         assert asset is not None
