@@ -6,6 +6,7 @@ from pathlib import Path
 import logging
 import shutil
 import subprocess
+import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -1172,15 +1173,32 @@ class Renderer:
         """
         import threading
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=1,
-        )
+        # On Windows, use shell=True to bypass MAX_PATH (260 char) limit
+        # when command line is very long (e.g., many text overlays)
+        use_shell = sys.platform == 'win32'
+        if use_shell:
+            # Convert list to string for shell execution
+            cmd_str = subprocess.list2cmdline(cmd)
+            process = subprocess.Popen(
+                cmd_str,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+                shell=True,
+            )
+        else:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+            )
 
         stderr_lines: List[str] = []
         last_heartbeat = time.monotonic()
