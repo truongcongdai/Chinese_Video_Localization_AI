@@ -231,6 +231,29 @@ class TranslatorFactory:
                     batch: list[str] = []
                     batch_chars = 0
 
+                    # Adaptive batch size and delay based on total text count
+                    total_texts = len(texts)
+                    if total_texts < 50:
+                        # Short video: keep current settings
+                        batch_size = 10
+                        char_limit = 1000
+                        inter_batch_delay = 0.0
+                    elif total_texts < 200:
+                        # Medium video: reduce batch size, add small delay
+                        batch_size = 5
+                        char_limit = 500
+                        inter_batch_delay = 0.5
+                    else:
+                        # Long video: aggressive reduction, significant delay
+                        batch_size = 3
+                        char_limit = 300
+                        inter_batch_delay = 1.0
+
+                    self.logger.info(
+                        "Adaptive translation: total_texts=%d batch_size=%d char_limit=%d delay=%s",
+                        total_texts, batch_size, char_limit, inter_batch_delay
+                    )
+
                     async def flush() -> None:
                         nonlocal batch, batch_chars
                         translated = await self.translate(
@@ -244,12 +267,15 @@ class TranslatorFactory:
                         results.extend(part.strip() for part in parts)
                         batch = []
                         batch_chars = 0
+                        # Add delay between batches for long videos to avoid rate-limit
+                        if inter_batch_delay > 0:
+                            await asyncio.sleep(inter_batch_delay)
 
                     for text in texts:
                         extra = len(text) + (len(separator) if batch else 0)
                         # Conservative batches are less likely to trip the
                         # unauthenticated endpoint's URL/content heuristics.
-                        if batch and (len(batch) >= 10 or batch_chars + extra > 1000):
+                        if batch and (len(batch) >= batch_size or batch_chars + extra > char_limit):
                             await flush()
                         batch.append(text)
                         batch_chars += extra
