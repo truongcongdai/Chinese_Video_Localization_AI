@@ -266,6 +266,11 @@ class RenderConfig:
     # Two local cleanup passes remove antialiased glyph edges much more
     # reliably than one pass while remaining limited to the learned region.
     adaptive_text_cleanup_passes: int = 5
+    # Keep large jobs below FFmpeg's practical filter-chain limit. A long
+    # video can contain thousands of subtitle windows; multiplying every
+    # window by all cleanup passes has caused native FFmpeg crashes during
+    # graph initialization (before it can print a useful error).
+    adaptive_text_cleanup_filter_budget: int = 3000
     # Cleanup time is deliberately wider than translated-text display time.
     # OCR/ASR boundaries can differ by a few frames, so using the exact cue
     # window can expose the tail of the source subtitle. Padding is calculated
@@ -362,6 +367,26 @@ class Renderer:
         # Neighbour-based temporal extension requires chronological order.
         tracked = sorted(tracked, key=lambda item: (item[0].start, item[0].end))
 
+        requested_cleanup_passes = max(1, int(self.config.adaptive_text_cleanup_passes))
+        cleanup_passes = requested_cleanup_passes
+        if self.config.adaptive_text_cleanup_enabled and tracked:
+            cleanup_filter_budget = max(
+                1, int(self.config.adaptive_text_cleanup_filter_budget)
+            )
+            cleanup_passes = min(
+                requested_cleanup_passes,
+                max(1, cleanup_filter_budget // len(tracked)),
+            )
+            if cleanup_passes < requested_cleanup_passes:
+                self.logger.warning(
+                    "Reducing adaptive text cleanup from %d to %d pass(es) per "
+                    "window for %d overlays (FFmpeg filter budget=%d).",
+                    requested_cleanup_passes,
+                    cleanup_passes,
+                    len(tracked),
+                    cleanup_filter_budget,
+                )
+
         for index, (overlay, region) in enumerate(tracked):
             # Keep translated text on its exact canonical cue clock, while the
             # source-subtitle cleanup gets a slightly wider adaptive window.
@@ -417,13 +442,12 @@ class Renderer:
                     region.cleanup_width, region.cleanup_height,
                     frame_w, frame_h,
                 )
-                passes = max(1, int(self.config.adaptive_text_cleanup_passes))
                 # Alternate expanded and core passes. The expanded passes
                 # remove anti-aliased outline/shadow pixels; the core passes
                 # suppress the bright glyph body. Every amount is proportional
                 # to the learned region, never a fixed screen coordinate.
                 pass_scales = (1.06, 1.00, 0.96, 1.02, 0.98)
-                for pass_index in range(passes):
+                for pass_index in range(cleanup_passes):
                     scale = pass_scales[pass_index] if pass_index < len(pass_scales) else 1.0
                     pw = max(2, int(round(cw * scale)))
                     ph = max(2, int(round(ch * scale)))
@@ -971,7 +995,7 @@ class Renderer:
                 )
                 if self._should_use_filter_complex_script(filter_complex, len(filters)):
                     script_path = self._write_filter_complex_script(output, filter_complex)
-                    cmd.extend(["-filter_complex_script", str(script_path), "-map", "[outv]"])
+                    cmd.extend(["-/filter_complex", str(script_path), "-map", "[outv]"])
                 else:
                     cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]"])
             else:
@@ -980,7 +1004,7 @@ class Renderer:
                     if self._should_use_filter_complex_script(vf, len(filters)):
                         filter_complex = f"[0:v]{vf}[outv]"
                         script_path = self._write_filter_complex_script(output, filter_complex)
-                        cmd.extend(["-filter_complex_script", str(script_path), "-map", "[outv]"])
+                        cmd.extend(["-/filter_complex", str(script_path), "-map", "[outv]"])
                     else:
                         cmd.extend(["-map", "0:v", "-vf", vf])
                 else:
@@ -1093,6 +1117,25 @@ class Renderer:
         try:
             returncode, stderr_text = self._run_ffmpeg_with_progress(cmd, self.config.timeout_seconds)
 
+            # FFmpeg deprecated -filter_complex_script in 2024 and removed it
+            # from newer builds in favour of the generic file-loading form
+            # -/filter_complex. Keep a narrow fallback for older FFmpeg
+            # releases which predate that replacement syntax.
+            if (
+                    returncode != 0
+                    and "-/filter_complex" in cmd
+                    and "Unrecognized option '/filter_complex'" in stderr_text
+            ):
+                legacy_cmd = list(cmd)
+                legacy_cmd[legacy_cmd.index("-/filter_complex")] = "-filter_complex_script"
+                self.logger.warning(
+                    "FFmpeg does not support -/filter_complex; retrying with the legacy "
+                    "-filter_complex_script option."
+                )
+                returncode, stderr_text = self._run_ffmpeg_with_progress(
+                    legacy_cmd, self.config.timeout_seconds
+                )
+
             if returncode != 0:
                 self.logger.error("FFmpeg returned non-zero exit code: %s", stderr_text)
                 raise RuntimeError(f"FFmpeg failed: {stderr_text}")
@@ -1180,6 +1223,12 @@ class Renderer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            # Current Windows FFmpeg builds emit UTF-8 paths and diagnostics,
+            # while Python otherwise defaults to the system ANSI code page.
+            # Replacement keeps malformed third-party output from killing the
+            # reader thread and hiding FFmpeg's real error.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
 

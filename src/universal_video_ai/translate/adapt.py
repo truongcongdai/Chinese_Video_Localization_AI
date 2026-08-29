@@ -386,6 +386,30 @@ class SegmentAdapter:
                     label=label,
                 )
             except Exception as batch_error:
+                has_empty_draft = any(
+                    not str(segment.text or "").strip()
+                    for segment in translated_batch
+                )
+                if has_empty_draft and not self._is_systemic_gemini_error(batch_error):
+                    self.logger.warning(
+                        "Gemini %s failed during direct translation; retrying as smaller batches: %s",
+                        label,
+                        batch_error,
+                    )
+                    batch_texts = self._recover_gemini_batch_by_splitting(
+                        source_batch,
+                        translated_batch,
+                        source_lang,
+                        target_lang,
+                        start_index=start_index,
+                        previous_error=batch_error,
+                    )
+                    if cache_key and self.cache is not None:
+                        self.cache.set(cache_key, batch_texts, ttl_seconds=86400 * 30)
+                    results.extend(batch_texts)
+                    self._report_progress(batch_index, total_batches, label)
+                    consecutive_failures = 0
+                    continue
                 failed_batches += 1
                 consecutive_failures += 1
                 if not self.config.fallback_on_error:
@@ -428,6 +452,64 @@ class SegmentAdapter:
                 failed_batches,
             )
         return results
+
+    def _recover_gemini_batch_by_splitting(
+        self,
+        source_segments: list[TranscriptSegment],
+        translated_segments: list[TranscriptSegment],
+        source_lang: str,
+        target_lang: str,
+        *,
+        start_index: int,
+        previous_error: Exception,
+    ) -> list[str]:
+        """Recover a malformed direct-translation batch without emitting blanks.
+
+        Optional adaptation has a usable draft to fall back to. Direct LLM
+        translation intentionally supplies empty drafts, so copying those
+        drafts would turn one malformed Gemini response into a job-wide
+        quality-gate failure. Split only the failed batch until Gemini returns
+        complete output; a failing singleton remains a real translation error.
+        """
+        if len(translated_segments) <= 1:
+            label = f"batch-{start_index}-{start_index}"
+            raise RuntimeError(
+                f"Gemini direct translation could not produce {label}: {previous_error}"
+            ) from previous_error
+
+        midpoint = len(translated_segments) // 2
+        recovered: list[str] = []
+        for offset, end in ((0, midpoint), (midpoint, len(translated_segments))):
+            source_batch = source_segments[offset:end]
+            translated_batch = translated_segments[offset:end]
+            child_start = start_index + offset
+            child_label = f"batch-{child_start}-{child_start + len(translated_batch) - 1}"
+            try:
+                child_texts = self._request_gemini_with_retries(
+                    source_batch,
+                    translated_batch,
+                    source_lang,
+                    target_lang,
+                    label=child_label,
+                )
+            except Exception as child_error:
+                if self._is_systemic_gemini_error(child_error):
+                    raise
+                self.logger.warning(
+                    "Gemini %s still failed; subdividing again: %s",
+                    child_label,
+                    child_error,
+                )
+                child_texts = self._recover_gemini_batch_by_splitting(
+                    source_batch,
+                    translated_batch,
+                    source_lang,
+                    target_lang,
+                    start_index=child_start,
+                    previous_error=child_error,
+                )
+            recovered.extend(child_texts)
+        return recovered
 
     @staticmethod
     def _is_systemic_gemini_error(exc: Exception) -> bool:

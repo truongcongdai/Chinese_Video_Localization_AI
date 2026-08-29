@@ -139,6 +139,42 @@ def test_gemini_batch_circuit_breaker_stops_repeating_provider_failure(monkeypat
     assert result == [segment.text for segment in draft]
 
 
+def test_direct_gemini_failure_subdivides_instead_of_falling_back_to_empty_drafts(monkeypatch):
+    source = _segments("source", 8)
+    adapter = SegmentAdapter(
+        AdaptationConfig(
+            enabled=True,
+            provider="gemini",
+            api_key="test",
+            fallback_on_error=True,
+            gemini_retry_count=0,
+            gemini_batch_size=4,
+        )
+    )
+    labels: list[str] = []
+
+    def fake_request(source_segments, translated_segments, source_lang, target_lang, *, label):
+        labels.append(label)
+        if label in {"full", "batch-0-3"}:
+            raise RuntimeError("segment indices mismatch; missing=[3] extra=[]")
+        return [f"translated {segment.text}" for segment in source_segments]
+
+    monkeypatch.setattr(adapter, "_request_gemini_with_retries", fake_request)
+
+    result = asyncio.run(adapter.translate_source_segments(source, "zh", "vi"))
+
+    assert [segment.text for segment in result] == [
+        f"translated source {index}" for index in range(8)
+    ]
+    assert labels == [
+        "full",
+        "batch-0-3",
+        "batch-0-1",
+        "batch-2-3",
+        "batch-4-7",
+    ]
+
+
 def test_optional_adaptation_failure_keeps_base_translation(monkeypatch):
     source = _segments("nguồn", 3)
     draft = _segments("bản dịch", 3)

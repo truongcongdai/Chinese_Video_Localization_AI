@@ -44,7 +44,10 @@ def _make_fake_popen(returncode: int, stderr_text: str, output_writer=None):
     """Build a fake Popen-like object matching what _run_ffmpeg_with_progress expects."""
 
     class FakePopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=None, bufsize=None):
+        def __init__(
+                self, cmd, stdout=None, stderr=None, text=None,
+                encoding=None, errors=None, bufsize=None,
+        ):
             self.cmd = cmd
             self.stderr = iter(stderr_text.splitlines(keepends=True))
             self._returncode = returncode
@@ -148,7 +151,7 @@ def test_render_with_subtitles(tmp_path: Path, monkeypatch):
     assert out.read_bytes() == b"final video with subs"
 
 
-def test_many_animated_subtitles_use_filter_complex_script(tmp_path: Path):
+def test_many_animated_subtitles_load_filter_complex_from_file(tmp_path: Path):
     video = tmp_path / "video.mp4"
     audio = tmp_path / "audio.mp3"
     output = tmp_path / "output.mp4"
@@ -163,8 +166,9 @@ def test_many_animated_subtitles_use_filter_complex_script(tmp_path: Path):
 
     cmd = renderer._build_command(video, audio, output, subtitle_segments=segments)
 
-    assert "-filter_complex_script" in cmd
-    script_path = Path(cmd[cmd.index("-filter_complex_script") + 1])
+    assert "-/filter_complex" in cmd
+    assert "-filter_complex_script" not in cmd
+    script_path = Path(cmd[cmd.index("-/filter_complex") + 1])
     assert script_path.exists()
     script_text = script_path.read_text(encoding="utf-8")
     assert script_text.startswith("[0:v]drawtext=")
@@ -172,6 +176,38 @@ def test_many_animated_subtitles_use_filter_complex_script(tmp_path: Path):
     assert script_text.count("drawtext=") == 120
     assert "-vf" not in cmd
     assert len(" ".join(cmd)) < 1000
+
+
+def test_render_retries_legacy_filter_complex_script_for_old_ffmpeg(tmp_path: Path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    segments = [
+        {"text": f"Subtitle line {idx}", "start": float(idx), "end": float(idx) + 0.8}
+        for idx in range(120)
+    ]
+    calls = []
+
+    def run_ffmpeg(cmd, timeout_seconds):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return 1, "Unrecognized option '/filter_complex'"
+        output.write_bytes(b"final video")
+        return 0, ""
+
+    renderer = Renderer(
+        RenderConfig(animated_subtitle_config=AnimatedSubtitleConfig(enabled=True))
+    )
+    monkeypatch.setattr(renderer, "_run_ffmpeg_with_progress", run_ffmpeg)
+
+    result = renderer.render(video, audio, output_path=output, subtitle_segments=segments)
+
+    assert result == output
+    assert "-/filter_complex" in calls[0]
+    assert "-filter_complex_script" in calls[1]
+    assert "-/filter_complex" not in calls[1]
 
 
 def test_flip_runs_before_new_subtitles_are_drawn(tmp_path: Path):
@@ -307,9 +343,52 @@ def test_render_ffmpeg_error(tmp_path: Path, monkeypatch):
         renderer.render(video, audio)
 
 
+def test_large_overlay_job_limits_cleanup_filter_count():
+    config = RenderConfig(
+        adaptive_text_region_enabled=False,
+        adaptive_text_cleanup_passes=5,
+        adaptive_text_cleanup_filter_budget=10,
+    )
+    renderer = Renderer(config)
+    overlays = [
+        TextOverlay(float(index), float(index + 1), 100, 500, 300, 50, "")
+        for index in range(6)
+    ]
+
+    filters = renderer._build_text_overlay_filters(overlays, 1280, 720)
+
+    cleanup = [item for item in filters if item.startswith("delogo=")]
+    assert len(cleanup) == len(overlays)
+
+
+def test_ffmpeg_progress_reader_uses_utf8_with_replacement(monkeypatch):
+    popen_options = {}
+
+    class CapturingFakePopen:
+        def __init__(self, cmd, **kwargs):
+            popen_options.update(kwargs)
+            self.stderr = iter(["ffmpeg output\n"])
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(
+        "universal_video_ai.render.renderer.subprocess.Popen", CapturingFakePopen
+    )
+
+    returncode, stderr_text = Renderer()._run_ffmpeg_with_progress(
+        ["ffmpeg", "-version"], timeout_seconds=1
+    )
+
+    assert returncode == 0
+    assert "ffmpeg output" in stderr_text
+    assert popen_options["encoding"] == "utf-8"
+    assert popen_options["errors"] == "replace"
+
+
 def test_ffmpeg_timeout_allows_active_progress(monkeypatch):
     class ActiveFakePopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=None, bufsize=None):
+        def __init__(self, cmd, **kwargs):
             self.started_at = time.monotonic()
             self.killed = False
             self.stderr = self._stderr()
