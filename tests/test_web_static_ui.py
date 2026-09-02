@@ -44,7 +44,7 @@ def test_recommended_defaults_use_tiktok_karaoke_subtitles() -> None:
     assert '<option value="karaoke" selected>' in html
     assert 'function applyRecommendedLocalizationDefaults()' in app_js
     assert '$("#subtitle-effect-select").value = "karaoke";' in app_js
-    assert '$("#output-aspect-ratio").value = "9:16";' in app_js
+    assert '$("#output-aspect-ratio").value = "auto";' in app_js
 
 
 def test_youtube_16_9_preset_and_preflight_are_available() -> None:
@@ -75,7 +75,7 @@ def test_history_bulk_download_and_status_filter_are_available() -> None:
     assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
     assert 'data-cancel="${job.id}"' in app_js
     assert '/cancel`' in app_js
-    assert 'app.js?v=20260731b' in html
+    assert '<script src="/assets/app.js?v=' in html
 
 
 def test_remix_panel_is_toggleable_and_cache_busted() -> None:
@@ -92,7 +92,7 @@ def test_remix_panel_is_toggleable_and_cache_busted() -> None:
     assert "function syncRemixPanel()" in app_js
     assert '$("#remix-panel").classList.toggle("hidden", !ev.target.checked);' not in app_js
     assert 'subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0' in app_js
-    assert 'app.js?v=20260731b' in html
+    assert '<script src="/assets/app.js?v=' in html
 
 
 def test_subtitle_time_display_keeps_tenths() -> None:

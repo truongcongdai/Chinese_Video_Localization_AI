@@ -261,7 +261,21 @@ def test_flip_mirrors_text_cover_overlay_coordinates(tmp_path: Path, monkeypatch
     cmd = renderer._build_command(video, audio, output, text_overlays=[overlay])
 
     vf = cmd[cmd.index("-vf") + 1]
-    assert vf.startswith("hflip,drawbox=x=490:y=20:w=100:h=40")
+    filters = vf.split(",")
+    assert filters[0] == "hflip"
+
+    # The adaptive tracker expands the raw OCR box (50, 20, 100, 40) to
+    # (28, 11, 144, 58). Since hflip runs before cleanup/text rendering, the
+    # effective region -- not the raw OCR box -- must be mirrored: 640 - 28 - 144.
+    mirrored_x = 640 - 28 - 144
+    assert mirrored_x == 468
+    assert any(item.startswith("delogo=x=") for item in filters[1:])
+    assert any(
+        item.startswith("drawtext=")
+        and f"x={mirrored_x}+(144-text_w)/2" in item
+        and "y=11+(58-ascent+descent)/2" in item
+        for item in filters[1:]
+    )
 
 
 def test_text_overlay_drawtext_uses_baseline_vertical_center(tmp_path: Path, monkeypatch):
@@ -284,7 +298,10 @@ def test_text_overlay_drawtext_uses_baseline_vertical_center(tmp_path: Path, mon
     cmd = renderer._build_command(video, audio, output, text_overlays=[overlay])
 
     vf = cmd[cmd.index("-vf") + 1]
-    assert "y=20+(80-ascent+descent)/2" in vf
+    # Vertical padding is clamped to 2.5% of the 360px frame: 9px on each
+    # side, so the effective render region is y=11, height=98. Center text
+    # using font ascent/descent within that actual region.
+    assert "y=11+(98-ascent+descent)/2" in vf
 
 
 def test_multiple_fractional_watermark_boxes_are_blurred(tmp_path: Path, monkeypatch):

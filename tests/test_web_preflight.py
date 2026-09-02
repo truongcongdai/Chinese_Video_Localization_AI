@@ -215,7 +215,7 @@ def test_probe_provider_gemini_lists_generate_content_models(monkeypatch):
     assert result["llm_models"] == ["gemini-3.1-flash-lite"]
 
 
-def test_build_service_uses_strict_gemini_adapter(monkeypatch):
+def test_build_service_uses_resilient_gemini_adapter_unless_strict(monkeypatch):
     def fake_provider_settings(user_id, provider):
         if provider == "gemini":
             return {
@@ -249,9 +249,14 @@ def test_build_service_uses_strict_gemini_adapter(monkeypatch):
         subtitle_offset_seconds=0.0,
     )
 
+    monkeypatch.delenv("STRICT_TRANSLATION_ADAPTER", raising=False)
     service = web_app._build_service_for_job(job)
 
     assert service.segment_adapter.config.provider == "gemini"
     assert service.segment_adapter.config.model == "gemini-3.1-flash-lite"
-    assert service.segment_adapter.config.fallback_on_error is False
+    assert service.segment_adapter.config.fallback_on_error is True
     assert service.config.global_subtitle_offset == 0.0
+
+    monkeypatch.setenv("STRICT_TRANSLATION_ADAPTER", "true")
+    strict_service = web_app._build_service_for_job(job)
+    assert strict_service.segment_adapter.config.fallback_on_error is False

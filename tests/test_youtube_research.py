@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,11 +41,14 @@ class YouTubeResearchTests(unittest.TestCase):
         ]
 
     def test_feature_flag_defaults_disabled(self) -> None:
-        self.assertNotEqual(os.environ.get("YOUTUBE_RESEARCH_ENABLED"), "true")
         from universal_video_ai import config
 
-        self.assertFalse(config.YOUTUBE_RESEARCH_ENABLED)
-        self.assertEqual(config.YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS, 1)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(config._env_bool("YOUTUBE_RESEARCH_ENABLED", False))
+            self.assertEqual(
+                config._env_int("YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS", 1, minimum=1),
+                1,
+            )
 
     def test_score_clamp_and_confidence(self) -> None:
         self.assertEqual(clamp(float("nan")), 0.0)

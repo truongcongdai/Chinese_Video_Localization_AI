@@ -665,6 +665,8 @@ def test_burned_subtitle_alignment_does_not_shift_tts_audio_clock(tmp_path: Path
         ),
     )
 
+    service._wav_duration = lambda _path: 1.0
+
     with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
         audio_result_obj = MagicMock()
         audio_result_obj.audio_path = tmp_path / "audio.wav"
@@ -731,6 +733,8 @@ def test_small_global_subtitle_offset_also_syncs_tts_clock(tmp_path: Path):
             enable_text_cover=True,
         ),
     )
+
+    service._wav_duration = lambda _path: 2.0
 
     with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
         audio_result_obj = MagicMock()
@@ -861,6 +865,8 @@ def test_per_cue_source_subtitle_timing_drives_subtitle_and_tts_clock(tmp_path: 
         ),
     )
 
+    service._wav_duration = lambda _path: 0.95
+
     with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
         audio_result_obj = MagicMock()
         audio_result_obj.audio_path = tmp_path / "audio.wav"
@@ -930,6 +936,8 @@ def test_small_detected_offset_moves_first_subtitle_and_tts_segment(tmp_path: Pa
             enable_text_cover=True,
         ),
     )
+
+    service._wav_duration = lambda _path: 1.0
 
     with patch("universal_video_ai.orchestrator.service.create_audio_pipeline") as mock_pipeline_factory:
         audio_result_obj = MagicMock()

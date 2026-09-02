@@ -22,8 +22,23 @@ def repo(temp_db):
 
 
 @pytest.fixture
-def resolver(repo):
-    """Asset resolver instance."""
+def resolver(repo, monkeypatch):
+    """Asset resolver instance isolated from configured live providers."""
+    for name in (
+        "GEMINI_API_KEY",
+        "GOOGLE_AI_API_KEY",
+        "HUGGINGFACE_API_KEY",
+        "OPENAI_API_KEY",
+        "PEXELS_API_KEY",
+        "PEXELS_KEY",
+        "PIXABAY_API_KEY",
+        "PIXABAY_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        "universal_video_ai.content_os.asset_resolver._GEMINI_IMAGE_COOLDOWN_UNTIL",
+        0.0,
+    )
     return AssetResolver(repo)
 
 

@@ -112,7 +112,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
             try:
                 font = ImageFont.truetype("DejaVuSans-Bold.ttf", 56)
             except Exception:
-                font = ImageFont.load_default()
+                font = ImageFont.load_default(size=56)
             draw.text(
                 (300, 600),
                 "Subtitle text here now",
@@ -195,6 +195,8 @@ class TextDetectorExclusionTests(unittest.TestCase):
             search_radius=0.6,
             step=0.1,
             min_visible_samples=2,
+            use_ocr_boundary_refine=False,
+            use_ocr_text_match_refine=False,
         )
 
         self.assertIsNotNone(windows[0])
@@ -222,6 +224,7 @@ class TextDetectorExclusionTests(unittest.TestCase):
             search_radius=0.6,
             step=0.1,
             min_visible_samples=2,
+            use_ocr_text_match_refine=False,
         )
 
         self.assertIsNotNone(windows[0])

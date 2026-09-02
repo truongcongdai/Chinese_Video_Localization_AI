@@ -531,12 +531,13 @@ def test_renderer_builds_per_segment_overlay_filters():
         TextOverlay(start=5.0, end=8.0, x=10, y=20, width=200, height=40, text="Tạm biệt"),
     ]
 
-    filters = renderer._build_text_overlay_filters(overlays)
+    filters = renderer._build_text_overlay_filters(overlays, frame_w=640, frame_h=360)
     combined = ";".join(filters)
 
     assert "between(t\\,0.000\\,3.000)" in combined
     assert "between(t\\,5.000\\,8.000)" in combined
-    assert "drawbox" in combined
+    assert "delogo" in combined
+    assert "drawbox" not in combined
     assert "drawtext" in combined
 
 

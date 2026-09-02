@@ -124,12 +124,13 @@ class TestStateMachine:
             has_approval=True,
         )
     
-    def test_terminal_states(self):
-        """Should identify terminal states correctly."""
+    def test_terminal_and_restartable_states(self):
+        """Terminal states have no outgoing transitions; cancelled can restart."""
         assert StateMachine.is_terminal(WorkflowStage.COMPLETED)
-        assert StateMachine.is_terminal(WorkflowStage.CANCELLED)
         assert StateMachine.is_terminal(WorkflowStage.FAILED)
+        assert not StateMachine.is_terminal(WorkflowStage.CANCELLED)
         assert not StateMachine.is_terminal(WorkflowStage.TREND_RESEARCH)
+        StateMachine.validate_transition(WorkflowStage.CANCELLED, WorkflowStage.CREATED)
     
     def test_control_states(self):
         """Should identify control states correctly."""

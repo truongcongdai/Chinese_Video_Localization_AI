@@ -54,8 +54,23 @@ class TestContentOSWorkflow:
         return ArtifactStore(base_dir=temp_dir)
     
     @pytest.fixture
-    def workflow(self, repo, artifact_store):
-        """Create workflow instance."""
+    def workflow(self, repo, artifact_store, monkeypatch):
+        """Create a workflow isolated from configured live providers."""
+        monkeypatch.setattr(
+            "universal_video_ai.content_os.agents.base.BaseAgent._call_llm",
+            lambda agent, prompt: agent._mock_output(),
+        )
+        for name in (
+            "GEMINI_API_KEY",
+            "GOOGLE_AI_API_KEY",
+            "HUGGINGFACE_API_KEY",
+            "OPENAI_API_KEY",
+            "PEXELS_API_KEY",
+            "PEXELS_KEY",
+            "PIXABAY_API_KEY",
+            "PIXABAY_KEY",
+        ):
+            monkeypatch.delenv(name, raising=False)
         return ContentOSWorkflow(
             repository=repo,
             artifact_store=artifact_store,

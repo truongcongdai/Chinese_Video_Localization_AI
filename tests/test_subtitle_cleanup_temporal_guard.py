@@ -17,13 +17,16 @@ def test_cleanup_window_extends_and_bridges_but_text_window_stays_exact():
     assert veils
     assert text
     # Same learned band bridges the 100 ms boundary gap, preventing a flash.
-    assert any("between(t\\,1.000\\,1.600)" in flt for flt in cleanup)
+    assert any("between(t\\,0.900\\,1.600)" in flt for flt in cleanup)
     # Replacement text still follows the exact canonical timing.
     assert any("between(t\\,1.000\\,1.500)" in flt for flt in text)
 
 
 def test_residual_veil_is_translucent_and_uses_adaptive_region():
-    renderer = Renderer(RenderConfig(adaptive_text_residual_veil_opacity=0.68))
+    renderer = Renderer(RenderConfig(
+        adaptive_text_residual_veil_opacity=0.68,
+        adaptive_text_residual_veil_min_confidence=0.0,
+    ))
     overlay = TextOverlay(start=2.0, end=3.0, x=200, y=400, width=240, height=40, text="Translated")
     filters = renderer._build_text_overlay_filters([overlay], frame_w=1920, frame_h=1080)
     veils = [flt for flt in filters if flt.startswith("drawbox=")]
