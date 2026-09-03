@@ -86,7 +86,15 @@ from universal_video_ai.publishing.profiles import (
 )
 from universal_video_ai.segment import TranscriptSegment
 from universal_video_ai.timeline.service import _balanced_caption_chunks
-from universal_video_ai.config import REDIS_URL, TEMP_DIR
+from universal_video_ai.config import (
+    REDIS_URL,
+    TEMP_DIR,
+    YOUTUBE_RESEARCH_HTTP_TIMEOUT,
+    YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS,
+    YOUTUBE_RESEARCH_MAX_RESULTS,
+)
+from universal_video_ai.analytics.youtube_research import YtDlpYouTubeResearchCollector
+from universal_video_ai.database import DatabaseManager, YouTubeResearchRepository
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
 from universal_video_ai.downloader.channel import (
@@ -102,6 +110,7 @@ from .auth import (
 from . import oauth as oauth_module
 from . import identity_oauth
 from .content_os_router import router as content_os_router
+from .youtube_research import router as youtube_research_router
 
 logger = logging.getLogger("universal_video_ai.web")
 
@@ -178,6 +187,16 @@ DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
+youtube_research_database = DatabaseManager(_DB_PATH)
+youtube_research_database.init_schema()
+app.state.youtube_research_repository = YouTubeResearchRepository(
+    youtube_research_database
+)
+app.state.youtube_research_collector = YtDlpYouTubeResearchCollector(
+    hard_max_results=YOUTUBE_RESEARCH_MAX_RESULTS,
+    timeout_seconds=YOUTUBE_RESEARCH_HTTP_TIMEOUT,
+    max_concurrency=YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS,
+)
 
 
 def _resolve_publishing_config_for_user(
@@ -7545,4 +7564,16 @@ def health():
 
 
 # Include Content OS router
+async def _submit_research_localization(
+    canonical_url: str, target_language: str, user_id: int
+) -> Dict[str, Any]:
+    """Enter the exact same preflight/job path as a manually submitted URL."""
+    return await create_job(
+        NewJobBody(url=canonical_url, target_language=target_language),
+        user_id,
+    )
+
+
+app.state.youtube_research_submit_localization = _submit_research_localization
+app.include_router(youtube_research_router)
 app.include_router(content_os_router)

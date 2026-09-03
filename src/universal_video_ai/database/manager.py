@@ -81,6 +81,7 @@ class DatabaseManager:
             3: self._migrate_3_create_audit_log,
             4: self._migrate_4_add_subscription,  # NEW
             5: self._migrate_5_create_youtube_research,
+            6: self._migrate_6_add_youtube_research_ownership,
         }
 
     # ---------------------------
@@ -393,6 +394,46 @@ class DatabaseManager:
             cur.execute("UPDATE schema_version SET version = 4 WHERE id = 1 AND version >= 5")
             self._conn.commit()
             self.logger.info("YouTube Research migration downgraded to schema version 4")
+
+    def _migrate_6_add_youtube_research_ownership(self) -> None:
+        """Add tenant ownership and scan/result linkage without rebuilding tables."""
+        cur = self._conn.cursor()
+
+        def add_column(table: str, column: str, declaration: str) -> None:
+            columns = {str(row["name"]) for row in cur.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+        add_column("youtube_research_projects", "user_id", "INTEGER")
+        add_column("youtube_research_sources", "status", "TEXT NOT NULL DEFAULT 'completed'")
+        add_column("youtube_research_sources", "max_results", "INTEGER")
+        add_column("youtube_research_sources", "result_count", "INTEGER")
+        add_column("youtube_research_sources", "error", "TEXT")
+        add_column("youtube_research_sources", "completed_at", "REAL")
+        add_column("youtube_research_videos", "canonical_url", "TEXT")
+        add_column("youtube_research_snapshots", "video_id", "TEXT")
+        add_column("youtube_research_analyses", "video_id", "TEXT")
+        add_column("youtube_research_opportunities", "video_id", "TEXT")
+        add_column("youtube_research_opportunities", "source_id", "INTEGER")
+
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ytr_projects_user_updated "
+            "ON youtube_research_projects(user_id, updated_at DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ytr_sources_project_status "
+            "ON youtube_research_sources(project_id, status, collected_at DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ytr_snapshots_project_video "
+            "ON youtube_research_snapshots(project_id, video_id, created_at DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ytr_opportunities_project_score "
+            "ON youtube_research_opportunities(project_id, adjusted_score DESC)"
+        )
+        self._conn.commit()
+        self.logger.debug("Migration 6: YouTube Research ownership and scan linkage added")
 
     # ---------------------------
     # Audit Logging (new feature)

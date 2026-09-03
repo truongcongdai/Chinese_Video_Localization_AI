@@ -494,6 +494,28 @@
   .research-json { min-height: 220px; resize: vertical; font-family: Consolas, "SFMono-Regular", monospace; font-size: 12px; line-height: 1.45; }
   .research-list { margin: 8px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
   .research-status { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+  .research-state {
+    margin-top:12px; padding:12px 14px; color:var(--text-dim);
+    border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--panel-2);
+  }
+  .research-state.error { color:var(--err); border-color:rgba(239,68,68,.35); }
+  .youtube-research-results { display:grid; gap:12px; margin-top:16px; }
+  .youtube-research-card {
+    display:grid; grid-template-columns:160px minmax(0,1fr); gap:14px;
+    padding:14px; border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--panel-2);
+  }
+  .youtube-research-card img {
+    width:160px; aspect-ratio:16/9; object-fit:cover; border-radius:8px; background:#080a0f;
+  }
+  .youtube-research-card h4 { margin:0 0 5px; font-size:15px; line-height:1.35; }
+  .youtube-research-meta { color:var(--text-dim); font-size:12px; line-height:1.55; }
+  .youtube-research-score { color:var(--ok); font-size:18px; font-weight:800; margin:7px 0; }
+  .youtube-research-reason { color:var(--text-dim); font-size:12px; margin:5px 0 10px; }
+  @media (max-width:620px) {
+    .youtube-research-card { grid-template-columns:1fr; }
+    .youtube-research-card img { width:100%; }
+  }
   .referral-row {
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
     border-top: 1px solid var(--border); padding-top: 14px; margin-top: 4px;

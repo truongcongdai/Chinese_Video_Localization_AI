@@ -68,6 +68,28 @@ class YouTubeResearchTests(unittest.TestCase):
         self.assertLessEqual(result.trend_score, 100)
         self.assertFalse(math.isnan(result.median_view_velocity))
 
+    def test_trend_excludes_partial_engagement_instead_of_imputing_zero(self) -> None:
+        videos = [
+            ResearchVideo(
+                video_id="partial",
+                title="Partial",
+                view_count=100,
+                like_count=90,
+                comment_count=None,
+            ),
+            ResearchVideo(
+                video_id="complete",
+                title="Complete",
+                view_count=100,
+                like_count=1,
+                comment_count=1,
+            ),
+        ]
+
+        result = TrendAnalyzer().analyze(videos)
+
+        self.assertAlmostEqual(result.engagement_rate, 0.02)
+
     def test_competition_detects_duplicate_titles(self) -> None:
         now = datetime(2026, 7, 26, tzinfo=timezone.utc)
         videos = self._videos()

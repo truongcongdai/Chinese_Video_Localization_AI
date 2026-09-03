@@ -9,6 +9,7 @@ from typing import Any, Optional
 class ResearchVideo:
     video_id: str
     title: str
+    canonical_url: str = ""
     channel_id: str = ""
     channel_title: str = ""
     published_at: Optional[datetime] = None

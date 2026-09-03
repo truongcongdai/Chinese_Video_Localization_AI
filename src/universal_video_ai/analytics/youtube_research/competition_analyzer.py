@@ -11,11 +11,27 @@ class CompetitionAnalyzer:
     def analyze(self, videos: list[ResearchVideo], now: datetime | None = None) -> CompetitionAnalysis:
         now = now or datetime.now(timezone.utc)
         count = len(videos)
-        sorted_by_views = sorted(videos, key=lambda item: item.view_count or 0, reverse=True)
+        sorted_by_views = sorted(
+            videos,
+            key=lambda item: item.view_count if item.view_count is not None else -1,
+            reverse=True,
+        )
         top_videos = sorted_by_views[:10]
-        new_30d = sum(1 for video in videos if self._age_hours(video, now) <= 24 * 30)
-        top_subscribers = [video.subscriber_count or 0 for video in top_videos]
-        top_views = [video.view_count or 0 for video in top_videos]
+        new_30d = sum(
+            1 for video in videos
+            if video.published_at is not None
+            and self._age_hours(video, now) <= 24 * 30
+        )
+        top_subscribers = [
+            video.subscriber_count
+            for video in top_videos
+            if video.subscriber_count is not None
+        ]
+        top_views = [
+            video.view_count
+            for video in top_videos
+            if video.view_count is not None
+        ]
 
         duplicate_pairs = 0
         comparisons = 0
@@ -28,7 +44,12 @@ class CompetitionAnalyzer:
 
         small_breakouts = [
             video for video in videos
-            if (video.subscriber_count or 0) <= 50000 and (video.view_count or 0) >= 100000
+            if (
+                video.subscriber_count is not None
+                and video.view_count is not None
+                and video.subscriber_count <= 50000
+                and video.view_count >= 100000
+            )
         ]
         channel_counts: dict[str, int] = {}
         for video in videos:

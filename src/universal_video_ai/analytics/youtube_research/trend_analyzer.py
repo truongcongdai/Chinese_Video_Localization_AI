@@ -10,23 +10,46 @@ from .scoring import confidence_from_sample_size, weighted_score
 class TrendAnalyzer:
     def analyze(self, videos: list[ResearchVideo], now: datetime | None = None) -> TrendAnalysis:
         now = now or datetime.now(timezone.utc)
-        ages = [self._age_hours(video, now) for video in videos]
-        views = [max(0, video.view_count or 0) for video in videos]
-        likes = [max(0, video.like_count or 0) for video in videos]
-        comments = [max(0, video.comment_count or 0) for video in videos]
+        ages = [
+            self._age_hours(video, now)
+            for video in videos
+            if video.published_at is not None
+        ]
+        views = [
+            max(0, video.view_count)
+            for video in videos
+            if video.view_count is not None
+        ]
         velocities = [
-            safe_divide(view, max(age, 1.0))
-            for view, age in zip(views, ages)
+            safe_divide(max(0, video.view_count), self._age_hours(video, now))
+            for video in videos
+            if video.view_count is not None and video.published_at is not None
         ]
         stable_velocities = winsorized(velocities)
 
-        new_24h = sum(1 for age in ages if age <= 24)
-        new_7d = sum(1 for age in ages if age <= 24 * 7)
-        new_30d = sum(1 for age in ages if age <= 24 * 30)
+        new_24h = sum(age <= 24 for age in ages)
+        new_7d = sum(age <= 24 * 7 for age in ages)
+        new_30d = sum(age <= 24 * 30 for age in ages)
         median_views = median(views)
         median_velocity = median(stable_velocities)
         median_age = median(ages)
-        engagement = safe_divide(sum(likes) + sum(comments), max(sum(views), 1))
+        engagement_samples = [
+            (
+                max(0, video.like_count),
+                max(0, video.comment_count),
+                max(0, video.view_count),
+            )
+            for video in videos
+            if (
+                video.view_count is not None
+                and video.like_count is not None
+                and video.comment_count is not None
+            )
+        ]
+        engagement = safe_divide(
+            sum(likes + comments for likes, comments, _views in engagement_samples),
+            sum(view_count for _likes, _comments, view_count in engagement_samples),
+        )
 
         velocity_score = log_score(median_velocity, reference=1000.0)
         publishing_growth_score = clamp(
@@ -34,7 +57,10 @@ class TrendAnalyzer:
             45.0 * safe_divide(new_24h, max(new_7d, 1))
         )
         engagement_score = clamp(engagement * 1000.0)
-        freshness_score = clamp(100.0 - safe_divide(median_age, 24 * 30) * 100.0)
+        freshness_score = (
+            clamp(100.0 - safe_divide(median_age, 24 * 30) * 100.0)
+            if ages else 0.0
+        )
 
         trend_score = weighted_score([
             (0.35, velocity_score),

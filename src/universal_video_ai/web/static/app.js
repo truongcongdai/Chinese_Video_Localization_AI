@@ -56,7 +56,9 @@ async function api(path, opts = {}) {
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
-    throw new Error(body.detail || `HTTP ${resp.status}`);
+    const detail = body.detail;
+    const message = detail && typeof detail === "object" ? detail.message : detail;
+    throw new Error(message || ("HTTP " + resp.status));
   }
   return resp.status === 204 ? null : resp.json();
 }
@@ -3500,11 +3502,166 @@ document.addEventListener("DOMContentLoaded", () => {
           if (feature === "content-os") {
             initContentOS();
           }
+          if (feature === "youtube-research") {
+            initYouTubeResearch();
+          }
         }
       });
     };
   });
 });
+
+// ---------------- YouTube Research ----------------
+let youtubeResearchInitialized = false;
+let youtubeResearchProjectId = null;
+
+function setYouTubeResearchState(name, message) {
+  ["loading", "error", "empty"].forEach(function (state) {
+    const element = $("#youtube-research-" + state);
+    element.classList.toggle("hidden", state !== name);
+  });
+  if (name === "error") $("#youtube-research-error").textContent = message || "Collection failed.";
+}
+
+async function initYouTubeResearch() {
+  if (youtubeResearchInitialized) return;
+  youtubeResearchInitialized = true;
+  try {
+    const status = await api("/api/youtube-research/status");
+    $("#youtube-research-status").textContent = status.enabled ? "Metadata-only collector" : "Feature disabled";
+    $("#youtube-research-feature-disabled").classList.toggle("hidden", status.enabled);
+    $("#youtube-research-collector-unavailable").classList.toggle(
+      "hidden", !status.enabled || status.collector_available
+    );
+    const ready = status.enabled && status.collector_available && status.database_enabled;
+    $("#youtube-research-workspace").classList.toggle("hidden", !ready);
+    const maximum = Math.max(1, Number(status.max_results) || 1);
+    $("#youtube-research-max-results").max = String(maximum);
+    $("#youtube-research-max-results").value = String(Math.min(20, maximum));
+    if (status.enabled && !status.database_enabled) {
+      $("#youtube-research-status").textContent = "Database unavailable";
+    }
+  } catch (error) {
+    youtubeResearchInitialized = false;
+    $("#youtube-research-status").textContent = "Availability check failed";
+    $("#youtube-research-error").textContent = error.message;
+    $("#youtube-research-error").classList.remove("hidden");
+  }
+}
+
+function researchValue(value, formatter) {
+  if (value === null || value === undefined || value === "") return "Unavailable";
+  return formatter ? formatter(value) : String(value);
+}
+
+function researchDuration(value) {
+  if (value === null || value === undefined) return "Unavailable";
+  const seconds = Math.max(0, Number(value) || 0);
+  const minutes = Math.floor(seconds / 60);
+  return minutes + ":" + String(Math.floor(seconds % 60)).padStart(2, "0");
+}
+
+function renderYouTubeResearchResults(results) {
+  const container = $("#youtube-research-results");
+  container.innerHTML = results.map(function (item) {
+    const title = researchValue(item.title);
+    const channel = researchValue(item.channel_name);
+    const published = researchValue(item.published_at, function (value) {
+      return new Date(value).toLocaleDateString(uiLocale());
+    });
+    const views = researchValue(item.view_count, function (value) {
+      return Number(value).toLocaleString(uiLocale());
+    });
+    const likes = researchValue(item.like_count, function (value) {
+      return Number(value).toLocaleString(uiLocale());
+    });
+    const comments = researchValue(item.comment_count, function (value) {
+      return Number(value).toLocaleString(uiLocale());
+    });
+    const subscribers = researchValue(item.subscriber_count, function (value) {
+      return Number(value).toLocaleString(uiLocale());
+    });
+    const thumbnail = item.thumbnail_url
+      ? '<img src="' + escapeHtml(item.thumbnail_url) + '" alt="">'
+      : '<div class="research-state">Thumbnail unavailable</div>';
+    const explanation = (item.explanations || [])[0] || "Score explanation unavailable.";
+    return '<article class="youtube-research-card" data-research-video-id="' +
+      escapeHtml(item.video_id) + '">' + thumbnail + '<div><h4>#' +
+      escapeHtml(item.rank) + ' ' + escapeHtml(title) + '</h4><div class="youtube-research-meta">' +
+      'Channel: ' + escapeHtml(channel) + ' | Published: ' + escapeHtml(published) +
+      ' | Duration: ' + escapeHtml(researchDuration(item.duration_seconds)) + '<br>' +
+      'Views: ' + escapeHtml(views) + ' | Likes: ' + escapeHtml(likes) +
+      ' | Comments: ' + escapeHtml(comments) + ' | Subscribers: ' +
+      escapeHtml(subscribers) + '</div><div class="youtube-research-score">' +
+      'Opportunity ' + Number(item.opportunity_score).toFixed(1) +
+      ' | Confidence ' + Number(item.confidence).toFixed(1) +
+      '</div><div class="youtube-research-reason">' + escapeHtml(explanation) +
+      '</div><button class="btn gradient small" type="button" data-localize-research="' +
+      escapeHtml(item.video_id) + '">Localize this video</button></div></article>';
+  }).join("");
+
+  container.querySelectorAll("[data-localize-research]").forEach(function (button) {
+    button.onclick = async function () {
+      button.disabled = true;
+      setYouTubeResearchState("", "");
+      try {
+        await api("/api/youtube-research/projects/" + youtubeResearchProjectId + "/localize", {
+          method: "POST",
+          body: JSON.stringify({
+            video_id: button.dataset.localizeResearch,
+            target_language: $("#youtube-research-language").value,
+          }),
+        });
+        $("#youtube-research-status").textContent = "Localization job created";
+        refreshJobs();
+        refreshMe();
+      } catch (error) {
+        setYouTubeResearchState("error", error.message);
+      } finally {
+        button.disabled = false;
+      }
+    };
+  });
+}
+
+$("#youtube-research-scan-btn").onclick = async function () {
+  const niche = $("#youtube-research-niche").value.trim();
+  const keyword = $("#youtube-research-keyword").value.trim();
+  if (!niche && !keyword) {
+    setYouTubeResearchState("error", "Enter a niche or keyword.");
+    return;
+  }
+  const button = $("#youtube-research-scan-btn");
+  button.disabled = true;
+  $("#youtube-research-results").innerHTML = "";
+  setYouTubeResearchState("loading", "");
+  try {
+    const project = await api("/api/youtube-research/projects", {
+      method: "POST",
+      body: JSON.stringify({
+        niche: niche,
+        keyword: keyword,
+        target_country: $("#youtube-research-country").value.trim() || null,
+        target_language: $("#youtube-research-language").value,
+      }),
+    });
+    youtubeResearchProjectId = project.id;
+    const scan = await api("/api/youtube-research/projects/" + project.id + "/scan", {
+      method: "POST",
+      body: JSON.stringify({
+        max_results: Number($("#youtube-research-max-results").value),
+      }),
+    });
+    setYouTubeResearchState(scan.results.length ? "" : "empty", "");
+    renderYouTubeResearchResults(scan.results);
+    $("#youtube-research-status").textContent = scan.result_count + " real candidates ranked";
+  } catch (error) {
+    setYouTubeResearchState("error", error.message);
+    $("#youtube-research-status").textContent = "Collection failed";
+  } finally {
+    button.disabled = false;
+  }
+};
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

@@ -259,6 +259,10 @@
       <span>🔍</span>
       <span>Quét Trend</span>
     </button>
+    <button class="feature-tab" data-feature="youtube-research">
+      <span>YT</span>
+      <span>YouTube Research</span>
+    </button>
     <button class="feature-tab" data-feature="content-os">
       <span>🚀</span>
       <span>Content OS</span>
@@ -1438,6 +1442,64 @@
     </div>
     <div id="trend-error" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
+  </div>
+
+  <!-- YouTube Research Panel -->
+  <div class="feature-panel" data-feature="youtube-research">
+    <div class="card">
+      <div class="template-library-heading">
+        <h3 class="section-title">YouTube Research</h3>
+        <span id="youtube-research-status" class="muted-help">Checking availability...</span>
+      </div>
+      <div id="youtube-research-feature-disabled" class="research-state hidden">
+        YouTube Research is disabled. Set YOUTUBE_RESEARCH_ENABLED=true and restart the web app.
+      </div>
+      <div id="youtube-research-collector-unavailable" class="research-state error hidden">
+        The yt-dlp metadata collector is unavailable in this installation.
+      </div>
+      <div id="youtube-research-workspace" class="hidden">
+        <div class="row">
+          <div class="field">
+            <label>Niche</label>
+            <input id="youtube-research-niche" maxlength="200" placeholder="e.g. home automation">
+          </div>
+          <div class="field">
+            <label>Keyword</label>
+            <input id="youtube-research-keyword" maxlength="200" placeholder="e.g. beginner smart home">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Target country (optional)</label>
+            <input id="youtube-research-country" maxlength="64" placeholder="e.g. Vietnam">
+          </div>
+          <div class="field">
+            <label>Target language</label>
+            <select id="youtube-research-language">
+              <option value="vi">Vietnamese</option>
+              <option value="en">English</option>
+              <option value="zh-CN">Chinese</option>
+              <option value="th">Thai</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Maximum results</label>
+            <input id="youtube-research-max-results" type="number" min="1" value="20">
+          </div>
+        </div>
+        <button class="btn gradient" id="youtube-research-scan-btn" type="button">Research / Scan</button>
+        <div id="youtube-research-loading" class="research-state hidden" aria-live="polite">
+          Collecting metadata and scoring candidates...
+        </div>
+        <div id="youtube-research-error" class="research-state error hidden" aria-live="polite"></div>
+        <div id="youtube-research-empty" class="research-state hidden">
+          No real YouTube candidates were returned for this query.
+        </div>
+        <div id="youtube-research-results" class="youtube-research-results" aria-live="polite"></div>
+      </div>
+    </div>
   </div>
 
   <!-- Content OS Panel -->
