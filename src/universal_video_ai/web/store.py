@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import statistics
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS social_accounts (
     expires_at REAL,
     account_name TEXT,               -- display name shown in the UI ("Connected as ...")
     account_ref TEXT,                -- platform-specific id (e.g. FB page id, open_id)
+    scopes TEXT,                     -- provider-granted OAuth scopes (space separated)
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(user_id, platform)
@@ -194,8 +196,10 @@ CREATE TABLE IF NOT EXISTS user_provider_settings (
 
 CREATE TABLE IF NOT EXISTS trend_scans (
     id TEXT PRIMARY KEY,
+    scan_key TEXT,
     user_id INTEGER NOT NULL,
     topic TEXT NOT NULL,
+    query_json TEXT DEFAULT '{}',
     platforms_json TEXT NOT NULL,
     providers_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -215,6 +219,7 @@ CREATE TABLE IF NOT EXISTS trend_items (
     provider TEXT NOT NULL,
     source_url TEXT NOT NULL,
     title TEXT,
+    description TEXT,
     author TEXT,
     thumbnail_url TEXT,
     duration_seconds REAL,
@@ -224,6 +229,10 @@ CREATE TABLE IF NOT EXISTS trend_items (
     share_count INTEGER,
     published_at TEXT,
     trend_score REAL,
+    niche_relevance_score REAL,
+    opportunity_score REAL,
+    relevance_status TEXT DEFAULT 'unscored',
+    match_reason_json TEXT,
     raw_json TEXT,
     download_status TEXT DEFAULT 'found',
     local_path TEXT,
@@ -232,6 +241,275 @@ CREATE TABLE IF NOT EXISTS trend_items (
     updated_at REAL NOT NULL,
     UNIQUE(user_id, platform, source_url)
 );
+
+CREATE TABLE IF NOT EXISTS trend_queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    relevance_language TEXT,
+    region_code TEXT,
+    published_within_days INTEGER NOT NULL DEFAULT 30,
+    duration_filter TEXT NOT NULL DEFAULT 'long',
+    search_order TEXT NOT NULL DEFAULT 'date',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    topic_terms TEXT,
+    exclusion_terms TEXT,
+    notes TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, query)
+);
+
+CREATE TABLE IF NOT EXISTS trend_item_queries (
+    item_id INTEGER NOT NULL,
+    query_id INTEGER NOT NULL,
+    first_matched_at REAL NOT NULL,
+    last_matched_at REAL NOT NULL,
+    PRIMARY KEY(item_id, query_id)
+);
+
+CREATE TABLE IF NOT EXISTS trend_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL,
+    captured_at REAL NOT NULL,
+    view_count INTEGER,
+    like_count INTEGER,
+    comment_count INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS competitor_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL DEFAULT 'youtube',
+    channel_id TEXT NOT NULL,
+    channel_title TEXT NOT NULL,
+    channel_url TEXT NOT NULL,
+    custom_url TEXT,
+    thumbnail_url TEXT,
+    subscriber_count INTEGER,
+    hidden_subscriber_count INTEGER NOT NULL DEFAULT 0,
+    lifetime_view_count INTEGER,
+    video_count INTEGER,
+    uploads_playlist_id TEXT,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    source_candidate_count INTEGER NOT NULL DEFAULT 0,
+    tracked INTEGER NOT NULL DEFAULT 1,
+    notes TEXT,
+    sample_mode TEXT NOT NULL DEFAULT 'long',
+    recent_upload_count INTEGER,
+    median_views REAL,
+    mean_views REAL,
+    median_duration_seconds REAL,
+    median_engagement_rate REAL,
+    breakout_frequency REAL,
+    breakout_count INTEGER,
+    consistency_score REAL,
+    uploads_per_week REAL,
+    median_upload_interval_hours REAL,
+    competitor_score REAL,
+    competitor_relevance_score REAL,
+    competitor_relevance_status TEXT NOT NULL DEFAULT 'unscored',
+    competitor_match_reasons_json TEXT,
+    niche_hit_rate REAL,
+    niche_matching_video_count INTEGER,
+    niche_analyzed_video_count INTEGER,
+    score_confidence TEXT,
+    patterns_json TEXT,
+    duration_buckets_json TEXT,
+    analyzed_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, platform, channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS competitor_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competitor_id INTEGER NOT NULL,
+    captured_at REAL NOT NULL,
+    subscriber_count INTEGER,
+    lifetime_view_count INTEGER,
+    video_count INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS competitor_videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competitor_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    video_url TEXT NOT NULL,
+    title TEXT,
+    description TEXT,
+    thumbnail_url TEXT,
+    published_at TEXT,
+    duration_seconds INTEGER,
+    view_count INTEGER,
+    like_count INTEGER,
+    comment_count INTEGER,
+    engagement_rate REAL,
+    outlier_ratio REAL,
+    breakout_strength TEXT,
+    rights_status TEXT NOT NULL DEFAULT 'idea_only',
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    UNIQUE(competitor_id, video_id)
+);
+
+CREATE TABLE IF NOT EXISTS content_brain_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    request_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    context_label TEXT,
+    evidence_hash TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    result_json TEXT,
+    error_message TEXT,
+    generation_attempt_count INTEGER NOT NULL DEFAULT 0,
+    failure_stage TEXT,
+    created_at REAL NOT NULL,
+    completed_at REAL
+);
+
+-- CP5 decision cards. Research snapshots deliberately contain normalized
+-- metadata only; production jobs and source media are never created here.
+CREATE TABLE IF NOT EXISTS content_opportunities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    source_type TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    source_candidate_id INTEGER,
+    source_gap_key TEXT,
+    brain_run_id INTEGER,
+    topic TEXT NOT NULL,
+    primary_motif TEXT,
+    evidence_score REAL NOT NULL,
+    evidence_confidence TEXT NOT NULL,
+    opportunity_rank_score REAL NOT NULL,
+    competition_level TEXT NOT NULL,
+    trend_score REAL,
+    niche_relevance_score REAL,
+    candidate_opportunity_score REAL,
+    competitor_strength_score REAL,
+    breakout_support_count INTEGER NOT NULL DEFAULT 0,
+    pattern_quality_score REAL,
+    gap_quality_score REAL,
+    ai_enrichment_status TEXT NOT NULL DEFAULT 'missing',
+    system_recommended_angle TEXT,
+    system_audience_promise TEXT,
+    system_core_conflict TEXT,
+    system_differentiation TEXT,
+    system_suggested_title TEXT,
+    system_suggested_hook TEXT,
+    system_risks_json TEXT NOT NULL DEFAULT '[]',
+    working_title TEXT,
+    selected_angle TEXT,
+    notes TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    target_format TEXT NOT NULL DEFAULT 'long_form',
+    target_duration_min INTEGER,
+    target_duration_max INTEGER,
+    rights_status TEXT NOT NULL DEFAULT 'idea_only',
+    risk_level TEXT NOT NULL DEFAULT 'medium',
+    evidence_hash TEXT NOT NULL,
+    evidence_snapshot_json TEXT NOT NULL,
+    score_breakdown_json TEXT NOT NULL,
+    waiting_for_json TEXT NOT NULL DEFAULT '[]',
+    rejection_reason TEXT,
+    rejection_note TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_refreshed_at REAL NOT NULL,
+    UNIQUE(user_id, dedupe_key)
+);
+
+CREATE TABLE IF NOT EXISTS content_opportunity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_opportunities_user_rank
+    ON content_opportunities(user_id, opportunity_rank_score DESC);
+CREATE INDEX IF NOT EXISTS idx_content_opportunities_user_status
+    ON content_opportunities(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_opportunity_events_owner
+    ON content_opportunity_events(user_id, opportunity_id, created_at DESC);
+
+-- CP6 planning queue. These records never execute the legacy localization,
+-- rendering, TTS, download, upload, or publishing pipelines.
+CREATE TABLE IF NOT EXISTS production_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    opportunity_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    priority INTEGER NOT NULL DEFAULT 0,
+    opportunity_rank_score REAL NOT NULL DEFAULT 0,
+    working_title TEXT NOT NULL,
+    selected_angle TEXT,
+    target_format TEXT NOT NULL,
+    target_duration_min INTEGER,
+    target_duration_max INTEGER,
+    production_brief_json TEXT NOT NULL,
+    rights_status TEXT NOT NULL,
+    rights_gate_status TEXT NOT NULL,
+    planning_ready INTEGER NOT NULL DEFAULT 0,
+    rights_ready INTEGER NOT NULL DEFAULT 0,
+    blocker_reason TEXT,
+    manual_notes TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    UNIQUE(user_id, opportunity_id)
+);
+
+CREATE TABLE IF NOT EXISTS production_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    required INTEGER NOT NULL DEFAULT 1,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
+    order_index INTEGER NOT NULL,
+    assignee_type TEXT NOT NULL DEFAULT 'manual',
+    manual_notes TEXT,
+    output_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    UNIQUE(production_item_id, task_type)
+);
+
+CREATE TABLE IF NOT EXISTS production_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_item_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    task_id INTEGER,
+    from_status TEXT,
+    to_status TEXT,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_items_user_queue
+    ON production_items(user_id, status, priority DESC, opportunity_rank_score DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_production_tasks_item_order
+    ON production_tasks(user_id, production_item_id, order_index);
+CREATE INDEX IF NOT EXISTS idx_production_events_owner
+    ON production_events(user_id, production_item_id, created_at DESC);
 
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
@@ -504,6 +782,174 @@ _MIGRATIONS = [
     # time, in the /api/register handler — this table just tracks the link.
     ("users", "referral_code", "ALTER TABLE users ADD COLUMN referral_code TEXT"),
     ("users", "referred_by_user_id", "ALTER TABLE users ADD COLUMN referred_by_user_id INTEGER"),
+    # Scope evidence is required to distinguish old upload-only YouTube
+    # credentials from credentials explicitly re-consented for Analytics.
+    ("social_accounts", "scopes", "ALTER TABLE social_accounts ADD COLUMN scopes TEXT"),
+    # Legacy Trend Scanner installations used several smaller variants of
+    # these tables. CREATE TABLE IF NOT EXISTS does not add missing columns,
+    # so every field used by current Store methods needs an additive upgrade.
+    ("trend_scans", "id", "ALTER TABLE trend_scans ADD COLUMN id TEXT"),
+    ("trend_scans", "scan_key", "ALTER TABLE trend_scans ADD COLUMN scan_key TEXT"),
+    ("trend_scans", "user_id", "ALTER TABLE trend_scans ADD COLUMN user_id INTEGER"),
+    ("trend_scans", "topic", "ALTER TABLE trend_scans ADD COLUMN topic TEXT"),
+    ("trend_scans", "query_json", "ALTER TABLE trend_scans ADD COLUMN query_json TEXT DEFAULT '{}'"),
+    ("trend_scans", "platforms_json", "ALTER TABLE trend_scans ADD COLUMN platforms_json TEXT DEFAULT '[]'"),
+    ("trend_scans", "providers_json", "ALTER TABLE trend_scans ADD COLUMN providers_json TEXT DEFAULT '[]'"),
+    ("trend_scans", "status", "ALTER TABLE trend_scans ADD COLUMN status TEXT DEFAULT 'pending'"),
+    ("trend_scans", "progress_note", "ALTER TABLE trend_scans ADD COLUMN progress_note TEXT"),
+    ("trend_scans", "warnings_json", "ALTER TABLE trend_scans ADD COLUMN warnings_json TEXT DEFAULT '[]'"),
+    ("trend_scans", "error", "ALTER TABLE trend_scans ADD COLUMN error TEXT"),
+    ("trend_scans", "max_results", "ALTER TABLE trend_scans ADD COLUMN max_results INTEGER DEFAULT 20"),
+    ("trend_scans", "created_at", "ALTER TABLE trend_scans ADD COLUMN created_at REAL"),
+    ("trend_scans", "updated_at", "ALTER TABLE trend_scans ADD COLUMN updated_at REAL"),
+    ("trend_items", "id", "ALTER TABLE trend_items ADD COLUMN id INTEGER"),
+    ("trend_items", "scan_id", "ALTER TABLE trend_items ADD COLUMN scan_id TEXT"),
+    ("trend_items", "user_id", "ALTER TABLE trend_items ADD COLUMN user_id INTEGER"),
+    ("trend_items", "platform", "ALTER TABLE trend_items ADD COLUMN platform TEXT"),
+    ("trend_items", "provider", "ALTER TABLE trend_items ADD COLUMN provider TEXT"),
+    ("trend_items", "source_url", "ALTER TABLE trend_items ADD COLUMN source_url TEXT"),
+    ("trend_items", "title", "ALTER TABLE trend_items ADD COLUMN title TEXT"),
+    ("trend_items", "description", "ALTER TABLE trend_items ADD COLUMN description TEXT"),
+    ("trend_items", "author", "ALTER TABLE trend_items ADD COLUMN author TEXT"),
+    ("trend_items", "thumbnail_url", "ALTER TABLE trend_items ADD COLUMN thumbnail_url TEXT"),
+    ("trend_items", "duration_seconds", "ALTER TABLE trend_items ADD COLUMN duration_seconds REAL"),
+    ("trend_items", "view_count", "ALTER TABLE trend_items ADD COLUMN view_count INTEGER"),
+    ("trend_items", "like_count", "ALTER TABLE trend_items ADD COLUMN like_count INTEGER"),
+    ("trend_items", "comment_count", "ALTER TABLE trend_items ADD COLUMN comment_count INTEGER"),
+    ("trend_items", "share_count", "ALTER TABLE trend_items ADD COLUMN share_count INTEGER"),
+    ("trend_items", "published_at", "ALTER TABLE trend_items ADD COLUMN published_at TEXT"),
+    ("trend_items", "trend_score", "ALTER TABLE trend_items ADD COLUMN trend_score REAL DEFAULT 0"),
+    ("trend_items", "niche_relevance_score", "ALTER TABLE trend_items ADD COLUMN niche_relevance_score REAL"),
+    ("trend_items", "opportunity_score", "ALTER TABLE trend_items ADD COLUMN opportunity_score REAL"),
+    ("trend_items", "relevance_status", "ALTER TABLE trend_items ADD COLUMN relevance_status TEXT DEFAULT 'unscored'"),
+    ("trend_items", "match_reason_json", "ALTER TABLE trend_items ADD COLUMN match_reason_json TEXT"),
+    ("trend_items", "raw_json", "ALTER TABLE trend_items ADD COLUMN raw_json TEXT DEFAULT '{}'"),
+    ("trend_items", "download_status", "ALTER TABLE trend_items ADD COLUMN download_status TEXT DEFAULT 'found'"),
+    ("trend_items", "local_path", "ALTER TABLE trend_items ADD COLUMN local_path TEXT"),
+    ("trend_items", "error", "ALTER TABLE trend_items ADD COLUMN error TEXT"),
+    ("trend_items", "created_at", "ALTER TABLE trend_items ADD COLUMN created_at REAL"),
+    ("trend_items", "updated_at", "ALTER TABLE trend_items ADD COLUMN updated_at REAL"),
+    ("trend_items", "source_id", "ALTER TABLE trend_items ADD COLUMN source_id TEXT"),
+    ("trend_items", "channel_id", "ALTER TABLE trend_items ADD COLUMN channel_id TEXT"),
+    ("trend_items", "rights_status", "ALTER TABLE trend_items ADD COLUMN rights_status TEXT NOT NULL DEFAULT 'idea_only'"),
+    ("trend_items", "first_seen_at", "ALTER TABLE trend_items ADD COLUMN first_seen_at REAL"),
+    ("trend_items", "last_seen_at", "ALTER TABLE trend_items ADD COLUMN last_seen_at REAL"),
+    ("trend_items", "observed_vph", "ALTER TABLE trend_items ADD COLUMN observed_vph REAL"),
+    ("trend_items", "approx_vph", "ALTER TABLE trend_items ADD COLUMN approx_vph REAL"),
+    ("trend_items", "engagement_rate", "ALTER TABLE trend_items ADD COLUMN engagement_rate REAL"),
+    ("trend_items", "outlier_ratio", "ALTER TABLE trend_items ADD COLUMN outlier_ratio REAL"),
+    ("trend_items", "channel_typical_views", "ALTER TABLE trend_items ADD COLUMN channel_typical_views REAL"),
+    ("trend_items", "freshness_score", "ALTER TABLE trend_items ADD COLUMN freshness_score REAL"),
+    ("trend_items", "competition_proxy", "ALTER TABLE trend_items ADD COLUMN competition_proxy REAL"),
+    ("trend_items", "score_confidence", "ALTER TABLE trend_items ADD COLUMN score_confidence TEXT"),
+    ("trend_items", "available_signal_count", "ALTER TABLE trend_items ADD COLUMN available_signal_count INTEGER NOT NULL DEFAULT 0"),
+    ("trend_items", "score_explanation_json", "ALTER TABLE trend_items ADD COLUMN score_explanation_json TEXT"),
+    ("trend_items", "snapshot_count", "ALTER TABLE trend_items ADD COLUMN snapshot_count INTEGER NOT NULL DEFAULT 0"),
+    ("trend_queries", "id", "ALTER TABLE trend_queries ADD COLUMN id INTEGER"),
+    ("trend_queries", "user_id", "ALTER TABLE trend_queries ADD COLUMN user_id INTEGER"),
+    ("trend_queries", "query", "ALTER TABLE trend_queries ADD COLUMN query TEXT"),
+    ("trend_queries", "relevance_language", "ALTER TABLE trend_queries ADD COLUMN relevance_language TEXT"),
+    ("trend_queries", "region_code", "ALTER TABLE trend_queries ADD COLUMN region_code TEXT"),
+    ("trend_queries", "published_within_days", "ALTER TABLE trend_queries ADD COLUMN published_within_days INTEGER DEFAULT 30"),
+    ("trend_queries", "duration_filter", "ALTER TABLE trend_queries ADD COLUMN duration_filter TEXT DEFAULT 'long'"),
+    ("trend_queries", "search_order", "ALTER TABLE trend_queries ADD COLUMN search_order TEXT DEFAULT 'date'"),
+    ("trend_queries", "enabled", "ALTER TABLE trend_queries ADD COLUMN enabled INTEGER DEFAULT 1"),
+    ("trend_queries", "topic_terms", "ALTER TABLE trend_queries ADD COLUMN topic_terms TEXT"),
+    ("trend_queries", "exclusion_terms", "ALTER TABLE trend_queries ADD COLUMN exclusion_terms TEXT"),
+    ("trend_queries", "notes", "ALTER TABLE trend_queries ADD COLUMN notes TEXT"),
+    ("trend_queries", "created_at", "ALTER TABLE trend_queries ADD COLUMN created_at REAL"),
+    ("trend_queries", "updated_at", "ALTER TABLE trend_queries ADD COLUMN updated_at REAL"),
+    ("trend_item_queries", "item_id", "ALTER TABLE trend_item_queries ADD COLUMN item_id INTEGER"),
+    ("trend_item_queries", "query_id", "ALTER TABLE trend_item_queries ADD COLUMN query_id INTEGER"),
+    ("trend_item_queries", "first_matched_at", "ALTER TABLE trend_item_queries ADD COLUMN first_matched_at REAL"),
+    ("trend_item_queries", "last_matched_at", "ALTER TABLE trend_item_queries ADD COLUMN last_matched_at REAL"),
+    ("trend_snapshots", "id", "ALTER TABLE trend_snapshots ADD COLUMN id INTEGER"),
+    ("trend_snapshots", "item_id", "ALTER TABLE trend_snapshots ADD COLUMN item_id INTEGER"),
+    ("trend_snapshots", "captured_at", "ALTER TABLE trend_snapshots ADD COLUMN captured_at REAL"),
+    ("trend_snapshots", "view_count", "ALTER TABLE trend_snapshots ADD COLUMN view_count INTEGER"),
+    ("trend_snapshots", "like_count", "ALTER TABLE trend_snapshots ADD COLUMN like_count INTEGER"),
+    ("trend_snapshots", "comment_count", "ALTER TABLE trend_snapshots ADD COLUMN comment_count INTEGER"),
+    ("competitor_channels", "id", "ALTER TABLE competitor_channels ADD COLUMN id INTEGER"),
+    ("competitor_channels", "user_id", "ALTER TABLE competitor_channels ADD COLUMN user_id INTEGER"),
+    ("competitor_channels", "platform", "ALTER TABLE competitor_channels ADD COLUMN platform TEXT DEFAULT 'youtube'"),
+    ("competitor_channels", "channel_id", "ALTER TABLE competitor_channels ADD COLUMN channel_id TEXT"),
+    ("competitor_channels", "channel_title", "ALTER TABLE competitor_channels ADD COLUMN channel_title TEXT"),
+    ("competitor_channels", "channel_url", "ALTER TABLE competitor_channels ADD COLUMN channel_url TEXT"),
+    ("competitor_channels", "custom_url", "ALTER TABLE competitor_channels ADD COLUMN custom_url TEXT"),
+    ("competitor_channels", "thumbnail_url", "ALTER TABLE competitor_channels ADD COLUMN thumbnail_url TEXT"),
+    ("competitor_channels", "subscriber_count", "ALTER TABLE competitor_channels ADD COLUMN subscriber_count INTEGER"),
+    ("competitor_channels", "hidden_subscriber_count", "ALTER TABLE competitor_channels ADD COLUMN hidden_subscriber_count INTEGER DEFAULT 0"),
+    ("competitor_channels", "lifetime_view_count", "ALTER TABLE competitor_channels ADD COLUMN lifetime_view_count INTEGER"),
+    ("competitor_channels", "video_count", "ALTER TABLE competitor_channels ADD COLUMN video_count INTEGER"),
+    ("competitor_channels", "uploads_playlist_id", "ALTER TABLE competitor_channels ADD COLUMN uploads_playlist_id TEXT"),
+    ("competitor_channels", "first_seen_at", "ALTER TABLE competitor_channels ADD COLUMN first_seen_at REAL"),
+    ("competitor_channels", "last_seen_at", "ALTER TABLE competitor_channels ADD COLUMN last_seen_at REAL"),
+    ("competitor_channels", "source_candidate_count", "ALTER TABLE competitor_channels ADD COLUMN source_candidate_count INTEGER DEFAULT 0"),
+    ("competitor_channels", "tracked", "ALTER TABLE competitor_channels ADD COLUMN tracked INTEGER DEFAULT 1"),
+    ("competitor_channels", "notes", "ALTER TABLE competitor_channels ADD COLUMN notes TEXT"),
+    ("competitor_channels", "sample_mode", "ALTER TABLE competitor_channels ADD COLUMN sample_mode TEXT DEFAULT 'long'"),
+    ("competitor_channels", "recent_upload_count", "ALTER TABLE competitor_channels ADD COLUMN recent_upload_count INTEGER"),
+    ("competitor_channels", "median_views", "ALTER TABLE competitor_channels ADD COLUMN median_views REAL"),
+    ("competitor_channels", "mean_views", "ALTER TABLE competitor_channels ADD COLUMN mean_views REAL"),
+    ("competitor_channels", "median_duration_seconds", "ALTER TABLE competitor_channels ADD COLUMN median_duration_seconds REAL"),
+    ("competitor_channels", "median_engagement_rate", "ALTER TABLE competitor_channels ADD COLUMN median_engagement_rate REAL"),
+    ("competitor_channels", "breakout_frequency", "ALTER TABLE competitor_channels ADD COLUMN breakout_frequency REAL"),
+    ("competitor_channels", "breakout_count", "ALTER TABLE competitor_channels ADD COLUMN breakout_count INTEGER"),
+    ("competitor_channels", "consistency_score", "ALTER TABLE competitor_channels ADD COLUMN consistency_score REAL"),
+    ("competitor_channels", "uploads_per_week", "ALTER TABLE competitor_channels ADD COLUMN uploads_per_week REAL"),
+    ("competitor_channels", "median_upload_interval_hours", "ALTER TABLE competitor_channels ADD COLUMN median_upload_interval_hours REAL"),
+    ("competitor_channels", "competitor_score", "ALTER TABLE competitor_channels ADD COLUMN competitor_score REAL"),
+    ("competitor_channels", "competitor_relevance_score", "ALTER TABLE competitor_channels ADD COLUMN competitor_relevance_score REAL"),
+    ("competitor_channels", "competitor_relevance_status", "ALTER TABLE competitor_channels ADD COLUMN competitor_relevance_status TEXT DEFAULT 'unscored'"),
+    ("competitor_channels", "competitor_match_reasons_json", "ALTER TABLE competitor_channels ADD COLUMN competitor_match_reasons_json TEXT"),
+    ("competitor_channels", "niche_hit_rate", "ALTER TABLE competitor_channels ADD COLUMN niche_hit_rate REAL"),
+    ("competitor_channels", "niche_matching_video_count", "ALTER TABLE competitor_channels ADD COLUMN niche_matching_video_count INTEGER"),
+    ("competitor_channels", "niche_analyzed_video_count", "ALTER TABLE competitor_channels ADD COLUMN niche_analyzed_video_count INTEGER"),
+    ("competitor_channels", "score_confidence", "ALTER TABLE competitor_channels ADD COLUMN score_confidence TEXT"),
+    ("competitor_channels", "patterns_json", "ALTER TABLE competitor_channels ADD COLUMN patterns_json TEXT"),
+    ("competitor_channels", "duration_buckets_json", "ALTER TABLE competitor_channels ADD COLUMN duration_buckets_json TEXT"),
+    ("competitor_channels", "analyzed_at", "ALTER TABLE competitor_channels ADD COLUMN analyzed_at REAL"),
+    ("competitor_channels", "created_at", "ALTER TABLE competitor_channels ADD COLUMN created_at REAL"),
+    ("competitor_channels", "updated_at", "ALTER TABLE competitor_channels ADD COLUMN updated_at REAL"),
+    ("competitor_snapshots", "id", "ALTER TABLE competitor_snapshots ADD COLUMN id INTEGER"),
+    ("competitor_snapshots", "competitor_id", "ALTER TABLE competitor_snapshots ADD COLUMN competitor_id INTEGER"),
+    ("competitor_snapshots", "captured_at", "ALTER TABLE competitor_snapshots ADD COLUMN captured_at REAL"),
+    ("competitor_snapshots", "subscriber_count", "ALTER TABLE competitor_snapshots ADD COLUMN subscriber_count INTEGER"),
+    ("competitor_snapshots", "lifetime_view_count", "ALTER TABLE competitor_snapshots ADD COLUMN lifetime_view_count INTEGER"),
+    ("competitor_snapshots", "video_count", "ALTER TABLE competitor_snapshots ADD COLUMN video_count INTEGER"),
+    ("competitor_videos", "id", "ALTER TABLE competitor_videos ADD COLUMN id INTEGER"),
+    ("competitor_videos", "competitor_id", "ALTER TABLE competitor_videos ADD COLUMN competitor_id INTEGER"),
+    ("competitor_videos", "video_id", "ALTER TABLE competitor_videos ADD COLUMN video_id TEXT"),
+    ("competitor_videos", "video_url", "ALTER TABLE competitor_videos ADD COLUMN video_url TEXT"),
+    ("competitor_videos", "title", "ALTER TABLE competitor_videos ADD COLUMN title TEXT"),
+    ("competitor_videos", "description", "ALTER TABLE competitor_videos ADD COLUMN description TEXT"),
+    ("competitor_videos", "thumbnail_url", "ALTER TABLE competitor_videos ADD COLUMN thumbnail_url TEXT"),
+    ("competitor_videos", "published_at", "ALTER TABLE competitor_videos ADD COLUMN published_at TEXT"),
+    ("competitor_videos", "duration_seconds", "ALTER TABLE competitor_videos ADD COLUMN duration_seconds INTEGER"),
+    ("competitor_videos", "view_count", "ALTER TABLE competitor_videos ADD COLUMN view_count INTEGER"),
+    ("competitor_videos", "like_count", "ALTER TABLE competitor_videos ADD COLUMN like_count INTEGER"),
+    ("competitor_videos", "comment_count", "ALTER TABLE competitor_videos ADD COLUMN comment_count INTEGER"),
+    ("competitor_videos", "engagement_rate", "ALTER TABLE competitor_videos ADD COLUMN engagement_rate REAL"),
+    ("competitor_videos", "outlier_ratio", "ALTER TABLE competitor_videos ADD COLUMN outlier_ratio REAL"),
+    ("competitor_videos", "breakout_strength", "ALTER TABLE competitor_videos ADD COLUMN breakout_strength TEXT"),
+    ("competitor_videos", "rights_status", "ALTER TABLE competitor_videos ADD COLUMN rights_status TEXT DEFAULT 'idea_only'"),
+    ("competitor_videos", "first_seen_at", "ALTER TABLE competitor_videos ADD COLUMN first_seen_at REAL"),
+    ("competitor_videos", "last_seen_at", "ALTER TABLE competitor_videos ADD COLUMN last_seen_at REAL"),
+    ("content_brain_runs", "id", "ALTER TABLE content_brain_runs ADD COLUMN id INTEGER"),
+    ("content_brain_runs", "user_id", "ALTER TABLE content_brain_runs ADD COLUMN user_id INTEGER"),
+    ("content_brain_runs", "request_type", "ALTER TABLE content_brain_runs ADD COLUMN request_type TEXT"),
+    ("content_brain_runs", "status", "ALTER TABLE content_brain_runs ADD COLUMN status TEXT DEFAULT 'running'"),
+    ("content_brain_runs", "provider", "ALTER TABLE content_brain_runs ADD COLUMN provider TEXT DEFAULT 'ollama'"),
+    ("content_brain_runs", "model", "ALTER TABLE content_brain_runs ADD COLUMN model TEXT DEFAULT ''"),
+    ("content_brain_runs", "context_label", "ALTER TABLE content_brain_runs ADD COLUMN context_label TEXT"),
+    ("content_brain_runs", "evidence_hash", "ALTER TABLE content_brain_runs ADD COLUMN evidence_hash TEXT"),
+    ("content_brain_runs", "evidence_json", "ALTER TABLE content_brain_runs ADD COLUMN evidence_json TEXT DEFAULT '{}'"),
+    ("content_brain_runs", "result_json", "ALTER TABLE content_brain_runs ADD COLUMN result_json TEXT"),
+    ("content_brain_runs", "error_message", "ALTER TABLE content_brain_runs ADD COLUMN error_message TEXT"),
+    ("content_brain_runs", "generation_attempt_count", "ALTER TABLE content_brain_runs ADD COLUMN generation_attempt_count INTEGER DEFAULT 0"),
+    ("content_brain_runs", "failure_stage", "ALTER TABLE content_brain_runs ADD COLUMN failure_stage TEXT"),
+    ("content_brain_runs", "created_at", "ALTER TABLE content_brain_runs ADD COLUMN created_at REAL"),
+    ("content_brain_runs", "completed_at", "ALTER TABLE content_brain_runs ADD COLUMN completed_at REAL"),
     # Per-job source language + optional brand-logo overlay settings,
     # added after jobs already existed in the wild.
     ("jobs", "source_language", "ALTER TABLE jobs ADD COLUMN source_language TEXT DEFAULT 'auto'"),
@@ -749,7 +1195,10 @@ class Store:
                 for table in
                 ("users", "jobs", "content_os_projects", "content_os_channels", "content_os_runs", "content_os_steps",
                  "content_os_artifacts", "content_os_sources", "content_os_reviews", "content_os_approvals",
-                 "content_os_memories", "channel_scan_states", "channel_scan_videos")
+                 "content_os_memories", "channel_scan_states", "channel_scan_videos", "social_accounts",
+                 "trend_scans", "trend_items", "trend_queries", "trend_item_queries",
+                 "trend_snapshots", "competitor_channels", "competitor_snapshots",
+                 "competitor_videos", "content_brain_runs")
             }
             migrated_legacy_projects = (
                     "target_platforms_json" in existing_cols.get("content_os_projects", set())
@@ -761,6 +1210,44 @@ class Store:
                     conn.execute(ddl)
                     if column == "is_admin":
                         ran_is_admin_migration = True
+
+            # A legacy table may not have declared id as INTEGER PRIMARY KEY.
+            # Preserve its rows and give null compatibility ids their stable
+            # SQLite rowid; current inserts also set ids explicitly below.
+            for table in ("trend_items", "trend_queries", "trend_snapshots", "competitor_channels",
+                          "competitor_snapshots", "competitor_videos", "content_brain_runs"):
+                conn.execute(f"UPDATE {table} SET id = rowid WHERE id IS NULL")
+
+            # CP2 uses UUID scan identifiers, while the original Trend Scanner
+            # table deployed in the Windows app uses INTEGER PRIMARY KEY. Keep
+            # that legacy key intact and address CP2 scans through a separate
+            # text key. Existing rows receive a stable compatibility key.
+            conn.execute(
+                "UPDATE trend_scans SET scan_key=CAST(id AS TEXT) "
+                "WHERE scan_key IS NULL AND id IS NOT NULL"
+            )
+
+            # Indexes referencing legacy columns must be created only after
+            # the additive migrations above have established those columns.
+            for ddl in (
+                "CREATE INDEX IF NOT EXISTS idx_trend_queries_user ON trend_queries(user_id, enabled)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_items_user_score ON trend_items(user_id, trend_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_items_user_opportunity ON trend_items(user_id, opportunity_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_items_user_source ON trend_items(user_id, platform, source_id)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_item_queries_query ON trend_item_queries(query_id)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_snapshots_item_time ON trend_snapshots(item_id, captured_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_trend_scans_user_time ON trend_scans(user_id, created_at DESC)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trend_scans_scan_key ON trend_scans(scan_key) WHERE scan_key IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_channels_user_score ON competitor_channels(user_id, competitor_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_channels_user_relevance ON competitor_channels(user_id, competitor_relevance_status, competitor_relevance_score DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_channels_identity ON competitor_channels(user_id, platform, channel_id)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_snapshots_time ON competitor_snapshots(competitor_id, captured_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_videos_identity ON competitor_videos(competitor_id, video_id)",
+                "CREATE INDEX IF NOT EXISTS idx_competitor_videos_outlier ON competitor_videos(competitor_id, outlier_ratio DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_content_brain_runs_user_time ON content_brain_runs(user_id, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_content_brain_runs_evidence ON content_brain_runs(user_id, evidence_hash, request_type, model)",
+            ):
+                conn.execute(ddl)
 
             if migrated_legacy_projects:
                 # The first Content OS schema stored platforms as a JSON list.
@@ -1878,11 +2365,978 @@ class Store:
                 (job_id, platform, int(success), message, remote_url, time.time()),
             )
 
+    # ---- Channel Agent trend research (per-user, metadata only) ----
+    def list_trend_queries(self, user_id: int, *, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM trend_queries WHERE user_id = ?"
+        params: List[Any] = [user_id]
+        if enabled_only:
+            sql += " AND enabled = 1"
+        sql += " ORDER BY created_at ASC"
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def create_trend_query(self, user_id: int, query: str, **fields: Any) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM trend_queries WHERE user_id=? AND query=? LIMIT 1",
+                (user_id, query.strip()),
+            ).fetchone():
+                raise sqlite3.IntegrityError("duplicate trend query")
+            cur = conn.execute(
+                """INSERT INTO trend_queries
+                (user_id, query, relevance_language, region_code, published_within_days,
+                 duration_filter, search_order, enabled, topic_terms, exclusion_terms, notes,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, query.strip(), fields.get("relevance_language"), fields.get("region_code"),
+                 int(fields.get("published_within_days", 30)), fields.get("duration_filter", "long"),
+                 fields.get("search_order", "date"), int(bool(fields.get("enabled", True))),
+                 fields.get("topic_terms"), fields.get("exclusion_terms"), fields.get("notes"), now, now),
+            )
+            row_id = int(cur.lastrowid)
+            conn.execute("UPDATE trend_queries SET id=rowid WHERE rowid=? AND id IS NULL", (row_id,))
+            return row_id
+
+    def update_trend_query(self, user_id: int, query_id: int, **fields: Any) -> bool:
+        allowed = {"query", "relevance_language", "region_code", "published_within_days",
+                   "duration_filter", "search_order", "enabled", "topic_terms",
+                   "exclusion_terms", "notes"}
+        updates: List[str] = []
+        values: List[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            updates.append(f"{key} = ?")
+            values.append(int(bool(value)) if key == "enabled" else value)
+        if not updates:
+            return False
+        updates.append("updated_at = ?")
+        values.extend([time.time(), query_id, user_id])
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE trend_queries SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+                values,
+            )
+            return cur.rowcount > 0
+
+    def delete_trend_query(self, user_id: int, query_id: int) -> bool:
+        with self._connect() as conn:
+            owned = conn.execute(
+                "SELECT 1 FROM trend_queries WHERE id = ? AND user_id = ?", (query_id, user_id)
+            ).fetchone()
+            if not owned:
+                return False
+            conn.execute("DELETE FROM trend_item_queries WHERE query_id = ?", (query_id,))
+            conn.execute("DELETE FROM trend_queries WHERE id = ? AND user_id = ?", (query_id, user_id))
+            return True
+
+    def create_trend_scan(self, scan_id: str, user_id: int, topic: str, max_results: int) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            schema = {str(row["name"]): row for row in conn.execute("PRAGMA table_info(trend_scans)")}
+            columns = [
+                "scan_key", "user_id", "topic", "platforms_json", "providers_json", "status",
+                "progress_note", "warnings_json", "max_results", "created_at", "updated_at",
+            ]
+            values: List[Any] = [
+                scan_id, user_id, topic, '["youtube"]', '["youtube_data_api"]', "running",
+                "Searching public metadata", "[]", max_results, now, now,
+            ]
+            # A fresh CP2 database has a TEXT primary key. The deployed legacy
+            # table has INTEGER PRIMARY KEY AUTOINCREMENT, which must be left
+            # for SQLite to generate to avoid a datatype mismatch.
+            id_column = schema.get("id")
+            id_type = str(id_column["type"] if id_column is not None else "").upper()
+            if "INT" not in id_type:
+                columns.insert(0, "id")
+                values.insert(0, scan_id)
+            # The legacy scanner requires query_json on every insert. It is
+            # harmless compatibility metadata on fresh CP2 databases.
+            if "query_json" in schema:
+                columns.append("query_json")
+                values.append(json.dumps({"topic": topic}, ensure_ascii=False))
+            placeholders = ",".join("?" for _ in columns)
+            conn.execute(
+                f"INSERT INTO trend_scans ({','.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+
+    def finish_trend_scan(self, scan_id: str, *, status: str, note: str,
+                          warnings: Optional[List[str]] = None, error: Optional[str] = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trend_scans SET status=?,progress_note=?,warnings_json=?,error=?,updated_at=? WHERE scan_key=?",
+                (status, note, json.dumps(warnings or [], ensure_ascii=False), error, time.time(), scan_id),
+            )
+
+    def latest_trend_scan(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM trend_scans WHERE user_id=? ORDER BY created_at DESC LIMIT 1", (user_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["scan_id"] = result.get("scan_key") or str(result.get("id"))
+        return result
+
+    def upsert_trend_candidate(self, user_id: int, video: Dict[str, Any], rights_status: str) -> int:
+        now = float(video.get("captured_at") or time.time())
+        source_url = str(video["source_url"])
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT rowid AS _rowid,id FROM trend_items WHERE user_id=? AND platform='youtube' AND source_url=? LIMIT 1",
+                (user_id, source_url),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE trend_items SET scan_id=?,source_id=?,title=?,description=?,author=?,channel_id=?,
+                    thumbnail_url=?,duration_seconds=?,view_count=?,like_count=?,comment_count=?,
+                    published_at=?,last_seen_at=?,updated_at=? WHERE rowid=?""",
+                    (video["scan_id"], video["source_id"], video.get("title"), video.get("description"),
+                     video.get("channel_title"), video.get("channel_id"), video.get("thumbnail_url"),
+                     video.get("duration_seconds"), video.get("view_count"), video.get("like_count"),
+                     video.get("comment_count"), video.get("published_at"), now, now, existing["_rowid"]),
+                )
+            else:
+                cur = conn.execute(
+                    """INSERT INTO trend_items
+                    (scan_id,user_id,platform,provider,source_url,source_id,title,description,author,channel_id,
+                     thumbnail_url,duration_seconds,view_count,like_count,comment_count,published_at,
+                     trend_score,raw_json,rights_status,first_seen_at,last_seen_at,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (video["scan_id"], user_id, "youtube", "youtube_data_api", source_url,
+                     video["source_id"], video.get("title"), video.get("description"), video.get("channel_title"),
+                     video.get("channel_id"), video.get("thumbnail_url"), video.get("duration_seconds"),
+                     video.get("view_count"), video.get("like_count"), video.get("comment_count"),
+                     video.get("published_at"), 0.0, "{}", rights_status, now, now, now, now),
+                )
+                conn.execute("UPDATE trend_items SET id=rowid WHERE rowid=? AND id IS NULL", (cur.lastrowid,))
+            row = conn.execute(
+                "SELECT id FROM trend_items WHERE user_id=? AND platform='youtube' AND source_url=?",
+                (user_id, source_url),
+            ).fetchone()
+            return int(row["id"])
+
+    def match_trend_candidate_query(self, item_id: int, query_id: int, captured_at: float) -> None:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT rowid AS _rowid FROM trend_item_queries WHERE item_id=? AND query_id=? LIMIT 1",
+                (item_id, query_id),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE trend_item_queries SET last_matched_at=? WHERE rowid=?",
+                    (captured_at, existing["_rowid"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO trend_item_queries(item_id,query_id,first_matched_at,last_matched_at) VALUES (?,?,?,?)",
+                    (item_id, query_id, captured_at, captured_at),
+                )
+
+    def add_trend_snapshot(self, item_id: int, captured_at: float, views: Optional[int],
+                           likes: Optional[int], comments: Optional[int]) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM trend_snapshots WHERE item_id=? ORDER BY captured_at DESC,id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO trend_snapshots(item_id,captured_at,view_count,like_count,comment_count) VALUES (?,?,?,?,?)",
+                (item_id, captured_at, views, likes, comments),
+            )
+            conn.execute("UPDATE trend_snapshots SET id=rowid WHERE id IS NULL")
+            conn.execute(
+                "UPDATE trend_items SET snapshot_count=snapshot_count+1 WHERE id=?", (item_id,)
+            )
+        return dict(previous) if previous else None
+
+    def update_trend_candidate_score(self, user_id: int, item_id: int, **values: Any) -> bool:
+        allowed = {"observed_vph", "approx_vph", "engagement_rate", "outlier_ratio",
+                   "channel_typical_views", "freshness_score", "competition_proxy",
+                   "trend_score", "niche_relevance_score", "opportunity_score",
+                   "relevance_status", "match_reason_json", "score_confidence",
+                   "available_signal_count", "score_explanation_json"}
+        fields = [(key, value) for key, value in values.items() if key in allowed]
+        if not fields:
+            return False
+        sql = ",".join(f"{key}=?" for key, _ in fields)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE trend_items SET {sql},updated_at=? WHERE id=? AND user_id=?",
+                [value for _, value in fields] + [time.time(), item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def list_trend_candidates(self, user_id: int, limit: int = 100,
+                              min_score: float = 0.0, min_relevance: float = 0.0,
+                              include_filtered: bool = True) -> List[Dict[str, Any]]:
+        clauses = ["i.user_id=?", "i.platform='youtube'", "COALESCE(i.trend_score,0)>=?"]
+        params: List[Any] = [user_id, min_score]
+        if not include_filtered:
+            clauses.append("i.niche_relevance_score IS NOT NULL")
+            clauses.append("i.niche_relevance_score>=?")
+            params.append(min_relevance)
+        elif min_relevance > 0:
+            clauses.append("COALESCE(i.niche_relevance_score,0)>=?")
+            params.append(min_relevance)
+        params.append(min(200, max(1, limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT i.*,
+                (SELECT group_concat(q.query, ' | ') FROM trend_item_queries m
+                 JOIN trend_queries q ON q.id=m.query_id WHERE m.item_id=i.id) AS matched_queries
+                FROM trend_items i WHERE """ + " AND ".join(clauses) +
+                " ORDER BY COALESCE(i.opportunity_score,0) DESC,i.trend_score DESC,i.last_seen_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._trend_item_dict(row) for row in rows]
+
+    def get_trend_candidate(self, user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT i.*,
+                (SELECT group_concat(q.query, ' | ') FROM trend_item_queries m
+                 JOIN trend_queries q ON q.id=m.query_id WHERE m.item_id=i.id) AS matched_queries
+                FROM trend_items i WHERE i.id=? AND i.user_id=?""", (item_id, user_id)
+            ).fetchone()
+        return self._trend_item_dict(row) if row else None
+
+    def list_trend_snapshots(self, user_id: int, item_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT s.* FROM trend_snapshots s JOIN trend_items i ON i.id=s.item_id
+                WHERE s.item_id=? AND i.user_id=? ORDER BY s.captured_at DESC LIMIT ?""",
+                (item_id, user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _trend_item_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        try:
+            result["score_explanations"] = json.loads(result.pop("score_explanation_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["score_explanations"] = []
+        try:
+            result["match_reasons"] = json.loads(result.pop("match_reason_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["match_reasons"] = []
+        result.pop("raw_json", None)
+        result.pop("local_path", None)
+        score = float(result.get("trend_score") or 0.0)
+        result["trend_status"] = "hot" if score >= 0.90 else (
+            "rising" if score >= 0.75 else ("watch" if score >= 0.60 else "normal")
+        )
+        return result
+
+    # ---- Channel Agent competitor intelligence (per-user, metadata only) ----
+    def list_qualified_trend_channels(self, user_id: int, min_relevance: float,
+                                      limit: int = 10) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT channel_id,author,opportunity_score,niche_relevance_score
+                FROM trend_items WHERE user_id=? AND platform='youtube' AND channel_id IS NOT NULL
+                AND channel_id<>'' AND relevance_status='relevant'
+                AND niche_relevance_score>=? ORDER BY opportunity_score DESC LIMIT 1000""",
+                (user_id, min_relevance),
+            ).fetchall()
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            entry = grouped.setdefault(str(row["channel_id"]), {
+                "channel_id": str(row["channel_id"]), "channel_title": row["author"],
+                "opportunities": [], "relevances": [], "source_candidate_count": 0,
+            })
+            entry["source_candidate_count"] += 1
+            if row["opportunity_score"] is not None:
+                entry["opportunities"].append(float(row["opportunity_score"]))
+            if row["niche_relevance_score"] is not None:
+                entry["relevances"].append(float(row["niche_relevance_score"]))
+        result: List[Dict[str, Any]] = []
+        for entry in grouped.values():
+            opportunities = entry.pop("opportunities")
+            relevances = entry.pop("relevances")
+            entry["median_opportunity_score"] = statistics.median(opportunities) if opportunities else None
+            entry["median_relevance_score"] = statistics.median(relevances) if relevances else None
+            result.append(entry)
+        result.sort(key=lambda item: (item["median_opportunity_score"] or 0, item["source_candidate_count"]), reverse=True)
+        return result[:min(200, max(1, limit))]
+
+    def upsert_competitor(self, user_id: int, channel: Dict[str, Any], *,
+                          source_candidate_count: int = 0, tracked: bool = True,
+                          notes: Optional[str] = None) -> int:
+        now = time.time()
+        channel_id = str(channel["channel_id"])
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rowid AS _rowid,id FROM competitor_channels WHERE user_id=? AND platform='youtube' AND channel_id=? LIMIT 1",
+                (user_id, channel_id),
+            ).fetchone()
+            values = (
+                channel.get("channel_title") or "YouTube channel", channel.get("channel_url") or f"https://www.youtube.com/channel/{channel_id}",
+                channel.get("custom_url"), channel.get("thumbnail_url"), channel.get("subscriber_count"),
+                int(bool(channel.get("hidden_subscriber_count"))), channel.get("lifetime_view_count"),
+                channel.get("video_count"), channel.get("uploads_playlist_id"), now,
+                max(0, int(source_candidate_count or 0)), int(bool(tracked)), notes,
+            )
+            if row:
+                conn.execute(
+                    """UPDATE competitor_channels SET channel_title=?,channel_url=?,custom_url=?,thumbnail_url=?,
+                    subscriber_count=?,hidden_subscriber_count=?,lifetime_view_count=?,video_count=?,uploads_playlist_id=?,
+                    last_seen_at=?,source_candidate_count=MAX(source_candidate_count,?),tracked=?,notes=COALESCE(?,notes),updated_at=?
+                    WHERE rowid=?""",
+                    (*values, now, row["_rowid"]),
+                )
+                return int(row["id"])
+            cur = conn.execute(
+                """INSERT INTO competitor_channels
+                (user_id,platform,channel_id,channel_title,channel_url,custom_url,thumbnail_url,
+                 subscriber_count,hidden_subscriber_count,lifetime_view_count,video_count,uploads_playlist_id,
+                 first_seen_at,last_seen_at,source_candidate_count,tracked,notes,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (user_id, "youtube", channel_id, values[0], values[1], values[2], values[3], values[4], values[5],
+                 values[6], values[7], values[8], now, now, values[10], values[11], notes, now, now),
+            )
+            conn.execute("UPDATE competitor_channels SET id=rowid WHERE rowid=? AND id IS NULL", (cur.lastrowid,))
+            return int(cur.lastrowid)
+
+    def list_competitors(self, user_id: int, *, competitor_id: Optional[int] = None,
+                         limit: int = 100, include_filtered: bool = True) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM competitor_channels WHERE user_id=?"
+        params: List[Any] = [user_id]
+        if competitor_id is not None:
+            sql += " AND id=?"
+            params.append(competitor_id)
+        if not include_filtered:
+            sql += " AND competitor_relevance_status IN ('qualified','watch')"
+        sql += " ORDER BY CASE competitor_relevance_status WHEN 'qualified' THEN 0 WHEN 'watch' THEN 1 ELSE 2 END,COALESCE(competitor_score,0) DESC,last_seen_at DESC LIMIT ?"
+        params.append(min(200, max(1, limit)))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._competitor_dict(row) for row in rows]
+
+    def get_competitor(self, user_id: int, competitor_id: int) -> Optional[Dict[str, Any]]:
+        rows = self.list_competitors(user_id, competitor_id=competitor_id, limit=1, include_filtered=True)
+        return rows[0] if rows else None
+
+    def delete_competitor(self, user_id: int, competitor_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT id FROM competitor_channels WHERE id=? AND user_id=?", (competitor_id, user_id)).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM competitor_snapshots WHERE competitor_id=?", (competitor_id,))
+            conn.execute("DELETE FROM competitor_videos WHERE competitor_id=?", (competitor_id,))
+            conn.execute("DELETE FROM competitor_channels WHERE id=? AND user_id=?", (competitor_id, user_id))
+            return True
+
+    def update_competitor_analysis(self, user_id: int, competitor_id: int, analysis: Dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE competitor_channels SET sample_mode=?,recent_upload_count=?,median_views=?,mean_views=?,
+                median_duration_seconds=?,median_engagement_rate=?,breakout_frequency=?,breakout_count=?,
+                consistency_score=?,uploads_per_week=?,median_upload_interval_hours=?,competitor_score=?,
+                competitor_relevance_score=?,competitor_relevance_status=?,competitor_match_reasons_json=?,
+                niche_hit_rate=?,niche_matching_video_count=?,niche_analyzed_video_count=?,
+                score_confidence=?,patterns_json=?,duration_buckets_json=?,analyzed_at=?,updated_at=?
+                WHERE id=? AND user_id=?""",
+                (analysis.get("sample_mode"), analysis.get("recent_upload_count"), analysis.get("median_views"),
+                 analysis.get("mean_views"), analysis.get("median_duration_seconds"), analysis.get("median_engagement_rate"),
+                 analysis.get("breakout_frequency"), analysis.get("breakout_count"), analysis.get("consistency_score"),
+                 analysis.get("uploads_per_week"), analysis.get("median_upload_interval_hours"), analysis.get("competitor_score"),
+                 analysis.get("competitor_relevance_score"), analysis.get("competitor_relevance_status", "unscored"),
+                 json.dumps(analysis.get("competitor_match_reasons", []), ensure_ascii=False),
+                 analysis.get("niche_hit_rate"), analysis.get("niche_matching_video_count"),
+                 analysis.get("niche_analyzed_video_count"),
+                 analysis.get("score_confidence"), json.dumps(analysis.get("patterns", []), ensure_ascii=False),
+                 json.dumps(analysis.get("duration_buckets", []), ensure_ascii=False), analysis.get("analyzed_at"),
+                 time.time(), competitor_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def upsert_competitor_video(self, competitor_id: int, video: Dict[str, Any]) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rowid AS _rowid,id FROM competitor_videos WHERE competitor_id=? AND video_id=? LIMIT 1",
+                (competitor_id, video["video_id"]),
+            ).fetchone()
+            payload = (video.get("video_url"), video.get("title"), video.get("description"), video.get("thumbnail_url"),
+                       video.get("published_at"), video.get("duration_seconds"), video.get("view_count"),
+                       video.get("like_count"), video.get("comment_count"), video.get("engagement_rate"),
+                       video.get("outlier_ratio"), video.get("breakout_strength"), now)
+            if row:
+                conn.execute(
+                    """UPDATE competitor_videos SET video_url=?,title=?,description=?,thumbnail_url=?,published_at=?,
+                    duration_seconds=?,view_count=?,like_count=?,comment_count=?,engagement_rate=?,outlier_ratio=?,
+                    breakout_strength=?,last_seen_at=? WHERE rowid=?""", (*payload, row["_rowid"]),
+                )
+                return int(row["id"])
+            cur = conn.execute(
+                """INSERT INTO competitor_videos
+                (competitor_id,video_id,video_url,title,description,thumbnail_url,published_at,duration_seconds,
+                 view_count,like_count,comment_count,engagement_rate,outlier_ratio,breakout_strength,rights_status,
+                 first_seen_at,last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'idea_only',?,?)""",
+                (competitor_id, video["video_id"], *payload[:-1], now, now),
+            )
+            conn.execute("UPDATE competitor_videos SET id=rowid WHERE rowid=? AND id IS NULL", (cur.lastrowid,))
+            return int(cur.lastrowid)
+
+    def list_competitor_videos(self, user_id: int, competitor_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT v.* FROM competitor_videos v JOIN competitor_channels c ON c.id=v.competitor_id
+                WHERE v.competitor_id=? AND c.user_id=? ORDER BY COALESCE(v.outlier_ratio,0) DESC,v.published_at DESC LIMIT ?""",
+                (competitor_id, user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_competitor_snapshot(self, user_id: int, competitor_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO competitor_snapshots(competitor_id,captured_at,subscriber_count,lifetime_view_count,video_count)
+                SELECT id,?,subscriber_count,lifetime_view_count,video_count FROM competitor_channels WHERE id=? AND user_id=?""",
+                (time.time(), competitor_id, user_id),
+            )
+            conn.execute("UPDATE competitor_snapshots SET id=rowid WHERE id IS NULL")
+            return cur.rowcount > 0
+
+    def list_competitor_snapshots(self, user_id: int, competitor_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT s.* FROM competitor_snapshots s JOIN competitor_channels c ON c.id=s.competitor_id
+                WHERE s.competitor_id=? AND c.user_id=? ORDER BY s.captured_at DESC LIMIT ?""",
+                (competitor_id, user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _competitor_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target in (("patterns_json", "patterns"), ("duration_buckets_json", "duration_buckets"),
+                               ("competitor_match_reasons_json", "competitor_match_reasons")):
+            try:
+                result[target] = json.loads(result.pop(source) or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = []
+        return result
+
+    # ---- Channel Agent CP4 Content Brain runs (per-user, no credentials) ----
+    def create_content_brain_run(
+        self,
+        user_id: int,
+        *,
+        request_type: str,
+        provider: str,
+        model: str,
+        evidence_hash: str,
+        evidence: Dict[str, Any],
+        context_label: Optional[str] = None,
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO content_brain_runs
+                (user_id,request_type,status,provider,model,context_label,evidence_hash,
+                 evidence_json,created_at)
+                VALUES (?,?, 'running',?,?,?,?,?,?)""",
+                (
+                    user_id,
+                    request_type,
+                    provider,
+                    model,
+                    context_label,
+                    evidence_hash,
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def complete_content_brain_run(
+        self,
+        run_id: int,
+        user_id: int,
+        result: Dict[str, Any],
+        *,
+        generation_attempt_count: int = 0,
+    ) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE content_brain_runs SET status='completed',result_json=?,
+                error_message=NULL,generation_attempt_count=?,failure_stage=NULL,completed_at=?
+                WHERE id=? AND user_id=?""",
+                (
+                    json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    max(0, min(2, int(generation_attempt_count))),
+                    time.time(),
+                    run_id,
+                    user_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def fail_content_brain_run(
+        self,
+        run_id: int,
+        user_id: int,
+        message: str,
+        *,
+        generation_attempt_count: int = 1,
+        failure_stage: Optional[str] = None,
+    ) -> bool:
+        sanitized = " ".join(str(message or "Content Brain failed.").split())[:500]
+        sanitized_stage = "".join(
+            char for char in str(failure_stage or "") if char.isalnum() or char == "_"
+        )[:80] or None
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE content_brain_runs SET status='failed',error_message=?,
+                generation_attempt_count=?,failure_stage=?,completed_at=?
+                WHERE id=? AND user_id=?""",
+                (
+                    sanitized,
+                    max(0, min(2, int(generation_attempt_count))),
+                    sanitized_stage,
+                    time.time(),
+                    run_id,
+                    user_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def list_content_brain_runs(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_brain_runs WHERE user_id=?
+                ORDER BY created_at DESC,id DESC LIMIT ?""",
+                (user_id, min(100, max(1, limit))),
+            ).fetchall()
+        return [self._content_brain_run_dict(row, include_evidence=False) for row in rows]
+
+    def get_content_brain_run(self, user_id: int, run_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_brain_runs WHERE id=? AND user_id=?",
+                (run_id, user_id),
+            ).fetchone()
+        return self._content_brain_run_dict(row, include_evidence=True) if row else None
+
+    def delete_content_brain_run(self, user_id: int, run_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM content_brain_runs WHERE id=? AND user_id=?", (run_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    @staticmethod
+    def _content_brain_run_dict(row: Any, *, include_evidence: bool) -> Dict[str, Any]:
+        result = dict(row)
+        raw_result = result.pop("result_json", None)
+        try:
+            brain_result = json.loads(raw_result) if raw_result else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            brain_result = None
+        raw_evidence = result.pop("evidence_json", None)
+        if include_evidence:
+            try:
+                result["evidence"] = json.loads(raw_evidence) if raw_evidence else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["evidence"] = {}
+            result["result"] = brain_result
+        result["confidence"] = (
+            (brain_result.get("evidence_confidence") or {}).get("label")
+            if isinstance(brain_result, dict) else None
+        )
+        return result
+
+    # ---- Channel Agent CP5 Content Opportunities (per-user, deterministic) ----
+    _OPPORTUNITY_JSON_FIELDS = {
+        "system_risks_json": ("system_risks", []),
+        "evidence_snapshot_json": ("evidence_snapshot", {}),
+        "score_breakdown_json": ("score_breakdown", {}),
+        "waiting_for_json": ("waiting_for", []),
+    }
+
+    @classmethod
+    def _content_opportunity_dict(cls, row: Any, *, include_snapshot: bool = True) -> Dict[str, Any]:
+        result = dict(row)
+        for source, (target, fallback) in cls._OPPORTUNITY_JSON_FIELDS.items():
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else fallback
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = fallback
+        now = time.time()
+        age_days = max(0.0, (now - float(result.get("last_refreshed_at") or now)) / 86400.0)
+        result["freshness_status"] = "fresh" if age_days <= 7 else ("aging" if age_days <= 30 else "stale")
+        result["approved_for_production"] = result.get("status") == "approved"
+        if not include_snapshot:
+            result.pop("evidence_snapshot", None)
+            result.pop("score_breakdown", None)
+            result.pop("system_risks", None)
+            result.pop("waiting_for", None)
+        return result
+
+    def insert_content_opportunity(self, user_id: int, data: Dict[str, Any]) -> int:
+        now = time.time()
+        fields = (
+            "status", "source_type", "source_key", "dedupe_key", "source_candidate_id",
+            "source_gap_key", "brain_run_id", "topic", "primary_motif", "evidence_score",
+            "evidence_confidence", "opportunity_rank_score", "competition_level", "trend_score",
+            "niche_relevance_score", "candidate_opportunity_score", "competitor_strength_score",
+            "breakout_support_count", "pattern_quality_score", "gap_quality_score",
+            "ai_enrichment_status", "system_recommended_angle", "system_audience_promise",
+            "system_core_conflict", "system_differentiation", "system_suggested_title",
+            "system_suggested_hook", "system_risks_json", "working_title", "selected_angle",
+            "notes", "priority", "target_format", "target_duration_min", "target_duration_max",
+            "rights_status", "risk_level", "evidence_hash", "evidence_snapshot_json",
+            "score_breakdown_json", "waiting_for_json", "rejection_reason", "rejection_note",
+        )
+        values = [data.get(field) for field in fields]
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"INSERT INTO content_opportunities (user_id,{','.join(fields)},created_at,updated_at,last_refreshed_at) "
+                f"VALUES ({','.join('?' for _ in range(len(fields) + 4))})",
+                [user_id, *values, now, now, now],
+            )
+            opportunity_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO content_opportunity_events "
+                "(opportunity_id,user_id,event_type,to_status,created_at) VALUES (?,?,'created',?,?)",
+                (opportunity_id, user_id, data.get("status") or "draft", now),
+            )
+            return opportunity_id
+
+    def get_content_opportunity(self, user_id: int, opportunity_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            ).fetchone()
+        return self._content_opportunity_dict(row) if row else None
+
+    def get_content_opportunity_by_dedupe(self, user_id: int, dedupe_key: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_opportunities WHERE user_id=? AND dedupe_key=?",
+                (user_id, dedupe_key),
+            ).fetchone()
+        return self._content_opportunity_dict(row) if row else None
+
+    def list_content_opportunities(
+        self, user_id: int, *, statuses: Optional[List[str]] = None,
+        confidence: Optional[str] = None, competition: Optional[str] = None,
+        source_type: Optional[str] = None, min_score: float = 0.0, limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["user_id=?", "evidence_score>=?"]
+        params: List[Any] = [user_id, max(0.0, min(100.0, float(min_score)))]
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if confidence:
+            clauses.append("evidence_confidence=?")
+            params.append(confidence)
+        if competition:
+            clauses.append("competition_level=?")
+            params.append(competition)
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        params.append(min(100, max(1, int(limit))))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_opportunities WHERE " + " AND ".join(clauses)
+                + " ORDER BY opportunity_rank_score DESC,updated_at DESC,id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._content_opportunity_dict(row, include_snapshot=False) for row in rows]
+
+    def update_content_opportunity(self, user_id: int, opportunity_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            "status", "brain_run_id", "topic", "primary_motif", "evidence_score",
+            "evidence_confidence", "opportunity_rank_score", "competition_level", "trend_score",
+            "niche_relevance_score", "candidate_opportunity_score", "competitor_strength_score",
+            "breakout_support_count", "pattern_quality_score", "gap_quality_score",
+            "ai_enrichment_status", "system_recommended_angle", "system_audience_promise",
+            "system_core_conflict", "system_differentiation", "system_suggested_title",
+            "system_suggested_hook", "system_risks_json", "working_title", "selected_angle",
+            "notes", "priority", "target_format", "target_duration_min", "target_duration_max",
+            "rights_status", "risk_level", "evidence_hash", "evidence_snapshot_json",
+            "score_breakdown_json", "waiting_for_json", "rejection_reason", "rejection_note",
+            "last_refreshed_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_content_opportunity(user_id, opportunity_id))
+        payload["updated_at"] = time.time()
+        assignments = ",".join(f"{key}=?" for key in payload)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE content_opportunities SET {assignments} WHERE id=? AND user_id=?",
+                [*payload.values(), opportunity_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def add_content_opportunity_event(
+        self, user_id: int, opportunity_id: int, *, event_type: str,
+        from_status: Optional[str] = None, to_status: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> int:
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT 1 FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            ).fetchone()
+            if not owner:
+                return 0
+            cur = conn.execute(
+                "INSERT INTO content_opportunity_events "
+                "(opportunity_id,user_id,event_type,from_status,to_status,note,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (opportunity_id, user_id, event_type, from_status, to_status, note, time.time()),
+            )
+            return int(cur.lastrowid)
+
+    def list_content_opportunity_events(self, user_id: int, opportunity_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_opportunity_events WHERE user_id=? AND opportunity_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 100",
+                (user_id, opportunity_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_content_opportunity(self, user_id: int, opportunity_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "DELETE FROM content_opportunity_events WHERE opportunity_id=? AND user_id=?",
+                (opportunity_id, user_id),
+            )
+            conn.execute(
+                "DELETE FROM content_opportunities WHERE id=? AND user_id=?",
+                (opportunity_id, user_id),
+            )
+            return True
+
+    # ---- Channel Agent CP6 Production Queue (planning only) ----
+    @staticmethod
+    def _production_item_dict(row: Any, *, include_brief: bool = True) -> Dict[str, Any]:
+        result = dict(row)
+        raw = result.pop("production_brief_json", None)
+        if include_brief:
+            try:
+                result["production_brief"] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["production_brief"] = {}
+        result["planning_ready"] = bool(result.get("planning_ready"))
+        result["rights_ready"] = bool(result.get("rights_ready"))
+        return result
+
+    @staticmethod
+    def _production_task_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target, fallback in (
+            ("depends_on_json", "depends_on", []),
+            ("output_json", "output", {}),
+        ):
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else fallback
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = fallback
+        result["required"] = bool(result.get("required"))
+        return result
+
+    def insert_production_item_with_tasks(
+        self, user_id: int, data: Dict[str, Any], tasks: List[Dict[str, Any]],
+    ) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO production_items
+                (user_id,opportunity_id,status,priority,opportunity_rank_score,working_title,
+                 selected_angle,target_format,target_duration_min,target_duration_max,
+                 production_brief_json,rights_status,rights_gate_status,planning_ready,
+                 rights_ready,blocker_reason,manual_notes,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    user_id, data["opportunity_id"], data.get("status", "queued"),
+                    data.get("priority", 0), data.get("opportunity_rank_score", 0),
+                    data["working_title"], data.get("selected_angle"), data["target_format"],
+                    data.get("target_duration_min"), data.get("target_duration_max"),
+                    json.dumps(data["production_brief"], ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")),
+                    data["rights_status"], data["rights_gate_status"],
+                    int(bool(data.get("planning_ready"))), int(bool(data.get("rights_ready"))),
+                    data.get("blocker_reason"), data.get("manual_notes"), now, now,
+                ),
+            )
+            item_id = int(cur.lastrowid)
+            for task in tasks:
+                conn.execute(
+                    """INSERT INTO production_tasks
+                    (user_id,production_item_id,task_type,status,required,title,description,
+                     depends_on_json,order_index,assignee_type,manual_notes,output_json,
+                     created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        user_id, item_id, task["task_type"], task["status"],
+                        int(bool(task.get("required", True))), task["title"], task["description"],
+                        json.dumps(task.get("depends_on", []), ensure_ascii=False),
+                        task["order_index"], task.get("assignee_type", "manual"), None,
+                        "{}", now, now,
+                    ),
+                )
+            conn.execute(
+                """INSERT INTO production_events
+                (production_item_id,user_id,event_type,to_status,created_at)
+                VALUES (?,?,'item_created','queued',?)""",
+                (item_id, user_id, now),
+            )
+            return item_id
+
+    def get_production_item(self, user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_items WHERE id=? AND user_id=?", (item_id, user_id)
+            ).fetchone()
+        return self._production_item_dict(row) if row else None
+
+    def get_production_item_by_opportunity(
+        self, user_id: int, opportunity_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_items WHERE user_id=? AND opportunity_id=?",
+                (user_id, opportunity_id),
+            ).fetchone()
+        return self._production_item_dict(row) if row else None
+
+    def list_production_items(
+        self, user_id: int, *, statuses: Optional[List[str]] = None,
+        min_priority: int = 0, rights: Optional[str] = None,
+        target_format: Optional[str] = None, opportunity_id: Optional[int] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["user_id=?", "priority>=?"]
+        params: List[Any] = [user_id, min(100, max(0, int(min_priority)))]
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if rights:
+            clauses.append("rights_gate_status=?")
+            params.append(rights)
+        if target_format:
+            clauses.append("target_format=?")
+            params.append(target_format)
+        if opportunity_id is not None:
+            clauses.append("opportunity_id=?")
+            params.append(opportunity_id)
+        params.append(min(100, max(1, int(limit))))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_items WHERE " + " AND ".join(clauses)
+                + " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'planning' THEN 1 "
+                  "WHEN 'ready' THEN 2 WHEN 'queued' THEN 3 WHEN 'blocked' THEN 4 ELSE 5 END,"
+                  "priority DESC,opportunity_rank_score DESC,created_at ASC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._production_item_dict(row, include_brief=False) for row in rows]
+
+    def update_production_item(self, user_id: int, item_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            "status", "priority", "opportunity_rank_score", "working_title", "selected_angle",
+            "target_format", "target_duration_min", "target_duration_max",
+            "production_brief_json", "rights_status", "rights_gate_status", "planning_ready",
+            "rights_ready", "blocker_reason", "manual_notes", "started_at", "completed_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_production_item(user_id, item_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_items SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND user_id=?",
+                [*payload.values(), item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def list_production_tasks(self, user_id: int, item_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_tasks WHERE user_id=? AND production_item_id=? "
+                "ORDER BY order_index,id", (user_id, item_id),
+            ).fetchall()
+        return [self._production_task_dict(row) for row in rows]
+
+    def get_production_task(
+        self, user_id: int, item_id: int, task_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_tasks WHERE id=? AND production_item_id=? AND user_id=?",
+                (task_id, item_id, user_id),
+            ).fetchone()
+        return self._production_task_dict(row) if row else None
+
+    def update_production_task(
+        self, user_id: int, item_id: int, task_id: int, data: Dict[str, Any],
+    ) -> bool:
+        allowed = {"status", "manual_notes", "output_json", "completed_at"}
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if not payload:
+            return bool(self.get_production_task(user_id, item_id, task_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_tasks SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND production_item_id=? AND user_id=?",
+                [*payload.values(), task_id, item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def add_production_event(
+        self, user_id: int, item_id: int, *, event_type: str,
+        task_id: Optional[int] = None, from_status: Optional[str] = None,
+        to_status: Optional[str] = None, note: Optional[str] = None,
+    ) -> int:
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT 1 FROM production_items WHERE id=? AND user_id=?", (item_id, user_id)
+            ).fetchone()
+            if not owner:
+                return 0
+            cur = conn.execute(
+                """INSERT INTO production_events
+                (production_item_id,user_id,event_type,task_id,from_status,to_status,note,created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (item_id, user_id, event_type, task_id, from_status, to_status, note, time.time()),
+            )
+            return int(cur.lastrowid)
+
+    def list_production_events(self, user_id: int, item_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_events WHERE user_id=? AND production_item_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 200", (user_id, item_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(
             self, user_id: int, platform: str, access_token: Optional[str],
             refresh_token: Optional[str] = None, expires_at: Optional[float] = None,
             account_name: Optional[str] = None, account_ref: Optional[str] = None,
+            scopes: Optional[str] = None,
     ) -> None:
         now = time.time()
         with self._connect() as conn:
@@ -1890,18 +3344,35 @@ class Store:
                 """
                 INSERT INTO social_accounts
                 (user_id, platform, access_token, refresh_token, expires_at,
-                 account_name, account_ref, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform) DO
+                 account_name, account_ref, scopes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform) DO
                 UPDATE SET
                     access_token=excluded.access_token,
                     refresh_token= COALESCE (excluded.refresh_token, social_accounts.refresh_token),
                     expires_at=excluded.expires_at,
                     account_name=excluded.account_name,
                     account_ref=excluded.account_ref,
+                    scopes=COALESCE(excluded.scopes, social_accounts.scopes),
                     updated_at=excluded.updated_at
                 """,
                 (user_id, platform, access_token, refresh_token, expires_at,
-                 account_name, account_ref, now, now),
+                 account_name, account_ref, scopes, now, now),
+            )
+
+    def update_social_access_token(
+            self, user_id: int, platform: str, access_token: str,
+            expires_at: Optional[float], scopes: Optional[str] = None,
+    ) -> None:
+        """Update an already-owned credential after centralized refresh."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE social_accounts
+                SET access_token = ?, expires_at = ?,
+                    scopes = COALESCE(?, scopes), updated_at = ?
+                WHERE user_id = ? AND platform = ?
+                """,
+                (access_token, expires_at, scopes, time.time(), user_id, platform),
             )
 
     def get_social_account(self, user_id: int, platform: str) -> Optional[sqlite3.Row]:

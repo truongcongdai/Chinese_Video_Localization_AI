@@ -263,6 +263,10 @@
       <span>YT</span>
       <span>YouTube Research</span>
     </button>
+    <button class="feature-tab hidden" data-feature="channel-agent">
+      <span>🧭</span>
+      <span>AI Channel Agent</span>
+    </button>
     <button class="feature-tab" data-feature="content-os">
       <span>🚀</span>
       <span>Content OS</span>
@@ -1502,6 +1506,167 @@
     </div>
   </div>
 
+  <!-- AI Channel Agent CP1 Panel -->
+  <div class="feature-panel" data-feature="channel-agent">
+    <div class="card">
+      <div class="template-library-heading">
+        <h3 class="section-title">🧭 AI Channel Agent</h3>
+        <button class="btn secondary small" id="channel-agent-refresh" type="button">Refresh</button>
+      </div>
+      <div id="channel-agent-status" class="muted-help">Loading YouTube connection...</div>
+      <div id="channel-agent-connect" class="hidden" style="margin-top:16px">
+        <p id="channel-agent-connect-message">YouTube is not connected.</p>
+        <button class="btn gradient" id="channel-agent-connect-btn" type="button">Connect YouTube</button>
+      </div>
+      <div id="channel-agent-dashboard" class="hidden">
+        <div class="template-library-heading" style="margin-top:18px">
+          <h3 id="channel-agent-channel-title" class="section-title">YouTube Connected</h3>
+          <span id="channel-agent-handle" class="muted-help"></span>
+        </div>
+        <div class="stat-grid" style="margin-top:12px">
+          <div class="stat-box"><div class="num" id="channel-agent-subscribers">—</div><div class="label">Subscribers</div></div>
+          <div class="stat-box"><div class="num" id="channel-agent-lifetime-views">—</div><div class="label">Total views</div></div>
+          <div class="stat-box"><div class="num" id="channel-agent-video-count">—</div><div class="label">Videos</div></div>
+        </div>
+        <h3 class="section-title" style="margin-top:22px">Last 28 days</h3>
+        <div class="stat-grid" style="margin-top:12px">
+          <div class="stat-box"><div class="num" id="channel-agent-period-views">—</div><div class="label">Views</div></div>
+          <div class="stat-box"><div class="num" id="channel-agent-watch-time">—</div><div class="label">Watch time (minutes)</div></div>
+          <div class="stat-box"><div class="num" id="channel-agent-subs-gained">—</div><div class="label">Subscribers gained</div></div>
+          <div class="stat-box"><div class="num" id="channel-agent-avg-duration">—</div><div class="label">Avg view duration</div></div>
+        </div>
+        <div id="channel-agent-no-data" class="muted-help hidden" style="margin-top:12px">No analytics data yet.</div>
+        <h3 class="section-title" style="margin-top:22px">Top videos</h3>
+        <div id="channel-agent-top-videos" class="muted-help">Loading...</div>
+        <h3 class="section-title" style="margin-top:22px">Traffic sources</h3>
+        <div id="channel-agent-traffic" class="muted-help">Loading...</div>
+        <h3 class="section-title" style="margin-top:22px">Content type</h3>
+        <div id="channel-agent-content-type" class="muted-help">Loading...</div>
+        <div style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+          <div class="template-library-heading">
+            <h3 class="section-title">YouTube Trend Scanner</h3>
+            <button class="btn gradient small" id="trend-research-scan" type="button">Scan Now</button>
+          </div>
+          <p class="muted-help">Metadata-only research. Scores rank observed signals; they are not viral predictions or reuse permission.</p>
+          <div class="row" style="align-items:end;margin-top:12px">
+            <div class="field" style="flex:1"><label>Research query</label><input id="trend-research-new-query" maxlength="200" placeholder="家族修仙 一口气看完"></div>
+            <div class="field"><label>Duration</label><select id="trend-research-duration"><option value="long">Long-form</option><option value="any">Any</option><option value="medium">4–20 min</option><option value="short">Short</option></select></div>
+            <button class="btn secondary small" id="trend-research-add" type="button">Add query</button>
+          </div>
+          <div class="row">
+            <div class="field" style="flex:1"><label>Topic terms (comma separated)</label><input id="trend-research-topic-terms" maxlength="2000" placeholder="家族, 修仙, 长生, 老祖"></div>
+            <div class="field" style="flex:1"><label>Exclude terms (optional)</label><input id="trend-research-exclusion-terms" maxlength="2000" placeholder="短剧, 电视剧"></div>
+          </div>
+          <div id="trend-research-message" class="muted-help"></div>
+          <div id="trend-research-queries" style="margin-top:12px"></div>
+          <div class="template-library-heading" style="margin-top:22px">
+            <h3 class="section-title">Ranked research opportunities</h3>
+            <label class="muted-help"><input type="checkbox" id="trend-research-show-filtered"> Show low relevance</label>
+          </div>
+          <div id="trend-research-candidates" class="muted-help">No scan loaded.</div>
+          <div id="trend-research-detail" class="hidden" style="margin-top:18px"></div>
+        </div>
+        <div style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+          <div class="template-library-heading">
+            <h3 class="section-title">Competitor Intelligence</h3>
+            <div>
+              <button class="btn secondary small" id="competitor-discover" type="button">Discover from Trends</button>
+              <button class="btn gradient small" id="competitor-refresh" type="button">Refresh</button>
+            </div>
+          </div>
+          <p class="muted-help">Qualified niche channels only. Metadata research, not reuse permission or a viral prediction.</p>
+          <div class="row" style="align-items:end;margin-top:12px">
+            <div class="field" style="flex:1"><label>Channel URL, @handle, or channel ID</label><input id="competitor-reference" maxlength="500" placeholder="https://youtube.com/@channel"></div>
+            <div class="field"><label>Sample</label><select id="competitor-mode"><option value="long">Long-form</option><option value="short">Shorts</option><option value="all">All</option></select></div>
+            <button class="btn secondary small" id="competitor-add" type="button">Add competitor</button>
+          </div>
+          <div id="competitor-message" class="muted-help"></div>
+          <label class="muted-help" style="display:inline-flex;align-items:center;gap:6px;margin-top:8px">
+            <input id="competitor-show-filtered" type="checkbox" style="width:auto"> Show low relevance
+          </label>
+          <div id="competitor-list" class="muted-help" style="margin-top:12px">No competitors loaded.</div>
+          <div id="competitor-detail" class="hidden" style="margin-top:18px"></div>
+          <div class="template-library-heading" style="margin-top:22px">
+            <h3 class="section-title">Opportunity gaps</h3>
+            <label class="muted-help" style="display:inline-flex;align-items:center;gap:6px">
+              <input id="competitor-show-filtered-patterns" type="checkbox" style="width:auto"> Show filtered patterns
+            </label>
+          </div>
+          <div id="competitor-gaps" class="muted-help">Refresh competitors to calculate evidence-backed gaps.</div>
+        </div>
+      </div>
+      <div id="content-brain" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+        <div class="template-library-heading">
+          <h3 class="section-title">🧠 Content Brain</h3>
+          <button class="btn secondary small" id="content-brain-status-refresh" type="button">Refresh status</button>
+        </div>
+        <p class="muted-help">Local Ollama interpretation of qualified CP1–CP3 metadata evidence. No source media or transcript is downloaded.</p>
+        <div id="content-brain-status" class="muted-help">Ollama status not checked yet.</div>
+        <div class="row" style="align-items:end;margin-top:14px">
+          <div class="field" style="flex:1">
+            <label>Analyze</label>
+            <select id="content-brain-selector"><option value="top_opportunity|">Top qualified opportunity</option></select>
+          </div>
+          <div class="field" style="flex:1">
+            <label>Mode</label>
+            <select id="content-brain-mode">
+              <option value="opportunity_analysis">Opportunity Analysis</option>
+              <option value="content_angles">Content Angles</option>
+              <option value="title_hooks">Titles &amp; Hooks</option>
+              <option value="longform_outline">Long-form Outline</option>
+            </select>
+          </div>
+          <button class="btn gradient small" id="content-brain-analyze" type="button">Analyze with Local AI</button>
+        </div>
+        <label class="muted-help" style="display:inline-flex;align-items:center;gap:6px;margin-top:8px">
+          <input id="content-brain-low-confidence" type="checkbox" style="width:auto"> Allow explicitly low-confidence brainstorming
+        </label>
+        <div id="content-brain-message" class="muted-help" style="margin-top:8px"></div>
+        <div id="content-brain-result" class="hidden" style="margin-top:18px"></div>
+        <div class="template-library-heading" style="margin-top:24px">
+          <h3 class="section-title">Previous analyses</h3>
+        </div>
+        <div id="content-brain-history" class="muted-help">No Content Brain runs loaded.</div>
+      </div>
+      <div id="content-opportunities" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+        <div class="template-library-heading">
+          <h3 class="section-title">📌 Content Opportunities</h3>
+          <div>
+            <button class="btn secondary small" id="content-opportunity-refresh-list" type="button">Refresh board</button>
+            <button class="btn gradient small" id="content-opportunity-generate" type="button">Generate from top research</button>
+          </div>
+        </div>
+        <p class="muted-help">Deterministic decision cards from stored CP2–CP4 evidence. Approval means ready for later planning; it never creates, downloads, renders, or publishes content.</p>
+        <div class="row" style="align-items:end;margin-top:12px">
+          <div class="field"><label>Status</label><select id="content-opportunity-status-filter"><option value="draft,watch,approved">Active</option><option value="draft">Draft</option><option value="watch">Watch</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="archived">Archived</option><option value="all">All</option></select></div>
+          <div class="field"><label>Confidence</label><select id="content-opportunity-confidence-filter"><option value="">All</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></div>
+          <div class="field"><label>Competition</label><select id="content-opportunity-competition-filter"><option value="">All</option><option value="low">Limited observed</option><option value="medium">Medium</option><option value="high">High</option><option value="unknown">Unknown</option></select></div>
+          <div class="field"><label>Source</label><select id="content-opportunity-source-filter"><option value="">All</option><option value="candidate">Trend candidate</option><option value="gap">Opportunity gap</option><option value="brain_run">Content Brain run</option></select></div>
+          <div class="field"><label>Min score</label><input id="content-opportunity-min-score" type="number" min="0" max="100" value="0" style="width:90px"></div>
+        </div>
+        <div id="content-opportunity-message" class="muted-help"></div>
+        <div id="content-opportunity-board" class="muted-help" style="margin-top:12px">No opportunities loaded.</div>
+        <div id="content-opportunity-detail" class="hidden" style="margin-top:18px"></div>
+      </div>
+      <div id="production-queue" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+        <div class="template-library-heading">
+          <h3 class="section-title">🗂️ Production Queue</h3>
+          <button class="btn secondary small" id="production-refresh-list" type="button">Refresh queue</button>
+        </div>
+        <p class="muted-help">Planning packages created only from approved Content Opportunities. This queue does not download, render, upload, publish, or call Ollama.</p>
+        <div class="row" style="align-items:end;margin-top:12px">
+          <div class="field"><label>Status</label><select id="production-status-filter"><option value="queued,planning,ready,in_progress,blocked">Active</option><option value="queued">Queued</option><option value="planning">Planning</option><option value="ready">Ready</option><option value="in_progress">In progress</option><option value="blocked">Blocked</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option><option value="all">All</option></select></div>
+          <div class="field"><label>Min priority</label><input id="production-min-priority" type="number" min="0" max="100" value="0" style="width:90px"></div>
+          <div class="field"><label>Rights gate</label><select id="production-rights-filter"><option value="">All</option><option value="research_only">Research only</option><option value="needs_review">Needs review</option><option value="cleared">Cleared</option></select></div>
+          <div class="field"><label>Format</label><select id="production-format-filter"><option value="">All</option><option value="long_form">Long form</option><option value="short_form">Short form</option><option value="all">All/unspecified</option><option value="unspecified">Unspecified</option></select></div>
+        </div>
+        <div id="production-message" class="muted-help"></div>
+        <div id="production-board" class="muted-help" style="margin-top:12px">No production items loaded.</div>
+        <div id="production-detail" class="hidden" style="margin-top:18px"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Content OS Panel -->
   <div class="feature-panel" data-feature="content-os">
     <div class="card">
@@ -1900,6 +2065,9 @@
 </div>
 
 <script src="/assets/i18n.js?v=20260801g" defer></script>
-<script src="/assets/app.js?v=20260805-channel" defer></script>
+<script src="/assets/content_brain_ui.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
+<script src="/assets/content_opportunity_ui.js?v=20260821-channel-agent-cp5-opportunities1" defer></script>
+<script src="/assets/content_production_ui.js?v=20260821-channel-agent-cp6-production1" defer></script>
+<script src="/assets/app.js?v=20260821-channel-agent-cp6-production1" defer></script>
 </body>
 </html>

@@ -62,6 +62,7 @@ class ConnectResult:
     expires_at: Optional[float]
     account_name: Optional[str]
     account_ref: Optional[str]
+    scopes: Optional[str] = None
 
 
 class PlatformOAuth:
@@ -84,7 +85,14 @@ class GoogleOAuth(PlatformOAuth):
     platform = "youtube"
     AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
     TOKEN_URL = "https://oauth2.googleapis.com/token"
-    SCOPE = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
+    # Keep the existing upload permission so reconnecting does not break the
+    # established private-upload workflow. CP1 adds only the two least-
+    # privilege read scopes needed for own-channel data and analytics.
+    SCOPE = (
+        "https://www.googleapis.com/auth/youtube.upload "
+        "https://www.googleapis.com/auth/youtube.readonly "
+        "https://www.googleapis.com/auth/yt-analytics.readonly"
+    )
 
     def is_configured(self) -> bool:
         return bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))
@@ -141,9 +149,13 @@ class GoogleOAuth(PlatformOAuth):
             expires_at=expires_at,
             account_name=account_name,
             account_ref=None,
+            scopes=data.get("scope") or self.SCOPE,
         )
 
     def refresh_access_token(self, refresh_token: str) -> str:
+        return self.refresh_access_token_details(refresh_token)["access_token"]
+
+    def refresh_access_token_details(self, refresh_token: str) -> dict:
         resp = requests.post(self.TOKEN_URL, data={
             "client_id": os.environ["GOOGLE_CLIENT_ID"],
             "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
@@ -151,7 +163,10 @@ class GoogleOAuth(PlatformOAuth):
             "grant_type": "refresh_token",
         }, timeout=30)
         resp.raise_for_status()
-        return resp.json()["access_token"]
+        data = resp.json()
+        if not data.get("access_token"):
+            raise ValueError("Google token refresh response did not contain an access token")
+        return data
 
 
 class FacebookOAuth(PlatformOAuth):

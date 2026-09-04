@@ -73,6 +73,8 @@ async function initAuth() {
   const boot = await api("/api/bootstrap");
   bootstrapConfig = boot;
   needsRegistrationGlobal = boot.needs_registration;
+  const channelAgentEnabled = !!(boot.features && boot.features.ai_channel_agent);
+  document.querySelector('[data-feature="channel-agent"].feature-tab')?.classList.toggle("hidden", !channelAgentEnabled);
 
   if (needsRegistrationGlobal) {
     $("#auth-title").textContent = "Tạo tài khoản admin";
@@ -300,6 +302,7 @@ async function refreshMe() {
 window.addEventListener("message", (ev) => {
   if (ev.data === "social-connected") {
     loadConnections();
+    if (bootstrapConfig.features?.ai_channel_agent) initChannelAgent();
   }
 });
 
@@ -3505,6 +3508,9 @@ document.addEventListener("DOMContentLoaded", () => {
           if (feature === "youtube-research") {
             initYouTubeResearch();
           }
+          if (feature === "channel-agent") {
+            initChannelAgent();
+          }
         }
       });
     };
@@ -3662,6 +3668,1092 @@ $("#youtube-research-scan-btn").onclick = async function () {
     button.disabled = false;
   }
 };
+
+// ---------------- AI Channel Agent (CP1) ----------------
+function channelAgentNumber(value) {
+  return value == null ? "—" : new Intl.NumberFormat().format(value);
+}
+
+function channelAgentDuration(seconds) {
+  if (seconds == null) return "—";
+  const total = Math.max(0, Math.round(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function channelAgentTable(headers, rows, htmlColumns = []) {
+  if (!rows.length) return '<div class="muted-help">No data yet.</div>';
+  const heading = headers.map(item => `<th>${escapeHtml(item)}</th>`).join("");
+  const body = rows.map(row => `<tr>${row.map((value, index) =>
+    `<td>${htmlColumns.includes(index) ? String(value ?? "") : escapeHtml(value)}</td>`
+  ).join("")}</tr>`).join("");
+  return `<div style="overflow-x:auto"><table class="admin-table"><thead><tr>${heading}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+async function initChannelAgent() {
+  const statusNode = $("#channel-agent-status");
+  const connectNode = $("#channel-agent-connect");
+  const dashboardNode = $("#channel-agent-dashboard");
+  statusNode.textContent = "Loading YouTube connection...";
+  connectNode.classList.add("hidden");
+  dashboardNode.classList.add("hidden");
+  try {
+    await loadContentBrain();
+  } catch (brainError) {
+    $("#content-brain-message").textContent = `Content Brain unavailable: ${brainError.message}`;
+  }
+  try {
+    await loadContentOpportunities();
+  } catch (opportunityError) {
+    $("#content-opportunity-message").textContent = `Content Opportunities unavailable: ${opportunityError.message}`;
+  }
+  try {
+    await loadProductionQueue();
+  } catch (productionError) {
+    $("#production-message").textContent = `Production Queue unavailable: ${productionError.message}`;
+  }
+  try {
+    const status = await api("/api/channel-agent/youtube/status");
+    if (!status.connected) {
+      connectNode.classList.remove("hidden");
+      const missingScope = status.credential_present && !status.analytics_scope_granted;
+      $("#channel-agent-connect-message").textContent = missingScope
+        ? "Reconnect YouTube to enable Analytics access."
+        : (status.credential_present
+          ? "YouTube authorization is no longer usable. Please reconnect."
+          : "YouTube account is not connected.");
+      $("#channel-agent-connect-btn").textContent = status.credential_present ? "Reconnect YouTube" : "Connect YouTube";
+      statusNode.textContent = missingScope ? "Analytics permission missing" : "YouTube not connected";
+      return;
+    }
+
+    statusNode.textContent = "YouTube Connected · Loading channel data...";
+    const [channel, overview, videos, traffic, contentType] = await Promise.all([
+      api("/api/channel-agent/youtube/channel"),
+      api("/api/channel-agent/youtube/overview?days=28"),
+      api("/api/channel-agent/youtube/top-videos?days=28&limit=10"),
+      api("/api/channel-agent/youtube/traffic-sources?days=28"),
+      api("/api/channel-agent/youtube/content-type?days=28"),
+    ]);
+    dashboardNode.classList.remove("hidden");
+    statusNode.textContent = "YouTube Connected";
+    $("#channel-agent-channel-title").textContent = `Channel: ${channel.title}`;
+    $("#channel-agent-handle").textContent = channel.custom_url || "";
+    $("#channel-agent-subscribers").textContent = channel.hidden_subscriber_count
+      ? "Hidden" : channelAgentNumber(channel.subscriber_count);
+    $("#channel-agent-lifetime-views").textContent = channelAgentNumber(channel.view_count);
+    $("#channel-agent-video-count").textContent = channelAgentNumber(channel.video_count);
+    $("#channel-agent-period-views").textContent = channelAgentNumber(overview.views);
+    $("#channel-agent-watch-time").textContent = channelAgentNumber(overview.watch_time_minutes);
+    $("#channel-agent-subs-gained").textContent = channelAgentNumber(overview.subscribers_gained);
+    $("#channel-agent-avg-duration").textContent = channelAgentDuration(overview.average_view_duration_seconds);
+    const noData = [overview.views, overview.watch_time_minutes, overview.likes, overview.comments]
+      .every(value => value == null || Number(value) === 0);
+    $("#channel-agent-no-data").classList.toggle("hidden", !noData);
+    $("#channel-agent-top-videos").innerHTML = channelAgentTable(
+      ["Video", "Views", "Watch minutes", "Avg duration", "Likes", "Comments"],
+      videos.map(video => [video.title || video.video_id, channelAgentNumber(video.views), channelAgentNumber(video.estimated_minutes_watched), channelAgentDuration(video.average_view_duration_seconds), channelAgentNumber(video.likes), channelAgentNumber(video.comments)])
+    );
+    $("#channel-agent-traffic").innerHTML = channelAgentTable(
+      ["Source", "Views", "Watch minutes", "% views"],
+      traffic.map(item => [item.source, channelAgentNumber(item.views), channelAgentNumber(item.watch_time_minutes), `${item.percentage_of_views.toFixed(1)}%`])
+    );
+    $("#channel-agent-content-type").innerHTML = contentType.available
+      ? channelAgentTable(
+          ["Type", "Views", "Watch minutes", "% views"],
+          contentType.items.map(item => [item.content_type, channelAgentNumber(item.views), channelAgentNumber(item.watch_time_minutes), `${item.percentage_of_views.toFixed(1)}%`])
+        )
+      : '<div class="muted-help">Content-type breakdown is not available for this channel.</div>';
+    try {
+      await loadTrendResearch();
+    } catch (trendError) {
+      $("#trend-research-message").textContent = `Trend Scanner unavailable: ${trendError.message}`;
+    }
+    try {
+      await loadCompetitors();
+    } catch (competitorError) {
+      $("#competitor-message").textContent = `Competitor Intelligence unavailable: ${competitorError.message}`;
+    }
+  } catch (e) {
+    statusNode.textContent = `YouTube data unavailable: ${e.message}`;
+    connectNode.classList.remove("hidden");
+    $("#channel-agent-connect-message").textContent = e.message.toLowerCase().includes("permission")
+      ? "Reconnect YouTube to enable Analytics access."
+      : "Refresh the dashboard or reconnect YouTube if authorization expired.";
+    $("#channel-agent-connect-btn").textContent = "Reconnect YouTube";
+  }
+}
+
+$("#channel-agent-refresh").onclick = initChannelAgent;
+$("#channel-agent-connect-btn").onclick = () => startConnect("youtube");
+
+function trendAge(value) {
+  if (!value) return "—";
+  const hours = Math.max(0, (Date.now() - new Date(value).getTime()) / 3600000);
+  return hours < 48 ? `${Math.round(hours)}h` : `${Math.round(hours / 24)}d`;
+}
+
+function trendCandidateTable(candidates) {
+  if (!candidates.length) return '<div class="muted-help">No ranked opportunities meet the current relevance threshold.</div>';
+  return `<div style="overflow-x:auto"><table class="admin-table"><thead><tr>${["Trend", "Relevance", "Opportunity", "Status", "Title", "Channel", "Views", "VPH", "Outlier", "Engagement", "Age", "Match reason", "Rights"].map(value => `<th>${value}</th>`).join("")}</tr></thead><tbody>${candidates.map(item => `
+    <tr><td>${Math.round((item.trend_score || 0) * 100)}</td>
+    <td>${item.niche_relevance_score != null ? `${Math.round(item.niche_relevance_score * 100)}%` : "—"}</td>
+    <td>${item.opportunity_score != null ? Math.round(item.opportunity_score * 100) : "—"}</td>
+    <td>${escapeHtml(String(item.relevance_status === "low_relevance" ? "LOW RELEVANCE" : (item.relevance_status === "unscored" ? "UNSCORED" : item.trend_status || "normal")).toUpperCase())}</td>
+    <td><button class="btn secondary small" data-trend-candidate="${item.id}">${escapeHtml(item.title || item.source_id)}</button></td>
+    <td>${escapeHtml(item.author || "—")}</td><td>${channelAgentNumber(item.view_count)}</td>
+    <td>${item.observed_vph != null ? channelAgentNumber(item.observed_vph) : (item.approx_vph != null ? `~${channelAgentNumber(item.approx_vph)}` : "—")}</td>
+    <td>${item.outlier_ratio != null ? `${item.outlier_ratio.toFixed(1)}x` : "—"}</td>
+    <td>${item.engagement_rate != null ? `${(item.engagement_rate * 100).toFixed(1)}%` : "—"}</td>
+    <td>${trendAge(item.published_at)}</td>
+    <td>${escapeHtml((item.match_reasons || []).join(" + ") || "—")}</td>
+    <td>${escapeHtml(item.rights_status || "idea_only")}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+async function loadTrendResearch() {
+  const includeFiltered = $("#trend-research-show-filtered")?.checked || false;
+  const [queries, candidates, status] = await Promise.all([
+    api("/api/channel-agent/trends/queries"),
+    api(`/api/channel-agent/trends/candidates?limit=50&include_filtered=${includeFiltered}`),
+    api("/api/channel-agent/trends/status"),
+  ]);
+  $("#trend-research-queries").innerHTML = queries.length ? queries.map(item => `
+    <div data-trend-query-row="${item.id}" style="margin-bottom:12px;padding:10px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+      <div class="row" style="align-items:center">
+        <input data-trend-query-text value="${escapeHtml(item.query)}" maxlength="200" style="flex:1">
+        <select data-trend-query-duration>${["long", "any", "medium", "short"].map(value => `<option value="${value}" ${item.duration_filter === value ? "selected" : ""}>${value}</option>`).join("")}</select>
+        <label class="muted-help"><input type="checkbox" data-trend-query-enabled ${item.enabled ? "checked" : ""}> enabled</label>
+        <button class="btn secondary small" data-trend-query-save>Save</button>
+        <button class="btn secondary small" data-trend-query-delete>Delete</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input data-trend-query-topics value="${escapeHtml(item.topic_terms || "")}" maxlength="2000" placeholder="Topic terms: 家族, 修仙, 老祖" style="flex:1">
+        <input data-trend-query-exclusions value="${escapeHtml(item.exclusion_terms || "")}" maxlength="2000" placeholder="Exclude terms: 短剧, 电视剧" style="flex:1">
+      </div>
+    </div>`).join("") : '<div class="muted-help">Add a research query to begin. Seed examples are suggestions only.</div>';
+  const last = status.last_scan;
+  $("#trend-research-message").textContent = last
+    ? `Last scan: ${new Date(last.updated_at * 1000).toLocaleString()} · ${last.progress_note || last.status}`
+    : `Manual scans only · max ${status.limits.max_queries} queries · ${status.limits.results_per_query} results/query`;
+  $("#trend-research-candidates").innerHTML = trendCandidateTable(candidates);
+  bindTrendResearchActions();
+}
+
+function bindTrendResearchActions() {
+  document.querySelectorAll("[data-trend-query-save]").forEach(button => {
+    button.onclick = async () => {
+      const row = button.closest("[data-trend-query-row]");
+      await api(`/api/channel-agent/trends/queries/${row.dataset.trendQueryRow}`, {
+        method: "PUT", body: JSON.stringify({
+          query: row.querySelector("[data-trend-query-text]").value,
+          duration_filter: row.querySelector("[data-trend-query-duration]").value,
+          enabled: row.querySelector("[data-trend-query-enabled]").checked,
+          topic_terms: row.querySelector("[data-trend-query-topics]").value,
+          exclusion_terms: row.querySelector("[data-trend-query-exclusions]").value,
+        }),
+      });
+      await loadTrendResearch();
+    };
+  });
+  document.querySelectorAll("[data-trend-query-delete]").forEach(button => {
+    button.onclick = async () => {
+      const row = button.closest("[data-trend-query-row]");
+      await api(`/api/channel-agent/trends/queries/${row.dataset.trendQueryRow}`, {method: "DELETE"});
+      await loadTrendResearch();
+    };
+  });
+  document.querySelectorAll("[data-trend-candidate]").forEach(button => {
+    button.onclick = () => showTrendCandidate(Number(button.dataset.trendCandidate));
+  });
+}
+
+async function showTrendCandidate(id) {
+  const item = await api(`/api/channel-agent/trends/candidates/${id}`);
+  const detail = $("#trend-research-detail");
+  detail.classList.remove("hidden");
+  detail.innerHTML = `
+    <h3 class="section-title">${escapeHtml(item.title || item.source_id)}</h3>
+    <p><a href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener">Open original YouTube page</a></p>
+    <p class="muted-help">${escapeHtml(item.author || "Unknown channel")} · ${escapeHtml(item.matched_queries || "")}</p>
+    <p><strong>Trend:</strong> ${Math.round((item.trend_score || 0) * 100)} · <strong>Relevance:</strong> ${item.niche_relevance_score != null ? `${Math.round(item.niche_relevance_score * 100)}%` : "—"} · <strong>Opportunity:</strong> ${item.opportunity_score != null ? Math.round(item.opportunity_score * 100) : "—"}</p>
+    <p><strong>Matched:</strong> ${escapeHtml((item.match_reasons || []).join(" + ") || "—")}</p>
+    <p>${(item.score_explanations || []).map(reason => `• ${escapeHtml(reason)}`).join("<br>")}</p>
+    <p class="muted-help">Confidence: ${escapeHtml(item.score_confidence || "low")} · Signals: ${item.available_signal_count || 0}/5 · Rights: ${escapeHtml(item.rights_status || "idea_only")}</p>
+    <button class="btn secondary small" id="trend-candidate-create-opportunity" type="button">Create Content Opportunity</button>
+    <h4>Snapshot history</h4>
+    ${channelAgentTable(["Captured", "Views", "Likes", "Comments"], (item.snapshots || []).map(snapshot => [new Date(snapshot.captured_at * 1000).toLocaleString(), channelAgentNumber(snapshot.view_count), channelAgentNumber(snapshot.like_count), channelAgentNumber(snapshot.comment_count)]))}`;
+  $("#trend-candidate-create-opportunity").onclick = async () => {
+    try { await createContentOpportunity("candidate", id); }
+    catch (error) { $("#trend-research-message").textContent = error.message; }
+  };
+}
+
+$("#trend-research-add").onclick = async () => {
+  const input = $("#trend-research-new-query");
+  try {
+    await api("/api/channel-agent/trends/queries", {method: "POST", body: JSON.stringify({
+      query: input.value, duration_filter: $("#trend-research-duration").value,
+      topic_terms: $("#trend-research-topic-terms").value,
+      exclusion_terms: $("#trend-research-exclusion-terms").value,
+    })});
+    input.value = "";
+    $("#trend-research-topic-terms").value = "";
+    $("#trend-research-exclusion-terms").value = "";
+    await loadTrendResearch();
+  } catch (e) { $("#trend-research-message").textContent = e.message; }
+};
+
+$("#trend-research-show-filtered").onchange = loadTrendResearch;
+
+$("#trend-research-scan").onclick = async () => {
+  const button = $("#trend-research-scan");
+  button.disabled = true;
+  $("#trend-research-message").textContent = "Scanning public YouTube metadata...";
+  try {
+    const result = await api("/api/channel-agent/trends/scan", {method: "POST"});
+    $("#trend-research-message").textContent = `${result.queries_scanned} queries · ${result.candidates_found} candidates · ${result.snapshots_created} snapshots · ${result.filtered_low_relevance || 0} low relevance`;
+    await loadTrendResearch();
+  } catch (e) {
+    $("#trend-research-message").textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+};
+
+function competitorTable(items) {
+  if (!items.length) return '<div class="muted-help">No qualified/watch competitors. Refresh discovered channels or enable Show low relevance for audit.</div>';
+  return channelAgentTable(
+    ["Score", "Relevance", "Niche hit", "Status", "Channel", "Match reason", "Subscribers", "Median views", "Breakout", "Candidate hits", "Recent uploads"],
+    items.map(item => [
+      item.competitor_score != null ? Math.round(item.competitor_score * 100) : "—",
+      item.competitor_relevance_score != null ? `${Math.round(item.competitor_relevance_score * 100)}%` : "—",
+      item.niche_hit_rate != null ? `${Math.round(item.niche_hit_rate * 100)}%` : "—",
+      (item.competitor_relevance_status || "unscored").toUpperCase(),
+      `<button class="btn secondary small" data-competitor-id="${item.id}">${escapeHtml(item.channel_title)}</button>`,
+      (item.competitor_match_reasons || []).slice(0, 2).join(" · ") || "—",
+      item.hidden_subscriber_count ? "Hidden" : channelAgentNumber(item.subscriber_count),
+      channelAgentNumber(item.median_views),
+      item.breakout_frequency != null ? `${(item.breakout_frequency * 100).toFixed(0)}%` : "—",
+      channelAgentNumber(item.source_candidate_count), channelAgentNumber(item.recent_upload_count),
+    ]), [4]
+  );
+}
+
+async function loadCompetitors() {
+  const includeFiltered = $("#competitor-show-filtered").checked;
+  const includeFilteredPatterns = $("#competitor-show-filtered-patterns").checked;
+  const [items, gaps] = await Promise.all([
+    api(`/api/channel-agent/competitors?include_filtered=${includeFiltered}`),
+    api(`/api/channel-agent/competitors/gaps?include_filtered=${includeFilteredPatterns}`),
+  ]);
+  $("#competitor-list").innerHTML = competitorTable(items);
+  $("#competitor-gaps").innerHTML = gaps.length ? channelAgentTable(
+    ["Pattern", "Quality", "Status", "Competitors", "Breakouts", "Median outlier", "Qualified candidates", "Confidence", "Evidence", "Opportunity"],
+    gaps.map(gap => [gap.pattern, gap.gap_quality_score != null ? `${Math.round(gap.gap_quality_score * 100)}%` : "—",
+      (gap.gap_quality_status || "unscored").toUpperCase(), gap.supporting_competitor_count, gap.supporting_breakout_count,
+      gap.median_outlier != null ? `${gap.median_outlier.toFixed(1)}x` : "—", gap.qualified_candidate_count,
+      gap.confidence, (gap.evidence || []).map(video =>
+        `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title || video.video_id)}</a>`
+      ).join("<br>"), `<button class="btn secondary small" data-gap-create-opportunity="${escapeHtml(gap.pattern)}">Create card</button>`]), [8, 9]
+  ) : '<div class="muted-help">No evidence-backed opportunity gaps yet.</div>';
+  document.querySelectorAll("[data-competitor-id]").forEach(button => {
+    button.onclick = () => showCompetitor(Number(button.dataset.competitorId));
+  });
+  document.querySelectorAll("[data-gap-create-opportunity]").forEach(button => {
+    button.onclick = async () => {
+      try { await createContentOpportunity("gap", button.dataset.gapCreateOpportunity); }
+      catch (error) { $("#competitor-message").textContent = error.message; }
+    };
+  });
+}
+
+async function showCompetitor(id) {
+  const item = await api(`/api/channel-agent/competitors/${id}`);
+  const detail = $("#competitor-detail");
+  detail.classList.remove("hidden");
+  const videos = item.videos || [];
+  const breakouts = videos.filter(video => video.outlier_ratio != null && video.outlier_ratio >= 2);
+  const patterns = item.patterns || [];
+  const buckets = item.duration_buckets || [];
+  const snapshots = item.snapshots || [];
+  detail.innerHTML = `
+    <div class="template-library-heading"><h3 class="section-title">${escapeHtml(item.channel_title)}</h3>
+      <a href="${escapeHtml(item.channel_url)}" target="_blank" rel="noopener">Open channel</a></div>
+    <div class="stat-grid" style="margin-top:10px">
+      <div class="stat-box"><div class="num">${item.hidden_subscriber_count ? "Hidden" : channelAgentNumber(item.subscriber_count)}</div><div class="label">Subscribers</div></div>
+      <div class="stat-box"><div class="num">${channelAgentNumber(item.lifetime_view_count)}</div><div class="label">Lifetime views</div></div>
+      <div class="stat-box"><div class="num">${channelAgentNumber(item.median_views)}</div><div class="label">Recent median views</div></div>
+      <div class="stat-box"><div class="num">${item.breakout_frequency != null ? `${(item.breakout_frequency * 100).toFixed(0)}%` : "—"}</div><div class="label">Breakout frequency</div></div>
+      <div class="stat-box"><div class="num">${channelAgentNumber(item.video_count)}</div><div class="label">Channel videos</div></div>
+      <div class="stat-box"><div class="num">${channelAgentDuration(item.median_duration_seconds)}</div><div class="label">Median duration</div></div>
+      <div class="stat-box"><div class="num">${item.competitor_relevance_score != null ? `${Math.round(item.competitor_relevance_score * 100)}%` : "—"}</div><div class="label">Niche relevance</div></div>
+      <div class="stat-box"><div class="num">${item.niche_hit_rate != null ? `${Math.round(item.niche_hit_rate * 100)}%` : "—"}</div><div class="label">Niche hit rate</div></div>
+    </div>
+    <p class="muted-help">${channelAgentNumber(item.recent_upload_count)} analyzed ${escapeHtml(item.sample_mode || "long")} videos · ${item.uploads_per_week != null ? item.uploads_per_week.toFixed(1) : "—"} uploads/week (sample estimate) · Confidence: ${escapeHtml(item.score_confidence || "low")}</p>
+    <p><strong>Status:</strong> ${escapeHtml((item.competitor_relevance_status || "unscored").toUpperCase())}<br>${(item.competitor_match_reasons || []).map(reason => `• ${escapeHtml(reason)}`).join("<br>")}</p>
+    <h4>Top breakout videos</h4>
+    ${channelAgentTable(["Title", "Views", "Outlier", "Duration", "Published", "Engagement"], breakouts.slice(0, 10).map(video => [
+      `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title || video.video_id)}</a>`,
+      channelAgentNumber(video.view_count), video.outlier_ratio != null ? `${video.outlier_ratio.toFixed(1)}x` : "—",
+      channelAgentDuration(video.duration_seconds), video.published_at ? new Date(video.published_at).toLocaleDateString() : "—",
+      video.engagement_rate != null ? `${(video.engagement_rate * 100).toFixed(1)}%` : "—",
+    ]), [0])}
+    <h4>Observed title patterns</h4>
+    ${channelAgentTable(["Pattern", "Quality", "Status", "Support", "Breakouts", "Median outlier", "Evidence"], patterns.map(pattern => [
+      pattern.pattern, pattern.pattern_quality_score != null ? `${Math.round(pattern.pattern_quality_score * 100)}%` : "—",
+      (pattern.pattern_quality_status || "unscored").toUpperCase(), pattern.pattern_support ?? pattern.video_count, pattern.breakout_count,
+      pattern.median_outlier != null ? `${pattern.median_outlier.toFixed(1)}x` : "—",
+      (pattern.evidence || []).map(video => `<a href="${escapeHtml(video.video_url)}" target="_blank" rel="noopener">${escapeHtml(video.title)}</a>`).join("<br>"),
+    ]), [6])}
+    <h4>Duration performance</h4>
+    ${channelAgentTable(["Bucket", "Videos", "Median views", "Median outlier", "Breakouts"], buckets.map(bucket => [
+      bucket.bucket, bucket.video_count, channelAgentNumber(bucket.median_views),
+      bucket.median_outlier != null ? `${bucket.median_outlier.toFixed(1)}x` : "—", bucket.breakout_count,
+    ]))}
+    <h4>Channel snapshot history</h4>
+    ${channelAgentTable(["Captured", "Subscribers", "Lifetime views", "Videos"], snapshots.map(snapshot => [
+      new Date(snapshot.captured_at * 1000).toLocaleString(), channelAgentNumber(snapshot.subscriber_count),
+      channelAgentNumber(snapshot.lifetime_view_count), channelAgentNumber(snapshot.video_count),
+    ]))}`;
+}
+
+$("#competitor-discover").onclick = async () => {
+  $("#competitor-message").textContent = "Discovering qualified competitor channels...";
+  try {
+    const result = await api("/api/channel-agent/competitors/discover", {method: "POST"});
+    $("#competitor-message").textContent = `${result.competitors_discovered} competitors discovered from ${result.qualified_channels} qualified channels.`;
+    await loadCompetitors();
+  } catch (e) { $("#competitor-message").textContent = e.message; }
+};
+
+$("#competitor-add").onclick = async () => {
+  try {
+    await api("/api/channel-agent/competitors", {method: "POST", body: JSON.stringify({reference: $("#competitor-reference").value})});
+    $("#competitor-reference").value = "";
+    $("#competitor-message").textContent = "Competitor added. Click Refresh to analyze recent metadata.";
+    await loadCompetitors();
+  } catch (e) { $("#competitor-message").textContent = e.message; }
+};
+
+$("#competitor-refresh").onclick = async () => {
+  const button = $("#competitor-refresh");
+  button.disabled = true;
+  $("#competitor-message").textContent = "Refreshing competitor metadata and recent uploads...";
+  try {
+    const result = await api("/api/channel-agent/competitors/refresh", {method: "POST", body: JSON.stringify({mode: $("#competitor-mode").value})});
+    $("#competitor-message").textContent = `${result.competitors_refreshed} competitors refreshed.`;
+    await loadCompetitors();
+  } catch (e) { $("#competitor-message").textContent = e.message; }
+  finally { button.disabled = false; }
+};
+
+$("#competitor-show-filtered").onchange = loadCompetitors;
+$("#competitor-show-filtered-patterns").onchange = loadCompetitors;
+
+// ---------------- Content Brain (CP4) ----------------
+const contentBrainRequestState = ContentBrainUI.createRequestState();
+let contentBrainModelName = "local model";
+
+function contentBrainStatusText(status) {
+  if (!status.enabled) return "Local Content Brain is disabled.";
+  if (!status.reachable) return `● Disconnected · ${status.message}`;
+  if (!status.configured_model) return `● Ollama connected · ${status.message}`;
+  return `${status.model_available ? "● Ready" : "● Model unavailable"} · Model: ${status.configured_model} · ${status.message}`;
+}
+
+function contentBrainEvidenceMap(evidence) {
+  const rows = [];
+  if (evidence?.own_channel?.evidence_id) rows.push(evidence.own_channel);
+  ["trend_candidates", "competitors", "opportunity_gaps", "patterns", "breakout_videos"].forEach(section => {
+    (evidence?.[section] || []).forEach(item => rows.push(item));
+  });
+  return new Map(rows.map(item => [item.evidence_id, item]));
+}
+
+function contentBrainEvidenceRef(id, evidenceMap) {
+  const item = evidenceMap.get(id);
+  const url = item?.url || item?.channel_url;
+  const label = escapeHtml(id);
+  return url
+    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${label}</a>`
+    : `<span>${label}</span>`;
+}
+
+function contentBrainRefs(ids, evidenceMap) {
+  return (ids || []).map(id => contentBrainEvidenceRef(id, evidenceMap)).join(" · ") || "—";
+}
+
+function renderContentBrainEvidence(evidence) {
+  if (!evidence) return '<div class="muted-help">Stored evidence is unavailable.</div>';
+  const candidateRows = (evidence.trend_candidates || []).map(item => [
+    contentBrainEvidenceRef(item.evidence_id, contentBrainEvidenceMap(evidence)),
+    item.title || item.video_id || "—", Math.round((item.trend_score || 0) * 100),
+    item.niche_relevance_score != null ? `${Math.round(item.niche_relevance_score * 100)}%` : "—",
+    item.opportunity_score != null ? Math.round(item.opportunity_score * 100) : "—",
+    item.observed_vph != null ? channelAgentNumber(item.observed_vph) : (item.approx_vph != null ? `~${channelAgentNumber(item.approx_vph)}` : "—"),
+  ]);
+  const competitorRows = (evidence.competitors || []).map(item => [
+    contentBrainEvidenceRef(item.evidence_id, contentBrainEvidenceMap(evidence)), item.channel_title || "—",
+    item.competitor_relevance_score != null ? `${Math.round(item.competitor_relevance_score * 100)}%` : "—",
+    item.niche_hit_rate != null ? `${Math.round(item.niche_hit_rate * 100)}%` : "—",
+    channelAgentNumber(item.median_views), item.breakout_frequency != null ? `${Math.round(item.breakout_frequency * 100)}%` : "—",
+  ]);
+  const patternRows = (evidence.patterns || []).map(item => [
+    item.pattern, item.pattern_quality_score != null ? `${Math.round(item.pattern_quality_score * 100)}%` : "—",
+    item.support_count, item.breakout_support,
+  ]);
+  const gapRows = (evidence.opportunity_gaps || []).map(item => [
+    item.pattern, item.gap_quality_score != null ? `${Math.round(item.gap_quality_score * 100)}%` : "—",
+    item.supporting_competitor_count, item.supporting_breakout_count, item.qualified_candidate_supply,
+    item.confidence || "—",
+  ]);
+  const videoRows = (evidence.breakout_videos || []).map(item => [
+    contentBrainEvidenceRef(item.evidence_id, contentBrainEvidenceMap(evidence)), item.title || item.video_id,
+    channelAgentNumber(item.views), item.outlier_ratio != null ? `${Number(item.outlier_ratio).toFixed(1)}x` : "—",
+    channelAgentDuration(item.duration_seconds), item.rights_status || "idea_only",
+  ]);
+  return `
+    <h4>Evidence used (application data)</h4>
+    ${channelAgentTable(["ID", "Candidate", "Trend", "Relevance", "Opportunity", "VPH"], candidateRows, [0])}
+    ${channelAgentTable(["ID", "Competitor", "Relevance", "Niche hit", "Median views", "Breakout"], competitorRows, [0])}
+    ${channelAgentTable(["Pattern", "Quality", "Support", "Breakouts"], patternRows)}
+    ${channelAgentTable(["Gap", "Quality", "Competitors", "Breakouts", "Candidate supply", "Confidence"], gapRows)}
+    ${channelAgentTable(["ID", "Breakout video", "Views", "Outlier", "Duration", "Rights"], videoRows, [0])}`;
+}
+
+function contentBrainRunMeta(result, view) {
+  const runId = Number(result?.analysis_id || result?.run_id);
+  return `<p class="muted-help" data-content-brain-active-run="${Number.isSafeInteger(runId) ? runId : ""}">Mode: ${escapeHtml(view.mode)}${Number.isSafeInteger(runId) ? ` · Run #${runId}` : ""}</p>`;
+}
+
+function showContentBrainLoading(mode, token) {
+  const view = ContentBrainUI.modeView({ request_type: mode });
+  const node = $("#content-brain-result");
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <div data-content-brain-state="loading" data-content-brain-mode="${escapeHtml(view.mode)}" data-content-brain-sequence="${token.sequence}">
+      <h3 class="section-title">${escapeHtml(view.label)}</h3>
+      <p>Generating ${escapeHtml(view.label)} with ${escapeHtml(contentBrainModelName)}...</p>
+    </div>`;
+}
+
+function showContentBrainError(mode, message, runId = null) {
+  const view = ContentBrainUI.modeView({ request_type: mode });
+  const node = $("#content-brain-result");
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <div data-content-brain-state="error" data-content-brain-mode="${escapeHtml(view.mode)}">
+      <h3 class="section-title">${escapeHtml(view.label)} failed</h3>
+      ${runId ? `<p class="muted-help">Run #${Number(runId)}</p>` : ""}
+      <p>${escapeHtml(message || "Content Brain analysis failed.")}</p>
+    </div>`;
+}
+
+function renderContentBrainResult(result, storedEvidence = null, storedRequestType = null) {
+  const node = $("#content-brain-result");
+  const view = ContentBrainUI.modeView(result, storedRequestType);
+  node.classList.remove("hidden");
+  const evidence = storedEvidence || result?.evidence_summary || null;
+  const evidenceMap = contentBrainEvidenceMap(evidence);
+  const confidence = result?.evidence_confidence || evidence?.evidence_confidence || {};
+  if (result?.insufficient_evidence) {
+    node.innerHTML = `
+      <div data-content-brain-state="result" data-content-brain-mode="${escapeHtml(view.mode)}">
+        <h3 class="section-title">${escapeHtml(view.label)} · Insufficient evidence</h3>
+        ${contentBrainRunMeta(result, view)}
+        <p>${escapeHtml(result.summary || "Insufficient evidence for a high-confidence recommendation.")}</p>
+        <p><strong>Missing signals:</strong> ${escapeHtml((result.missing_signals || []).join(" · ") || "—")}</p>
+        <p><strong>Evidence confidence:</strong> ${escapeHtml((confidence.label || "low").toUpperCase())} (${Math.round((confidence.score || 0) * 100)}%)</p>
+        <p class="muted-help">${escapeHtml(result.rights_warning || "")}</p>
+        ${renderContentBrainEvidence(evidence)}
+      </div>`;
+    return;
+  }
+  const signals = (result?.supporting_signals || []).map(item => item.text ? `
+    <li><strong>${escapeHtml(item.type === "observed" ? "Observed" : "Inference")}:</strong> ${escapeHtml(item.text)}<br><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></li>` : `
+    <li><strong>Observed:</strong> ${escapeHtml(item.observation)}<br><strong>Inference:</strong> ${escapeHtml(item.inference)}<br><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></li>`).join("");
+  const angles = (result?.angles || result?.recommended_angles || []).map(item => `
+    <div style="margin:10px 0;padding:12px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+      <h4>${escapeHtml(item.angle_name)}</h4>
+      <p><strong>Audience promise:</strong> ${escapeHtml(item.audience_promise)}</p>
+      <p><strong>Core conflict:</strong> ${escapeHtml(item.core_conflict)}</p>
+      <p><strong>Difference:</strong> ${escapeHtml(item.differentiation)}</p>
+      <p><strong>Why supported:</strong> ${escapeHtml(item.why_supported)}</p>
+      <p><strong>Risk:</strong> ${escapeHtml(item.risk)}</p>
+      <p class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</p>
+    </div>`).join("");
+  const titles = (result?.titles || result?.recommended_titles || []).map(item => [
+    item.title, item.primary_motif || item.primary_keyword_or_motif, item.reason, contentBrainRefs(item.evidence_ids, evidenceMap),
+  ]);
+  const hooks = (result?.hooks || result?.recommended_hooks || []).map(item => item.hook ? `
+    <div style="margin-bottom:10px"><p>${escapeHtml(item.hook)}</p><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></div>` : `
+    <div style="margin-bottom:10px"><strong>${escapeHtml(item.angle_name)}</strong><ol>${(item.hooks || []).map(hook => `<li>${escapeHtml(hook)}</li>`).join("")}</ol><span class="muted-help">${contentBrainRefs(item.evidence_ids, evidenceMap)}</span></div>`).join("");
+  let outline = [];
+  if (Array.isArray(result?.outline)) {
+    outline = result.outline.map(item => [
+      item.section_name, item.purpose, (item.key_points || []).join(" · "), `${item.estimated_share_of_runtime}%`,
+      contentBrainRefs(item.evidence_ids, evidenceMap),
+    ]);
+  } else if (view.showOutline) {
+    const runtime = result?.runtime_allocation || {};
+    const sectionNames = [
+      "opening_hook", "setup", "inciting_problem", "progression", "escalation",
+      "midpoint", "climax", "resolution", "ending_open_loop",
+    ];
+    sectionNames.forEach(sectionName => {
+      const blocks = Array.isArray(result?.[sectionName]) ? result[sectionName] : [result?.[sectionName]];
+      blocks.filter(Boolean).forEach((item, index) => outline.push([
+        blocks.length > 1 ? `${sectionName}_${index + 1}` : sectionName,
+        item.purpose, (item.key_points || []).join(" · "),
+        runtime[sectionName] != null ? `${runtime[sectionName]}%` : "—",
+        contentBrainRefs(item.evidence_ids, evidenceMap),
+      ]));
+    });
+  }
+  let modeSections = "";
+  if (view.showOpportunity) {
+    modeSections = `
+      <h4>Why now</h4><p>${escapeHtml(result.why_now || "")}</p>
+      <h4>Why it fits the niche</h4><p>${escapeHtml(result.why_niche_fit || "")}</p>
+      <h4>Supporting signals</h4><ul>${signals}</ul>
+      <h4>Competitive context</h4><p>${escapeHtml(result.competitive_context || "")}</p>`;
+  } else if (view.showAngles) {
+    modeSections = `<h4>Three Vietnamese content angles</h4>${angles}`;
+  } else if (view.showTitlesHooks) {
+    modeSections = `
+      <h4>Vietnamese titles</h4>
+      ${channelAgentTable(["Title", "Motif", "Reason", "Evidence"], titles, [3])}
+      <h4>Opening hooks</h4>${hooks}`;
+  } else if (view.showOutline) {
+    modeSections = `
+      <h4>Original long-form structure</h4>
+      ${channelAgentTable(["Section", "Purpose", "Key points", "Runtime", "Evidence"], outline, [4])}`;
+  }
+  node.innerHTML = `
+    <div data-content-brain-state="result" data-content-brain-mode="${escapeHtml(view.mode)}">
+      <h3 class="section-title">${escapeHtml(view.label)}</h3>
+      ${contentBrainRunMeta(result, view)}
+      ${result?.summary ? `<p>${escapeHtml(result.summary)}</p>` : ""}
+      ${modeSections}
+      ${result?.differentiation ? `<h4>Differentiation</h4><p>${escapeHtml(result.differentiation)}</p>` : ""}
+      ${(result?.risks || []).length ? `<h4>Risks</h4><ul>${result.risks.map(risk => `<li>${escapeHtml(risk)}</li>`).join("")}</ul>` : ""}
+      <p><strong>Evidence confidence (authoritative):</strong> ${escapeHtml((confidence.label || "low").toUpperCase())} (${Math.round((confidence.score || 0) * 100)}%)${result?.ai_confidence || result?.ai_interpretation_confidence ? ` · <strong>AI interpretation confidence:</strong> ${escapeHtml((result.ai_confidence || result.ai_interpretation_confidence).toUpperCase())}` : ""}</p>
+      <p class="muted-help">${escapeHtml(result?.rights_warning || "")}</p>
+      ${renderContentBrainEvidence(evidence)}
+    </div>`;
+}
+
+async function loadContentBrain() {
+  const current = $("#content-brain-selector")?.value || "top_opportunity|";
+  const [status, candidates, competitors, gaps, runs] = await Promise.all([
+    api("/api/channel-agent/brain/status"),
+    api("/api/channel-agent/trends/candidates?limit=20&include_filtered=false"),
+    api("/api/channel-agent/competitors?include_filtered=false"),
+    api("/api/channel-agent/competitors/gaps?include_filtered=false"),
+    api("/api/channel-agent/brain/runs?limit=30"),
+  ]);
+  contentBrainModelName = status.configured_model || "local model";
+  $("#content-brain-status").textContent = contentBrainStatusText(status);
+  const options = ['<option value="top_opportunity|">Top qualified opportunity</option>'];
+  candidates.forEach(item => options.push(`<option value="candidate|${item.id}">Candidate #${item.id} · ${escapeHtml(item.title || item.source_id)}</option>`));
+  competitors.forEach(item => options.push(`<option value="competitor|${item.id}">Competitor #${item.id} · ${escapeHtml(item.channel_title)}</option>`));
+  gaps.forEach(item => options.push(`<option value="gap|${encodeURIComponent(item.pattern)}">Gap · ${escapeHtml(item.pattern)}</option>`));
+  $("#content-brain-selector").innerHTML = options.join("");
+  if ([...$("#content-brain-selector").options].some(option => option.value === current)) {
+    $("#content-brain-selector").value = current;
+  }
+  $("#content-brain-history").innerHTML = runs.length ? channelAgentTable(
+    ["Date", "Mode", "Model", "Status", "Attempts", "Failure stage", "Context", "Confidence", "Inspect", "Opportunity"],
+    runs.map(run => [
+      new Date(run.created_at * 1000).toLocaleString(), run.request_type, run.model || "not configured",
+      run.status, run.generation_attempt_count ?? "—", run.failure_stage || "—",
+      run.context_label || "—", run.confidence || "—",
+      `<button class="btn secondary small" data-content-brain-run="${run.id}" data-content-brain-mode="${escapeHtml(run.request_type)}">Inspect</button>`,
+      run.status === "completed" ? `<button class="btn secondary small" data-brain-create-opportunity="${run.id}">Create card</button>` : "—",
+    ]), [8, 9]
+  ) : '<div class="muted-help">No Content Brain analyses yet.</div>';
+  document.querySelectorAll("[data-content-brain-run]").forEach(button => {
+    button.onclick = async () => {
+      const runId = Number(button.dataset.contentBrainRun);
+      const token = contentBrainRequestState.beginHistory(runId);
+      const mode = ContentBrainUI.normalizeMode(button.dataset.contentBrainMode);
+      const analyzeButton = $("#content-brain-analyze");
+      analyzeButton.disabled = true;
+      showContentBrainLoading(mode, token);
+      $("#content-brain-message").textContent = `Loading stored ${ContentBrainUI.MODES[mode].label} run #${runId}...`;
+      try {
+        const run = await api(`/api/channel-agent/brain/runs/${runId}`);
+        if (!contentBrainRequestState.isCurrent(token)) return;
+        if (run.result) {
+          const storedResult = {
+            ...run.result,
+            request_type: run.result.request_type || run.request_type,
+            analysis_id: run.result.analysis_id || run.id,
+          };
+          contentBrainRequestState.accept(token, storedResult, run.request_type);
+          renderContentBrainResult(storedResult, run.evidence, run.request_type);
+          $("#content-brain-message").textContent = `Viewing stored ${ContentBrainUI.MODES[run.request_type].label} run #${run.id}. No local AI request was made.`;
+        } else {
+          showContentBrainError(run.request_type, run.error_message || "No result was stored.", run.id);
+          $("#content-brain-message").textContent = `Stored run #${run.id} did not complete.`;
+        }
+      } catch (error) {
+        if (!contentBrainRequestState.isCurrent(token)) return;
+        showContentBrainError(mode, error.message, runId);
+        $("#content-brain-message").textContent = error.message;
+      } finally {
+        if (contentBrainRequestState.isCurrent(token)) analyzeButton.disabled = false;
+      }
+    };
+  });
+  document.querySelectorAll("[data-brain-create-opportunity]").forEach(button => {
+    button.onclick = async () => {
+      try { await createContentOpportunity("brain_run", button.dataset.brainCreateOpportunity); }
+      catch (error) { $("#content-brain-message").textContent = error.message; }
+    };
+  });
+}
+
+$("#content-brain-status-refresh").onclick = async () => {
+  try { await loadContentBrain(); }
+  catch (e) { $("#content-brain-message").textContent = e.message; }
+};
+
+$("#content-brain-analyze").onclick = async () => {
+  const button = $("#content-brain-analyze");
+  let mode;
+  try {
+    mode = ContentBrainUI.normalizeMode($("#content-brain-mode").value);
+  } catch (error) {
+    $("#content-brain-result").classList.add("hidden");
+    $("#content-brain-result").innerHTML = "";
+    $("#content-brain-message").textContent = error.message;
+    return;
+  }
+  const value = $("#content-brain-selector").value;
+  const separator = value.indexOf("|");
+  const selectorType = value.slice(0, separator);
+  let selectorId = value.slice(separator + 1) || null;
+  if (selectorType === "gap" && selectorId) selectorId = decodeURIComponent(selectorId);
+  const token = contentBrainRequestState.begin(mode);
+  const payload = ContentBrainUI.buildAnalyzePayload({
+    mode,
+    selectorType,
+    selectorId,
+    allowLowConfidence: $("#content-brain-low-confidence").checked,
+  });
+  button.disabled = true;
+  showContentBrainLoading(mode, token);
+  $("#content-brain-message").textContent = `Generating ${ContentBrainUI.MODES[mode].label} with ${contentBrainModelName}...`;
+  try {
+    const result = await api("/api/channel-agent/brain/analyze", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (!contentBrainRequestState.isCurrent(token)) return;
+    contentBrainRequestState.accept(token, result);
+    renderContentBrainResult(result);
+    $("#content-brain-message").textContent = result.local_ai_used
+      ? `${ContentBrainUI.MODES[mode].label} completed as run #${result.analysis_id}.`
+      : `${ContentBrainUI.MODES[mode].label} run #${result.analysis_id} used the deterministic low-evidence response.`;
+    try {
+      await loadContentBrain();
+    } catch (historyError) {
+      if (contentBrainRequestState.isCurrent(token)) {
+        $("#content-brain-message").textContent += ` History refresh failed: ${historyError.message}`;
+      }
+    }
+  } catch (e) {
+    if (!contentBrainRequestState.isCurrent(token)) return;
+    showContentBrainError(mode, e.message);
+    $("#content-brain-message").textContent = e.message;
+    try {
+      await loadContentBrain();
+    } catch (_) {
+      // Preserve the mode-specific generation error; history can be refreshed later.
+    }
+  } finally {
+    if (contentBrainRequestState.isCurrent(token)) button.disabled = false;
+  }
+};
+
+// ---------------- Content Opportunities (CP5) ----------------
+function contentOpportunityFilters() {
+  return {
+    status: $("#content-opportunity-status-filter").value,
+    confidence: $("#content-opportunity-confidence-filter").value,
+    competition: $("#content-opportunity-competition-filter").value,
+    sourceType: $("#content-opportunity-source-filter").value,
+    minScore: $("#content-opportunity-min-score").value,
+  };
+}
+
+function contentOpportunityBoard(items) {
+  if (!items.length) return '<div class="muted-help">No opportunities match these filters. Generate a small set from qualified research or create one from a candidate, gap, or completed Content Brain run.</div>';
+  return channelAgentTable(
+    ["Rank", "Status", "Topic", "Evidence", "Confidence", "Competition", "Trend", "Relevance", "Breakouts", "Freshness", "Updated", "View"],
+    items.map(item => [
+      Number(item.opportunity_rank_score || 0).toFixed(1),
+      String(item.status || "draft").toUpperCase(),
+      item.topic || "Research opportunity",
+      Number(item.evidence_score || 0).toFixed(1),
+      String(item.evidence_confidence || "low").toUpperCase(),
+      ContentOpportunityUI.competitionLabel(item.competition_level).toUpperCase(),
+      item.trend_score == null ? "—" : Math.round(item.trend_score * 100),
+      item.niche_relevance_score == null ? "—" : `${Math.round(item.niche_relevance_score * 100)}%`,
+      item.breakout_support_count || 0,
+      String(item.freshness_status || "fresh").toUpperCase(),
+      new Date(item.updated_at * 1000).toLocaleString(),
+      `<button class="btn secondary small" data-content-opportunity-id="${item.id}">View</button>`,
+    ]), [11]
+  );
+}
+
+async function loadContentOpportunities() {
+  const query = ContentOpportunityUI.listQuery(contentOpportunityFilters());
+  const items = await api(`/api/channel-agent/opportunities?${query}`);
+  $("#content-opportunity-board").innerHTML = contentOpportunityBoard(items);
+  $("#content-opportunity-message").textContent = `${items.length} opportunity card${items.length === 1 ? "" : "s"} shown · top 20 maximum.`;
+  document.querySelectorAll("[data-content-opportunity-id]").forEach(button => {
+    button.onclick = () => showContentOpportunity(Number(button.dataset.contentOpportunityId));
+  });
+}
+
+function contentOpportunityEvidenceLinks(snapshot) {
+  const links = [];
+  (snapshot?.trend_candidates || []).forEach(row => {
+    if (row.url) links.push(`<a href="${escapeHtml(row.url)}" target="_blank" rel="noopener">Candidate #${row.candidate_id}: ${escapeHtml(row.title || row.video_id || "source")}</a>`);
+  });
+  (snapshot?.competitors || []).forEach(row => {
+    if (row.channel_url) links.push(`<a href="${escapeHtml(row.channel_url)}" target="_blank" rel="noopener">Competitor #${row.competitor_id}: ${escapeHtml(row.channel_title || "channel")}</a>`);
+  });
+  (snapshot?.breakout_videos || []).forEach(row => {
+    if (row.url) links.push(`<a href="${escapeHtml(row.url)}" target="_blank" rel="noopener">Breakout: ${escapeHtml(row.title || row.video_id)}</a>`);
+  });
+  return links.length ? `<ul>${links.map(link => `<li>${link}</li>`).join("")}</ul>` : '<p class="muted-help">No external evidence links stored.</p>';
+}
+
+function contentOpportunityStatusButtons(item) {
+  return (ContentOpportunityUI.transitions[item.status] || []).map(status =>
+    `<button class="btn secondary small" data-content-opportunity-status="${status}">${status.toUpperCase()}</button>`
+  ).join(" ");
+}
+
+async function showContentOpportunity(id) {
+  const item = await api(`/api/channel-agent/opportunities/${id}`);
+  const linkedProductionRows = await api(`/api/channel-agent/production?status=all&opportunity_id=${id}&limit=1`);
+  const linkedProduction = linkedProductionRows[0] || null;
+  const detail = $("#content-opportunity-detail");
+  detail.classList.remove("hidden");
+  const rows = ContentOpportunityUI.scoreRows(item.score_breakdown);
+  const recommendation = item.ai_enrichment_status === "available" ? `
+    <h4>CP4 recommendation</h4>
+    <p><strong>Recommended angle:</strong> ${escapeHtml(item.system_recommended_angle || "Not present in linked run")}</p>
+    <p><strong>Audience promise:</strong> ${escapeHtml(item.system_audience_promise || "—")}<br><strong>Core conflict:</strong> ${escapeHtml(item.system_core_conflict || "—")}</p>
+    <p><strong>Differentiation:</strong> ${escapeHtml(item.system_differentiation || "—")}</p>
+    <p><strong>Suggested title:</strong> ${escapeHtml(item.system_suggested_title || "—")}<br><strong>Suggested hook:</strong> ${escapeHtml(item.system_suggested_hook || "—")}</p>
+    ${(item.system_risks || []).length ? `<p><strong>Risks:</strong><br>${item.system_risks.map(value => `• ${escapeHtml(value)}`).join("<br>")}</p>` : ""}
+    ${item.brain_run_id ? `<button class="btn secondary small" data-content-opportunity-brain-run="${item.brain_run_id}">Inspect Content Brain Run #${item.brain_run_id}</button>` : ""}` : '<p class="muted-help">AI enrichment missing. CP5 remains fully usable offline; run Content Brain explicitly if enrichment is wanted.</p>';
+  detail.innerHTML = `
+    <div class="template-library-heading"><h3 class="section-title">${escapeHtml(item.topic)}</h3><span>${escapeHtml(String(item.status).toUpperCase())}</span></div>
+    <p><strong>Why this exists:</strong> ${escapeHtml(item.primary_motif || item.topic)} · source ${escapeHtml(item.source_type)}:${escapeHtml(item.source_key)}</p>
+    <div class="stat-grid" style="margin-top:10px">
+      <div class="stat-box"><div class="num">${Number(item.evidence_score).toFixed(1)}</div><div class="label">Evidence score</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(String(item.evidence_confidence).toUpperCase())}</div><div class="label">Confidence</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(ContentOpportunityUI.competitionLabel(item.competition_level).toUpperCase())}</div><div class="label">Competition</div></div>
+      <div class="stat-box"><div class="num">${Number(item.opportunity_rank_score).toFixed(1)}</div><div class="label">Rank score</div></div>
+      <div class="stat-box"><div class="num">${item.breakout_support_count || 0}</div><div class="label">Breakout support</div></div>
+      <div class="stat-box"><div class="num">${escapeHtml(String(item.freshness_status).toUpperCase())}</div><div class="label">Evidence freshness</div></div>
+    </div>
+    <h4>Score explanation</h4>
+    ${channelAgentTable(["Component", "Signal", "Points", "Available"], rows.map(row => [row.label, row.signal == null ? "—" : `${Math.round(row.signal * 100)}%`, row.normalized_points == null ? "—" : `${row.normalized_points}/100`, row.available ? "yes" : "unknown"]))}
+    <p><strong>Total:</strong> ${item.score_breakdown.total}/100 · Missing components are excluded and available weights are normalized; they are not converted to fake zeroes.</p>
+    ${(item.waiting_for || []).length ? `<h4>Waiting for</h4><ul>${item.waiting_for.map(value => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : ""}
+    ${recommendation}
+    <h4>Rights and transformation</h4>
+    <p><strong>Source rights:</strong> ${escapeHtml(item.rights_status)} · <strong>Risk:</strong> ${escapeHtml(item.risk_level)}</p>
+    <p class="muted-help">Approval is approval of the idea only. Create a new Vietnamese angle/script/commentary and use owned, licensed, or permitted visuals; do not copy source media.</p>
+    <h4>Evidence links</h4>${contentOpportunityEvidenceLinks(item.evidence_snapshot)}
+    <h4>Editorial fields</h4>
+    <div class="field"><label>Working title</label><input id="content-opportunity-working-title" maxlength="300" value="${escapeHtml(item.working_title || "")}"></div>
+    <div class="field"><label>Selected angle</label><textarea id="content-opportunity-selected-angle" rows="3" maxlength="1500">${escapeHtml(item.selected_angle || "")}</textarea></div>
+    <div class="field"><label>Notes</label><textarea id="content-opportunity-notes" rows="3" maxlength="5000">${escapeHtml(item.notes || "")}</textarea></div>
+    <div class="row"><div class="field"><label>Priority (0–100)</label><input id="content-opportunity-priority" type="number" min="0" max="100" value="${item.priority || 0}"></div>
+      <div class="field"><label>Format</label><select id="content-opportunity-target-format">${["long_form", "short_form", "all", "unspecified"].map(value => `<option value="${value}" ${item.target_format === value ? "selected" : ""}>${value}</option>`).join("")}</select></div>
+      <div class="field"><label>Min minutes</label><input id="content-opportunity-duration-min" type="number" min="1" max="600" value="${item.target_duration_min || ""}"></div>
+      <div class="field"><label>Max minutes</label><input id="content-opportunity-duration-max" type="number" min="1" max="600" value="${item.target_duration_max || ""}"></div></div>
+    <button class="btn gradient small" id="content-opportunity-save" type="button">Save editorial choices</button>
+    <button class="btn secondary small" id="content-opportunity-refresh-evidence" type="button">Refresh evidence</button>
+    ${linkedProduction
+      ? `<button class="btn gradient small" id="content-opportunity-open-production" type="button">Open Production Item #${linkedProduction.id}</button>`
+      : item.status === "approved"
+        ? '<button class="btn gradient small" id="content-opportunity-create-production" type="button">Create Production Item</button>'
+        : '<p class="muted-help">Approve this opportunity before creating a production planning item.</p>'}
+    <h4>Status actions</h4><div id="content-opportunity-status-actions">${contentOpportunityStatusButtons(item)}</div>
+    <h4>History</h4>${channelAgentTable(["Date", "Event", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
+  $("#content-opportunity-save").onclick = async () => {
+    try {
+      const updated = await api(`/api/channel-agent/opportunities/${id}`, {method: "PATCH", body: JSON.stringify({
+        working_title: $("#content-opportunity-working-title").value,
+        selected_angle: $("#content-opportunity-selected-angle").value,
+        notes: $("#content-opportunity-notes").value,
+        priority: Number($("#content-opportunity-priority").value),
+        target_format: $("#content-opportunity-target-format").value,
+        target_duration_min: Number($("#content-opportunity-duration-min").value),
+        target_duration_max: Number($("#content-opportunity-duration-max").value),
+      })});
+      $("#content-opportunity-message").textContent = "Editorial choices saved; evidence refresh will preserve them.";
+      await showContentOpportunity(updated.id);
+      await loadContentOpportunities();
+    } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  };
+  $("#content-opportunity-refresh-evidence").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/opportunities/${id}/refresh`, {method: "POST"});
+      $("#content-opportunity-message").textContent = "Stored research evidence and deterministic scores refreshed. Ollama was not called.";
+      await showContentOpportunity(id);
+      await loadContentOpportunities();
+    } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  };
+  $("#content-opportunity-create-production")?.addEventListener("click", async () => {
+    try {
+      const response = await api("/api/channel-agent/production", {
+        method: "POST", body: JSON.stringify({opportunity_id: id}),
+      });
+      $("#production-message").textContent = response.created
+        ? "Production planning item created. No media or legacy job was created."
+        : `Existing production item #${response.production_item.id} opened.`;
+      await loadProductionQueue();
+      await showProductionItem(response.production_item.id);
+      $("#production-queue").scrollIntoView({behavior: "smooth"});
+    } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  });
+  $("#content-opportunity-open-production")?.addEventListener("click", async () => {
+    await showProductionItem(linkedProduction.id);
+    $("#production-queue").scrollIntoView({behavior: "smooth"});
+  });
+  document.querySelectorAll("[data-content-opportunity-status]").forEach(button => {
+    button.onclick = async () => {
+      const status = button.dataset.contentOpportunityStatus;
+      const rejectionReason = status === "rejected" ? (window.prompt("Reject reason: low_evidence, wrong_niche, too_competitive, rights_concern, duplicate_idea, weak_differentiation, other", "low_evidence") || "low_evidence") : null;
+      try {
+        await api(`/api/channel-agent/opportunities/${id}/status`, {method: "POST", body: JSON.stringify({status, rejection_reason: rejectionReason})});
+        await showContentOpportunity(id);
+        await loadContentOpportunities();
+      } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+    };
+  });
+  document.querySelector("[data-content-opportunity-brain-run]")?.addEventListener("click", async event => {
+    const runId = Number(event.currentTarget.dataset.contentOpportunityBrainRun);
+    const run = await api(`/api/channel-agent/brain/runs/${runId}`);
+    if (run.result) renderContentBrainResult({...run.result, request_type: run.request_type, analysis_id: run.id}, run.evidence, run.request_type);
+    $("#content-brain-message").textContent = `Viewing stored run #${runId}. No Ollama request was made.`;
+    $("#content-brain").scrollIntoView({behavior: "smooth"});
+  });
+}
+
+async function createContentOpportunity(sourceType, sourceId) {
+  const response = await api("/api/channel-agent/opportunities", {method: "POST", body: JSON.stringify({source_type: sourceType, source_id: String(sourceId)})});
+  $("#content-opportunity-message").textContent = response.created ? "Content opportunity created." : `Duplicate research resolved to existing opportunity #${response.opportunity.id}.`;
+  await loadContentOpportunities();
+  await showContentOpportunity(response.opportunity.id);
+  $("#content-opportunities").scrollIntoView({behavior: "smooth"});
+}
+
+$("#content-opportunity-generate").onclick = async () => {
+  const button = $("#content-opportunity-generate");
+  button.disabled = true;
+  try {
+    const result = await api("/api/channel-agent/opportunities/generate", {method: "POST", body: JSON.stringify({limit: 5})});
+    $("#content-opportunity-message").textContent = `${result.created.length} created · ${result.existing.length} deduplicated existing · no local AI call.`;
+    await loadContentOpportunities();
+  } catch (error) { $("#content-opportunity-message").textContent = error.message; }
+  finally { button.disabled = false; }
+};
+
+$("#content-opportunity-refresh-list").onclick = loadContentOpportunities;
+["status", "confidence", "competition", "source"].forEach(name => {
+  $(`#content-opportunity-${name}-filter`).onchange = loadContentOpportunities;
+});
+$("#content-opportunity-min-score").onchange = loadContentOpportunities;
+
+// ---------------- Production Queue (CP6 planning only) ----------------
+function productionFilters() {
+  return {
+    status: $("#production-status-filter").value,
+    minPriority: $("#production-min-priority").value,
+    rights: $("#production-rights-filter").value,
+    targetFormat: $("#production-format-filter").value,
+  };
+}
+
+function productionDuration(item) {
+  if (item.target_duration_min && item.target_duration_max) return `${item.target_duration_min}–${item.target_duration_max} min`;
+  if (item.target_duration_min || item.target_duration_max) return `${item.target_duration_min || item.target_duration_max} min`;
+  return "—";
+}
+
+function productionBoard(items) {
+  if (!items.length) return '<div class="muted-help">No production planning items match these filters. Approve a Content Opportunity, then create one from its detail view.</div>';
+  return channelAgentTable(
+    ["Priority", "Status", "Title", "Format", "Duration", "Opportunity rank", "Rights", "Planning", "Progress", "Updated", "View"],
+    items.map(item => [
+      item.priority || 0,
+      String(item.status).toUpperCase(),
+      item.working_title,
+      item.target_format,
+      productionDuration(item),
+      Number(item.opportunity_rank_score || 0).toFixed(1),
+      String(item.rights_gate_status).toUpperCase(),
+      item.planning_ready ? "READY" : "NOT READY",
+      ContentProductionUI.progressLabel(item.progress),
+      new Date(item.updated_at * 1000).toLocaleString(),
+      `<button class="btn secondary small" data-production-id="${item.id}">View</button>`,
+    ]), [10]
+  );
+}
+
+async function loadProductionQueue() {
+  const query = ContentProductionUI.listQuery(productionFilters());
+  const items = await api(`/api/channel-agent/production?${query}`);
+  $("#production-board").innerHTML = productionBoard(items);
+  $("#production-message").textContent = `${items.length} planning item${items.length === 1 ? "" : "s"} shown · top 50 maximum · Ollama not required.`;
+  document.querySelectorAll("[data-production-id]").forEach(button => {
+    button.onclick = () => showProductionItem(Number(button.dataset.productionId));
+  });
+}
+
+function productionItemActions(item) {
+  return (ContentProductionUI.itemTransitions[item.status] || []).map(status =>
+    `<button class="btn secondary small" data-production-status="${status}">${status.replace("_", " ").toUpperCase()}</button>`
+  ).join(" ");
+}
+
+function productionTaskTable(item) {
+  return channelAgentTable(
+    ["Order", "Task", "Required", "Status", "Dependencies", "Notes", "Actions"],
+    item.tasks.map(task => [
+      task.order_index,
+      `${task.task_type}<br><span class="muted-help">${escapeHtml(task.description)}</span>`,
+      task.required ? "yes" : "optional",
+      String(task.status).toUpperCase(),
+      (task.depends_on || []).join(", ") || "none",
+      task.manual_notes || "—",
+      `${ContentProductionUI.taskActions(task).map(status => `<button class="btn secondary small" data-production-task-id="${task.id}" data-production-task-status="${status}">${status.replace("_", " ")}</button>`).join(" ")}
+       <button class="btn secondary small" data-production-task-notes="${task.id}">notes</button>`,
+    ]), [1, 6]
+  );
+}
+
+function productionBriefView(brief) {
+  const refs = brief.evidence_summary?.references || [];
+  return `
+    <p><strong>Topic:</strong> ${escapeHtml(brief.topic || "—")}<br>
+    <strong>Approved angle:</strong> ${escapeHtml(brief.selected_angle || "—")}<br>
+    <strong>Audience promise:</strong> ${escapeHtml(brief.audience_promise || "—")}<br>
+    <strong>Core conflict:</strong> ${escapeHtml(brief.core_conflict || "—")}<br>
+    <strong>Differentiation:</strong> ${escapeHtml(brief.differentiation || "—")}<br>
+    <strong>Hook direction:</strong> ${escapeHtml(brief.hook_direction || "—")}</p>
+    <p><strong>Motif:</strong> ${escapeHtml(brief.primary_motif || "—")} · <strong>Target:</strong> ${escapeHtml(brief.target_duration || "—")}</p>
+    <p><strong>Script:</strong> ${escapeHtml(brief.script_direction?.instruction || "—")}<br>
+    <strong>Visuals:</strong> ${escapeHtml(brief.visual_direction?.instruction || "—")}<br>
+    <strong>Voice:</strong> ${escapeHtml(`${brief.voice_direction?.language || "Vietnamese"} · ${brief.voice_direction?.tone || "editorial decision"}`)}<br>
+    <strong>Thumbnail:</strong> ${escapeHtml(brief.thumbnail_direction?.text_concept || "—")}<br>
+    <strong>Metadata:</strong> ${escapeHtml(brief.metadata_direction?.description || "—")}</p>
+    <p><strong>Rights guidance:</strong> ${escapeHtml(brief.rights_guidance || "Missing")}</p>
+    <h4>Research evidence references</h4>
+    ${refs.length ? `<ul>${refs.map(ref => `<li>${ref.url ? `<a href="${escapeHtml(ref.url)}" target="_blank" rel="noopener">${escapeHtml(ref.evidence_id)}</a>` : escapeHtml(ref.evidence_id)} · ${escapeHtml(ref.label || ref.type)}</li>`).join("")}</ul>` : '<p class="muted-help">No linkable references; brief uses stored evidence-only context.</p>'}`;
+}
+
+async function showProductionItem(id) {
+  const item = await api(`/api/channel-agent/production/${id}`);
+  const detail = $("#production-detail");
+  detail.classList.remove("hidden");
+  detail.innerHTML = `
+    <div class="template-library-heading"><h3 class="section-title">${escapeHtml(item.working_title)}</h3><span>${escapeHtml(String(item.status).toUpperCase())}</span></div>
+    <p><strong>Source opportunity:</strong> #${item.opportunity_id} · ${escapeHtml(item.source_opportunity?.topic || "stored opportunity")} · rank ${Number(item.opportunity_rank_score || 0).toFixed(1)}</p>
+    <div class="stat-grid" style="margin-top:10px">
+      <div class="stat-box"><div class="num">${item.priority || 0}</div><div class="label">User priority</div></div>
+      <div class="stat-box"><div class="num">${item.planning_ready ? "YES" : "NO"}</div><div class="label">Planning ready</div></div>
+      <div class="stat-box"><div class="num">${item.rights_ready ? "YES" : "NO"}</div><div class="label">Rights ready</div></div>
+      <div class="stat-box"><div class="num">${ContentProductionUI.progressLabel(item.progress)}</div><div class="label">Required-task progress</div></div>
+    </div>
+    <h4>Production brief</h4>${productionBriefView(item.production_brief)}
+    <h4>Rights gate</h4><p><strong>Source:</strong> ${escapeHtml(item.rights_status)} · <strong>Gate:</strong> ${escapeHtml(item.rights_gate_status)}</p>
+    <p class="muted-help">Idea approval is not source-media permission. Planning may continue while the separate rights gate remains visible.</p>
+    <h4>Tasks and dependencies</h4>${productionTaskTable(item)}
+    <h4>Production controls</h4>
+    <div class="row"><div class="field"><label>User priority</label><input id="production-item-priority" type="number" min="0" max="100" value="${item.priority || 0}"></div>
+      <div class="field"><label>Rights gate</label><select id="production-item-rights-gate">${["research_only", "needs_review", "cleared"].map(value => `<option value="${value}" ${item.rights_gate_status === value ? "selected" : ""}>${value}</option>`).join("")}</select></div></div>
+    <div class="field"><label>Production notes</label><textarea id="production-item-notes" rows="3" maxlength="5000">${escapeHtml(item.manual_notes || "")}</textarea></div>
+    <button class="btn gradient small" id="production-item-save" type="button">Save production decisions</button>
+    <button class="btn secondary small" id="production-item-sync" type="button">Sync from Opportunity</button>
+    <button class="btn secondary small" id="production-open-opportunity" type="button">Open source opportunity</button>
+    <h4>Status actions</h4><div>${productionItemActions(item)}</div>
+    ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
+    <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
+
+  $("#production-item-save").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/production/${id}`, {method: "PATCH", body: JSON.stringify({
+        priority: Number($("#production-item-priority").value),
+        rights_gate_status: $("#production-item-rights-gate").value,
+        manual_notes: $("#production-item-notes").value,
+      })});
+      $("#production-message").textContent = "Production decisions saved separately from research fields.";
+      await showProductionItem(id); await loadProductionQueue();
+    } catch (error) { $("#production-message").textContent = error.message; }
+  };
+  $("#production-item-sync").onclick = async () => {
+    try {
+      await api(`/api/channel-agent/production/${id}/sync`, {method: "POST"});
+      $("#production-message").textContent = "Brief synced from stored CP5/CP4 data; task states, blockers, and production notes were preserved.";
+      await showProductionItem(id); await loadProductionQueue();
+    } catch (error) { $("#production-message").textContent = error.message; }
+  };
+  $("#production-open-opportunity").onclick = async () => {
+    await showContentOpportunity(item.opportunity_id);
+    $("#content-opportunities").scrollIntoView({behavior: "smooth"});
+  };
+  document.querySelectorAll("[data-production-status]").forEach(button => {
+    button.onclick = async () => {
+      const status = button.dataset.productionStatus;
+      const blockerReason = status === "blocked" ? (window.prompt("Blocker: missing_angle, missing_title, missing_target_duration, rights_review_needed, insufficient_brief, manual_review_requested, other", "manual_review_requested") || "manual_review_requested") : null;
+      try {
+        await api(`/api/channel-agent/production/${id}/status`, {method: "POST", body: JSON.stringify({status, blocker_reason: blockerReason})});
+        await showProductionItem(id); await loadProductionQueue();
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+  document.querySelectorAll("[data-production-task-status]").forEach(button => {
+    button.onclick = async () => {
+      const taskId = Number(button.dataset.productionTaskId);
+      const status = button.dataset.productionTaskStatus;
+      const note = status === "blocked" ? (window.prompt("Task blocker note", "Manual review required") || "Manual review required") : null;
+      try {
+        await api(`/api/channel-agent/production/${id}/tasks/${taskId}/status`, {method: "POST", body: JSON.stringify({status, note})});
+        await showProductionItem(id); await loadProductionQueue();
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+  document.querySelectorAll("[data-production-task-notes]").forEach(button => {
+    button.onclick = async () => {
+      const taskId = Number(button.dataset.productionTaskNotes);
+      const current = item.tasks.find(task => task.id === taskId)?.manual_notes || "";
+      const notes = window.prompt("Manual planning notes", current);
+      if (notes == null) return;
+      try {
+        await api(`/api/channel-agent/production/${id}/tasks/${taskId}`, {method: "PATCH", body: JSON.stringify({manual_notes: notes})});
+        await showProductionItem(id);
+      } catch (error) { $("#production-message").textContent = error.message; }
+    };
+  });
+}
+
+$("#production-refresh-list").onclick = loadProductionQueue;
+["status", "rights", "format"].forEach(name => {
+  $(`#production-${name}-filter`).onchange = loadProductionQueue;
+});
+$("#production-min-priority").onchange = loadProductionQueue;
 
 // ---------------- Content OS ----------------
 let contentOSProjects = [];

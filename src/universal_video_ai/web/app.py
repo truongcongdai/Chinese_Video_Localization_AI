@@ -92,6 +92,7 @@ from universal_video_ai.config import (
     YOUTUBE_RESEARCH_HTTP_TIMEOUT,
     YOUTUBE_RESEARCH_MAX_CONCURRENT_JOBS,
     YOUTUBE_RESEARCH_MAX_RESULTS,
+    is_ai_channel_agent_enabled,
 )
 from universal_video_ai.analytics.youtube_research import YtDlpYouTubeResearchCollector
 from universal_video_ai.database import DatabaseManager, YouTubeResearchRepository
@@ -109,6 +110,7 @@ from .auth import (
 )
 from . import oauth as oauth_module
 from . import identity_oauth
+from .channel_agent_router import router as channel_agent_router
 from .content_os_router import router as content_os_router
 from .youtube_research import router as youtube_research_router
 
@@ -187,6 +189,7 @@ DEFAULT_OLLAMA_TRANSLATION_MODEL = "qwen3:1.7b"
 TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
+app.state.store = store
 youtube_research_database = DatabaseManager(_DB_PATH)
 youtube_research_database.init_schema()
 app.state.youtube_research_repository = YouTubeResearchRepository(
@@ -945,6 +948,9 @@ def bootstrap():
         "identity_providers": {
             name: identity_oauth.get_identity_oauth_client(name).is_configured()
             for name in ("google", "github", "facebook")
+        },
+        "features": {
+            "ai_channel_agent": is_ai_channel_agent_enabled(),
         },
     }
 
@@ -7325,13 +7331,19 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
             access_token=result.access_token, refresh_token=result.refresh_token,
             expires_at=result.expires_at, account_name=result.account_name,
             account_ref=result.account_ref,
+            scopes=result.scopes,
         )
         label = result.account_name or "tài khoản của bạn"
         return HTMLResponse(
             close_html.format(message=f"✓ Đã kết nối {platform} ({label}). Có thể đóng cửa sổ này."))
     except Exception as exc:
         logger.exception("OAuth callback failed for platform=%s", platform)
-        return HTMLResponse(close_html.format(message=f"Kết nối thất bại: {exc}"), status_code=400)
+        return HTMLResponse(
+            close_html.format(
+                message="Kết nối thất bại. Vui lòng thử lại hoặc kiểm tra cấu hình OAuth."
+            ),
+            status_code=400,
+        )
 
 
 @app.delete("/api/social/connections/{platform}")
@@ -7577,3 +7589,4 @@ async def _submit_research_localization(
 app.state.youtube_research_submit_localization = _submit_research_localization
 app.include_router(youtube_research_router)
 app.include_router(content_os_router)
+app.include_router(channel_agent_router)
