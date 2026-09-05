@@ -4664,8 +4664,114 @@ function productionBriefView(brief) {
     ${refs.length ? `<ul>${refs.map(ref => `<li>${ref.url ? `<a href="${escapeHtml(ref.url)}" target="_blank" rel="noopener">${escapeHtml(ref.evidence_id)}</a>` : escapeHtml(ref.evidence_id)} · ${escapeHtml(ref.label || ref.type)}</li>`).join("")}</ul>` : '<p class="muted-help">No linkable references; brief uses stored evidence-only context.</p>'}`;
 }
 
+function productionAssetWorkspace(assets, jobs, assetPackage) {
+  const latest = ContentProductionUI.latestByType(assets);
+  const blueprint = latest["script_blueprint:"];
+  const sections = ContentProductionUI.sectionRows(blueprint, assets);
+  const sectionTable = sections.length ? channelAgentTable(
+    ["#", "Title", "Words", "Duration", "Complete", "Version", "Status", "Actions"],
+    sections.map(section => [
+      section.section_index, section.title,
+      String(section.actual_words) + " / " + String(section.target_words),
+      String(section.estimated_duration_minutes) + " / " + String(section.target_duration_minutes) + " min",
+      String(section.completion_percentage) + "%",
+      section.version ? "v" + String(section.version) : "-",
+      String(section.status).toUpperCase(),
+      '<button class="btn secondary small" data-production-section="' + section.section_index
+        + '" data-section-action="' + (section.assetId ? "regenerate" : "generate") + '">'
+        + (section.assetId ? "Regenerate" : "Generate") + "</button>",
+    ]), [7]
+  ) : '<p class="muted-help">Generate a blueprint to create section budgets.</p>';
+  const versionRow = asset => [
+    asset.asset_type + (asset.asset_key ? " #" + asset.asset_key : ""),
+    "v" + asset.version, String(asset.status).toUpperCase(),
+    new Date(asset.created_at * 1000).toLocaleString(),
+    '<details><summary>Inspect</summary><pre class="code-box">'
+      + escapeHtml(JSON.stringify(asset.payload, null, 2)) + "</pre></details>",
+    ["script_draft", "visual_plan", "voice_plan", "thumbnail_brief", "metadata_package"].includes(asset.asset_type)
+      ? (asset.status === "draft"
+        ? '<button class="btn gradient small" data-production-review="' + asset.id + '">Submit for review</button> '
+          + '<button class="btn secondary small" data-production-reject="' + asset.id + '">Reject</button>'
+        : asset.status === "review"
+          ? '<button class="btn gradient small" data-production-approve="' + asset.id + '">Approve</button> '
+            + '<button class="btn secondary small" data-production-reject="' + asset.id + '">Reject</button>'
+          : "-")
+      : "-",
+  ];
+  const versionPanels = [
+    ["script_blueprint", "Script Blueprint"],
+    ["script_section", "Script Sections"],
+    ["script_draft", "Script Draft"],
+    ["visual_plan", "Visual Plan"],
+    ["voice_plan", "Voice Plan"],
+    ["thumbnail_brief", "Thumbnail Brief"],
+    ["metadata_package", "Metadata Package"],
+  ].map(([assetType, label]) => {
+    const rows = (assets || []).filter(asset => asset.asset_type === assetType).map(versionRow);
+    return '<section class="production-asset-panel" data-production-asset-panel="' + assetType + '">'
+      + "<h4>" + label + " Version History</h4>"
+      + (rows.length ? channelAgentTable(
+        ["Asset", "Version", "Status", "Created", "Payload", "Review"], rows, [4, 5])
+        : '<p class="muted-help">No ' + label + " versions yet.</p>")
+      + "</section>";
+  }).join("");
+  const jobRows = (jobs || []).map(job => [
+    job.id, job.job_type, String(job.status).toUpperCase(), job.current_stage || "-",
+    job.current_section || "-", String(job.completed_sections) + " / " + String(job.total_sections),
+    String(job.progress) + "%", job.error || "-",
+  ]);
+  return '<div id="production-assets-workspace" style="border-top:1px solid var(--border);margin-top:24px;padding-top:18px">'
+    + "<h4>CP7A Script &amp; Asset Production</h4>"
+    + '<p class="muted-help">Versioned planning assets only. No media download, TTS, rendering, upload, or publishing.</p>'
+    + "<h4>QA / Asset Package</h4>"
+    + '<p><strong>Readiness:</strong> ' + escapeHtml(ContentProductionUI.readinessLabel(assetPackage)) + "</p>"
+    + '<details><summary>Inspect readiness reasons and approved versions</summary><pre class="code-box">'
+    + escapeHtml(JSON.stringify(assetPackage || {}, null, 2)) + "</pre></details>"
+    + '<div class="button-row">'
+    + '<button class="btn gradient small" id="production-generate-blueprint">Generate Blueprint</button> '
+    + '<button class="btn secondary small" id="production-resume-script">Resume Missing Sections</button> '
+    + '<button class="btn secondary small" id="production-assemble-script">Assemble Draft</button> '
+    + '<button class="btn secondary small" data-production-generate-asset="visual-plan">Visual Plan</button> '
+    + '<button class="btn secondary small" data-production-generate-asset="voice-plan">Voice Plan</button> '
+    + '<button class="btn secondary small" data-production-generate-asset="thumbnail-brief">Thumbnail Brief</button> '
+    + '<button class="btn secondary small" data-production-generate-asset="metadata-package">Metadata</button> '
+    + '<button class="btn gradient small" id="production-run-asset-qa">Run QA</button></div>'
+    + "<h4>Script Blueprint</h4>"
+    + (blueprint ? "<p>Blueprint v" + blueprint.version + " | "
+      + blueprint.payload.section_count + " sections | "
+      + blueprint.payload.target_total_words + " words | "
+      + blueprint.payload.target_duration_minutes + " min at "
+      + blueprint.payload.narration_wpm + " WPM</p>" : "")
+    + "<h4>Script Sections</h4>" + sectionTable
+    + versionPanels
+    + "<h4>Generation progress</h4>"
+    + (jobRows.length ? channelAgentTable(
+      ["Job", "Type", "Status", "Stage", "Section", "Completed", "Progress", "Error"],
+      jobRows) : '<p class="muted-help">No persistent generation jobs yet.</p>')
+    + "</div>";
+}
+
+async function runProductionAssetAction(button, operation, id) {
+  button.disabled = true;
+  try {
+    await operation();
+    $("#production-message").textContent = "CP7A production asset state updated.";
+    await showProductionItem(id);
+    await loadProductionQueue();
+  } catch (error) {
+    $("#production-message").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function showProductionItem(id) {
   const item = await api(`/api/channel-agent/production/${id}`);
+  const [assets, jobs, assetPackage] = await Promise.all([
+    api("/api/channel-agent/production/" + id + "/assets"),
+    api("/api/channel-agent/production/" + id + "/generation-jobs"),
+    api("/api/channel-agent/production/" + id + "/asset-package"),
+  ]);
   const detail = $("#production-detail");
   detail.classList.remove("hidden");
   detail.innerHTML = `
@@ -4691,6 +4797,61 @@ async function showProductionItem(id) {
     <h4>Status actions</h4><div>${productionItemActions(item)}</div>
     ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
     <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
+
+  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(assets, jobs, assetPackage));
+  $("#production-generate-blueprint").onclick = button => runProductionAssetAction(
+    button.currentTarget,
+    () => api("/api/channel-agent/production/" + id + "/assets/script/blueprints", {
+      method: "POST", body: JSON.stringify({}),
+    }), id);
+  $("#production-resume-script").onclick = button => runProductionAssetAction(
+    button.currentTarget,
+    () => api("/api/channel-agent/production/" + id + "/assets/script/resume", {
+      method: "POST",
+    }), id);
+  $("#production-assemble-script").onclick = button => runProductionAssetAction(
+    button.currentTarget,
+    () => api("/api/channel-agent/production/" + id + "/assets/script/drafts", {
+      method: "POST",
+    }), id);
+  $("#production-run-asset-qa").onclick = button => runProductionAssetAction(
+    button.currentTarget,
+    () => api("/api/channel-agent/production/" + id + "/qa", {method: "POST"}), id);
+  document.querySelectorAll("[data-production-section]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button, () => {
+      const suffix = button.dataset.sectionAction === "regenerate" ? "/regenerate" : "";
+      return api("/api/channel-agent/production/" + id + "/assets/script/sections/"
+        + button.dataset.productionSection + suffix, {
+          method: "POST", body: JSON.stringify({}),
+        });
+    }, id);
+  });
+  document.querySelectorAll("[data-production-generate-asset]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button,
+      () => api("/api/channel-agent/production/" + id + "/assets/generate/"
+        + button.dataset.productionGenerateAsset, {method: "POST"}), id);
+  });
+  document.querySelectorAll("[data-production-approve]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button,
+      () => api("/api/channel-agent/production/" + id + "/assets/"
+        + button.dataset.productionApprove + "/approve", {
+          method: "POST", body: JSON.stringify({}),
+        }), id);
+  });
+  document.querySelectorAll("[data-production-review]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button,
+      () => api("/api/channel-agent/production/" + id + "/assets/"
+        + button.dataset.productionReview + "/review", {
+          method: "POST", body: JSON.stringify({}),
+        }), id);
+  });
+  document.querySelectorAll("[data-production-reject]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button,
+      () => api("/api/channel-agent/production/" + id + "/assets/"
+        + button.dataset.productionReject + "/reject", {
+          method: "POST", body: JSON.stringify({}),
+        }), id);
+  });
 
   $("#production-item-save").onclick = async () => {
     try {

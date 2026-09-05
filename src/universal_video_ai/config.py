@@ -181,6 +181,38 @@ def channel_agent_brain_settings() -> dict[str, object]:
         },
     }
 
+
+def channel_agent_production_settings() -> dict[str, object]:
+    """Bounded CP7A generation and deterministic word-budget settings."""
+
+    brain = channel_agent_brain_settings()
+    return {
+        "timeout_seconds": min(
+            900, _env_int("CHANNEL_AGENT_PRODUCTION_TIMEOUT_SECONDS", 300, minimum=30)
+        ),
+        "narration_wpm": _env_int("CHANNEL_AGENT_PRODUCTION_WPM", 145, minimum=80),
+        "minimum_word_ratio": _env_float(
+            "CHANNEL_AGENT_PRODUCTION_MIN_WORD_RATIO", 0.80, 0.50, 1.0
+        ),
+        "max_continuations": min(
+            6, _env_int("CHANNEL_AGENT_PRODUCTION_MAX_CONTINUATIONS", 5, minimum=0)
+        ),
+        "temperature": _env_float(
+            "CHANNEL_AGENT_PRODUCTION_TEMPERATURE", 0.35, 0.0, 1.0
+        ),
+        "repair_temperature": float(brain["repair_temperature"]),
+        "top_p": float(brain["top_p"]),
+        "blueprint_num_predict": min(
+            4000, _env_int("CHANNEL_AGENT_PRODUCTION_BLUEPRINT_NUM_PREDICT", 1800, minimum=512)
+        ),
+        "section_num_predict": min(
+            6000, _env_int("CHANNEL_AGENT_PRODUCTION_SECTION_NUM_PREDICT", 2400, minimum=1024)
+        ),
+        "asset_num_predict": min(
+            6000, _env_int("CHANNEL_AGENT_PRODUCTION_ASSET_NUM_PREDICT", 2600, minimum=512)
+        ),
+    }
+
 # AI Content OS Feature Flag
 CONTENT_OS_ENABLED = _env_bool("CONTENT_OS_ENABLED", False)
 CONTENT_OS_MAX_AUTO_REVISIONS = _env_int("CONTENT_OS_MAX_AUTO_REVISIONS", 1, minimum=0)

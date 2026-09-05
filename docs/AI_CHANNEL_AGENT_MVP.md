@@ -1026,6 +1026,28 @@ script/commentary and sequence using owned, licensed, or permitted visuals.
 8. Verify no source download, legacy localization job, render, upload, or
    publishing action occurs anywhere in the flow.
 
-## Next checkpoint
+## CP7A - Script & Asset Production Execution
+
+CP7A extends each CP6 Production Item with immutable, versioned planning
+assets: Script Blueprint, independently generated Script Sections,
+deterministically assembled Script Draft, Visual Plan, Voice Plan, Thumbnail
+Brief, and Metadata Package. Durable jobs record progress and errors. Resume
+uses acceptable persisted sections and generates only missing or failed ones.
+
+Word budgets derive from target duration (145 WPM by default). Undersized
+sections receive bounded continuations, and drafts below the configured
+minimum ratio (80% by default) cannot be approved. Regeneration always creates
+a new version. Only explicit approval of an exact Script Draft version
+completes the existing CP6 SCRIPT task and unlocks its dependents.
+
+Visual plans accept only original, owned, licensed, public-domain, or
+manual/diagram/map/text-card strategies. Competitor material remains
+reference-only. Asset readiness and rights readiness remain separate.
+
+CP7A stores text/JSON planning artifacts only. It does not download competitor
+media, synthesize final audio, create a thumbnail image, render video, upload,
+schedule, or publish.
+
+## Next checkpoint: CP7B - Render Pipeline Integration
 
 **CP7 — Production Execution**

@@ -40,5 +40,48 @@
     return [];
   }
 
-  return Object.freeze({activeStatuses, itemTransitions, listQuery, progressLabel, taskActions});
+  function latestByType(assets) {
+    const latest = {};
+    (assets || []).forEach(asset => {
+      const key = asset.asset_type + ":" + (asset.asset_key || "");
+      if (!latest[key] || Number(asset.version) > Number(latest[key].version)) latest[key] = asset;
+    });
+    return latest;
+  }
+
+  function sectionRows(blueprint, assets) {
+    if (!blueprint?.payload?.sections) return [];
+    const latest = latestByType((assets || []).filter(asset =>
+      asset.asset_type === "script_section"
+      && (!blueprint.id || Number(asset.payload?.blueprint_asset_id) === Number(blueprint.id))
+    ));
+    return blueprint.payload.sections.map(section => {
+      const key = "script_section:" + String(section.section_index).padStart(2, "0");
+      const asset = latest[key];
+      return {
+        ...section,
+        assetId: asset?.id || null,
+        version: asset?.version || null,
+        status: asset?.status || "missing",
+        actual_words: asset?.payload?.actual_words || 0,
+        estimated_duration_minutes: asset?.payload?.estimated_duration_minutes || 0,
+        completion_percentage: asset?.payload?.completion_percentage || 0,
+      };
+    });
+  }
+
+  function readinessLabel(assetPackage) {
+    if (!assetPackage) return "Not evaluated";
+    return [
+      "planning " + (assetPackage.planning_ready ? "ready" : "not ready"),
+      "assets " + (assetPackage.asset_ready ? "ready" : "not ready"),
+      "QA " + (assetPackage.qa_status || "pending"),
+      "rights " + (assetPackage.rights_ready ? "ready" : assetPackage.rights_gate),
+    ].join(" | ");
+  }
+
+  return Object.freeze({
+    activeStatuses, itemTransitions, listQuery, progressLabel, taskActions,
+    latestByType, sectionRows, readinessLabel,
+  });
 }));

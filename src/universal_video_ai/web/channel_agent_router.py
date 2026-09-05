@@ -44,6 +44,12 @@ from universal_video_ai.channel_agent.production import (
     ProductionNotFound,
     ProductionQueueService,
 )
+from universal_video_ai.channel_agent.production_assets import (
+    ASSET_TYPES,
+    ProductionAssetError,
+    ProductionAssetNotFound,
+    ProductionAssetService,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -202,6 +208,25 @@ class ProductionTaskStatusBody(BaseModel):
     note: Optional[str] = None
 
 
+class ProductionBlueprintBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    duration_minutes: Optional[float] = None
+    narration_wpm: Optional[int] = None
+
+
+class ProductionSectionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    blueprint_asset_id: Optional[int] = None
+
+
+class ProductionAssetReviewBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: Optional[str] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -268,6 +293,38 @@ def _opportunity_service(store: Store) -> ContentOpportunityService:
 
 def _production_service(store: Store) -> ProductionQueueService:
     return ProductionQueueService(store)
+
+
+def _production_asset_service(store: Store) -> ProductionAssetService:
+    settings = config.channel_agent_production_settings()
+    brain = config.channel_agent_brain_settings()
+    provider = OllamaProvider(
+        enabled=bool(brain["enabled"]),
+        base_url=str(brain["base_url"]),
+        model=str(brain["model"]),
+        timeout_seconds=float(settings["timeout_seconds"]),
+    )
+    return ProductionAssetService(
+        store, provider,
+        narration_wpm=int(settings["narration_wpm"]),
+        minimum_word_ratio=float(settings["minimum_word_ratio"]),
+        max_continuations=int(settings["max_continuations"]),
+        temperature=float(settings["temperature"]),
+        repair_temperature=float(settings["repair_temperature"]),
+        top_p=float(settings["top_p"]),
+        blueprint_num_predict=int(settings["blueprint_num_predict"]),
+        section_num_predict=int(settings["section_num_predict"]),
+        asset_num_predict=int(settings["asset_num_predict"]),
+    )
+
+
+def _production_asset_call(call: Any) -> Any:
+    try:
+        return call()
+    except ProductionAssetNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionAssetError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 def _validate_trend_query(data: dict[str, Any]) -> dict[str, Any]:
@@ -720,6 +777,223 @@ def production_events(
 ) -> list[dict[str, Any]]:
     _require_enabled()
     return production_item_detail(item_id, user_id, store)["events"]
+
+
+@router.get("/production/{item_id}/assets")
+def production_assets(
+    item_id: int, asset_type: Optional[str] = None, asset_key: Optional[str] = None,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    if asset_type and asset_type not in ASSET_TYPES:
+        raise HTTPException(422, "Unsupported production asset type.")
+    return _production_asset_call(lambda: _production_asset_service(store).list_assets(
+        user_id, item_id, asset_type=asset_type, asset_key=asset_key))
+
+
+@router.get("/production/{item_id}/assets/{asset_id}")
+def production_asset_detail(
+    item_id: int, asset_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).get_asset(user_id, item_id, asset_id))
+
+
+@router.post("/production/{item_id}/assets/script/blueprints")
+def generate_script_blueprint(
+    item_id: int, body: ProductionBlueprintBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).generate_blueprint(
+        user_id, item_id, **body.model_dump(exclude_unset=True)))
+
+
+@router.get("/production/{item_id}/assets/script/blueprints")
+def script_blueprint_versions(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).list_assets(
+        user_id, item_id, asset_type="script_blueprint"))
+
+
+@router.post("/production/{item_id}/assets/script/sections/{section_index}")
+def generate_script_section(
+    item_id: int, section_index: int, body: ProductionSectionBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).generate_section(
+        user_id, item_id, section_index, **body.model_dump(exclude_unset=True)))
+
+
+@router.post("/production/{item_id}/assets/script/sections/{section_index}/regenerate")
+def regenerate_script_section(
+    item_id: int, section_index: int, body: ProductionSectionBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return generate_script_section(item_id, section_index, body, user_id, store)
+
+
+@router.get("/production/{item_id}/assets/script/sections/{section_index}")
+def script_section_versions(
+    item_id: int, section_index: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).list_assets(
+        user_id, item_id, asset_type="script_section", asset_key=f"{section_index:02d}"))
+
+
+@router.post("/production/{item_id}/assets/script/resume")
+def resume_script_generation(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).resume_script(user_id, item_id))
+
+
+@router.post("/production/{item_id}/assets/script/drafts")
+def assemble_script_draft(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).assemble_script(user_id, item_id))
+
+
+@router.get("/production/{item_id}/assets/script/drafts")
+def script_draft_versions(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).list_assets(
+        user_id, item_id, asset_type="script_draft"))
+
+
+@router.post("/production/{item_id}/assets/{asset_id}/approve")
+def approve_production_asset(
+    item_id: int, asset_id: int, body: ProductionAssetReviewBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).review_asset(
+        user_id, item_id, asset_id, decision="approved", note=body.note))
+
+
+@router.post("/production/{item_id}/assets/{asset_id}/review")
+def submit_production_asset_for_review(
+    item_id: int, asset_id: int, body: ProductionAssetReviewBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).submit_for_review(
+        user_id, item_id, asset_id, note=body.note))
+
+
+@router.post("/production/{item_id}/assets/{asset_id}/reject")
+def reject_production_asset(
+    item_id: int, asset_id: int, body: ProductionAssetReviewBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).review_asset(
+        user_id, item_id, asset_id, decision="rejected", note=body.note))
+
+
+def _generate_asset_route(
+    item_id: int, asset_type: str, user_id: int, store: Store,
+) -> dict[str, Any]:
+    service = _production_asset_service(store)
+    method = {
+        "visual-plan": service.generate_visual_plan,
+        "voice-plan": service.generate_voice_plan,
+        "thumbnail-brief": service.generate_thumbnail_brief,
+        "metadata-package": service.generate_metadata_package,
+    }[asset_type]
+    return _production_asset_call(lambda: method(user_id, item_id))
+
+
+@router.post("/production/{item_id}/assets/generate/{asset_type}")
+def generate_production_asset(
+    item_id: int, asset_type: str,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if asset_type not in {
+        "visual-plan", "voice-plan", "thumbnail-brief", "metadata-package"
+    }:
+        raise HTTPException(422, "Unsupported generated production asset.")
+    return _generate_asset_route(item_id, asset_type, user_id, store)
+
+
+@router.get("/production/{item_id}/generation-jobs")
+def production_generation_jobs(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).list_jobs(user_id, item_id))
+
+
+@router.get("/production/{item_id}/generation-jobs/{job_id}")
+def production_generation_job(
+    item_id: int, job_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).get_job(user_id, item_id, job_id))
+
+
+@router.get("/production/{item_id}/asset-package")
+def production_asset_package(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).package(user_id, item_id))
+
+
+@router.get("/production/{item_id}/qa")
+def inspect_production_asset_qa(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(
+        lambda: _production_asset_service(store).inspect_qa(user_id, item_id))
+
+
+@router.post("/production/{item_id}/qa")
+def run_production_asset_qa(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_asset_call(lambda: _production_asset_service(store).inspect_qa(
+        user_id, item_id, complete_task=True))
 
 
 @router.get("/youtube/status")

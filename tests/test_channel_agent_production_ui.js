@@ -61,3 +61,57 @@ test("UI distinguishes planning from rights and exposes no publish action", () =
   assert.match(appSource, /Idea approval is not source-media permission/);
   assert.doesNotMatch(html.slice(html.indexOf('id="production-queue"'), html.indexOf("<!-- Content OS Panel -->")), /Publish|Upload|Render/);
 });
+
+test("CP7A section rows retain latest versions and budget metrics", () => {
+  const blueprint = {id: 20, payload: {sections: [
+    {section_index: 1, title: "Opening", target_words: 1000, target_duration_minutes: 7},
+    {section_index: 2, title: "Conflict", target_words: 1100, target_duration_minutes: 8},
+  ]}};
+  const rows = UI.sectionRows(blueprint, [
+    {id: 10, asset_type: "script_section", asset_key: "01", version: 1, status: "draft",
+      payload: {blueprint_asset_id: 20, actual_words: 850, estimated_duration_minutes: 5.9, completion_percentage: 85}},
+    {id: 11, asset_type: "script_section", asset_key: "01", version: 2, status: "review",
+      payload: {blueprint_asset_id: 20, actual_words: 1020, estimated_duration_minutes: 7, completion_percentage: 102}},
+    {id: 12, asset_type: "script_section", asset_key: "02", version: 3, status: "draft",
+      payload: {blueprint_asset_id: 19, actual_words: 9999, estimated_duration_minutes: 99,
+        completion_percentage: 999}},
+  ]);
+  assert.equal(rows[0].assetId, 11);
+  assert.equal(rows[0].version, 2);
+  assert.equal(rows[0].actual_words, 1020);
+  assert.equal(rows[1].status, "missing");
+});
+
+test("CP7A readiness keeps asset and rights state separate", () => {
+  const label = UI.readinessLabel({
+    planning_ready: true, asset_ready: true, qa_status: "approved",
+    rights_ready: false, rights_gate: "research_only",
+  });
+  assert.match(label, /assets ready/);
+  assert.match(label, /QA approved/);
+  assert.match(label, /rights research_only/);
+});
+
+test("Production Queue integrates CP7A controls without client user_id", () => {
+  assert.match(appSource, /CP7A Script &amp; Asset Production/);
+  assert.match(appSource, /assets\/script\/blueprints/);
+  assert.match(appSource, /assets\/script\/resume/);
+  assert.match(appSource, /assets\/script\/drafts/);
+  assert.match(appSource, /data-production-approve/);
+  assert.match(appSource, /data-production-review/);
+  assert.match(appSource, /production-run-asset-qa/);
+  for (const panel of [
+    "script_blueprint", "script_section", "script_draft", "visual_plan",
+    "voice_plan", "thumbnail_brief", "metadata_package",
+  ]) {
+    assert.match(appSource, new RegExp('\\["' + panel + '",'));
+  }
+  assert.match(appSource, /class="production-asset-panel"/);
+  assert.match(appSource, /QA \/ Asset Package/);
+  const section = appSource.slice(
+    appSource.indexOf("function productionAssetWorkspace"),
+    appSource.indexOf("// ---------------- Content OS"),
+  );
+  assert.doesNotMatch(section, /user_id/);
+  assert.doesNotMatch(section, /final TTS created|render final|publish video/i);
+});
