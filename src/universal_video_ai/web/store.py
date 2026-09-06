@@ -618,6 +618,119 @@ CREATE TABLE IF NOT EXISTS production_publishing_jobs (
 CREATE INDEX IF NOT EXISTS idx_production_publishing_jobs_owner
     ON production_publishing_jobs(user_id, production_item_id, updated_at DESC);
 
+-- CP9 immutable YouTube performance history and human-controlled learning.
+-- Nullable metric columns deliberately distinguish unavailable data from zero.
+CREATE TABLE IF NOT EXISTS video_performance_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    publishing_job_id INTEGER NOT NULL,
+    youtube_video_id TEXT NOT NULL,
+    captured_at REAL NOT NULL,
+    video_published_at REAL,
+    video_age_hours REAL NOT NULL,
+    evaluation_window_hours REAL NOT NULL,
+    content_type TEXT,
+    duration_seconds REAL,
+    duration_bucket TEXT,
+    views INTEGER,
+    impressions INTEGER,
+    impressions_ctr REAL,
+    watch_time_minutes REAL,
+    average_view_duration_seconds REAL,
+    average_view_percentage REAL,
+    likes INTEGER,
+    comments INTEGER,
+    subscribers_gained INTEGER,
+    subscribers_lost INTEGER,
+    retention_available INTEGER NOT NULL DEFAULT 0,
+    retention_json TEXT NOT NULL DEFAULT '[]',
+    traffic_sources_json TEXT,
+    device_types_json TEXT,
+    countries_json TEXT,
+    audience_segments_json TEXT,
+    playlist_sources_json TEXT,
+    data_quality_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_video_performance_owner_job
+    ON video_performance_snapshots(user_id, publishing_job_id, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_video_performance_baseline
+    ON video_performance_snapshots(user_id, channel_id, content_type, duration_bucket, video_age_hours);
+
+CREATE TABLE IF NOT EXISTS content_learning_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    publishing_job_id INTEGER NOT NULL,
+    snapshot_id INTEGER NOT NULL,
+    dimension TEXT NOT NULL,
+    status TEXT NOT NULL,
+    score REAL,
+    confidence REAL NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    source_metrics_json TEXT NOT NULL DEFAULT '[]',
+    time_window_hours REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_content_learning_signals_owner
+    ON content_learning_signals(user_id, channel_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_content_learning_signals_snapshot_dimension
+    ON content_learning_signals(user_id, snapshot_id, dimension);
+
+CREATE TABLE IF NOT EXISTS video_learning_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    publishing_job_id INTEGER NOT NULL,
+    youtube_video_id TEXT NOT NULL,
+    snapshot_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    evaluation_window_hours REAL NOT NULL,
+    status TEXT NOT NULL,
+    performance_summary_json TEXT NOT NULL,
+    strengths_json TEXT NOT NULL DEFAULT '[]',
+    weaknesses_json TEXT NOT NULL DEFAULT '[]',
+    likely_causes_json TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL,
+    recommendations_json TEXT NOT NULL DEFAULT '[]',
+    llm_status TEXT NOT NULL DEFAULT 'not_run',
+    llm_analysis_json TEXT,
+    created_at REAL NOT NULL,
+    UNIQUE(user_id, publishing_job_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_video_learning_reports_owner
+    ON video_learning_reports(user_id, publishing_job_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS learning_recommendation_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    report_id INTEGER NOT NULL,
+    recommendation_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    note TEXT,
+    created_at REAL NOT NULL,
+    UNIQUE(user_id, report_id, recommendation_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_learning_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    patterns_json TEXT NOT NULL DEFAULT '{}',
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    decay_half_life_days REAL NOT NULL DEFAULT 180,
+    generated_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_learning_profiles_owner
+    ON channel_learning_profiles(user_id, channel_id);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3794,6 +3907,298 @@ class Store:
                 [*payload.values(), job_id, item_id, user_id],
             )
             return cur.rowcount > 0
+
+    # ---- Channel Agent CP9 feedback and learning ----
+    @staticmethod
+    def _json_value(value: Any, default: Any) -> Any:
+        try:
+            return json.loads(value) if value not in (None, "") else default
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+
+    @classmethod
+    def _performance_snapshot_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target, default in (
+            ("retention_json", "retention", []),
+            ("traffic_sources_json", "traffic_sources", None),
+            ("device_types_json", "device_types", None),
+            ("countries_json", "countries", None),
+            ("audience_segments_json", "audience_segments", None),
+            ("playlist_sources_json", "playlist_sources", None),
+            ("data_quality_json", "data_quality", {}),
+        ):
+            result[target] = cls._json_value(result.pop(source, None), default)
+        result["retention_available"] = bool(result.get("retention_available"))
+        return result
+
+    _CP9_SNAPSHOT_SCALARS = (
+        "channel_id", "production_item_id", "publishing_job_id", "youtube_video_id",
+        "captured_at", "video_published_at", "video_age_hours", "evaluation_window_hours",
+        "content_type", "duration_seconds", "duration_bucket", "views", "impressions",
+        "impressions_ctr", "watch_time_minutes", "average_view_duration_seconds",
+        "average_view_percentage", "likes", "comments", "subscribers_gained", "subscribers_lost",
+    )
+    _CP9_SNAPSHOT_JSON = (
+        "retention", "traffic_sources", "device_types", "countries",
+        "audience_segments", "playlist_sources", "data_quality",
+    )
+
+    def _performance_snapshot_insert_parts(self, user_id: int, data: Dict[str, Any]) -> tuple[list, list]:
+        columns = ["user_id", *self._CP9_SNAPSHOT_SCALARS, "retention_available",
+                   *(field + "_json" for field in self._CP9_SNAPSHOT_JSON)]
+        values = [user_id, *(data.get(field) for field in self._CP9_SNAPSHOT_SCALARS),
+                  int(bool(data.get("retention_available"))),
+                  *(None if data.get(field) is None else json.dumps(
+                      data.get(field), ensure_ascii=False, sort_keys=True)
+                    for field in self._CP9_SNAPSHOT_JSON)]
+        return columns, values
+
+    @staticmethod
+    def _performance_linked(conn: sqlite3.Connection, user_id: int, data: Dict[str, Any]) -> bool:
+        return bool(conn.execute(
+            "SELECT 1 FROM production_publishing_jobs WHERE id=? AND production_item_id=? "
+            "AND user_id=? AND external_video_id=? AND channel_id=?",
+            (data["publishing_job_id"], data["production_item_id"], user_id,
+             data["youtube_video_id"], data["channel_id"])).fetchone())
+
+    def insert_video_performance_snapshot(self, user_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
+        columns, values = self._performance_snapshot_insert_parts(user_id, data)
+        with self._connect() as conn:
+            if not self._performance_linked(conn, user_id, data):
+                raise ValueError("Publishing linkage does not belong to this owner.")
+            cur = conn.execute("INSERT INTO video_performance_snapshots (" + ",".join(columns)
+                + ") VALUES (" + ",".join("?" for _ in columns) + ")", values)
+            snapshot_id = int(cur.lastrowid)
+        result = self.get_video_performance_snapshot(user_id, snapshot_id)
+        if not result:
+            raise RuntimeError("Performance snapshot insert failed.")
+        return result
+
+    def get_video_performance_snapshot(self, user_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM video_performance_snapshots WHERE id=? AND user_id=?",
+                (snapshot_id, user_id)).fetchone()
+        return self._performance_snapshot_dict(row) if row else None
+
+    def list_video_performance_snapshots(self, user_id: int, *,
+                                         publishing_job_id: Optional[int] = None,
+                                         channel_id: Optional[str] = None,
+                                         limit: int = 500) -> List[Dict[str, Any]]:
+        clauses, values = ["user_id=?"], [user_id]
+        if publishing_job_id is not None:
+            clauses.append("publishing_job_id=?"); values.append(publishing_job_id)
+        if channel_id is not None:
+            clauses.append("channel_id=?"); values.append(channel_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM video_performance_snapshots WHERE " + " AND ".join(clauses)
+                + " ORDER BY captured_at DESC,id DESC LIMIT ?",
+                [*values, min(2000, max(1, limit))]).fetchall()
+        return [self._performance_snapshot_dict(row) for row in rows]
+
+    @classmethod
+    def _learning_signal_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["evidence"] = cls._json_value(result.pop("evidence_json", None), [])
+        result["source_metrics"] = cls._json_value(
+            result.pop("source_metrics_json", None), [])
+        return result
+
+    def replace_content_learning_signals(
+        self, user_id: int, snapshot: Dict[str, Any], signals: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        created = time.time()
+        with self._connect() as conn:
+            for signal in signals:
+                conn.execute(
+                    "INSERT OR IGNORE INTO content_learning_signals (user_id,channel_id,production_item_id,"
+                    "publishing_job_id,snapshot_id,dimension,status,score,confidence,evidence_json,"
+                    "source_metrics_json,time_window_hours,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (user_id, snapshot["channel_id"], snapshot["production_item_id"],
+                     snapshot["publishing_job_id"], snapshot["id"], signal["dimension"],
+                     signal["status"], signal.get("score"), signal["confidence"],
+                     json.dumps(signal.get("evidence") or [], ensure_ascii=False),
+                     json.dumps(signal.get("source_metrics") or [], ensure_ascii=False),
+                     snapshot["evaluation_window_hours"], created))
+            rows = conn.execute(
+                "SELECT * FROM content_learning_signals WHERE snapshot_id=? AND user_id=? ORDER BY id",
+                (snapshot["id"], user_id)).fetchall()
+        return [self._learning_signal_dict(row) for row in rows]
+
+    def list_content_learning_signals(self, user_id: int,
+                                      snapshot_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_learning_signals WHERE snapshot_id=? AND user_id=? ORDER BY id",
+                (snapshot_id, user_id)).fetchall()
+        return [self._learning_signal_dict(row) for row in rows]
+
+    @classmethod
+    def _learning_report_dict(
+        cls, row: Any, actions: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target, default in (
+            ("performance_summary_json", "performance_summary", {}),
+            ("strengths_json", "strengths", []),
+            ("weaknesses_json", "weaknesses", []),
+            ("likely_causes_json", "likely_causes", []),
+            ("recommendations_json", "recommendations", []),
+            ("llm_analysis_json", "llm_analysis", None),
+        ):
+            result[target] = cls._json_value(result.pop(source, None), default)
+        action_map = actions or {}
+        for recommendation in result["recommendations"]:
+            recommendation["review_status"] = action_map.get(
+                str(recommendation.get("id")), "pending")
+        return result
+
+    @staticmethod
+    def _recommendation_actions(
+        conn: sqlite3.Connection, user_id: int, report_id: int
+    ) -> Dict[str, str]:
+        rows = conn.execute(
+            "SELECT recommendation_id,action FROM learning_recommendation_actions "
+            "WHERE user_id=? AND report_id=?", (user_id, report_id)).fetchall()
+        return {str(row["recommendation_id"]): str(row["action"]) for row in rows}
+
+    def insert_video_learning_report(self, user_id: int,
+                                     data: Dict[str, Any]) -> Dict[str, Any]:
+        with self._connect() as conn:
+            linked = conn.execute(
+                "SELECT 1 FROM video_performance_snapshots WHERE id=? AND user_id=? "
+                "AND publishing_job_id=? AND youtube_video_id=?",
+                (data["snapshot_id"], user_id, data["publishing_job_id"],
+                 data["youtube_video_id"])).fetchone()
+            if not linked:
+                raise ValueError("Snapshot linkage does not belong to this owner.")
+            version = int(conn.execute(
+                "SELECT COALESCE(MAX(version),0)+1 FROM video_learning_reports "
+                "WHERE user_id=? AND publishing_job_id=?",
+                (user_id, data["publishing_job_id"])).fetchone()[0])
+            fields = (
+                user_id, data["channel_id"], data["production_item_id"],
+                data["publishing_job_id"], data["youtube_video_id"], data["snapshot_id"],
+                version, data["evaluation_window_hours"], data["status"],
+                json.dumps(data["performance_summary"], ensure_ascii=False, sort_keys=True),
+                json.dumps(data.get("strengths") or [], ensure_ascii=False),
+                json.dumps(data.get("weaknesses") or [], ensure_ascii=False),
+                json.dumps(data.get("likely_causes") or [], ensure_ascii=False),
+                data["confidence"],
+                json.dumps(data.get("recommendations") or [], ensure_ascii=False),
+                data.get("llm_status", "not_run"),
+                None if data.get("llm_analysis") is None else json.dumps(
+                    data["llm_analysis"], ensure_ascii=False, sort_keys=True),
+                data.get("created_at", time.time()),
+            )
+            cur = conn.execute(
+                "INSERT INTO video_learning_reports (user_id,channel_id,production_item_id,"
+                "publishing_job_id,youtube_video_id,snapshot_id,version,evaluation_window_hours,"
+                "status,performance_summary_json,strengths_json,weaknesses_json,likely_causes_json,"
+                "confidence,recommendations_json,llm_status,llm_analysis_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fields)
+            report_id = int(cur.lastrowid)
+            row = conn.execute(
+                "SELECT * FROM video_learning_reports WHERE id=?", (report_id,)).fetchone()
+        return self._learning_report_dict(row)
+
+    def get_video_learning_report(self, user_id: int,
+                                  report_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM video_learning_reports WHERE id=? AND user_id=?",
+                (report_id, user_id)).fetchone()
+            actions = self._recommendation_actions(conn, user_id, report_id) if row else {}
+        return self._learning_report_dict(row, actions) if row else None
+
+    def list_video_learning_reports(
+        self, user_id: int, *, publishing_job_id: Optional[int] = None,
+        channel_id: Optional[str] = None, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        clauses, values = ["user_id=?"], [user_id]
+        if publishing_job_id is not None:
+            clauses.append("publishing_job_id=?"); values.append(publishing_job_id)
+        if channel_id is not None:
+            clauses.append("channel_id=?"); values.append(channel_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM video_learning_reports WHERE " + " AND ".join(clauses)
+                + " ORDER BY created_at DESC,id DESC LIMIT ?",
+                [*values, min(1000, max(1, limit))]).fetchall()
+            return [self._learning_report_dict(
+                row, self._recommendation_actions(conn, user_id, int(row["id"])))
+                for row in rows]
+
+    def set_learning_recommendation_action(
+        self, user_id: int, report_id: int, recommendation_id: str,
+        action: str, note: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        if action not in {"applied", "ignored"}:
+            raise ValueError("Recommendation action must be applied or ignored.")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM video_learning_reports WHERE id=? AND user_id=?",
+                (report_id, user_id)).fetchone()
+            if not row:
+                return None
+            report = self._learning_report_dict(row)
+            if recommendation_id not in {str(item.get("id"))
+                                         for item in report["recommendations"]}:
+                raise ValueError("Recommendation does not belong to this report.")
+            conn.execute(
+                "INSERT INTO learning_recommendation_actions "
+                "(user_id,report_id,recommendation_id,action,note,created_at) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(user_id,report_id,recommendation_id) DO UPDATE SET "
+                "action=excluded.action,note=excluded.note,created_at=excluded.created_at",
+                (user_id, report_id, recommendation_id, action, note, time.time()))
+        return self.get_video_learning_report(user_id, report_id)
+
+    @classmethod
+    def _learning_profile_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["patterns"] = cls._json_value(result.pop("patterns_json", None), {})
+        result["evidence_refs"] = cls._json_value(
+            result.pop("evidence_refs_json", None), [])
+        return result
+
+    def upsert_channel_learning_profile(
+        self, user_id: int, channel_id: str, data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        now = data.get("generated_at", time.time())
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO channel_learning_profiles (user_id,channel_id,version,patterns_json,"
+                "sample_count,evidence_refs_json,decay_half_life_days,generated_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,channel_id) DO UPDATE SET "
+                "version=channel_learning_profiles.version+1,patterns_json=excluded.patterns_json,"
+                "sample_count=excluded.sample_count,evidence_refs_json=excluded.evidence_refs_json,"
+                "decay_half_life_days=excluded.decay_half_life_days,"
+                "generated_at=excluded.generated_at,updated_at=excluded.updated_at",
+                (user_id, channel_id, 1,
+                 json.dumps(data.get("patterns") or {}, ensure_ascii=False),
+                 int(data.get("sample_count") or 0),
+                 json.dumps(data.get("evidence_refs") or [], ensure_ascii=False),
+                 float(data.get("decay_half_life_days") or 180), now, now))
+            row = conn.execute(
+                "SELECT * FROM channel_learning_profiles WHERE user_id=? AND channel_id=?",
+                (user_id, channel_id)).fetchone()
+        return self._learning_profile_dict(row)
+
+    def get_channel_learning_profile(
+        self, user_id: int, channel_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            if channel_id is None:
+                row = conn.execute(
+                    "SELECT * FROM channel_learning_profiles WHERE user_id=? "
+                    "ORDER BY updated_at DESC LIMIT 1", (user_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM channel_learning_profiles "
+                    "WHERE user_id=? AND channel_id=?", (user_id, channel_id)).fetchone()
+        return self._learning_profile_dict(row) if row else None
 
     # ---- social accounts (per-user OAuth connections) ----
     def upsert_social_account(

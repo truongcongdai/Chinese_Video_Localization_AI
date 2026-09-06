@@ -81,6 +81,28 @@ class ProductionAssetService:
         except ProductionNotFound as exc:
             raise ProductionAssetNotFound(str(exc)) from exc
 
+    def _learning_context(self, user_id: int, asset_type: str) -> dict[str, Any]:
+        profile = self.store.get_channel_learning_profile(user_id)
+        if not profile or not profile.get("sample_count"):
+            return {}
+        patterns = profile.get("patterns") or {}
+        shared = {
+            "profile_version": profile["version"],
+            "sample_count": profile["sample_count"],
+            "observational_only": True,
+            "applied_recommendations": patterns.get("applied_recommendations", [])[:8],
+        }
+        if asset_type in {"script_blueprint", "script_section"}:
+            shared.update({
+                "strong_hook_patterns": patterns.get("strong_hook_patterns", [])[:5],
+                "weak_retention_patterns": patterns.get("weak_retention_patterns", [])[:5],
+                "preferred_duration_range": patterns.get("preferred_duration_range"),
+            })
+        if asset_type in {"metadata_package", "thumbnail_brief"}:
+            shared["title_packaging_trends"] = patterns.get(
+                "title_packaging_trends", [])[:6]
+        return shared
+
     def list_assets(self, user_id: int, item_id: int, *, asset_type: Optional[str] = None,
                     asset_key: Optional[str] = None) -> list[dict[str, Any]]:
         self._item(user_id, item_id)
@@ -187,6 +209,7 @@ class ProductionAssetService:
                            duration_minutes: Optional[float] = None,
                            narration_wpm: Optional[int] = None) -> dict[str, Any]:
         item = self._item(user_id, item_id)
+        learning = self._learning_context(user_id, "script_blueprint")
         duration, wpm, target_words = self._target_budget(item, duration_minutes, narration_wpm)
         count = self._section_count(duration, str(item["target_format"]))
         job = self._new_job(user_id, item_id, "script_blueprint", total_sections=count,
@@ -220,7 +243,9 @@ class ProductionAssetService:
                 system="Create an original long-form script architecture. Return JSON only.",
                 prompt=(f"Create exactly {count} coherent sections. Each needs title, purpose, "
                         "content_goal, key_points, transition_guidance. Research is inspiration only.\n"
-                        + _json_text(item["production_brief"])),
+                        + _json_text(item["production_brief"])
+                        + "\nOwner learning for NEW generation only; bounded guidance:\n"
+                        + _json_text(learning)),
                 num_predict=self.blueprint_num_predict, validator=validate,
             )
             actual_count = len(value["sections"])
@@ -236,7 +261,8 @@ class ProductionAssetService:
                 completed_sections=actual_count)
             payload = {"schema_version": "cp7a-v1", "section_count": actual_count,
                 "target_duration_minutes": duration, "narration_wpm": wpm,
-                "target_total_words": target_words, "sections": value["sections"]}
+                "target_total_words": target_words, "sections": value["sections"],
+                "learning_profile_version": learning.get("profile_version")}
             asset = self.store.insert_production_asset(
                 user_id, item_id, asset_type="script_blueprint", payload=payload)
             if not asset:
@@ -287,6 +313,7 @@ class ProductionAssetService:
     def generate_section(self, user_id: int, item_id: int, section_index: int, *,
                          blueprint_asset_id: Optional[int] = None) -> dict[str, Any]:
         item = self._item(user_id, item_id)
+        learning = self._learning_context(user_id, "script_section")
         blueprint = (self.get_asset(user_id, item_id, blueprint_asset_id)
                      if blueprint_asset_id else self._current_blueprint(user_id, item_id))
         if blueprint["asset_type"] != "script_blueprint":
@@ -310,7 +337,8 @@ class ProductionAssetService:
                         "Do not conclude the overall section if more narration will be needed. "
                         "Stay on topic; use paragraphs; avoid repetition and "
                         "source copying.\nSection:\n" + _json_text(section)
-                        + "\nProduction brief:\n" + _json_text(item["production_brief"])),
+                        + "\nProduction brief:\n" + _json_text(item["production_brief"])
+                        + "\nOwner learning for NEW generation only:\n" + _json_text(learning)),
                 num_predict=min(self.section_num_predict, 900),
                 validator=self._section_response)
             content, attempts = value["content"], 0
@@ -347,6 +375,7 @@ class ProductionAssetService:
                 "completion_percentage": round(actual / target * 100, 1) if target else 100.,
                 "budget_acceptable": acceptable, "continuation_attempts": attempts,
                 "continuation_failures": continuation_failures,
+                "learning_profile_version": learning.get("profile_version"),
             }
             asset = self.store.insert_production_asset(
                 user_id, item_id, asset_type="script_section", asset_key=key, payload=payload)
@@ -526,6 +555,7 @@ class ProductionAssetService:
                              requirements: str,
                              validator: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
         item, script = self._item(user_id, item_id), self._approved_script(user_id, item_id)
+        learning = self._learning_context(user_id, asset_type)
         job = self._new_job(user_id, item_id, asset_type)
         script_context = {
             key: script["payload"].get(key) for key in (
@@ -549,11 +579,14 @@ class ProductionAssetService:
                 system=("Create an original production planning artifact. Research is reference-only. "
                         "Return JSON only."),
                 prompt=(requirements + "\nApproved script summary:\n" + _json_text(script_context)
-                        + "\nProduction brief:\n" + _json_text(item["production_brief"])),
+                        + "\nProduction brief:\n" + _json_text(item["production_brief"])
+                        + "\nOwner learning for NEW generation only; remain truthful:\n"
+                        + _json_text(learning)),
                 num_predict=self.asset_num_predict, validator=validator)
             value.update({"schema_version": "cp7a-v1",
                 "source_script_asset_id": script["id"],
-                "source_script_version": script["version"]})
+                "source_script_version": script["version"],
+                "learning_profile_version": learning.get("profile_version")})
             asset = self.store.insert_production_asset(
                 user_id, item_id, asset_type=asset_type, payload=value)
             if not asset:

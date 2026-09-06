@@ -60,6 +60,11 @@ from universal_video_ai.channel_agent.production_publishing import (
     ProductionPublishingNotFound,
     ProductionPublishingService,
 )
+from universal_video_ai.channel_agent.feedback_learning import (
+    FeedbackLearningError,
+    FeedbackLearningNotFound,
+    FeedbackLearningService,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -262,6 +267,18 @@ class ProductionPublishingBody(BaseModel):
     confirm_public: bool = False
 
 
+class PerformanceRefreshBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation_window_hours: Optional[float] = None
+
+
+class LearningRecommendationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: Optional[str] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -285,6 +302,17 @@ def _production_publishing_call(operation):
         raise HTTPException(404, str(exc)) from exc
     except ProductionPublishingError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+def _feedback_learning_call(operation):
+    try:
+        return operation()
+    except FeedbackLearningNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except FeedbackLearningError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except YouTubeReadOnlyError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
 
 
 def _service(store: Store) -> YouTubeReadOnlyService:
@@ -369,6 +397,10 @@ def _production_asset_service(store: Store) -> ProductionAssetService:
         section_num_predict=int(settings["section_num_predict"]),
         asset_num_predict=int(settings["asset_num_predict"]),
     )
+
+
+def _feedback_learning_service(store: Store) -> FeedbackLearningService:
+    return FeedbackLearningService(store, llm=_brain_provider())
 
 
 def _production_asset_call(call: Any) -> Any:
@@ -1149,6 +1181,99 @@ def mutate_production_publishing_job(
     if action not in operations:
         raise HTTPException(422, "Publishing action must be run, retry, refresh, or cancel.")
     return _production_publishing_call(lambda: operations[action](user_id, item_id, job_id))
+
+
+@router.post("/production/{item_id}/publishing-jobs/{job_id}/performance/refresh")
+def refresh_video_performance(
+    item_id: int, job_id: int, body: PerformanceRefreshBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _feedback_learning_call(lambda: _feedback_learning_service(store).refresh(
+        user_id, item_id, job_id,
+        evaluation_window_hours=body.evaluation_window_hours))
+
+
+@router.get("/production/{item_id}/publishing-jobs/{job_id}/performance/snapshots")
+def video_performance_snapshots(
+    item_id: int, job_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).snapshots(user_id, item_id, job_id))
+
+
+@router.get("/production/{item_id}/publishing-jobs/{job_id}/performance/snapshots/latest")
+def latest_video_performance(
+    item_id: int, job_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).latest(user_id, item_id, job_id))
+
+
+@router.get("/production/{item_id}/learning")
+def production_learning_summary(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).item_summary(user_id, item_id))
+
+
+@router.get("/learning/profile")
+def channel_learning_profile(
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).profile(user_id))
+
+
+@router.post("/production/{item_id}/publishing-jobs/{job_id}/learning/reports")
+def generate_video_learning_report(
+    item_id: int, job_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).generate_report(
+            user_id, item_id, job_id))
+
+
+@router.get("/production/{item_id}/publishing-jobs/{job_id}/learning/reports")
+def video_learning_reports(
+    item_id: int, job_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).reports(
+            user_id, item_id, job_id))
+
+
+@router.post(
+    "/production/{item_id}/publishing-jobs/{job_id}/learning/reports/{report_id}"
+    "/recommendations/{recommendation_id}/{action}"
+)
+def review_learning_recommendation(
+    item_id: int, job_id: int, report_id: int, recommendation_id: str,
+    action: str, body: LearningRecommendationBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if action not in {"apply", "ignore"}:
+        raise HTTPException(422, "Learning action must be apply or ignore.")
+    return _feedback_learning_call(
+        lambda: _feedback_learning_service(store).review_recommendation(
+            user_id, item_id, job_id, report_id, recommendation_id,
+            "applied" if action == "apply" else "ignored", body.note))
 
 
 @router.get("/production/{item_id}/qa")

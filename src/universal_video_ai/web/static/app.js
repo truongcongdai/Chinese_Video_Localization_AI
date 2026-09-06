@@ -3695,6 +3695,30 @@ function channelAgentTable(headers, rows, htmlColumns = []) {
   return `<div style="overflow-x:auto"><table class="admin-table"><thead><tr>${heading}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
+function learningPatternList(rows, key = "topic") {
+  if (!rows || !rows.length) return '<span class="muted-help">No evidence yet.</span>';
+  return "<ul>" + rows.slice(0, 6).map(row => "<li>" + escapeHtml(row[key] || row.pattern || "Pattern")
+    + " - n=" + escapeHtml(row.sample_count ?? 1)
+    + " - confidence " + Math.round(Number(row.confidence || 0) * 100) + "%</li>").join("") + "</ul>";
+}
+
+async function loadChannelLearningProfile() {
+  const profile = await api("/api/channel-agent/learning/profile");
+  const patterns = profile.patterns || {};
+  $("#channel-learning-state").textContent = "Profile v" + profile.version + " - "
+    + profile.sample_count + " report(s) - recency half-life " + profile.decay_half_life_days + " days";
+  $("#learning-winning-topics").innerHTML = learningPatternList(patterns.winning_topics);
+  $("#learning-underperforming-topics").innerHTML = learningPatternList(patterns.underperforming_topics);
+  $("#learning-strong-hooks").innerHTML = learningPatternList(patterns.strong_hook_patterns, "pattern");
+  $("#learning-weak-retention").innerHTML = learningPatternList(patterns.weak_retention_patterns, "pattern");
+  $("#learning-packaging-trends").innerHTML = learningPatternList(patterns.title_packaging_trends, "pattern");
+  const duration = patterns.preferred_duration_range;
+  $("#learning-duration-range").textContent = duration
+    ? Math.round(duration.min_seconds / 60) + "-" + Math.round(duration.max_seconds / 60)
+      + " minutes (n=" + duration.sample_count + ")"
+    : "No evidence yet.";
+}
+
 async function initChannelAgent() {
   const statusNode = $("#channel-agent-status");
   const connectNode = $("#channel-agent-connect");
@@ -3770,6 +3794,11 @@ async function initChannelAgent() {
         )
       : '<div class="muted-help">Content-type breakdown is not available for this channel.</div>';
     try {
+      await loadChannelLearningProfile();
+    } catch (learningError) {
+      $("#channel-learning-state").textContent = "Learning unavailable: " + learningError.message;
+    }
+    try {
       await loadTrendResearch();
     } catch (trendError) {
       $("#trend-research-message").textContent = `Trend Scanner unavailable: ${trendError.message}`;
@@ -3791,6 +3820,9 @@ async function initChannelAgent() {
 
 $("#channel-agent-refresh").onclick = initChannelAgent;
 $("#channel-agent-connect-btn").onclick = () => startConnect("youtube");
+$("#channel-learning-refresh").onclick = () => loadChannelLearningProfile().catch(error => {
+  $("#channel-learning-state").textContent = "Learning unavailable: " + error.message;
+});
 
 function trendAge(value) {
   if (!value) return "—";
@@ -4670,7 +4702,70 @@ function productionBriefView(brief) {
     ${refs.length ? `<ul>${refs.map(ref => `<li>${ref.url ? `<a href="${escapeHtml(ref.url)}" target="_blank" rel="noopener">${escapeHtml(ref.evidence_id)}</a>` : escapeHtml(ref.evidence_id)} · ${escapeHtml(ref.label || ref.type)}</li>`).join("")}</ul>` : '<p class="muted-help">No linkable references; brief uses stored evidence-only context.</p>'}`;
 }
 
-function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection) {
+function performanceLearningWorkspace(data) {
+  const rows = data?.items || [];
+  const body = rows.map(entry => {
+    const snapshot = entry.snapshot;
+    const evaluation = entry.evaluation;
+    const report = entry.report;
+    const metrics = snapshot ? channelAgentTable(
+      ["Views", "Impressions", "CTR", "Watch min", "Avg duration", "Avg viewed", "Likes", "Comments", "Subscriber impact", "Video age", "Last refreshed"],
+      [[channelAgentNumber(snapshot.views), channelAgentNumber(snapshot.impressions),
+        snapshot.impressions_ctr == null ? "unavailable" : Number(snapshot.impressions_ctr).toFixed(2) + "%",
+        channelAgentNumber(snapshot.watch_time_minutes),
+        channelAgentDuration(snapshot.average_view_duration_seconds),
+        snapshot.average_view_percentage == null ? "unavailable" : Number(snapshot.average_view_percentage).toFixed(1) + "%",
+        channelAgentNumber(snapshot.likes), channelAgentNumber(snapshot.comments),
+        snapshot.subscribers_gained == null || snapshot.subscribers_lost == null
+          ? "unavailable" : String(snapshot.subscribers_gained - snapshot.subscribers_lost),
+        Number(snapshot.video_age_hours).toFixed(1) + "h",
+        new Date(snapshot.captured_at * 1000).toLocaleString()]])
+      : '<p class="muted-help">No performance snapshot yet.</p>';
+    const normalized = evaluation?.normalized || {};
+    const baseline = evaluation ? channelAgentTable(
+      ["State", "Baseline sample", "CTR ratio", "Watch ratio", "Velocity ratio", "Engagement ratio"],
+      [[evaluation.status, evaluation.baseline.sample_count,
+        normalized.ctr_vs_baseline ?? "unavailable",
+        normalized.watch_pct_vs_baseline ?? "unavailable",
+        normalized.view_velocity_vs_baseline ?? "unavailable",
+        normalized.engagement_vs_baseline ?? "unavailable"]]) : "";
+    const recommendations = (report?.recommendations || []).map(rec =>
+      '<li><strong>' + escapeHtml(rec.category) + ':</strong> ' + escapeHtml(rec.reason)
+      + ' (' + Math.round(Number(rec.confidence || 0) * 100) + '% confidence; '
+      + escapeHtml(rec.review_status || "pending") + ') '
+      + (rec.review_status === "pending"
+        ? '<button class="btn secondary small" data-learning-report="' + report.id
+          + '" data-learning-recommendation="' + escapeHtml(rec.id)
+          + '" data-learning-action="apply" data-learning-job="' + entry.publishing_job_id
+          + '">Apply learning suggestion</button> '
+          + '<button class="btn secondary small" data-learning-report="' + report.id
+          + '" data-learning-recommendation="' + escapeHtml(rec.id)
+          + '" data-learning-action="ignore" data-learning-job="' + entry.publishing_job_id
+          + '">Ignore</button>' : '') + '</li>').join("");
+    return '<article style="border-top:1px solid var(--border);margin-top:12px;padding-top:12px">'
+      + '<h4>YouTube video ' + escapeHtml(entry.youtube_video_id) + '</h4>'
+      + '<button class="btn secondary small" data-learning-refresh="' + entry.publishing_job_id
+      + '">Refresh metrics</button> <button class="btn gradient small" data-learning-generate="'
+      + entry.publishing_job_id + '">Generate learning report</button>'
+      + metrics + '<h4>Performance vs baseline</h4>' + baseline
+      + (evaluation?.status === "INSUFFICIENT_DATA"
+        ? '<p><strong>INSUFFICIENT DATA</strong> - collect more views, impressions, or video age.</p>' : '')
+      + '<h4>AI Learning</h4>'
+      + (report ? '<p>Report v' + report.version + ' - confidence '
+        + Math.round(Number(report.confidence || 0) * 100) + '% - Ollama ' + escapeHtml(report.llm_status)
+        + '</p><p><strong>Strengths:</strong> ' + escapeHtml((report.strengths || []).join("; ") || "None established")
+        + '</p><p><strong>Weaknesses:</strong> ' + escapeHtml((report.weaknesses || []).join("; ") || "None established")
+        + '</p><ul>' + recommendations + '</ul>' : '<p class="muted-help">No learning report yet.</p>')
+      + '</article>';
+  }).join("");
+  return '<section id="production-learning-workspace" style="border-top:1px solid var(--border);margin-top:22px;padding-top:16px">'
+    + '<h4>CP9 Performance / Learning</h4>'
+    + '<p class="muted-help">Owner-only analytics. Refresh is manual; recommendations never rewrite approved work.</p>'
+    + (body || '<p class="muted-help">Publish a linked YouTube video before collecting performance.</p>')
+    + '</section>';
+}
+
+function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection, learningData) {
   const latest = ContentProductionUI.latestByType(assets);
   const blueprint = latest["script_blueprint:"];
   const sections = ContentProductionUI.sectionRows(blueprint, assets);
@@ -4814,6 +4909,7 @@ function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publis
     + '<div class="button-row"><button class="btn secondary small" id="production-publish-dry-run">Validate dry run</button> <button class="btn gradient small" id="production-publish-now">Publish now</button> <button class="btn gradient small" id="production-publish-schedule-action">Schedule</button></div>'
     + "<h4>Publishing jobs</h4>" + (publishingRows.length ? channelAgentTable(["Job", "Mode", "Status", "Channel", "Privacy", "Schedule UTC", "Thumbnail", "Progress", "Remote / Error", "Actions"], publishingRows, [8, 9]) : '<p class="muted-help">No publishing jobs yet.</p>')
     + "</section>"
+    + performanceLearningWorkspace(learningData)
     + "</div>";
 }
 
@@ -4833,13 +4929,14 @@ async function runProductionAssetAction(button, operation, id) {
 
 async function showProductionItem(id) {
   const item = await api(`/api/channel-agent/production/${id}`);
-  const [assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection] = await Promise.all([
+  const [assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection, learningData] = await Promise.all([
     api("/api/channel-agent/production/" + id + "/assets"),
     api("/api/channel-agent/production/" + id + "/generation-jobs"),
     api("/api/channel-agent/production/" + id + "/asset-package"),
     api("/api/channel-agent/production/" + id + "/render-jobs"),
     api("/api/channel-agent/production/" + id + "/publishing-jobs"),
     api("/api/channel-agent/publishing/youtube/connection"),
+    api("/api/channel-agent/production/" + id + "/learning"),
   ]);
   const detail = $("#production-detail");
   detail.classList.remove("hidden");
@@ -4867,7 +4964,8 @@ async function showProductionItem(id) {
     ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
     <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
 
-  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection));
+  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(
+    assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection, learningData));
   $("#production-generate-blueprint").onclick = button => runProductionAssetAction(
     button.currentTarget,
     () => api("/api/channel-agent/production/" + id + "/assets/script/blueprints", {
@@ -4976,6 +5074,25 @@ async function showProductionItem(id) {
   $("#production-publish-schedule-action").onclick = event => submitPublishing(event.currentTarget, "schedule");
   document.querySelectorAll("[data-production-publishing-job]").forEach(button => {
     button.onclick = () => runProductionAssetAction(button, () => api("/api/channel-agent/production/" + id + "/publishing-jobs/" + button.dataset.productionPublishingJob + "/" + button.dataset.publishingAction, {method: "POST"}), id);
+  });
+  document.querySelectorAll("[data-learning-refresh]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button, () => api(
+      "/api/channel-agent/production/" + id + "/publishing-jobs/"
+        + button.dataset.learningRefresh + "/performance/refresh",
+      {method: "POST", body: JSON.stringify({})}), id);
+  });
+  document.querySelectorAll("[data-learning-generate]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button, () => api(
+      "/api/channel-agent/production/" + id + "/publishing-jobs/"
+        + button.dataset.learningGenerate + "/learning/reports",
+      {method: "POST"}), id);
+  });
+  document.querySelectorAll("[data-learning-action]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button, () => api(
+      "/api/channel-agent/production/" + id + "/publishing-jobs/" + button.dataset.learningJob
+        + "/learning/reports/" + button.dataset.learningReport + "/recommendations/"
+        + encodeURIComponent(button.dataset.learningRecommendation) + "/" + button.dataset.learningAction,
+      {method: "POST", body: JSON.stringify({})}), id);
   });
 
   $("#production-item-save").onclick = async () => {

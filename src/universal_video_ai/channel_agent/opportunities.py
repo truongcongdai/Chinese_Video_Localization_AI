@@ -175,7 +175,7 @@ class ContentOpportunityService:
         limit = min(100, max(1, int(filters.pop("limit", 20))))
         rows = self.store.list_content_opportunities(user_id, limit=100, **filters)
         for row in rows:
-            row["opportunity_rank_score"] = self._current_rank(row)
+            self._apply_learning(user_id, row)
         rows.sort(key=lambda row: (-float(row["opportunity_rank_score"]), -float(row.get("updated_at") or 0), -int(row["id"])))
         return rows[:limit]
 
@@ -567,9 +567,56 @@ class ContentOpportunityService:
 
     def _with_events(self, user_id: int, row: dict[str, Any]) -> dict[str, Any]:
         result = dict(row)
-        result["opportunity_rank_score"] = self._current_rank(result)
+        self._apply_learning(user_id, result)
         result["events"] = self.store.list_content_opportunity_events(user_id, int(row["id"]))
         return result
+
+    def _apply_learning(self, user_id: int, row: dict[str, Any]) -> None:
+        base = self._current_rank(row)
+        profile = self.store.get_channel_learning_profile(user_id)
+        if not profile or int(profile.get("sample_count") or 0) < 1:
+            row["learning_signals"] = {
+                "channel_topic_affinity": None, "historical_performance_fit": None,
+                "format_fit": None, "duration_fit": None,
+            }
+            row["learning_adjustment"] = 0.0
+            row["opportunity_rank_score"] = base
+            return
+        patterns = profile.get("patterns") or {}
+        topic = str(row.get("topic") or "").casefold()
+        winning = [item for item in patterns.get("winning_topics", [])
+                   if str(item.get("topic") or "").casefold() in topic
+                   or topic in str(item.get("topic") or "").casefold()]
+        weak = [item for item in patterns.get("underperforming_topics", [])
+                if str(item.get("topic") or "").casefold() in topic
+                or topic in str(item.get("topic") or "").casefold()]
+        affinity = .75 if winning else (.25 if weak else .5)
+        format_fit = .5
+        format_rows = [item for item in patterns.get("format_performance", [])
+                       if item.get("format") == row.get("target_format")
+                       and item.get("weighted_score") is not None]
+        if format_rows:
+            format_fit = min(1.0, max(0.0,
+                float(format_rows[0]["weighted_score"]) / 2.0))
+        duration_fit = .5
+        preferred = patterns.get("preferred_duration_range")
+        minimum, maximum = row.get("target_duration_min"), row.get("target_duration_max")
+        if preferred and (minimum is not None or maximum is not None):
+            target_seconds = float(minimum or maximum) * 60
+            duration_fit = (1.0 if preferred["min_seconds"] <= target_seconds
+                            <= preferred["max_seconds"] else .25)
+        signals = {
+            "channel_topic_affinity": affinity,
+            "historical_performance_fit": affinity,
+            "format_fit": format_fit,
+            "duration_fit": duration_fit,
+        }
+        adjustment = max(-5.0, min(5.0,
+            sum(value - .5 for value in signals.values()) / len(signals) * 10.0))
+        row["learning_signals"] = signals
+        row["learning_adjustment"] = round(adjustment, 2)
+        row["opportunity_rank_score"] = round(
+            min(100.0, max(0.0, base + adjustment)), 2)
 
     @classmethod
     def _current_rank(cls, row: dict[str, Any]) -> float:
