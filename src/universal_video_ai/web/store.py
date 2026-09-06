@@ -577,6 +577,47 @@ CREATE TABLE IF NOT EXISTS production_render_jobs (
 CREATE INDEX IF NOT EXISTS idx_production_render_jobs_owner
     ON production_render_jobs(user_id, production_item_id, updated_at DESC);
 
+-- CP8 owner-scoped, restart-safe publishing. Upload session URLs are stored
+-- server-side and deliberately removed from public API representations.
+CREATE TABLE IF NOT EXISTS production_publishing_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    render_job_id INTEGER NOT NULL,
+    metadata_asset_id INTEGER NOT NULL,
+    thumbnail_asset_id INTEGER,
+    platform TEXT NOT NULL DEFAULT 'youtube',
+    channel_id TEXT,
+    channel_title TEXT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    thumbnail_path TEXT,
+    thumbnail_status TEXT NOT NULL DEFAULT 'not_provided',
+    privacy TEXT NOT NULL DEFAULT 'private',
+    schedule_local TEXT,
+    schedule_timezone TEXT,
+    schedule_utc TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    dry_run INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL,
+    upload_session_uri TEXT,
+    upload_offset INTEGER NOT NULL DEFAULT 0,
+    upload_size INTEGER NOT NULL DEFAULT 0,
+    progress REAL NOT NULL DEFAULT 0,
+    external_video_id TEXT,
+    external_url TEXT,
+    remote_status_json TEXT NOT NULL DEFAULT '{}',
+    package_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    published_at REAL,
+    UNIQUE(user_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_production_publishing_jobs_owner
+    ON production_publishing_jobs(user_id, production_item_id, updated_at DESC);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3658,6 +3699,98 @@ class Store:
                 "UPDATE production_render_jobs SET "
                 + ",".join(f"{key}=?" for key in payload)
                 + " WHERE id=? AND production_item_id=? AND user_id=?",
+                [*payload.values(), job_id, item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    # ---- Channel Agent CP8 publishing jobs ----
+    @staticmethod
+    def _production_publishing_job_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target, default in (
+            ("tags_json", "tags", []),
+            ("remote_status_json", "remote_status", {}),
+            ("package_json", "package", {}),
+        ):
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else default
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = default
+        result["dry_run"] = bool(result.get("dry_run"))
+        result.pop("upload_session_uri", None)
+        return result
+
+    def create_production_publishing_job(self, user_id: int, item_id: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM production_items WHERE id=? AND user_id=?", (item_id, user_id)).fetchone():
+                return None
+            existing = conn.execute(
+                "SELECT * FROM production_publishing_jobs WHERE user_id=? AND idempotency_key=?",
+                (user_id, data["idempotency_key"]),
+            ).fetchone()
+            if existing:
+                return self._production_publishing_job_dict(existing)
+            columns = [
+                "user_id", "production_item_id", "render_job_id", "metadata_asset_id",
+                "thumbnail_asset_id", "channel_id", "channel_title", "title", "description",
+                "tags_json", "thumbnail_path", "thumbnail_status", "privacy", "schedule_local",
+                "schedule_timezone", "schedule_utc", "status", "dry_run", "idempotency_key",
+                "upload_size", "package_json", "created_at", "updated_at",
+            ]
+            values = [
+                user_id, item_id, data["render_job_id"], data["metadata_asset_id"],
+                data.get("thumbnail_asset_id"), data.get("channel_id"), data.get("channel_title"),
+                data["title"], data["description"], json.dumps(data.get("tags") or [], ensure_ascii=False),
+                data.get("thumbnail_path"), data.get("thumbnail_status", "not_provided"), data["privacy"],
+                data.get("schedule_local"), data.get("schedule_timezone"), data.get("schedule_utc"),
+                data.get("status", "draft"), int(bool(data.get("dry_run", True))), data["idempotency_key"],
+                int(data.get("upload_size") or 0), json.dumps(data.get("package") or {}, ensure_ascii=False, sort_keys=True),
+                now, now,
+            ]
+            cur = conn.execute(
+                "INSERT INTO production_publishing_jobs (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")",
+                values,
+            )
+            job_id = int(cur.lastrowid)
+        return self.get_production_publishing_job(user_id, item_id, job_id)
+
+    def get_production_publishing_job(self, user_id: int, item_id: int, job_id: int, *, private: bool = False) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_publishing_jobs WHERE id=? AND production_item_id=? AND user_id=?",
+                (job_id, item_id, user_id),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row) if private else self._production_publishing_job_dict(row)
+        if private:
+            for source, target, default in (("tags_json", "tags", []), ("remote_status_json", "remote_status", {}), ("package_json", "package", {})):
+                try: result[target] = json.loads(result.pop(source) or "")
+                except (TypeError, ValueError, json.JSONDecodeError): result[target] = default
+            result["dry_run"] = bool(result.get("dry_run"))
+        return result
+
+    def list_production_publishing_jobs(self, user_id: int, item_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_publishing_jobs WHERE production_item_id=? AND user_id=? ORDER BY created_at DESC,id DESC",
+                (item_id, user_id),
+            ).fetchall()
+        return [self._production_publishing_job_dict(row) for row in rows]
+
+    def update_production_publishing_job(self, user_id: int, item_id: int, job_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {"status", "channel_id", "channel_title", "thumbnail_status", "upload_session_uri", "upload_offset", "upload_size", "progress", "external_video_id", "external_url", "error", "published_at"}
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if "remote_status" in data:
+            payload["remote_status_json"] = json.dumps(data["remote_status"], ensure_ascii=False, sort_keys=True)
+        if not payload:
+            return bool(self.get_production_publishing_job(user_id, item_id, job_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_publishing_jobs SET " + ",".join(f"{key}=?" for key in payload) + " WHERE id=? AND production_item_id=? AND user_id=?",
                 [*payload.values(), job_id, item_id, user_id],
             )
             return cur.rowcount > 0

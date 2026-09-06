@@ -27,3 +27,15 @@ def test_voice_catalog_shows_provider_availability_and_refresh():
     assert "provider === \"edge\" ? \"free\" : provider" in app
     assert "voice.cost_class" in app
     assert "voice.is_local" in app
+
+
+def test_production_queue_exposes_cp8_manual_publishing_controls():
+    root = Path(__file__).parents[1]
+    app = (root / "src/universal_video_ai/web/static/app.js").read_text(encoding="utf-8")
+    for marker in (
+        "CP8 Publishing &amp; Scheduling", "production-publish-dry-run",
+        "production-publish-now", "production-publish-schedule-action",
+        "Confirm PUBLIC publishing", "/publishing-jobs",
+    ):
+        assert marker in app
+    assert "user_id:" not in app[app.index("production-publish-dry-run"):]

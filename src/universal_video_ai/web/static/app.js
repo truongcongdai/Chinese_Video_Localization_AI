@@ -4670,7 +4670,7 @@ function productionBriefView(brief) {
     ${refs.length ? `<ul>${refs.map(ref => `<li>${ref.url ? `<a href="${escapeHtml(ref.url)}" target="_blank" rel="noopener">${escapeHtml(ref.evidence_id)}</a>` : escapeHtml(ref.evidence_id)} · ${escapeHtml(ref.label || ref.type)}</li>`).join("")}</ul>` : '<p class="muted-help">No linkable references; brief uses stored evidence-only context.</p>'}`;
 }
 
-function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs) {
+function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection) {
   const latest = ContentProductionUI.latestByType(assets);
   const blueprint = latest["script_blueprint:"];
   const sections = ContentProductionUI.sectionRows(blueprint, assets);
@@ -4744,6 +4744,17 @@ function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs) {
         + '" data-render-action="' + (job.status === "queued" ? "run" : "resume") + '">'
         + (job.status === "queued" ? "Run" : "Resume") + "</button>",
   ]);
+  const completedRenders = (renderJobs || []).filter(job => job.status === "completed" && job.qc?.passed);
+  const approvedMetadata = (assets || []).filter(asset => asset.asset_type === "metadata_package" && asset.status === "approved");
+  const publishingRows = (publishingJobs || []).map(job => [
+    job.id, job.dry_run ? "DRY RUN" : "YOUTUBE", String(job.status).toUpperCase(),
+    escapeHtml(job.channel_title || job.channel_id || "not connected"),
+    escapeHtml(job.privacy), job.schedule_utc ? escapeHtml(job.schedule_utc) : "now",
+    job.thumbnail_status || "not_provided", String(job.progress || 0) + "%",
+    job.external_url ? '<a href="' + escapeHtml(job.external_url) + '" target="_blank" rel="noopener">Open video</a>' : (job.error || "-"),
+    job.dry_run ? "-" : '<button class="btn secondary small" data-production-publishing-job="' + job.id + '" data-publishing-action="' + (job.status === "failed" ? "retry" : "refresh") + '">' + (job.status === "failed" ? "Retry" : "Refresh") + '</button> '
+      + (["draft", "queued", "failed"].includes(job.status) ? '<button class="btn secondary small" data-production-publishing-job="' + job.id + '" data-publishing-action="cancel">Cancel</button>' : ""),
+  ]);
   return '<div id="production-assets-workspace" style="border-top:1px solid var(--border);margin-top:24px;padding-top:18px">'
     + "<h4>CP7A Script &amp; Asset Production</h4>"
     + '<p class="muted-help">Versioned planning assets only. No media download, TTS, rendering, upload, or publishing.</p>'
@@ -4788,6 +4799,21 @@ function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs) {
       ["Job", "Status", "Stage", "Progress", "Output", "QC / Error", "Action"],
       renderRows, [4, 5, 6]) : '<p class="muted-help">No CP7B render jobs yet.</p>')
     + "</section>"
+    + '<section id="production-publishing-workspace" style="border-top:1px solid var(--border);margin-top:22px;padding-top:16px">'
+    + "<h4>CP8 Publishing &amp; Scheduling</h4>"
+    + '<p class="muted-help">Manual, owner-controlled publishing only. Approved metadata is used verbatim; public publishing requires confirmation and a cleared rights gate.</p>'
+    + '<p><strong>YouTube:</strong> ' + escapeHtml(publishingConnection?.account_name || "not connected")
+    + ' | upload permission: ' + (publishingConnection?.upload_scope_granted ? "YES" : "NO") + "</p>"
+    + '<div class="row"><div class="field"><label>Completed render</label><select id="production-publish-render">'
+    + completedRenders.map(job => '<option value="' + job.id + '">#' + job.id + " - " + escapeHtml(job.output_path || "render") + "</option>").join("")
+    + '</select></div><div class="field"><label>Approved metadata version</label><select id="production-publish-metadata">'
+    + approvedMetadata.map(asset => '<option value="' + asset.id + '">v' + asset.version + " - " + escapeHtml(asset.payload?.recommended_title || "metadata") + "</option>").join("") + "</select></div></div>"
+    + '<div class="field"><label>Approved/user-owned thumbnail path (optional)</label><input id="production-publish-thumbnail" type="text" placeholder="D:\\media\\owned-thumbnail.jpg"></div>'
+    + '<div class="row"><div class="field"><label>Privacy</label><select id="production-publish-privacy"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public (confirmation required)</option></select></div>'
+    + '<div class="field"><label>Schedule local time (optional)</label><input id="production-publish-schedule" type="datetime-local"></div><div class="field"><label>Timezone</label><input id="production-publish-timezone" value="Asia/Bangkok"></div></div>'
+    + '<div class="button-row"><button class="btn secondary small" id="production-publish-dry-run">Validate dry run</button> <button class="btn gradient small" id="production-publish-now">Publish now</button> <button class="btn gradient small" id="production-publish-schedule-action">Schedule</button></div>'
+    + "<h4>Publishing jobs</h4>" + (publishingRows.length ? channelAgentTable(["Job", "Mode", "Status", "Channel", "Privacy", "Schedule UTC", "Thumbnail", "Progress", "Remote / Error", "Actions"], publishingRows, [8, 9]) : '<p class="muted-help">No publishing jobs yet.</p>')
+    + "</section>"
     + "</div>";
 }
 
@@ -4807,11 +4833,13 @@ async function runProductionAssetAction(button, operation, id) {
 
 async function showProductionItem(id) {
   const item = await api(`/api/channel-agent/production/${id}`);
-  const [assets, jobs, assetPackage, renderJobs] = await Promise.all([
+  const [assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection] = await Promise.all([
     api("/api/channel-agent/production/" + id + "/assets"),
     api("/api/channel-agent/production/" + id + "/generation-jobs"),
     api("/api/channel-agent/production/" + id + "/asset-package"),
     api("/api/channel-agent/production/" + id + "/render-jobs"),
+    api("/api/channel-agent/production/" + id + "/publishing-jobs"),
+    api("/api/channel-agent/publishing/youtube/connection"),
   ]);
   const detail = $("#production-detail");
   detail.classList.remove("hidden");
@@ -4839,7 +4867,7 @@ async function showProductionItem(id) {
     ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
     <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
 
-  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(assets, jobs, assetPackage, renderJobs));
+  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publishingJobs, publishingConnection));
   $("#production-generate-blueprint").onclick = button => runProductionAssetAction(
     button.currentTarget,
     () => api("/api/channel-agent/production/" + id + "/assets/script/blueprints", {
@@ -4926,6 +4954,28 @@ async function showProductionItem(id) {
       ),
       id,
     );
+  });
+  const submitPublishing = (button, mode) => runProductionAssetAction(button, () => {
+    const privacy = $("#production-publish-privacy").value;
+    const schedule = $("#production-publish-schedule").value || null;
+    if (!$("#production-publish-render").value || !$("#production-publish-metadata").value) throw new Error("A completed render and approved metadata are required.");
+    const dryRun = mode === "dry-run";
+    if (!dryRun && !window.confirm(mode === "schedule" ? "Schedule this video on the selected channel?" : "Upload this video now?")) return Promise.resolve();
+    const confirmPublic = privacy !== "public" || window.confirm("Confirm PUBLIC publishing? This action can expose the video immediately.");
+    if (!confirmPublic) return Promise.resolve();
+    return api("/api/channel-agent/production/" + id + "/publishing-jobs", {method: "POST", body: JSON.stringify({
+      render_job_id: Number($("#production-publish-render").value), metadata_asset_id: Number($("#production-publish-metadata").value),
+      thumbnail_path: $("#production-publish-thumbnail").value || null, privacy,
+      schedule_local: mode === "schedule" ? schedule : null,
+      schedule_timezone: mode === "schedule" ? $("#production-publish-timezone").value : null,
+      dry_run: dryRun, confirm_publish: !dryRun, confirm_public: privacy === "public" && confirmPublic,
+    })}).then(job => dryRun ? job : api("/api/channel-agent/production/" + id + "/publishing-jobs/" + job.id + "/run", {method: "POST"}));
+  }, id);
+  $("#production-publish-dry-run").onclick = event => submitPublishing(event.currentTarget, "dry-run");
+  $("#production-publish-now").onclick = event => submitPublishing(event.currentTarget, "now");
+  $("#production-publish-schedule-action").onclick = event => submitPublishing(event.currentTarget, "schedule");
+  document.querySelectorAll("[data-production-publishing-job]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(button, () => api("/api/channel-agent/production/" + id + "/publishing-jobs/" + button.dataset.productionPublishingJob + "/" + button.dataset.publishingAction, {method: "POST"}), id);
   });
 
   $("#production-item-save").onclick = async () => {

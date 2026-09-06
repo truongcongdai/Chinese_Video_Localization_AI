@@ -130,6 +130,7 @@ class GoogleOAuth(PlatformOAuth):
         expires_at = time.time() + data.get("expires_in", 3600)
 
         account_name = None
+        account_ref = None
         try:
             ch = requests.get(
                 "https://www.googleapis.com/youtube/v3/channels",
@@ -140,6 +141,7 @@ class GoogleOAuth(PlatformOAuth):
             items = ch.get("items") or []
             if items:
                 account_name = items[0]["snippet"]["title"]
+                account_ref = items[0].get("id")
         except Exception:
             pass
 
@@ -148,7 +150,7 @@ class GoogleOAuth(PlatformOAuth):
             refresh_token=data.get("refresh_token"),
             expires_at=expires_at,
             account_name=account_name,
-            account_ref=None,
+            account_ref=account_ref,
             scopes=data.get("scope") or self.SCOPE,
         )
 

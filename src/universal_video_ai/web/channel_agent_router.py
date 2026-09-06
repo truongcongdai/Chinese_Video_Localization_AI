@@ -55,6 +55,11 @@ from universal_video_ai.channel_agent.production_render import (
     ProductionRenderNotFound,
     ProductionRenderService,
 )
+from universal_video_ai.channel_agent.production_publishing import (
+    ProductionPublishingError,
+    ProductionPublishingNotFound,
+    ProductionPublishingService,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -243,6 +248,20 @@ class ProductionRenderBody(BaseModel):
     source_subtitle_boxes: Optional[list[dict[str, Any]]] = None
 
 
+class ProductionPublishingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    render_job_id: int
+    metadata_asset_id: Optional[int] = None
+    thumbnail_path: Optional[str] = None
+    privacy: str = "private"
+    schedule_local: Optional[str] = None
+    schedule_timezone: Optional[str] = None
+    dry_run: bool = True
+    confirm_publish: bool = False
+    confirm_public: bool = False
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -256,6 +275,15 @@ def _production_render_call(operation):
     except ProductionRenderNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except ProductionRenderError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _production_publishing_call(operation):
+    try:
+        return operation()
+    except ProductionPublishingNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionPublishingError as exc:
         raise HTTPException(409, str(exc)) from exc
 
 
@@ -1064,6 +1092,63 @@ def resume_production_render(
     return _production_render_call(
         lambda: ProductionRenderService(store).resume(user_id, item_id, job_id)
     )
+
+
+@router.get("/publishing/youtube/connection")
+def production_publishing_connection(
+    verify: bool = Query(False), user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_publishing_call(
+        lambda: ProductionPublishingService(store).connection(user_id, verify=verify)
+    )
+
+
+@router.post("/production/{item_id}/publishing-jobs")
+def submit_production_publishing(
+    item_id: int, body: ProductionPublishingBody,
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_publishing_call(lambda: ProductionPublishingService(store).submit(
+        user_id, item_id, render_job_id=body.render_job_id,
+        metadata_asset_id=body.metadata_asset_id, thumbnail_path=body.thumbnail_path,
+        privacy=body.privacy, schedule_local=body.schedule_local,
+        schedule_timezone=body.schedule_timezone, dry_run=body.dry_run,
+        confirm_publish=body.confirm_publish, confirm_public=body.confirm_public,
+    ))
+
+
+@router.get("/production/{item_id}/publishing-jobs")
+def production_publishing_jobs(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _production_publishing_call(lambda: ProductionPublishingService(store).list(user_id, item_id))
+
+
+@router.get("/production/{item_id}/publishing-jobs/{job_id}")
+def production_publishing_job(
+    item_id: int, job_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_publishing_call(lambda: ProductionPublishingService(store).get(user_id, item_id, job_id))
+
+
+@router.post("/production/{item_id}/publishing-jobs/{job_id}/{action}")
+def mutate_production_publishing_job(
+    item_id: int, job_id: int, action: str,
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    service = ProductionPublishingService(store)
+    operations = {"run": service.run, "retry": service.run, "refresh": service.refresh, "cancel": service.cancel}
+    if action not in operations:
+        raise HTTPException(422, "Publishing action must be run, retry, refresh, or cancel.")
+    return _production_publishing_call(lambda: operations[action](user_id, item_id, job_id))
 
 
 @router.get("/production/{item_id}/qa")

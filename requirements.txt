@@ -23,6 +23,8 @@ edge-tts>=7.2.8
 redis>=5.0.0
 Flask>=3.0.0
 requests>=2.31.0
+# IANA timezone database for timezone-safe scheduling on Windows.
+tzdata>=2026.1
 python-telegram-bot>=21.0
 googletrans>=4.0.0
 librosa>=0.10.2

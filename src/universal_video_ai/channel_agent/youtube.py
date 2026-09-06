@@ -279,11 +279,12 @@ class GoogleOAuthTokenService:
             account_name=_row_value(row, "account_name"),
         )
 
-    def get_valid_access_token(self, user_id: int) -> str:
+    def get_valid_access_token(self, user_id: int, *, required_scopes: Optional[set[str]] = None) -> str:
         row = self._store.get_social_account(user_id, "youtube")
         if not row:
             raise YouTubeNotConnectedError()
-        if not REQUIRED_CHANNEL_AGENT_SCOPES.issubset(_parse_scopes(_row_value(row, "scopes"))):
+        required = REQUIRED_CHANNEL_AGENT_SCOPES if required_scopes is None else frozenset(required_scopes)
+        if not required.issubset(_parse_scopes(_row_value(row, "scopes"))):
             raise YouTubePermissionError()
 
         access_token = _row_value(row, "access_token")
