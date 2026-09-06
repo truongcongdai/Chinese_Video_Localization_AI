@@ -339,7 +339,11 @@ class TimelineService:
                 f"{{\\fad(80,100){placement}}}" + r"\N".join(rendered_lines)
             )
 
-        font_size = font_size or (48 if frame_height >= frame_width else 50)
+        # Scale against actual frame height. A fixed 50px landscape font
+        # overflows 640x360 renders even when caption chunking is correct.
+        font_size = font_size or max(
+            18, min(50, round(frame_height * 0.065))
+        )
         margin_lr = max(40, round(frame_width * 0.07))
         margin_v = max(60, round(frame_height * 0.07))
         header = f"""[Script Info]

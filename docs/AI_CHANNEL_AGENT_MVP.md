@@ -1048,6 +1048,42 @@ CP7A stores text/JSON planning artifacts only. It does not download competitor
 media, synthesize final audio, create a thumbnail image, render video, upload,
 schedule, or publish.
 
-## Next checkpoint: CP7B - Render Pipeline Integration
+## CP7B - Render Pipeline Integration
+
+CP7B executes exact approved CP7A asset versions through the existing TTS,
+timeline, mixer, Renderer/FFmpeg, and MP4 validation stack. Owner-scoped render
+jobs persist their current stage, progress, error, immutable asset references,
+output path, and deterministic QC result. A failed or interrupted job can be
+resumed; completed non-empty TTS section clips are reused rather than generated
+again. The dubbed track is silence-padded to the video duration, and QC compares
+the final audio and video stream durations instead of trusting container duration
+alone.
+
+Original-subtitle cleanup is derived from temporally grouped observations. It
+uses local consensus, rejects positional outliers, applies small bounded
+padding, clamps each rectangle to the frame, and enforces a default maximum
+height of 12 percent of the frame. Unsafe regions are skipped and reported
+instead of expanding into a destructive lower-frame smear. Debug geometry is
+available as metadata and is never drawn into the production output.
+
+Opening OCR evidence is reconciled with ASR so a missed first utterance does
+not silently disappear. Timestamp zero is valid. Before render, deterministic
+coverage checks require each relevant source event to have subtitle and TTS
+timeline coverage unless it has an explicit non-dialogue/omission decision.
+
+Voice discovery is provider-neutral. Edge remains supported and its two native
+Vietnamese identities are reported accurately. Optional Piper voices are
+listed only from user-installed models under `PIPER_VOICE_DIR`; no model is
+downloaded automatically. Rate and pitch settings remain style parameters and
+are never counted as distinct speakers. Role-to-voice mapping can execute the
+approved CP7A Voice Plan without automatic voice cloning.
+
+Authenticated routes under
+`/api/channel-agent/production/{item_id}/render-jobs` queue, inspect, run, and
+resume CP7B jobs. Source media must be explicitly attested as owned, licensed,
+or public-domain. CP7B neither downloads competitor media nor uploads,
+schedules, or publishes output.
+
+## Next checkpoint: CP8 - Publishing & Scheduling
 
 **CP7 — Production Execution**

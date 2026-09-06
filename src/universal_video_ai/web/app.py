@@ -70,7 +70,7 @@ from universal_video_ai.render.visual_director import direct_visual_scene
 from universal_video_ai.remix import build_remix_plan
 from universal_video_ai.tts.tts import DEFAULT_VOICES_BY_LANGUAGE
 from universal_video_ai.tts.tts import voice_for_language
-from universal_video_ai.tts.voices import voices_for_language
+from universal_video_ai.tts.registry import RegistryTTSBackend, get_default_voice_registry
 from universal_video_ai.tts.backend import EdgeTTSBackend
 from universal_video_ai.tts.premium import (
     OPENAI_BUILTIN_VOICES,
@@ -6156,6 +6156,7 @@ def delete_provider_settings(provider: str, user_id: int = Depends(get_current_u
 def list_voices(
         language: str = "vi",
         provider: str = "edge",
+        refresh: bool = False,
         user_id: int = Depends(get_current_user_id),
 ):
     """Curated male/female voice choices for `language`, for the optional
@@ -6163,8 +6164,19 @@ def list_voices(
     this language, UI should just show 'Mặc định' (None -> whatever
     tts.voice_for_language() picks automatically, unchanged behavior)."""
     provider = (provider or "edge").strip().lower()
-    if provider == "edge":
-        voices = voices_for_language(language)
+    if provider in {"edge", "free", "all"}:
+        registry = get_default_voice_registry()
+        registry_provider = "edge" if provider == "edge" else None
+        voice_records = registry.list_voices(
+            language,
+            provider=registry_provider,
+            refresh=refresh,
+            # Vietnamese catalog entries are exposed only after a real,
+            # non-empty synthesis succeeds. The singleton registry caches the
+            # result so ordinary catalog refreshes do not regenerate previews.
+            verify=(language or "").lower().split("-", 1)[0] == "vi",
+        )
+        voices = [item.to_dict() for item in voice_records]
     elif provider == "openai":
         settings = store.get_provider_settings(user_id, "openai")
         voices = (settings or {}).get("extra", {}).get("voices") or []
@@ -6180,6 +6192,17 @@ def list_voices(
         "language_label": LANGUAGE_LABELS.get(language, language),
         "default_voice": voice_for_language(language),
         "provider": provider,
+        "provider_health": [
+            {"provider": item.provider, "available": item.available, "detail": item.detail}
+            for item in get_default_voice_registry().health()
+        ] if provider in {"edge", "free", "all"} else [],
+        "distinct_speaker_count": (
+            get_default_voice_registry().distinct_speaker_count(voice_records)
+            if provider in {"edge", "free", "all"} else len({
+                item.get("speaker_identity", item.get("id"))
+                for item in voices
+            })
+        ),
     }
 
 
@@ -6233,23 +6256,23 @@ async def tts_synthesize(body: TTSSynthesizeBody, user_id: int = Depends(get_cur
     temp_dir = Path(TEMP_DIR) / "tts_temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
     provider = (body.provider or "edge").strip().lower()
-    suffix = ".mp3" if provider == "edge" else ".wav"
+    selected_voice_provider = (
+        body.voice.split(":", 1)[0]
+        if body.voice and ":" in body.voice else provider
+    )
+    suffix = ".mp3" if selected_voice_provider == "edge" else ".wav"
     output_path = temp_dir / f"tts_{uuid.uuid4().hex}{suffix}"
 
     try:
         if provider == "edge":
-            import edge_tts
-
-            preset = body.voice or voice_for_language(body.language)
-            preset_parts = preset.split("|") if preset else []
-            effective_voice = preset_parts[0] if preset_parts else voice_for_language(body.language)
-            communicate = edge_tts.Communicate(
-                body.text.replace("\n", " "),
-                effective_voice,
-                rate=body.rate,
-                pitch=body.pitch,
+            backend = RegistryTTSBackend()
+            await asyncio.to_thread(
+                backend.synthesize,
+                body.text,
+                output_path,
+                body.language,
+                body.voice or voice_for_language(body.language).split("|", 1)[0],
             )
-            await communicate.save(str(output_path))
         elif provider == "openai":
             settings = store.get_provider_settings(user_id, "openai")
             if not settings or not settings.get("api_key"):

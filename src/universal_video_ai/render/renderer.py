@@ -265,7 +265,7 @@ class RenderConfig:
     adaptive_text_drawbox_enabled: bool = False
     # Two local cleanup passes remove antialiased glyph edges much more
     # reliably than one pass while remaining limited to the learned region.
-    adaptive_text_cleanup_passes: int = 5
+    adaptive_text_cleanup_passes: int = 2
     # Keep large jobs below FFmpeg's practical filter-chain limit. A long
     # video can contain thousands of subtitle windows; multiplying every
     # window by all cleanup passes has caused native FFmpeg crashes during
@@ -436,7 +436,7 @@ class Renderer:
             # Clean the original glyphs before the replacement box is painted.
             # delogo works as a local adaptive blur/inpaint approximation and is
             # gated to the exact cue time, so the rest of the video stays sharp.
-            if self.config.adaptive_text_cleanup_enabled and frame_w and frame_h:
+            if self.config.adaptive_text_cleanup_enabled and frame_w and frame_h and region.cleanup_safe:
                 cx, cy, cw, ch = self._clamp_delogo_box(
                     region.cleanup_x, region.cleanup_y,
                     region.cleanup_width, region.cleanup_height,
@@ -477,6 +477,13 @@ class Renderer:
                             f"color={self.config.adaptive_text_residual_veil_color}@{veil_opacity:.3f}:"
                             f"t=fill:enable='{cleanup_enable_expr}'"
                         )
+            elif self.config.adaptive_text_cleanup_enabled and frame_w and frame_h:
+                self.logger.warning(
+                    "Skipping unsafe subtitle cleanup at %.3f-%.3fs: %s",
+                    overlay.start,
+                    overlay.end,
+                    region.safety_reason or "geometry_guard",
+                )
 
             text_len = max(1, len(overlay.text))
             font_size = overlay.font_size if overlay.font_size is not None else max(
@@ -526,6 +533,16 @@ class Renderer:
                     f"enable='{text_enable_expr}'"
                 )
         return filters
+
+    def get_cleanup_geometry(
+            self, overlays: List[TextOverlay], frame_w: int, frame_h: int
+    ) -> List[dict]:
+        """Expose cleanup rectangles for diagnostics without drawing overlays."""
+        tracker = AdaptiveSubtitleRegionTracker(
+            self.config.adaptive_text_region_config or AdaptiveSubtitleRegionConfig()
+        )
+        tracked = tracker.track(overlays, frame_w, frame_h)
+        return tracker.diagnostics(tracked, frame_w, frame_h)
 
     def _build_animated_subtitle_filters(
             self, subtitle_segments: List[dict]
@@ -825,7 +842,7 @@ class Renderer:
                 or (self.config.video_template_config and self.config.video_template_config.enabled)
         )
 
-        if text_overlays and not self.config.default_overlay_font_path and not any(
+        if any(o.text for o in text_overlays) and not self.config.default_overlay_font_path and not any(
                 o.font_path for o in text_overlays
         ):
             self.logger.warning(

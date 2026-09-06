@@ -146,6 +146,8 @@ def test_build_dubbed_track_trims_clip_before_next_start(tmp_path: Path, monkeyp
     assert "atempo=1.2371" in filter_graph
     assert "atrim=duration=0.970" in filter_graph
     assert "adelay=1000|1000" in filter_graph
+    assert "apad=whole_dur=3.000" in filter_graph
+    assert "atrim=duration=3.000" in filter_graph
 
 
 def test_build_dubbed_track_batches_large_clip_lists(tmp_path: Path, monkeypatch) -> None:
@@ -178,3 +180,4 @@ def test_build_dubbed_track_batches_large_clip_lists(tmp_path: Path, monkeypatch
     assert final_op == "build_dubbed_track (combine batches)"
     assert "amix=inputs=3" in final_filter
     assert "adelay=64000|64000" in final_filter
+    assert "apad=whole_dur=130.000" in final_filter

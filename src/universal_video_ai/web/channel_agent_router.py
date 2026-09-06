@@ -50,6 +50,11 @@ from universal_video_ai.channel_agent.production_assets import (
     ProductionAssetNotFound,
     ProductionAssetService,
 )
+from universal_video_ai.channel_agent.production_render import (
+    ProductionRenderError,
+    ProductionRenderNotFound,
+    ProductionRenderService,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -227,11 +232,31 @@ class ProductionAssetReviewBody(BaseModel):
     note: Optional[str] = None
 
 
+class ProductionRenderBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_video_path: str
+    source_media_rights: str
+    voice_id: Optional[str] = None
+    speaker_mapping: Optional[dict[str, str]] = None
+    preserve_source_audio: bool = False
+    source_subtitle_boxes: Optional[list[dict[str, Any]]] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
         raise HTTPException(503, "Application storage is unavailable.")
     return store
+
+
+def _production_render_call(operation):
+    try:
+        return operation()
+    except ProductionRenderNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProductionRenderError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def _service(store: Store) -> YouTubeReadOnlyService:
@@ -974,6 +999,71 @@ def production_asset_package(
     _require_enabled()
     return _production_asset_call(
         lambda: _production_asset_service(store).package(user_id, item_id))
+
+
+@router.post("/production/{item_id}/render-jobs")
+def submit_production_render(
+    item_id: int, body: ProductionRenderBody,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_render_call(lambda: ProductionRenderService(store).submit(
+        user_id, item_id,
+        source_video_path=body.source_video_path,
+        source_media_rights=body.source_media_rights,
+        voice_id=body.voice_id,
+        speaker_mapping=body.speaker_mapping,
+        preserve_source_audio=body.preserve_source_audio,
+        source_subtitle_boxes=body.source_subtitle_boxes,
+    ))
+
+
+@router.get("/production/{item_id}/render-jobs")
+def production_render_jobs(
+    item_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _production_render_call(
+        lambda: ProductionRenderService(store).list(user_id, item_id)
+    )
+
+
+@router.get("/production/{item_id}/render-jobs/{job_id}")
+def production_render_job(
+    item_id: int, job_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_render_call(
+        lambda: ProductionRenderService(store).get(user_id, item_id, job_id)
+    )
+
+
+@router.post("/production/{item_id}/render-jobs/{job_id}/run")
+def run_production_render(
+    item_id: int, job_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_render_call(
+        lambda: ProductionRenderService(store).run(user_id, item_id, job_id)
+    )
+
+
+@router.post("/production/{item_id}/render-jobs/{job_id}/resume")
+def resume_production_render(
+    item_id: int, job_id: int,
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _production_render_call(
+        lambda: ProductionRenderService(store).resume(user_id, item_id, job_id)
+    )
 
 
 @router.get("/production/{item_id}/qa")

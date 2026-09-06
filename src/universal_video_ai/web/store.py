@@ -554,6 +554,29 @@ CREATE INDEX IF NOT EXISTS idx_production_assets_owner
 CREATE INDEX IF NOT EXISTS idx_production_generation_jobs_owner
     ON production_generation_jobs(user_id, production_item_id, updated_at DESC);
 
+-- CP7B restart-safe render execution. Paths reference generated artifacts;
+-- approved CP7A asset versions are retained as immutable JSON references.
+CREATE TABLE IF NOT EXISTS production_render_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    production_item_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    current_stage TEXT NOT NULL DEFAULT 'queued',
+    progress REAL NOT NULL DEFAULT 0,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    approved_asset_refs_json TEXT NOT NULL DEFAULT '{}',
+    output_path TEXT,
+    qc_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_render_jobs_owner
+    ON production_render_jobs(user_id, production_item_id, updated_at DESC);
+
 -- Content OS tables (feature-flagged content creation workflow)
 CREATE TABLE IF NOT EXISTS content_os_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3545,6 +3568,94 @@ class Store:
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE production_generation_jobs SET "
+                + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND production_item_id=? AND user_id=?",
+                [*payload.values(), job_id, item_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    @staticmethod
+    def _production_render_job_dict(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        for source, target in (
+            ("request_json", "request"),
+            ("approved_asset_refs_json", "approved_asset_refs"),
+            ("qc_json", "qc"),
+        ):
+            raw = result.pop(source, None)
+            try:
+                result[target] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[target] = {}
+        return result
+
+    def create_production_render_job(
+        self, user_id: int, item_id: int, *, request: Dict[str, Any],
+        approved_asset_refs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            owner = conn.execute(
+                "SELECT 1 FROM production_items WHERE id=? AND user_id=?",
+                (item_id, user_id),
+            ).fetchone()
+            if not owner:
+                return None
+            cur = conn.execute(
+                """INSERT INTO production_render_jobs
+                (user_id,production_item_id,status,current_stage,progress,request_json,
+                 approved_asset_refs_json,qc_json,created_at,updated_at)
+                VALUES (?,?,'queued','queued',0,?,?, '{}',?,?)""",
+                (
+                    user_id, item_id,
+                    json.dumps(request, ensure_ascii=False, sort_keys=True),
+                    json.dumps(approved_asset_refs, ensure_ascii=False, sort_keys=True),
+                    now, now,
+                ),
+            )
+            job_id = int(cur.lastrowid)
+        return self.get_production_render_job(user_id, item_id, job_id)
+
+    def get_production_render_job(
+        self, user_id: int, item_id: int, job_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM production_render_jobs "
+                "WHERE id=? AND production_item_id=? AND user_id=?",
+                (job_id, item_id, user_id),
+            ).fetchone()
+        return self._production_render_job_dict(row) if row else None
+
+    def list_production_render_jobs(
+        self, user_id: int, item_id: int,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM production_render_jobs "
+                "WHERE production_item_id=? AND user_id=? ORDER BY created_at DESC,id DESC",
+                (item_id, user_id),
+            ).fetchall()
+        return [self._production_render_job_dict(row) for row in rows]
+
+    def update_production_render_job(
+        self, user_id: int, item_id: int, job_id: int, data: Dict[str, Any],
+    ) -> bool:
+        allowed = {
+            "status", "current_stage", "progress", "output_path", "error",
+            "started_at", "completed_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if "qc" in data:
+            payload["qc_json"] = json.dumps(
+                data["qc"], ensure_ascii=False, sort_keys=True
+            )
+        if not payload:
+            return bool(self.get_production_render_job(user_id, item_id, job_id))
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE production_render_jobs SET "
                 + ",".join(f"{key}=?" for key in payload)
                 + " WHERE id=? AND production_item_id=? AND user_id=?",
                 [*payload.values(), job_id, item_id, user_id],

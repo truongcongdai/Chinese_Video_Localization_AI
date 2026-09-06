@@ -19,4 +19,5 @@ def test_residual_veil_is_tight_and_subtle():
 def test_cleanup_expansion_is_not_excessive():
     path = Path(__file__).parents[1] / "src/universal_video_ai/render/subtitle_region_tracker.py"
     text = path.read_text(encoding="utf-8")
-    assert "cleanup_extra_height_ratio: float = 0.42" in text
+    assert "cleanup_extra_height_ratio: float = 0.20" in text
+    assert "max_cleanup_height_ratio: float = 0.12" in text

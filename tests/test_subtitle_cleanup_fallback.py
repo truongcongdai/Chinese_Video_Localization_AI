@@ -33,7 +33,7 @@ def test_missing_window_uses_nearest_band_when_layout_changes():
 def test_renderer_defaults_to_natural_cleanup_without_white_box():
     config = RenderConfig()
     assert config.adaptive_text_drawbox_enabled is False
-    assert config.adaptive_text_cleanup_passes >= 2
+    assert config.adaptive_text_cleanup_passes == 2
 
 
 def test_cleanup_filters_use_multiple_delogo_passes_and_no_drawbox():

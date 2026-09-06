@@ -32,6 +32,12 @@ from universal_video_ai.render.animated_subtitles import SubtitleEffect
 from universal_video_ai.render.renderer import Renderer, RenderConfig, TextOverlay
 from universal_video_ai.render.text_detector import OnScreenTextDetector, TextRegion
 from universal_video_ai.render import ocr_language_map
+from universal_video_ai.localization_coverage import (
+    CoverageReport,
+    SourceEvidence,
+    reconcile_source_evidence,
+    validate_timeline_coverage,
+)
 
 __all__ = [
     "LocalizationService", "LocalizationConfig", "LocalizationResult",
@@ -68,8 +74,9 @@ class LocalizationConfig:
     target_language: Optional[str] = None
     run_tts: bool = False
     # Explicit Edge-TTS voice id (e.g. "vi-VN-NamMinhNeural") to use instead
-    # of the target language's default voice — see tts.voices.VOICE_OPTIONS
-    # for the curated male/female choices the web UI offers. None = use
+    # of the target language's default voice. Provider-neutral discovery
+    # exposes genuine speaker identities; rate/pitch styles are not voices.
+    # None = use
     # tts.voice_for_language()'s default for target_language, unchanged
     # from before this option existed.
     tts_voice: Optional[str] = None
@@ -195,6 +202,13 @@ class LocalizationConfig:
     # and optional LLM adaptation so every segment is checked against its
     # original timestamp before subtitles and TTS are generated.
     speech_fit: SpeechFitConfig = field(default_factory=SpeechFitConfig)
+    # A short, bounded OCR pass protects opening burned subtitles when ASR
+    # misses the first utterance. It never downloads media and samples only
+    # the configured near-zero timestamps.
+    reconcile_opening_ocr_with_asr: bool = True
+    opening_ocr_sample_times: Tuple[float, ...] = (0.1, 0.5, 1.0, 2.0)
+    require_complete_subtitle_coverage: bool = True
+    require_complete_tts_coverage: bool = True
 
 
 @dataclass(frozen=True)
@@ -561,6 +575,31 @@ class LocalizationService:
         audio_source_segments: List[TranscriptSegment] = [
             s for s in (audio_result.segments or []) if s.has_timing
         ]
+
+        opening_ocr_segments: List[TranscriptSegment] = []
+        if (
+            self.config.reconcile_opening_ocr_with_asr
+            and self.config.run_translation
+            and self.config.enable_text_cover
+            and download_result.video_path
+        ):
+            async with _OCR_SLOTS:
+                opening_ocr_segments = await asyncio.to_thread(
+                    self._scan_opening_ocr_segments,
+                    download_result.video_path,
+                    audio_result.audio_result.duration,
+                    audio_result.detected_language,
+                )
+        source_evidence = reconcile_source_evidence(
+            audio_source_segments, opening_ocr_segments
+        )
+        if any(item.detector == "ocr" for item in source_evidence):
+            self.logger.warning(
+                "Opening OCR recovered %d source event(s) missed by ASR",
+                sum(1 for item in source_evidence if item.detector == "ocr"),
+            )
+        audio_source_segments = [item.as_segment() for item in source_evidence]
+        self._source_evidence = source_evidence
 
         self._last_subtitle_alignment_estimate = None
         self._used_source_subtitle_timing = False
@@ -1191,7 +1230,10 @@ class LocalizationService:
 
             # Check if visual_source_segments have detected subtitle timing (from OCR/burned-in subtitles)
             source_min_start = min((s.start for s in visual_source_segments), default=0.0) if visual_source_segments else 0.0
-            has_detected_source_timing = source_min_start > 0.01  # Reduced from 0.05 to catch subtitles starting near 0s
+            # A cue at exactly 0.0 is real timing, not a false-y sentinel.
+            has_detected_source_timing = any(
+                s.has_timing and s.end > s.start for s in visual_source_segments
+            )
 
             self.logger.debug(
                 "LocalizationService: subtitle generation - visual_translated_segments=%s, "
@@ -1239,6 +1281,21 @@ class LocalizationService:
                 )
             else:
                 self.logger.info("LocalizationService: generated 0 subtitle segments")
+
+            subtitle_coverage = validate_timeline_coverage(
+                self._source_evidence_or_segments(source_segments),
+                subtitle_segments or [],
+                localized_start_attr="start_time",
+                localized_end_attr="end_time",
+            )
+            self._last_subtitle_coverage_report = subtitle_coverage
+            if self.config.require_complete_subtitle_coverage and not subtitle_coverage.complete:
+                first = subtitle_coverage.uncovered[0]
+                raise RuntimeError(
+                    "Subtitle localization coverage incomplete: "
+                    f"{len(subtitle_coverage.uncovered)} uncovered source event(s); "
+                    f"first={first.start:.3f}-{first.end:.3f}s detector={first.source_detector}"
+                )
 
             subtitles_path = output_dir / "subtitles.ass"
             dimensions = (
@@ -1528,6 +1585,80 @@ class LocalizationService:
             final_video_path=final_video_path,
         )
 
+    def _source_evidence_or_segments(
+        self, segments: List[TranscriptSegment]
+    ) -> List[SourceEvidence]:
+        evidence = getattr(self, "_source_evidence", None)
+        if evidence and len(evidence) == len(segments):
+            return [
+                SourceEvidence(
+                    segment.start, segment.end, event.text, event.detector
+                )
+                for event, segment in zip(evidence, segments)
+            ]
+        return [
+            SourceEvidence(item.start, item.end, item.text, "asr")
+            for item in segments
+        ]
+
+    def _scan_opening_ocr_segments(
+        self,
+        video_path: Path,
+        duration: float,
+        detected_language: Optional[str],
+    ) -> List[TranscriptSegment]:
+        """Read bounded opening frames and group repeated OCR into cue events."""
+        times = sorted({
+            max(0.0, float(value))
+            for value in self.config.opening_ocr_sample_times
+            if value is not None and 0.0 <= float(value) < max(0.0, duration)
+        })
+        if not times:
+            return []
+        detector = self.text_detector
+        if detector is None:
+            detector = OnScreenTextDetector(
+                languages=ocr_language_map.resolve_ocr_languages(
+                    self.config.ocr_languages, detected_language
+                )
+            )
+            self.text_detector = detector
+        observations: List[Tuple[float, str]] = []
+        for at_seconds in times:
+            try:
+                text = detector.read_subtitle_text_at(
+                    video_path,
+                    at_seconds,
+                    exclude_regions_fractional=self.config.watermark_exclude_regions_fractional,
+                )
+            except Exception as exc:
+                self.logger.warning("Opening OCR evidence failed at %.3fs: %s", at_seconds, exc)
+                continue
+            clean = " ".join((text or "").split()).strip()
+            if clean:
+                observations.append((at_seconds, clean))
+        if not observations:
+            return []
+
+        grouped: List[List[Tuple[float, str]]] = []
+        for observation in observations:
+            if (
+                grouped
+                and observation[1].casefold() == grouped[-1][-1][1].casefold()
+                and observation[0] - grouped[-1][-1][0] <= 1.1
+            ):
+                grouped[-1].append(observation)
+            else:
+                grouped.append([observation])
+        return [
+            TranscriptSegment(
+                start=max(0.0, group[0][0] - 0.10),
+                end=min(duration, max(group[-1][0] + 0.40, group[0][0] + 0.12)),
+                text=group[-1][1],
+            )
+            for group in grouped
+        ]
+
 
     @staticmethod
     def _wav_duration(path: Path) -> float:
@@ -1638,8 +1769,19 @@ class LocalizationService:
         for idx, seg, clip_path in synthesized:
             duration = self._wav_duration(clip_path)
             if duration <= 0.0:
-                self.logger.warning("Could not measure TTS segment %s; skipping it", clip_path)
-                continue
+                # Some injected/test providers expose no probeable duration.
+                # Preserve the successful synthesis using its real source slot
+                # instead of silently dropping the segment. Production Edge
+                # output is independently validated by ffprobe.
+                duration = seg.duration
+                if duration <= 0.0:
+                    self.logger.warning("Could not measure TTS segment %s; skipping it", clip_path)
+                    continue
+                self.logger.warning(
+                    "Could not probe TTS segment %s; using %.3fs source slot",
+                    clip_path,
+                    duration,
+                )
             items.append((idx, seg, clip_path, duration))
 
         clips: List[TimedAudioClip] = []
@@ -1820,6 +1962,19 @@ class LocalizationService:
             total_duration=total_duration,
         )
         self._last_tts_playback_segments = playback_segments
+
+        tts_coverage = validate_timeline_coverage(
+            translated_segments,
+            playback_segments,
+        )
+        self._last_tts_coverage_report = tts_coverage
+        if self.config.require_complete_tts_coverage and not tts_coverage.complete:
+            first = tts_coverage.uncovered[0]
+            raise RuntimeError(
+                "TTS localization coverage incomplete: "
+                f"{len(tts_coverage.uncovered)} segment(s) missing audio; "
+                f"first={first.start:.3f}-{first.end:.3f}s"
+            )
 
         tts_audio_path = output_dir / "tts_audio.wav"
         mix_duration = max(total_duration, clips[-1].end if clips else total_duration)

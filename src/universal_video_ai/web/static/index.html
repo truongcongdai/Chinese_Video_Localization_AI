@@ -466,6 +466,7 @@
         <div id="voice-select-help" style="font-size:12px;color:var(--text-dim);margin-top:5px">Danh sách voice thay đổi theo ngôn ngữ, provider và kết nối đã lưu.</div>
         <div class="voice-preview-row">
           <button class="btn secondary small" id="voice-preview-btn" type="button">▶ Nghe thử giọng</button>
+          <button class="btn secondary small" id="voice-refresh-btn" type="button">↻ Làm mới giọng</button>
           <span id="voice-preview-status" class="muted-help"></span>
         </div>
         <audio id="voice-preview-audio" class="hidden" controls preload="none"></audio>
@@ -1653,7 +1654,7 @@
           <h3 class="section-title">🗂️ Production Queue</h3>
           <button class="btn secondary small" id="production-refresh-list" type="button">Refresh queue</button>
         </div>
-        <p class="muted-help">Planning packages start from approved Content Opportunities. CP7A uses local Ollama for versioned scripts and briefs; it does not download competitor media, create final TTS, render, upload, or publish.</p>
+        <p class="muted-help">Planning packages start from approved Content Opportunities. CP7A creates versioned assets; CP7B executes approved assets through TTS, subtitles, bounded cleanup, audio mix, render, and QC. Neither checkpoint downloads competitor media or publishes.</p>
         <div class="row" style="align-items:end;margin-top:12px">
           <div class="field"><label>Status</label><select id="production-status-filter"><option value="queued,planning,ready,in_progress,blocked">Active</option><option value="queued">Queued</option><option value="planning">Planning</option><option value="ready">Ready</option><option value="in_progress">In progress</option><option value="blocked">Blocked</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option><option value="all">All</option></select></div>
           <div class="field"><label>Min priority</label><input id="production-min-priority" type="number" min="0" max="100" value="0" style="width:90px"></div>

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from statistics import median
-from typing import Iterable, List, Optional, Protocol, Sequence, Tuple, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, TypeVar
 
 __all__ = [
     "AdaptiveSubtitleRegionConfig",
@@ -54,7 +54,18 @@ class AdaptiveSubtitleRegionConfig:
     max_padding_x_frame_ratio: float = 0.035
     max_padding_y_frame_ratio: float = 0.025
     # Extra cleanup expansion for delogo/inpaint before the cover box.
-    cleanup_extra_height_ratio: float = 0.42
+    cleanup_extra_height_ratio: float = 0.20
+    # Hard production guards. OCR occasionally joins a subtitle to a nearby
+    # label or actor, creating a tall box. Padding that box and applying
+    # delogo repeatedly produced the broad vertical smear seen in real jobs.
+    # These caps are frame-relative so they work for portrait and landscape
+    # media. Unsafe source geometry is reported and cleanup is disabled for
+    # that cue; translated captions may still render as normal.
+    max_cleanup_height_ratio: float = 0.12
+    max_cleanup_width_ratio: float = 0.96
+    max_vertical_padding_px: int = 28
+    min_subtitle_center_y_ratio: float = 0.05
+    max_subtitle_center_y_ratio: float = 0.98
     # A single OCR cue can occasionally merge subtitle text with a nearby
     # label, producing an abnormally tall/shifted box.  Reject such one-off
     # geometry when the surrounding cues form a stable local consensus.
@@ -76,6 +87,8 @@ class TrackedRegion:
     cleanup_height: int
     cluster_id: int
     confidence: float
+    cleanup_safe: bool = True
+    safety_reason: Optional[str] = None
 
 
 @dataclass
@@ -223,6 +236,7 @@ class AdaptiveSubtitleRegionTracker:
                 for other_idx, other in enumerate(overlays)
                 if other_idx != idx
                 and self._valid(other)
+                and assignments[other_idx] == cluster_id
                 and abs(((other.start + other.end) / 2.0) - midpoint) <= self.config.local_consensus_seconds
             ]
             local_consensus_cy = None
@@ -295,12 +309,17 @@ class AdaptiveSubtitleRegionTracker:
                 if candidates:
                     distance, nearest_idx = min(candidates)
                     nearest = overlays[nearest_idx]
+                    nearest_cy = nearest.y + nearest.height / 2.0
                     if distance <= self.config.temporal_neighbor_seconds:
-                        smoothed_cy = nearest.y + nearest.height / 2.0
+                        smoothed_cy = nearest_cy
                         smoothed_height = float(nearest.height)
                         confidence = 0.5
                     else:
-                        confidence = 0.25
+                        # A distant one-cue observation has no local evidence
+                        # either way, so preserve it without ever unioning it
+                        # into a global subtitle band. Repeated alternate
+                        # positions form an accepted cluster above.
+                        confidence = 0.35
 
             base_height = max(2, int(round(smoothed_height)))
             base_y = int(round(smoothed_cy - base_height / 2.0))
@@ -314,6 +333,7 @@ class AdaptiveSubtitleRegionTracker:
             pad_y = min(
                 int(round(base_height * self.config.padding_y_height_ratio)),
                 int(round(frame_h * self.config.max_padding_y_frame_ratio)),
+                max(0, int(self.config.max_vertical_padding_px)),
             )
             pad_x = max(1, pad_x)
             pad_y = max(1, pad_y)
@@ -337,6 +357,37 @@ class AdaptiveSubtitleRegionTracker:
                 frame_h,
             )
 
+            max_cleanup_height = max(2, int(round(frame_h * self.config.max_cleanup_height_ratio)))
+            max_cleanup_width = max(2, int(round(frame_w * self.config.max_cleanup_width_ratio)))
+            cleanup_safe = True
+            safety_reason: Optional[str] = None
+            center_ratio = smoothed_cy / max(1.0, float(frame_h))
+
+            if base_height > max_cleanup_height:
+                cleanup_safe = False
+                safety_reason = "detected_glyph_height_exceeds_limit"
+            elif not (
+                self.config.min_subtitle_center_y_ratio
+                <= center_ratio
+                <= self.config.max_subtitle_center_y_ratio
+            ):
+                cleanup_safe = False
+                safety_reason = "subtitle_position_outside_safe_band"
+            else:
+                # Reduce expansion around the observed glyph union rather
+                # than allowing padding to turn a normal cue into a large
+                # lower-frame band.
+                if cleanup_height > max_cleanup_height:
+                    cleanup_height = max_cleanup_height
+                    cleanup_y = int(round(smoothed_cy - cleanup_height / 2.0))
+                if cleanup_width > max_cleanup_width:
+                    cleanup_center_x = cleanup_x + cleanup_width / 2.0
+                    cleanup_width = max_cleanup_width
+                    cleanup_x = int(round(cleanup_center_x - cleanup_width / 2.0))
+                cleanup_x, cleanup_y, cleanup_width, cleanup_height = self._clamp_box(
+                    cleanup_x, cleanup_y, cleanup_width, cleanup_height, frame_w, frame_h,
+                )
+
             results.append(
                 (
                     overlay,
@@ -351,8 +402,42 @@ class AdaptiveSubtitleRegionTracker:
                         cleanup_height=cleanup_height,
                         cluster_id=cluster_id,
                         confidence=confidence,
+                        cleanup_safe=cleanup_safe,
+                        safety_reason=safety_reason,
                     ),
                 )
             )
 
         return results
+
+    @staticmethod
+    def diagnostics(
+        tracked: Sequence[Tuple[OverlayLike, TrackedRegion]],
+        frame_w: int,
+        frame_h: int,
+    ) -> List[Dict[str, Any]]:
+        """Return debug-only cleanup geometry; never changes rendered pixels."""
+        frame_area = max(1, frame_w * frame_h)
+        return [
+            {
+                "start": round(float(overlay.start), 3),
+                "end": round(float(overlay.end), 3),
+                "x": region.cleanup_x,
+                "y": region.cleanup_y,
+                "width": region.cleanup_width,
+                "height": region.cleanup_height,
+                "frame_width": frame_w,
+                "frame_height": frame_h,
+                "height_ratio": region.cleanup_height / max(1, frame_h),
+                "area_ratio": (region.cleanup_width * region.cleanup_height) / frame_area,
+                "source_box": {
+                    "x": overlay.x, "y": overlay.y,
+                    "width": overlay.width, "height": overlay.height,
+                },
+                "cluster_id": region.cluster_id,
+                "confidence": region.confidence,
+                "cleanup_safe": region.cleanup_safe,
+                "safety_reason": region.safety_reason,
+            }
+            for overlay, region in tracked
+        ]

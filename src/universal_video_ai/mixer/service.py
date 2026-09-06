@@ -522,7 +522,11 @@ class MixerService:
         filter_parts.append(
             f"{mix_inputs}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0[summed]"
         )
-        filter_parts.append("[summed]alimiter=limit=0.95:attack=5:release=50[mixed]")
+        duration = max(0.01, float(total_duration))
+        filter_parts.append(
+            "[summed]alimiter=limit=0.95:attack=5:release=50,"
+            f"apad=whole_dur={duration:.3f},atrim=duration={duration:.3f}[mixed]"
+        )
 
         filter_complex = ";".join(filter_parts)
 
@@ -531,7 +535,7 @@ class MixerService:
             *inputs,
             "-filter_complex", filter_complex,
             "-map", "[mixed]",
-            "-t", str(max(0.01, total_duration)),
+            "-t", str(duration),
             "-ar", str(self.config.sample_rate),
             "-y", str(output_path),
         ]
@@ -612,13 +616,17 @@ class MixerService:
                 f"{''.join(delayed_labels)}amix=inputs={len(delayed_labels)}:"
                 "duration=longest:dropout_transition=0:normalize=0[summed]"
             )
-            filter_parts.append("[summed]alimiter=limit=0.95:attack=5:release=50[mixed]")
+            duration = max(0.01, float(total_duration))
+            filter_parts.append(
+                "[summed]alimiter=limit=0.95:attack=5:release=50,"
+                f"apad=whole_dur={duration:.3f},atrim=duration={duration:.3f}[mixed]"
+            )
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 *inputs,
                 "-filter_complex", ";".join(filter_parts),
                 "-map", "[mixed]",
-                "-t", str(max(0.01, total_duration)),
+                "-t", str(duration),
                 "-ar", str(self.config.sample_rate),
                 "-y", str(output_path),
             ]

@@ -12,6 +12,7 @@ from universal_video_ai.translate.adapt import AdaptationConfig, SegmentAdapter
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.tts.backend import EdgeTTSBackend
 from universal_video_ai.tts.premium import OpenAITTSBackend, ElevenLabsTTSBackend
+from universal_video_ai.tts.registry import RegistryTTSBackend
 from universal_video_ai.timeline.service import TimelineService
 from universal_video_ai.mixer.service import MixerService, MixerConfig
 from universal_video_ai.render.renderer import Renderer, RenderConfig
@@ -170,7 +171,7 @@ def create_localization_service(
             elif provider in {"playht", "cartesia", "xtts"}:
                 raise RuntimeError(f"{provider} TTS runtime is not wired yet; use Edge, OpenAI, or ElevenLabs")
             else:
-                tts_backend = EdgeTTSBackend(logger=logger)
+                tts_backend = RegistryTTSBackend()
             tts_service = TTSService(backend=tts_backend, logger=logger)
             logger.info("%s TTS backend available; TTS enabled", provider)
         except Exception as exc:

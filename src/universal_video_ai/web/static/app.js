@@ -443,21 +443,21 @@ document.addEventListener("ui-language-changed", () => {
   if ($("#lang-select")?.options.length) loadLanguages();
 });
 
-async function loadVoices() {
+async function loadVoices(refresh = false) {
   let voices = [];
   const provider = $("#tts-provider-select").value;
   const meta = providerMeta(provider);
   try {
-    ({ voices } = await api(`/api/voices?language=${encodeURIComponent($("#lang-select").value)}&provider=${encodeURIComponent(provider)}`));
+    ({ voices } = await api(`/api/voices?language=${encodeURIComponent($("#lang-select").value)}&provider=${encodeURIComponent(provider === "edge" ? "free" : provider)}&refresh=${refresh ? "true" : "false"}`));
     $("#voice-select").innerHTML = `<option value="">Mặc định</option>` +
-      voices.map(v => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.label || v.name || v.id)}</option>`).join("");
+      voices.map(v => `<option value="${escapeHtml(v.id)}">${escapeHtml((v.label || v.name || v.id) + " · " + (v.provider || provider))}</option>`).join("");
   } catch (e) {
     $("#voice-select").innerHTML = `<option value="">Mặc định</option>`;
   }
   const help = $("#voice-select-help");
   if (help) {
     if (provider === "edge") {
-      help.textContent = `Free mode: ${voices.length} giọng hệ thống khả dụng theo ngôn ngữ đã chọn.`;
+        help.textContent = `Free/local: ${voices.length} giọng khả dụng; danh tính người nói không tính biến thể pitch/rate.`;
     } else if (meta.connected) {
       help.textContent = `${meta.label || provider}: ${voices.length} giọng/model voice khả dụng từ kết nối đã lưu.`;
     } else {
@@ -495,7 +495,7 @@ function renderVoiceLibrary(voices) {
     <button class="voice-library-card ${$("#voice-select").value === voice.id ? "active" : ""}"
             type="button" data-library-voice="${escapeHtml(voice.id)}">
       <strong>${index % 2 ? "🎙️" : "🔊"} ${escapeHtml(voice.label)}</strong>
-      <small>${escapeHtml(voice.gender || "Neural")} · ${escapeHtml($("#lang-select").selectedOptions[0]?.textContent || "")}</small>
+        <small>${escapeHtml(voice.provider || "auto")} · ${escapeHtml(voice.gender || "unknown")} · ${voice.is_local ? "local" : "online"} · ${escapeHtml(voice.cost_class || "unknown")} · ${voice.available === false ? "unavailable" : "available"}</small>
     </button>
   `).join("");
   box.querySelectorAll("[data-library-voice]").forEach(button => {
@@ -556,6 +556,12 @@ async function previewSelectedVoice() {
 }
 
 $("#voice-preview-btn").addEventListener("click", previewSelectedVoice);
+$("#voice-refresh-btn").addEventListener("click", async () => {
+  const button = $("#voice-refresh-btn");
+  button.disabled = true;
+  try { await loadVoices(true); }
+  finally { button.disabled = false; }
+});
 $("#voice-select").addEventListener("change", () => {
   document.querySelectorAll("[data-library-voice]").forEach(card => {
     card.classList.toggle("active", card.dataset.libraryVoice === $("#voice-select").value);
@@ -4664,7 +4670,7 @@ function productionBriefView(brief) {
     ${refs.length ? `<ul>${refs.map(ref => `<li>${ref.url ? `<a href="${escapeHtml(ref.url)}" target="_blank" rel="noopener">${escapeHtml(ref.evidence_id)}</a>` : escapeHtml(ref.evidence_id)} · ${escapeHtml(ref.label || ref.type)}</li>`).join("")}</ul>` : '<p class="muted-help">No linkable references; brief uses stored evidence-only context.</p>'}`;
 }
 
-function productionAssetWorkspace(assets, jobs, assetPackage) {
+function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs) {
   const latest = ContentProductionUI.latestByType(assets);
   const blueprint = latest["script_blueprint:"];
   const sections = ContentProductionUI.sectionRows(blueprint, assets);
@@ -4720,6 +4726,24 @@ function productionAssetWorkspace(assets, jobs, assetPackage) {
     job.current_section || "-", String(job.completed_sections) + " / " + String(job.total_sections),
     String(job.progress) + "%", job.error || "-",
   ]);
+  const renderRows = (renderJobs || []).map(job => [
+    job.id,
+    String(job.status).toUpperCase(),
+    job.current_stage || "-",
+    String(job.progress || 0) + "%",
+    job.output_path
+      ? '<code>' + escapeHtml(job.output_path) + "</code>"
+      : "-",
+    job.qc && Object.keys(job.qc).length
+      ? '<details><summary>QC</summary><pre class="code-box">'
+        + escapeHtml(JSON.stringify(job.qc, null, 2)) + "</pre></details>"
+      : (job.error || "-"),
+    job.status === "completed"
+      ? "-"
+      : '<button class="btn gradient small" data-production-render-job="' + job.id
+        + '" data-render-action="' + (job.status === "queued" ? "run" : "resume") + '">'
+        + (job.status === "queued" ? "Run" : "Resume") + "</button>",
+  ]);
   return '<div id="production-assets-workspace" style="border-top:1px solid var(--border);margin-top:24px;padding-top:18px">'
     + "<h4>CP7A Script &amp; Asset Production</h4>"
     + '<p class="muted-help">Versioned planning assets only. No media download, TTS, rendering, upload, or publishing.</p>'
@@ -4748,6 +4772,22 @@ function productionAssetWorkspace(assets, jobs, assetPackage) {
     + (jobRows.length ? channelAgentTable(
       ["Job", "Type", "Status", "Stage", "Section", "Completed", "Progress", "Error"],
       jobRows) : '<p class="muted-help">No persistent generation jobs yet.</p>')
+    + '<section id="production-render-workspace" style="border-top:1px solid var(--border);margin-top:22px;padding-top:16px">'
+    + "<h4>CP7B Render Pipeline</h4>"
+    + '<p class="muted-help">Executes exact approved CP7A versions. Source media must be user-owned, licensed, or public domain. No competitor download or publishing.</p>'
+    + '<div class="field"><label>Rights-safe source video path</label><input id="production-render-source" type="text" placeholder="D:\\media\\owned-source.mp4"></div>'
+    + '<div class="row"><div class="field"><label>Source rights</label><select id="production-render-rights">'
+    + '<option value="owned">Owned</option><option value="licensed">Licensed</option><option value="public_domain">Public domain</option>'
+    + '</select></div><div class="field"><label>Voice ID</label><input id="production-render-voice" type="text" placeholder="vi-VN-HoaiMyNeural"></div></div>'
+    + '<div class="field"><label>Role → voice mapping (JSON, optional)</label><textarea id="production-render-speakers" rows="2" placeholder="{&quot;narrator&quot;:&quot;vi-VN-HoaiMyNeural&quot;}"></textarea></div>'
+    + '<div class="field"><label>Observed source subtitle boxes (JSON array, optional)</label><textarea id="production-render-boxes" rows="3" placeholder="[{&quot;start&quot;:0,&quot;end&quot;:1,&quot;x&quot;:100,&quot;y&quot;:600,&quot;width&quot;:800,&quot;height&quot;:40}]"></textarea></div>'
+    + '<label><input id="production-render-preserve-audio" type="checkbox"> Preserve and duck source audio under narration</label> '
+    + '<button class="btn gradient small" id="production-submit-render" type="button">Queue Render</button>'
+    + "<h4>Render progress / QC</h4>"
+    + (renderRows.length ? channelAgentTable(
+      ["Job", "Status", "Stage", "Progress", "Output", "QC / Error", "Action"],
+      renderRows, [4, 5, 6]) : '<p class="muted-help">No CP7B render jobs yet.</p>')
+    + "</section>"
     + "</div>";
 }
 
@@ -4767,10 +4807,11 @@ async function runProductionAssetAction(button, operation, id) {
 
 async function showProductionItem(id) {
   const item = await api(`/api/channel-agent/production/${id}`);
-  const [assets, jobs, assetPackage] = await Promise.all([
+  const [assets, jobs, assetPackage, renderJobs] = await Promise.all([
     api("/api/channel-agent/production/" + id + "/assets"),
     api("/api/channel-agent/production/" + id + "/generation-jobs"),
     api("/api/channel-agent/production/" + id + "/asset-package"),
+    api("/api/channel-agent/production/" + id + "/render-jobs"),
   ]);
   const detail = $("#production-detail");
   detail.classList.remove("hidden");
@@ -4798,7 +4839,7 @@ async function showProductionItem(id) {
     ${item.blocker_reason ? `<p><strong>Blocker:</strong> ${escapeHtml(item.blocker_reason)}</p>` : ""}
     <h4>History</h4>${channelAgentTable(["Date", "Event", "Task", "From", "To", "Note"], (item.events || []).map(event => [new Date(event.created_at * 1000).toLocaleString(), event.event_type, event.task_id || "—", event.from_status || "—", event.to_status || "—", event.note || "—"]))}`;
 
-  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(assets, jobs, assetPackage));
+  detail.insertAdjacentHTML("beforeend", productionAssetWorkspace(assets, jobs, assetPackage, renderJobs));
   $("#production-generate-blueprint").onclick = button => runProductionAssetAction(
     button.currentTarget,
     () => api("/api/channel-agent/production/" + id + "/assets/script/blueprints", {
@@ -4851,6 +4892,40 @@ async function showProductionItem(id) {
         + button.dataset.productionReject + "/reject", {
           method: "POST", body: JSON.stringify({}),
         }), id);
+  });
+  $("#production-submit-render").onclick = button => runProductionAssetAction(
+    button.currentTarget,
+    () => {
+      let speakerMapping = {};
+      let sourceSubtitleBoxes = [];
+      try {
+        speakerMapping = JSON.parse($("#production-render-speakers").value || "{}");
+        sourceSubtitleBoxes = JSON.parse($("#production-render-boxes").value || "[]");
+      } catch (error) {
+        throw new Error("Speaker mapping / subtitle boxes must be valid JSON.");
+      }
+      return api("/api/channel-agent/production/" + id + "/render-jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          source_video_path: $("#production-render-source").value,
+          source_media_rights: $("#production-render-rights").value,
+          voice_id: $("#production-render-voice").value || null,
+          speaker_mapping: speakerMapping,
+          preserve_source_audio: $("#production-render-preserve-audio").checked,
+          source_subtitle_boxes: sourceSubtitleBoxes,
+        }),
+      });
+    }, id);
+  document.querySelectorAll("[data-production-render-job]").forEach(button => {
+    button.onclick = () => runProductionAssetAction(
+      button,
+      () => api(
+        "/api/channel-agent/production/" + id + "/render-jobs/"
+          + button.dataset.productionRenderJob + "/" + button.dataset.renderAction,
+        {method: "POST"},
+      ),
+      id,
+    );
   });
 
   $("#production-item-save").onclick = async () => {
