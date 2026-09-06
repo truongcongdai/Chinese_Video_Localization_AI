@@ -618,6 +618,103 @@ CREATE TABLE IF NOT EXISTS production_publishing_jobs (
 CREATE INDEX IF NOT EXISTS idx_production_publishing_jobs_owner
     ON production_publishing_jobs(user_id, production_item_id, updated_at DESC);
 
+-- CP10 provider-neutral publishing records.  A production publishing job
+-- remains the shared state machine; these rows preserve provider capability,
+-- destination, and result history without putting credentials in job JSON.
+CREATE TABLE IF NOT EXISTS publishing_destinations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    publishing_job_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    account_name TEXT,
+    destination_type TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    adapted_metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    UNIQUE(user_id, publishing_job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_publishing_destinations_owner
+    ON publishing_destinations(user_id, platform, account_id);
+
+CREATE TABLE IF NOT EXISTS publishing_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    publishing_job_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    status TEXT NOT NULL,
+    external_id TEXT,
+    external_url TEXT,
+    provider_state_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, publishing_job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_publishing_results_owner
+    ON publishing_results(user_id, publishing_job_id);
+
+-- CP10 durable, human-gated automation.  Configuration snapshots and step
+-- references are non-secret JSON.  No worker or recurring scheduler is
+-- created by this schema.
+CREATE TABLE IF NOT EXISTS automation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id TEXT,
+    run_type TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    current_stage TEXT,
+    current_step_id INTEGER,
+    progress REAL NOT NULL DEFAULT 0,
+    trigger TEXT NOT NULL,
+    configuration_json TEXT NOT NULL DEFAULT '{}',
+    refs_json TEXT NOT NULL DEFAULT '{}',
+    waiting_reason TEXT,
+    error TEXT,
+    initiated_by INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    UNIQUE(user_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_owner
+    ON automation_runs(user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS automation_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    order_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    input_refs_json TEXT NOT NULL DEFAULT '{}',
+    output_refs_json TEXT NOT NULL DEFAULT '{}',
+    started_at REAL,
+    completed_at REAL,
+    error TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    UNIQUE(user_id, run_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_automation_steps_owner
+    ON automation_steps(user_id, run_id, order_index);
+
+CREATE TABLE IF NOT EXISTS automation_approval_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor_user_id INTEGER NOT NULL,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_automation_approvals_owner
+    ON automation_approval_events(user_id, run_id, stage, created_at DESC);
+
 -- CP9 immutable YouTube performance history and human-controlled learning.
 -- Nullable metric columns deliberately distinguish unavailable data from zero.
 CREATE TABLE IF NOT EXISTS video_performance_snapshots (
@@ -3847,14 +3944,14 @@ class Store:
                 return self._production_publishing_job_dict(existing)
             columns = [
                 "user_id", "production_item_id", "render_job_id", "metadata_asset_id",
-                "thumbnail_asset_id", "channel_id", "channel_title", "title", "description",
+                "thumbnail_asset_id", "platform", "channel_id", "channel_title", "title", "description",
                 "tags_json", "thumbnail_path", "thumbnail_status", "privacy", "schedule_local",
                 "schedule_timezone", "schedule_utc", "status", "dry_run", "idempotency_key",
                 "upload_size", "package_json", "created_at", "updated_at",
             ]
             values = [
                 user_id, item_id, data["render_job_id"], data["metadata_asset_id"],
-                data.get("thumbnail_asset_id"), data.get("channel_id"), data.get("channel_title"),
+                data.get("thumbnail_asset_id"), data.get("platform", "youtube"), data.get("channel_id"), data.get("channel_title"),
                 data["title"], data["description"], json.dumps(data.get("tags") or [], ensure_ascii=False),
                 data.get("thumbnail_path"), data.get("thumbnail_status", "not_provided"), data["privacy"],
                 data.get("schedule_local"), data.get("schedule_timezone"), data.get("schedule_utc"),
@@ -4201,6 +4298,228 @@ class Store:
         return self._learning_profile_dict(row) if row else None
 
     # ---- social accounts (per-user OAuth connections) ----
+    # ---- Channel Agent CP10 provider-neutral publishing + automation ----
+    @classmethod
+    def _publishing_destination_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["capabilities"] = cls._json_value(result.pop("capabilities_json", None), {})
+        result["adapted_metadata"] = cls._json_value(result.pop("adapted_metadata_json", None), {})
+        return result
+
+    @classmethod
+    def _publishing_result_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["provider_state"] = cls._json_value(result.pop("provider_state_json", None), {})
+        return result
+
+    def create_publishing_destination(self, user_id: int, publishing_job_id: int,
+                                      data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            job = conn.execute(
+                "SELECT id FROM production_publishing_jobs WHERE id=? AND user_id=?",
+                (publishing_job_id, user_id),
+            ).fetchone()
+            if not job:
+                return None
+            conn.execute(
+                "INSERT INTO publishing_destinations "
+                "(user_id,publishing_job_id,platform,account_id,account_name,destination_type,"
+                "capabilities_json,adapted_metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(user_id,publishing_job_id) DO UPDATE SET "
+                "capabilities_json=excluded.capabilities_json,adapted_metadata_json=excluded.adapted_metadata_json",
+                (user_id, publishing_job_id, data["platform"], data["account_id"],
+                 data.get("account_name"), data["destination_type"],
+                 json.dumps(data.get("capabilities") or {}, ensure_ascii=False, sort_keys=True),
+                 json.dumps(data.get("adapted_metadata") or {}, ensure_ascii=False, sort_keys=True), now),
+            )
+            row = conn.execute(
+                "SELECT * FROM publishing_destinations WHERE user_id=? AND publishing_job_id=?",
+                (user_id, publishing_job_id),
+            ).fetchone()
+        return self._publishing_destination_dict(row) if row else None
+
+    def get_publishing_destination(self, user_id: int, publishing_job_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM publishing_destinations WHERE user_id=? AND publishing_job_id=?",
+                (user_id, publishing_job_id),
+            ).fetchone()
+        return self._publishing_destination_dict(row) if row else None
+
+    def upsert_publishing_result(self, user_id: int, publishing_job_id: int,
+                                 data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM production_publishing_jobs WHERE id=? AND user_id=?",
+                (publishing_job_id, user_id),
+            ).fetchone():
+                return None
+            conn.execute(
+                "INSERT INTO publishing_results "
+                "(user_id,publishing_job_id,platform,status,external_id,external_url,provider_state_json,error,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,publishing_job_id) DO UPDATE SET "
+                "status=excluded.status,external_id=excluded.external_id,external_url=excluded.external_url,"
+                "provider_state_json=excluded.provider_state_json,error=excluded.error,updated_at=excluded.updated_at",
+                (user_id, publishing_job_id, data["platform"], data["status"],
+                 data.get("external_id"), data.get("external_url"),
+                 json.dumps(data.get("provider_state") or {}, ensure_ascii=False, sort_keys=True),
+                 data.get("error"), now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM publishing_results WHERE user_id=? AND publishing_job_id=?",
+                (user_id, publishing_job_id),
+            ).fetchone()
+        return self._publishing_result_dict(row) if row else None
+
+    def get_publishing_result(self, user_id: int, publishing_job_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM publishing_results WHERE user_id=? AND publishing_job_id=?",
+                (user_id, publishing_job_id),
+            ).fetchone()
+        return self._publishing_result_dict(row) if row else None
+
+    @classmethod
+    def _automation_run_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["configuration"] = cls._json_value(result.pop("configuration_json", None), {})
+        result["refs"] = cls._json_value(result.pop("refs_json", None), {})
+        return result
+
+    @classmethod
+    def _automation_step_dict(cls, row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        result["input_refs"] = cls._json_value(result.pop("input_refs_json", None), {})
+        result["output_refs"] = cls._json_value(result.pop("output_refs_json", None), {})
+        return result
+
+    def create_automation_run(self, user_id: int, data: Dict[str, Any],
+                              stages: List[str]) -> tuple[Dict[str, Any], bool]:
+        now = time.time()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM automation_runs WHERE user_id=? AND idempotency_key=?",
+                (user_id, data["idempotency_key"]),
+            ).fetchone()
+            if existing:
+                return self._automation_run_dict(existing), False
+            cur = conn.execute(
+                "INSERT INTO automation_runs "
+                "(user_id,channel_id,run_type,mode,status,current_stage,progress,trigger,configuration_json,refs_json,"
+                "initiated_by,idempotency_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (user_id, data.get("channel_id"), data["run_type"], data["mode"], "queued",
+                 stages[0] if stages else None, 0, data["trigger"],
+                 json.dumps(data.get("configuration") or {}, ensure_ascii=False, sort_keys=True), "{}",
+                 data.get("initiated_by", user_id), data["idempotency_key"], now, now),
+            )
+            run_id = int(cur.lastrowid)
+            conn.executemany(
+                "INSERT INTO automation_steps (user_id,run_id,stage,order_index,status,updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                [(user_id, run_id, stage, index, "pending", now)
+                 for index, stage in enumerate(stages)],
+            )
+        return self.get_automation_run(user_id, run_id), True  # type: ignore[return-value]
+
+    def get_automation_run(self, user_id: int, run_id: int,
+                           *, include_history: bool = True) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM automation_runs WHERE id=? AND user_id=?", (run_id, user_id)
+            ).fetchone()
+            if not row:
+                return None
+            result = self._automation_run_dict(row)
+            if include_history:
+                steps = conn.execute(
+                    "SELECT * FROM automation_steps WHERE run_id=? AND user_id=? ORDER BY order_index",
+                    (run_id, user_id),
+                ).fetchall()
+                approvals = conn.execute(
+                    "SELECT * FROM automation_approval_events WHERE run_id=? AND user_id=? ORDER BY created_at,id",
+                    (run_id, user_id),
+                ).fetchall()
+                result["steps"] = [self._automation_step_dict(step) for step in steps]
+                result["approval_events"] = [dict(event) for event in approvals]
+        return result
+
+    def list_automation_runs(self, user_id: int, *, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM automation_runs WHERE user_id=? ORDER BY updated_at DESC,id DESC LIMIT ?",
+                (user_id, min(100, max(1, int(limit)))),
+            ).fetchall()
+        return [self._automation_run_dict(row) for row in rows]
+
+    def update_automation_run(self, user_id: int, run_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {"status", "current_stage", "current_step_id", "progress", "waiting_reason",
+                   "error", "started_at", "completed_at"}
+        payload = {key: value for key, value in data.items() if key in allowed}
+        if "refs" in data:
+            payload["refs_json"] = json.dumps(data["refs"], ensure_ascii=False, sort_keys=True)
+        if not payload:
+            return self.get_automation_run(user_id, run_id, include_history=False) is not None
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE automation_runs SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE id=? AND user_id=?", [*payload.values(), run_id, user_id],
+            )
+            return cur.rowcount > 0
+
+    def get_automation_step(self, user_id: int, run_id: int, stage: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM automation_steps WHERE user_id=? AND run_id=? AND stage=?",
+                (user_id, run_id, stage),
+            ).fetchone()
+        return self._automation_step_dict(row) if row else None
+
+    def update_automation_step(self, user_id: int, run_id: int, stage: str,
+                               data: Dict[str, Any]) -> bool:
+        allowed = {"status", "started_at", "completed_at", "error", "retry_count"}
+        payload = {key: value for key, value in data.items() if key in allowed}
+        for key in ("input_refs", "output_refs"):
+            if key in data:
+                payload[key + "_json"] = json.dumps(data[key], ensure_ascii=False, sort_keys=True)
+        payload["updated_at"] = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE automation_steps SET " + ",".join(f"{key}=?" for key in payload)
+                + " WHERE user_id=? AND run_id=? AND stage=?",
+                [*payload.values(), user_id, run_id, stage],
+            )
+            return cur.rowcount > 0
+
+    def add_automation_approval(self, user_id: int, run_id: int, stage: str,
+                                action: str, note: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM automation_runs WHERE id=? AND user_id=?", (run_id, user_id)
+            ).fetchone():
+                return None
+            cur = conn.execute(
+                "INSERT INTO automation_approval_events "
+                "(user_id,run_id,stage,action,actor_user_id,note,created_at) VALUES (?,?,?,?,?,?,?)",
+                (user_id, run_id, stage, action, user_id, note, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM automation_approval_events WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_automation_approval(self, user_id: int, run_id: int,
+                                   stage: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM automation_approval_events WHERE user_id=? AND run_id=? AND stage=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 1", (user_id, run_id, stage),
+            ).fetchone()
+        return dict(row) if row else None
+
     def upsert_social_account(
             self, user_id: int, platform: str, access_token: Optional[str],
             refresh_token: Optional[str] = None, expires_at: Optional[float] = None,

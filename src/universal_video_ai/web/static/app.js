@@ -3719,6 +3719,79 @@ async function loadChannelLearningProfile() {
     : "No evidence yet.";
 }
 
+const automationStageOrder = ["research", "competitor", "opportunity", "production", "script", "assets", "render", "publish", "analytics", "learning"];
+
+function automationStageGraph(steps) {
+  const byStage = Object.fromEntries((steps || []).map(step => [step.stage, step]));
+  return '<div class="row" style="gap:6px;flex-wrap:wrap">' + automationStageOrder.map(stage => {
+    const status = byStage[stage]?.status || "pending";
+    return '<span class="status-badge ' + escapeHtml(status) + '" title="' + escapeHtml(status)
+      + '">' + escapeHtml(stage) + ': ' + escapeHtml(status) + '</span>';
+  }).join("") + "</div>";
+}
+
+async function loadAutomationWorkspace() {
+  const [capabilities, summaries] = await Promise.all([
+    api("/api/channel-agent/publishing/capabilities"),
+    api("/api/channel-agent/automation/runs?limit=20"),
+  ]);
+  const youtube = capabilities.youtube || {};
+  const facebook = capabilities.facebook || {};
+  $("#publishing-capabilities").innerHTML = '<strong>YouTube:</strong> '
+    + escapeHtml(youtube.connected ? (youtube.upload_supported ? "upload + schedule + analytics" : "connected; upload permission unavailable") : "not connected")
+    + ' &nbsp; <strong>Facebook:</strong> '
+    + escapeHtml(facebook.connected
+      ? ((facebook.page_video_supported ? "Page video" : "Page video unavailable")
+        + (facebook.reels_supported ? ", Reels" : ", Reels unavailable")
+        + (facebook.schedule_supported ? ", schedule" : ", scheduling unavailable"))
+      : "not connected");
+  const runs = await Promise.all(summaries.map(run => api("/api/channel-agent/automation/runs/" + run.id)));
+  $("#automation-runs").innerHTML = runs.length ? runs.map(run => {
+    const waiting = run.waiting_reason ? '<p><strong>Next action:</strong> ' + escapeHtml(run.waiting_reason) + '</p>' : "";
+    const error = run.error ? '<p class="research-state error"><strong>Error:</strong> ' + escapeHtml(run.error) + '</p>' : "";
+    const destinations = run.refs?.publishing_jobs || {};
+    const destinationText = Object.entries(destinations).map(([platform, value]) => platform + ": " + (value.status || "pending")).join("; ") || "Not reached";
+    const gate = run.current_stage === "render" ? "publish" : run.current_stage;
+    const approveButton = run.status === "waiting_approval" && ["opportunity", "script", "assets", "publish"].includes(gate)
+      ? '<button class="btn gradient small" data-automation-run="' + run.id + '" data-automation-approve="' + gate + '">Approve current gate</button>' : "";
+    const openButton = run.refs?.production_item_id
+      ? '<button class="btn secondary small" data-automation-production="' + run.refs.production_item_id + '">Open Production Item</button>' : "";
+    return '<section class="production-asset-panel"><div class="template-library-heading"><h4>Run #'
+      + run.id + ' - ' + escapeHtml(run.status) + '</h4><span class="muted-help">'
+      + escapeHtml(run.mode) + ' - ' + Number(run.progress || 0).toFixed(0) + '%</span></div>'
+      + automationStageGraph(run.steps) + waiting + error
+      + '<p><strong>Destinations:</strong> ' + escapeHtml(destinationText) + '</p>'
+      + '<p class="muted-help">Trigger: ' + escapeHtml(run.trigger) + ' - created '
+      + new Date(run.created_at * 1000).toLocaleString() + ' - approval events: ' + (run.approval_events || []).length + '</p>'
+      + '<div class="row" style="gap:6px"><button class="btn secondary small" data-automation-run="' + run.id + '" data-automation-action="advance">Next step</button>'
+      + '<button class="btn secondary small" data-automation-run="' + run.id + '" data-automation-action="resume">Resume</button>'
+      + '<button class="btn secondary small" data-automation-run="' + run.id + '" data-automation-action="pause">Pause</button>'
+      + '<button class="btn secondary small" data-automation-run="' + run.id + '" data-automation-action="retry">Retry</button>'
+      + '<button class="btn secondary small" data-automation-run="' + run.id + '" data-automation-action="cancel">Cancel</button>'
+      + approveButton + openButton + '</div></section>';
+  }).join("") : '<p class="muted-help">No automation runs yet.</p>';
+  document.querySelectorAll("[data-automation-action]").forEach(button => button.onclick = async () => {
+    try {
+      await api("/api/channel-agent/automation/runs/" + button.dataset.automationRun + "/" + button.dataset.automationAction, {method: "POST"});
+      await loadAutomationWorkspace();
+    } catch (error) { $("#automation-message").textContent = error.message; }
+  });
+  document.querySelectorAll("[data-automation-approve]").forEach(button => button.onclick = async () => {
+    try {
+      const refs = {};
+      if (button.dataset.automationApprove === "opportunity") {
+        const opportunityId = window.prompt("Enter the approved Content Opportunity ID");
+        if (!opportunityId) return;
+        refs.opportunity_id = Number(opportunityId);
+      }
+      await api("/api/channel-agent/automation/runs/" + button.dataset.automationRun + "/approvals/" + button.dataset.automationApprove,
+        {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({refs})});
+      await loadAutomationWorkspace();
+    } catch (error) { $("#automation-message").textContent = error.message; }
+  });
+  document.querySelectorAll("[data-automation-production]").forEach(button => button.onclick = () => showProductionItem(Number(button.dataset.automationProduction)));
+}
+
 async function initChannelAgent() {
   const statusNode = $("#channel-agent-status");
   const connectNode = $("#channel-agent-connect");
@@ -3799,6 +3872,11 @@ async function initChannelAgent() {
       $("#channel-learning-state").textContent = "Learning unavailable: " + learningError.message;
     }
     try {
+      await loadAutomationWorkspace();
+    } catch (automationError) {
+      $("#automation-message").textContent = "Automation unavailable: " + automationError.message;
+    }
+    try {
       await loadTrendResearch();
     } catch (trendError) {
       $("#trend-research-message").textContent = `Trend Scanner unavailable: ${trendError.message}`;
@@ -3823,6 +3901,51 @@ $("#channel-agent-connect-btn").onclick = () => startConnect("youtube");
 $("#channel-learning-refresh").onclick = () => loadChannelLearningProfile().catch(error => {
   $("#channel-learning-state").textContent = "Learning unavailable: " + error.message;
 });
+$("#automation-refresh").onclick = () => loadAutomationWorkspace().catch(error => {
+  $("#automation-message").textContent = error.message;
+});
+$("#facebook-connect-btn").onclick = () => startConnect("facebook");
+$("#facebook-page-select").onclick = async () => {
+  try {
+    const pages = await api("/api/channel-agent/publishing/facebook/pages");
+    if (!pages.length) throw new Error("No managed Facebook Pages are available.");
+    const choices = pages.map(page => page.page_id + " - " + page.page_name
+      + (page.selected ? " (selected)" : "")).join("\n");
+    const pageId = window.prompt("Enter a Page ID from this owner-scoped list:\n" + choices);
+    if (!pageId) return;
+    await api("/api/channel-agent/publishing/facebook/pages/select", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({page_id: pageId}),
+    });
+    $("#automation-message").textContent = "Facebook Page selection updated.";
+    await loadAutomationWorkspace();
+  } catch (error) { $("#automation-message").textContent = error.message; }
+};
+$("#automation-start").onclick = async () => {
+  const targetPlatforms = [];
+  if ($("#automation-youtube").checked) targetPlatforms.push("youtube");
+  if ($("#automation-facebook").checked) targetPlatforms.push("facebook");
+  try {
+    await api("/api/channel-agent/automation/runs", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        mode: $("#automation-mode").value, start_now: false,
+        configuration: {
+          target_platforms: targetPlatforms,
+          research_refresh: $("#automation-research").checked,
+          competitor_refresh: $("#automation-research").checked,
+          auto_generate_assets: false,
+          auto_render_after_approval: false,
+          refresh_analytics: false,
+          generate_learning: false,
+          default_publishing_privacy: "private",
+        },
+      }),
+    });
+    $("#automation-message").textContent = "Automation run created. Use Next step; approval gates remain mandatory.";
+    await loadAutomationWorkspace();
+  } catch (error) { $("#automation-message").textContent = error.message; }
+};
 
 function trendAge(value) {
   if (!value) return "—";

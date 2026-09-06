@@ -12,6 +12,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 
 from universal_video_ai.channel_agent.production_assets import ProductionAssetService
+from universal_video_ai.channel_agent.social_publishing import (
+    PublishingDestination,
+    PublishingResult,
+    SocialPublishingError,
+    SocialPublishingService,
+)
 from universal_video_ai.channel_agent.youtube import GoogleOAuthTokenService, YouTubeReadOnlyService
 from universal_video_ai.web.store import Store
 
@@ -19,7 +25,7 @@ YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 PRIVACY_VALUES = {"private", "unlisted", "public"}
 
 
-class ProductionPublishingError(RuntimeError): pass
+class ProductionPublishingError(SocialPublishingError): pass
 class ProductionPublishingNotFound(ProductionPublishingError): pass
 
 
@@ -88,12 +94,13 @@ class YouTubeResumablePublisher:
         if response.status_code not in {200, 201}: raise ProductionPublishingError("YouTube thumbnail upload failed.")
 
 
-class ProductionPublishingService:
+class ProductionPublishingService(SocialPublishingService):
+    platform = "youtube"
+
     def __init__(self, store: Store, *, publisher: Optional[YouTubeResumablePublisher] = None, now: Any = None) -> None:
-        self.store = store
+        super().__init__(store, now=now)
         self.tokens = GoogleOAuthTokenService(store)
         self.publisher = publisher or YouTubeResumablePublisher(self.tokens)
-        self.now = now or (lambda: datetime.now(timezone.utc))
 
     def _item(self, user_id: int, item_id: int) -> dict:
         item = self.store.get_production_item(user_id, item_id)
@@ -103,7 +110,7 @@ class ProductionPublishingService:
     def _job(self, user_id: int, item_id: int, job_id: int, *, private: bool = False) -> dict:
         self._item(user_id, item_id)
         job = self.store.get_production_publishing_job(user_id, item_id, job_id, private=private)
-        if not job: raise ProductionPublishingNotFound("Publishing job not found.")
+        if not job or job.get("platform") != self.platform: raise ProductionPublishingNotFound("Publishing job not found.")
         return job
 
     def connection(self, user_id: int, *, verify: bool = False) -> dict:
@@ -121,17 +128,10 @@ class ProductionPublishingService:
         return base
 
     def _schedule(self, local_value: Optional[str], tz_name: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        if not local_value: return None, None, None
-        if not tz_name: raise ProductionPublishingError("A timezone is required for scheduled publishing.")
-        try: zone = ZoneInfo(tz_name)
-        except ZoneInfoNotFoundError as exc: raise ProductionPublishingError("Unknown publishing timezone.") from exc
-        try: local = datetime.fromisoformat(local_value)
-        except ValueError as exc: raise ProductionPublishingError("Schedule time must be ISO local date/time.") from exc
-        if local.tzinfo is not None: raise ProductionPublishingError("Schedule local time must not include an offset; select its timezone separately.")
-        aware = local.replace(tzinfo=zone)
-        utc = aware.astimezone(timezone.utc)
-        if utc <= self.now(): raise ProductionPublishingError("Scheduled publishing time must be in the future.")
-        return local.isoformat(timespec="minutes"), tz_name, utc.isoformat().replace("+00:00", "Z")
+        try:
+            return self.schedule(local_value, tz_name)
+        except SocialPublishingError as exc:
+            raise ProductionPublishingError(str(exc)) from exc
 
     def submit(self, user_id: int, item_id: int, *, render_job_id: int, metadata_asset_id: Optional[int] = None, thumbnail_path: Optional[str] = None, privacy: str = "private", schedule_local: Optional[str] = None, schedule_timezone: Optional[str] = None, dry_run: bool = True, confirm_publish: bool = False, confirm_public: bool = False) -> dict:
         item = self._item(user_id, item_id)
@@ -167,12 +167,26 @@ class ProductionPublishingService:
         canonical = {"user": user_id, "item": item_id, "render": render_job_id, "metadata": metadata["id"], "privacy": privacy, "schedule": utc, "channel": channel_id, "thumbnail": str(thumb_file) if thumb_file else None, "dry_run": dry_run}
         key = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
         publish_package = {"production_item_id": item_id, "render_job_id": render_job_id, "video_path": str(video), "metadata_asset_id": metadata["id"], "metadata_version": metadata["version"], "title": title, "description": description, "tags": tags, "privacy": privacy, "schedule_local": local, "schedule_timezone": tz_name, "schedule_utc": utc, "target_channel": {"id": channel_id, "title": channel_title}, "thumbnail_path": str(thumb_file) if thumb_file else None, "thumbnail_asset_id": thumb["id"] if thumb else None, "rights_ready": package["rights_ready"], "rights_gate": package["rights_gate"]}
-        job = self.store.create_production_publishing_job(user_id, item_id, {**publish_package, "render_job_id": render_job_id, "metadata_asset_id": metadata["id"], "thumbnail_asset_id": thumb["id"] if thumb else None, "channel_id": channel_id, "channel_title": channel_title, "thumbnail_status": "pending" if thumb_file else "not_provided", "status": "draft" if dry_run else "queued", "dry_run": dry_run, "idempotency_key": key, "upload_size": video.stat().st_size, "package": publish_package})
+        job = self.store.create_production_publishing_job(user_id, item_id, {**publish_package, "platform": self.platform, "render_job_id": render_job_id, "metadata_asset_id": metadata["id"], "thumbnail_asset_id": thumb["id"] if thumb else None, "channel_id": channel_id, "channel_title": channel_title, "thumbnail_status": "pending" if thumb_file else "not_provided", "status": "draft" if dry_run else "queued", "dry_run": dry_run, "idempotency_key": key, "upload_size": video.stat().st_size, "package": publish_package})
         if not job: raise ProductionPublishingNotFound("Production item not found.")
+        self.persist_destination(user_id, int(job["id"]), PublishingDestination(
+            platform=self.platform, account_id=str(channel_id), account_name=channel_title,
+            destination_type="channel_video", capabilities={
+                "connected": True, "upload_supported": True, "schedule_supported": True,
+                "analytics_supported": True,
+            }, adapted_metadata={"title": title, "description": description, "tags": tags,
+                                  "privacy": privacy, "schedule_utc": utc},
+        ))
+        self.persist_result(user_id, int(job["id"]), PublishingResult(
+            platform=self.platform, status=str(job["status"])
+        ))
         self.store.add_production_event(user_id, item_id, event_type="publishing_dry_run_validated" if dry_run else "publishing_queued", note=f"CP8 publishing job {job['id']}")
         return job
 
-    def list(self, user_id: int, item_id: int) -> list[dict]: self._item(user_id, item_id); return self.store.list_production_publishing_jobs(user_id, item_id)
+    def list(self, user_id: int, item_id: int) -> list[dict]:
+        self._item(user_id, item_id)
+        return [job for job in self.store.list_production_publishing_jobs(user_id, item_id)
+                if job.get("platform") == self.platform]
     def get(self, user_id: int, item_id: int, job_id: int) -> dict: return self._job(user_id, item_id, job_id)
 
     def run(self, user_id: int, item_id: int, job_id: int) -> dict:
@@ -188,6 +202,10 @@ class ProductionPublishingService:
             payload = self.publisher.upload(user_id, session, job["package"]["video_path"], int(job["upload_size"]))
             video_id = str(payload["id"])
             self.store.update_production_publishing_job(user_id, item_id, job_id, {"external_video_id": video_id, "external_url": f"https://www.youtube.com/watch?v={video_id}", "status": "processing", "progress": 90, "upload_offset": job["upload_size"]})
+            self.persist_result(user_id, job_id, PublishingResult(
+                platform=self.platform, status="processing", external_id=video_id,
+                external_url=f"https://www.youtube.com/watch?v={video_id}", provider_state=payload,
+            ))
             if job.get("thumbnail_path"):
                 self.publisher.thumbnail(user_id, video_id, job["thumbnail_path"])
                 self.store.update_production_publishing_job(user_id, item_id, job_id, {"thumbnail_status": "uploaded"})
@@ -209,10 +227,19 @@ class ProductionPublishingService:
         values: dict[str, Any] = {"status": local, "remote_status": remote, "progress": 100 if local in {"scheduled", "published"} else 95, "error": None}
         if local == "published": values["published_at"] = time.time()
         self.store.update_production_publishing_job(user_id, item_id, job_id, values)
+        self.persist_result(user_id, job_id, PublishingResult(
+            platform=self.platform, status=local, external_id=job.get("external_video_id"),
+            external_url=job.get("external_url"), provider_state=remote,
+        ))
         return self._job(user_id, item_id, job_id)
 
     def cancel(self, user_id: int, item_id: int, job_id: int) -> dict:
         job = self._job(user_id, item_id, job_id, private=True)
         if job["status"] not in {"draft", "queued", "failed"}: raise ProductionPublishingError("Only local draft, queued, or failed jobs can be cancelled; remote video was not deleted.")
         self.store.update_production_publishing_job(user_id, item_id, job_id, {"status": "cancelled", "error": "Local job cancelled; no remote delete was performed." if job.get("external_video_id") else None})
+        self.persist_result(user_id, job_id, PublishingResult(
+            platform=self.platform, status="cancelled", external_id=job.get("external_video_id"),
+            external_url=job.get("external_url"),
+            error="Local job cancelled; no remote delete was performed." if job.get("external_video_id") else None,
+        ))
         return self._job(user_id, item_id, job_id)

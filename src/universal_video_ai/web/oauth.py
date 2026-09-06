@@ -228,10 +228,13 @@ class FacebookOAuth(PlatformOAuth):
         page = pages[0]
         return ConnectResult(
             access_token=page["access_token"],
-            refresh_token=None,
+            # Retained server-side solely so the owner can inspect and select
+            # another managed Page later; it is never returned by an API.
+            refresh_token=user_token,
             expires_at=None,  # Page tokens derived from a long-lived user token don't expire in practice
             account_name=page.get("name"),
             account_ref=page.get("id"),
+            scopes=self.SCOPE,
         )
 
 

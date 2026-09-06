@@ -65,6 +65,17 @@ from universal_video_ai.channel_agent.feedback_learning import (
     FeedbackLearningNotFound,
     FeedbackLearningService,
 )
+from universal_video_ai.channel_agent.facebook_publishing import (
+    FacebookPublishingError,
+    FacebookPublishingNotFound,
+    FacebookPublishingService,
+)
+from universal_video_ai.channel_agent.automation import (
+    AutomationError,
+    AutomationNotFound,
+    AutomationOrchestrator,
+    AutomationWaiting,
+)
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -279,6 +290,43 @@ class LearningRecommendationBody(BaseModel):
     note: Optional[str] = None
 
 
+class FacebookPublishingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    render_job_id: int
+    metadata_asset_id: Optional[int] = None
+    destination_type: str = "page_video"
+    schedule_local: Optional[str] = None
+    schedule_timezone: Optional[str] = None
+    dry_run: bool = True
+    confirm_publish: bool = False
+
+
+class FacebookPageSelectionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page_id: str
+
+
+class AutomationStartBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "MANUAL_STEP"
+    configuration: dict[str, Any]
+    trigger: str = "manual"
+    run_type: str = "content_pipeline"
+    channel_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    start_now: bool = False
+
+
+class AutomationApprovalBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    refs: Optional[dict[str, Any]] = None
+    note: Optional[str] = None
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -313,6 +361,24 @@ def _feedback_learning_call(operation):
         raise HTTPException(409, str(exc)) from exc
     except YouTubeReadOnlyError as exc:
         raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
+
+
+def _facebook_publishing_call(operation):
+    try:
+        return operation()
+    except FacebookPublishingNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except FacebookPublishingError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _automation_call(operation):
+    try:
+        return operation()
+    except AutomationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except AutomationError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def _service(store: Store) -> YouTubeReadOnlyService:
@@ -401,6 +467,129 @@ def _production_asset_service(store: Store) -> ProductionAssetService:
 
 def _feedback_learning_service(store: Store) -> FeedbackLearningService:
     return FeedbackLearningService(store, llm=_brain_provider())
+
+
+def _automation_service(store: Store) -> AutomationOrchestrator:
+    def research(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        result = _trend_service(store).scan(user_id)
+        return {"trend_scan_id": result.get("scan_id"), "research_result": result}
+
+    def competitor(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        service = _competitor_service(store)
+        if config.get("discover_competitors", True):
+            service.discover(user_id)
+        result = service.refresh(user_id, mode=str(config.get("competitor_mode", "long")))
+        return {"competitor_result": result}
+
+    def script(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        if not config.get("auto_generate_assets", False):
+            raise AutomationWaiting("Generate the Script Draft explicitly, then approve it.")
+        item_id = int(refs.get("production_item_id") or config.get("production_item_id") or 0)
+        service = _production_asset_service(store)
+        service.generate_blueprint(user_id, item_id)
+        service.resume_script(user_id, item_id)
+        result = service.assemble_script(user_id, item_id)
+        return {"script_asset_id": int(result["asset"]["id"] if "asset" in result else result["id"])}
+
+    def assets(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        if not config.get("auto_generate_assets", False):
+            raise AutomationWaiting("Generate and review production assets explicitly.")
+        item_id = int(refs.get("production_item_id") or config.get("production_item_id") or 0)
+        item = store.get_production_item(user_id, item_id)
+        service = _production_asset_service(store)
+        generated = {
+            "visual_plan": service.generate_visual_plan(user_id, item_id),
+            "voice_plan": service.generate_voice_plan(user_id, item_id),
+            "metadata_package": service.generate_metadata_package(user_id, item_id),
+        }
+        if item and item.get("target_format") != "short_form":
+            generated["thumbnail_brief"] = service.generate_thumbnail_brief(user_id, item_id)
+        return {"generated_asset_ids": {
+            name: int(value["asset"]["id"] if "asset" in value else value["id"])
+            for name, value in generated.items()
+        }}
+
+    def render(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        if not config.get("auto_render_after_approval", False):
+            raise AutomationWaiting("Start the approved CP7B render explicitly.")
+        request = config.get("render_request")
+        if not isinstance(request, dict):
+            raise AutomationWaiting("A reviewed render request is required.")
+        item_id = int(refs.get("production_item_id") or config.get("production_item_id") or 0)
+        service = ProductionRenderService(store)
+        job = service.submit(user_id, item_id, **request)
+        result = service.run(user_id, item_id, int(job["id"]))
+        return {"render_job_id": int(result["id"])}
+
+    def publish(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        item_id = int(refs.get("production_item_id") or config.get("production_item_id") or 0)
+        render_id = int(refs.get("render_job_id") or 0)
+        existing = store.list_production_publishing_jobs(user_id, item_id)
+        results: dict[str, Any] = {}
+        for platform in config.get("target_platforms") or []:
+            prior = next((row for row in existing if row.get("platform") == platform
+                          and row.get("status") != "cancelled"), None)
+            if prior:
+                results[platform] = {"job_id": int(prior["id"]), "status": prior["status"], "reused": True}
+                continue
+            try:
+                if platform == "youtube":
+                    privacy = str(config.get("default_publishing_privacy", "private"))
+                    service: Any = ProductionPublishingService(store)
+                    job = service.submit(
+                        user_id, item_id, render_job_id=render_id, privacy=privacy,
+                        schedule_local=config.get("schedule_local"),
+                        schedule_timezone=config.get("schedule_timezone"), dry_run=False,
+                        confirm_publish=True,
+                        confirm_public=bool(config.get("confirm_public", False)),
+                    )
+                else:
+                    service = FacebookPublishingService(store)
+                    job = service.submit(
+                        user_id, item_id, render_job_id=render_id,
+                        destination_type=str(config.get("facebook_destination", "page_video")),
+                        schedule_local=config.get("schedule_local"),
+                        schedule_timezone=config.get("schedule_timezone"), dry_run=False,
+                        confirm_publish=True,
+                    )
+                result = service.run(user_id, item_id, int(job["id"]))
+                results[platform] = {"job_id": int(result["id"]), "status": result["status"]}
+            except Exception as exc:
+                failed = next((row for row in store.list_production_publishing_jobs(user_id, item_id)
+                               if row.get("platform") == platform), None)
+                results[platform] = {
+                    "job_id": int(failed["id"]) if failed else None,
+                    "status": failed["status"] if failed else "failed", "error": str(exc),
+                }
+        return {"publishing_jobs": results,
+                "partial_success": any(row["status"] != "failed" for row in results.values())
+                and any(row["status"] == "failed" for row in results.values())}
+
+    def analytics(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        youtube = (refs.get("publishing_jobs") or {}).get("youtube")
+        if not youtube or not youtube.get("job_id"):
+            raise AutomationWaiting("A linked YouTube publishing job is required for analytics.")
+        item_id = int(refs.get("production_item_id") or config.get("production_item_id") or 0)
+        result = _feedback_learning_service(store).refresh(
+            user_id, item_id, int(youtube["job_id"])
+        )
+        return {"snapshot_id": int(result["snapshot"]["id"])}
+
+    def learning(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+        youtube = (refs.get("publishing_jobs") or {}).get("youtube")
+        if not youtube or not youtube.get("job_id"):
+            raise AutomationWaiting("A linked YouTube publishing job is required for learning.")
+        item_id = int(refs.get("production_item_id") or config.get("production_item_id") or 0)
+        result = _feedback_learning_service(store).generate_report(
+            user_id, item_id, int(youtube["job_id"])
+        )
+        return {"learning_report_id": int(result["id"])}
+
+    return AutomationOrchestrator(store, handlers={
+        "research": research, "competitor": competitor,
+        "script": script, "assets": assets, "render": render,
+        "publish": publish, "analytics": analytics, "learning": learning,
+    })
 
 
 def _production_asset_call(call: Any) -> Any:
@@ -1137,6 +1326,45 @@ def production_publishing_connection(
     )
 
 
+@router.get("/publishing/capabilities")
+def social_publishing_capabilities(
+    verify: bool = Query(False), user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    youtube = _production_publishing_call(
+        lambda: ProductionPublishingService(store).connection(user_id, verify=verify)
+    )
+    facebook = _facebook_publishing_call(
+        lambda: FacebookPublishingService(store).connection(user_id, verify=verify)
+    )
+    return {"youtube": {
+        **youtube, "connected": bool(youtube.get("connected")),
+        "upload_supported": bool(youtube.get("upload_scope_granted")),
+        "schedule_supported": bool(youtube.get("upload_scope_granted")),
+        "analytics_supported": bool(youtube.get("connected")),
+    }, "facebook": facebook}
+
+
+@router.get("/publishing/facebook/pages")
+def facebook_managed_pages(
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _facebook_publishing_call(lambda: FacebookPublishingService(store).pages(user_id))
+
+
+@router.post("/publishing/facebook/pages/select")
+def select_facebook_page(
+    body: FacebookPageSelectionBody, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _facebook_publishing_call(
+        lambda: FacebookPublishingService(store).select_page(user_id, body.page_id)
+    )
+
+
 @router.post("/production/{item_id}/publishing-jobs")
 def submit_production_publishing(
     item_id: int, body: ProductionPublishingBody,
@@ -1152,13 +1380,30 @@ def submit_production_publishing(
     ))
 
 
+@router.post("/production/{item_id}/publishing-jobs/facebook")
+def submit_facebook_publishing_job(
+    item_id: int, body: FacebookPublishingBody,
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _facebook_publishing_call(lambda: FacebookPublishingService(store).submit(
+        user_id, item_id, render_job_id=body.render_job_id,
+        metadata_asset_id=body.metadata_asset_id,
+        destination_type=body.destination_type,
+        schedule_local=body.schedule_local, schedule_timezone=body.schedule_timezone,
+        dry_run=body.dry_run, confirm_publish=body.confirm_publish,
+    ))
+
+
 @router.get("/production/{item_id}/publishing-jobs")
 def production_publishing_jobs(
     item_id: int, user_id: int = Depends(get_current_user_id),
     store: Store = Depends(_store_from_request),
 ) -> list[dict[str, Any]]:
     _require_enabled()
-    return _production_publishing_call(lambda: ProductionPublishingService(store).list(user_id, item_id))
+    if not store.get_production_item(user_id, item_id):
+        raise HTTPException(404, "Production item not found.")
+    return store.list_production_publishing_jobs(user_id, item_id)
 
 
 @router.get("/production/{item_id}/publishing-jobs/{job_id}")
@@ -1167,7 +1412,11 @@ def production_publishing_job(
     store: Store = Depends(_store_from_request),
 ) -> dict[str, Any]:
     _require_enabled()
-    return _production_publishing_call(lambda: ProductionPublishingService(store).get(user_id, item_id, job_id))
+    job = store.get_production_publishing_job(user_id, item_id, job_id)
+    if not job:
+        raise HTTPException(404, "Publishing job not found.")
+    return {**job, "destination": store.get_publishing_destination(user_id, job_id),
+            "result": store.get_publishing_result(user_id, job_id)}
 
 
 @router.post("/production/{item_id}/publishing-jobs/{job_id}/{action}")
@@ -1176,11 +1425,16 @@ def mutate_production_publishing_job(
     user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
 ) -> dict[str, Any]:
     _require_enabled()
-    service = ProductionPublishingService(store)
+    job = store.get_production_publishing_job(user_id, item_id, job_id)
+    if not job:
+        raise HTTPException(404, "Publishing job not found.")
+    service: Any = (FacebookPublishingService(store) if job.get("platform") == "facebook"
+                    else ProductionPublishingService(store))
     operations = {"run": service.run, "retry": service.run, "refresh": service.refresh, "cancel": service.cancel}
     if action not in operations:
         raise HTTPException(422, "Publishing action must be run, retry, refresh, or cancel.")
-    return _production_publishing_call(lambda: operations[action](user_id, item_id, job_id))
+    call = _facebook_publishing_call if job.get("platform") == "facebook" else _production_publishing_call
+    return call(lambda: operations[action](user_id, item_id, job_id))
 
 
 @router.post("/production/{item_id}/publishing-jobs/{job_id}/performance/refresh")
@@ -1274,6 +1528,71 @@ def review_learning_recommendation(
         lambda: _feedback_learning_service(store).review_recommendation(
             user_id, item_id, job_id, report_id, recommendation_id,
             "applied" if action == "apply" else "ignored", body.note))
+
+
+@router.post("/automation/runs")
+def start_automation_run(
+    body: AutomationStartBody, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    def operation() -> dict[str, Any]:
+        service = _automation_service(store)
+        run, created = service.start(
+            user_id, mode=body.mode, configuration=body.configuration,
+            trigger=body.trigger, run_type=body.run_type, channel_id=body.channel_id,
+            idempotency_key=body.idempotency_key,
+        )
+        if body.start_now and created:
+            run = service.advance(user_id, int(run["id"]))
+        return {"run": run, "created": created}
+    return _automation_call(operation)
+
+
+@router.get("/automation/runs")
+def automation_runs(
+    limit: int = Query(50, ge=1, le=100),
+    user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _automation_call(lambda: _automation_service(store).list(user_id, limit=limit))
+
+
+@router.get("/automation/runs/{run_id}")
+def automation_run(
+    run_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _automation_call(lambda: _automation_service(store).get(user_id, run_id))
+
+
+@router.post("/automation/runs/{run_id}/{action}")
+def mutate_automation_run(
+    run_id: int, action: str, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    service = _automation_service(store)
+    operations = {
+        "advance": service.advance, "resume": service.resume, "pause": service.pause,
+        "retry": service.retry, "cancel": service.cancel,
+    }
+    if action not in operations:
+        raise HTTPException(422, "Automation action must be advance, resume, pause, retry, or cancel.")
+    return _automation_call(lambda: operations[action](user_id, run_id))
+
+
+@router.post("/automation/runs/{run_id}/approvals/{stage}")
+def approve_automation_gate(
+    run_id: int, stage: str, body: AutomationApprovalBody,
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _automation_call(lambda: _automation_service(store).approve(
+        user_id, run_id, stage, refs=body.refs, note=body.note
+    ))
 
 
 @router.get("/production/{item_id}/qa")

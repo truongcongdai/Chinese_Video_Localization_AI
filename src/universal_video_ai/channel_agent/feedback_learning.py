@@ -189,7 +189,7 @@ class FeedbackLearningService:
             raise FeedbackLearningNotFound("Production item not found.")
         job = self.store.get_production_publishing_job(
             user_id, item_id, job_id, private=True)
-        if not job or not job.get("external_video_id"):
+        if not job or job.get("platform") != "youtube" or not job.get("external_video_id"):
             raise FeedbackLearningNotFound("Published YouTube video linkage not found.")
         account = self.store.get_social_account(user_id, "youtube")
         if not account or not account["account_ref"]:

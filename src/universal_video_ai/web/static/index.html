@@ -1669,6 +1669,26 @@
           <div class="field"><h4>Preferred Duration Range</h4><div id="learning-duration-range" class="muted-help">No evidence yet.</div></div>
         </div>
       </div>
+      <div id="automation-workspace" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
+        <div class="template-library-heading">
+          <h3 class="section-title">Automation</h3>
+          <div>
+            <button class="btn secondary small" id="facebook-connect-btn" type="button">Connect Facebook Page</button>
+            <button class="btn secondary small" id="facebook-page-select" type="button">Select Page</button>
+            <button class="btn secondary small" id="automation-refresh" type="button">Refresh runs</button>
+          </div>
+        </div>
+        <p class="muted-help">Controlled multi-platform production automation. Opportunity, script, asset, and publish approvals always remain human decisions.</p>
+        <div id="publishing-capabilities" class="muted-help">Loading platform capabilities...</div>
+        <div class="row" style="align-items:end;margin-top:12px">
+          <div class="field"><label>Mode</label><select id="automation-mode"><option value="MANUAL_STEP">Manual step</option><option value="ASSISTED">Assisted</option><option value="AUTOMATION_WITH_GATES">Automation with gates</option></select></div>
+          <div class="field"><label>Platforms</label><label class="muted-help"><input id="automation-youtube" type="checkbox" checked style="width:auto"> YouTube</label><label class="muted-help"><input id="automation-facebook" type="checkbox" style="width:auto"> Facebook</label></div>
+          <div class="field"><label>Research</label><label class="muted-help"><input id="automation-research" type="checkbox" checked style="width:auto"> Refresh research</label></div>
+          <button class="btn gradient small" id="automation-start" type="button">Start run</button>
+        </div>
+        <div id="automation-message" class="muted-help"></div>
+        <div id="automation-runs" class="muted-help" style="margin-top:14px">No runs loaded.</div>
+      </div>
       <div id="production-queue" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
         <div class="template-library-heading">
           <h3 class="section-title">🗂️ Production Queue</h3>
