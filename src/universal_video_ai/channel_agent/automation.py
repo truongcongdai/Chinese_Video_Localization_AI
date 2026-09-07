@@ -11,9 +11,15 @@ from universal_video_ai.channel_agent.opportunities import ContentOpportunitySer
 from universal_video_ai.channel_agent.production import ProductionQueueService
 from universal_video_ai.channel_agent.production_assets import ProductionAssetService
 from universal_video_ai.web.store import Store
+from universal_video_ai.provider_runtime import (
+    ProviderMode,
+    execute_provider_call,
+)
 
 
-AUTOMATION_MODES = frozenset({"MANUAL_STEP", "ASSISTED", "AUTOMATION_WITH_GATES"})
+AUTOMATION_MODES = frozenset({
+    "MANUAL_STEP", "ASSISTED", "AUTOMATION_WITH_GATES", "FULL_AUTONOMOUS",
+})
 RUN_STATUSES = frozenset({
     "queued", "running", "waiting_approval", "paused", "completed", "failed", "cancelled",
 })
@@ -24,6 +30,12 @@ PIPELINE_STAGES = (
 )
 GATE_AFTER_STAGE = {
     "opportunity": "opportunity", "script": "script", "assets": "assets", "render": "publish",
+}
+GATE_POLICY_KEYS = {
+    "opportunity": "require_opportunity_approval",
+    "script": "require_script_approval",
+    "assets": "require_asset_approval",
+    "publish": "require_publish_approval",
 }
 MAX_RETRIES = 3
 FORBIDDEN_CONFIG_KEYS = frozenset({
@@ -66,20 +78,25 @@ class AutomationOrchestrator:
               trigger: str = "manual", run_type: str = "content_pipeline",
               channel_id: Optional[str] = None,
               idempotency_key: Optional[str] = None) -> tuple[dict[str, Any], bool]:
+        mode = str(mode).upper()
         if mode not in AUTOMATION_MODES:
-            raise AutomationError("Mode must be MANUAL_STEP, ASSISTED, or AUTOMATION_WITH_GATES.")
-        if str(mode).upper() == "FULL_AUTONOMOUS":
-            raise AutomationError("FULL_AUTONOMOUS belongs to CP11 and is unavailable.")
+            raise AutomationError(
+                "Mode must be MANUAL_STEP, ASSISTED, AUTOMATION_WITH_GATES, or FULL_AUTONOMOUS."
+            )
         if _contains_secret(configuration):
             raise AutomationError("Automation configuration cannot contain credentials or tokens.")
         platforms = configuration.get("target_platforms") or []
         if not isinstance(platforms, list) or any(item not in {"youtube", "facebook"} for item in platforms):
             raise AutomationError("Target platforms must be a list containing youtube and/or facebook.")
         configuration = dict(configuration)
+        approval_policy = dict(configuration.get("approval_policy") or {})
+        for policy_key in GATE_POLICY_KEYS.values():
+            approval_policy[policy_key] = approval_policy.get(policy_key) is not False
         configuration.update({
             "target_platforms": list(dict.fromkeys(platforms)),
             "max_opportunities": min(20, max(1, int(configuration.get("max_opportunities", 5)))),
             "production_limit": min(10, max(1, int(configuration.get("production_limit", 1)))),
+            "approval_policy": approval_policy,
         })
         key = idempotency_key or hashlib.sha256(
             f"{user_id}:{uuid.uuid4().hex}:{json.dumps(configuration, sort_keys=True)}".encode()
@@ -105,6 +122,7 @@ class AutomationOrchestrator:
             (stage == "research" and not config.get("research_refresh", True))
             or (stage == "competitor" and not config.get("competitor_refresh", True))
             or (stage == "publish" and not config.get("target_platforms"))
+            or (stage == "publish" and "auto_publish" in config and not config.get("auto_publish"))
             or (stage == "analytics" and not config.get("refresh_analytics", False))
             or (stage == "learning" and not config.get("generate_learning", False))
         )
@@ -128,7 +146,13 @@ class AutomationOrchestrator:
             )
             return {"script_asset_id": int(rows[0]["id"])} if rows else None
         if stage == "assets":
-            package = ProductionAssetService(self.store, provider=None).package(user_id, item_id)  # type: ignore[arg-type]
+            try:
+                package = ProductionAssetService(self.store, provider=None).package(user_id, item_id)  # type: ignore[arg-type]
+            except Exception:
+                # A stale/mocked reference is not a valid reusable output. The
+                # stage executor will either recreate it or persist its exact
+                # failure; idempotency inspection itself must not crash a run.
+                return None
             return {"asset_package": package} if package.get("asset_ready") else None
         if stage == "render":
             rows = self.store.list_production_render_jobs(user_id, item_id)
@@ -169,7 +193,35 @@ class AutomationOrchestrator:
             result = ContentOpportunityService(self.store).generate(
                 user_id, limit=int(config["max_opportunities"])
             )
-            return {"opportunity_candidates": [int(item["id"]) for item in result.get("items", [])]}
+            items = list(result.get("items", []))
+            output: dict[str, Any] = {
+                "opportunity_candidates": [int(item["id"]) for item in items]
+            }
+            if config.get("auto_shortlist", False):
+                minimum = float(config.get("minimum_opportunity_score", 0.65))
+                confidence_rank = {"low": 1, "medium": 2, "high": 3}
+                required_confidence = confidence_rank.get(
+                    str(config.get("minimum_opportunity_confidence", "medium")).lower(), 2
+                )
+                eligible = [item for item in items if (
+                    float(item.get("final_score") or item.get("score") or 0) >= minimum
+                    and confidence_rank.get(str(item.get("confidence") or "low").lower(), 1) >= required_confidence
+                    and str(item.get("rights_gate_status") or item.get("rights_status") or "cleared")
+                    not in {"blocked", "research_only"}
+                )]
+                if eligible:
+                    selected = eligible[0]
+                    output["opportunity_id"] = int(selected["id"])
+                    output["shortlist_reason"] = {
+                        "score": float(selected.get("final_score") or selected.get("score") or 0),
+                        "confidence": str(selected.get("confidence") or "low"),
+                        "bounded_limit": int(config.get("production_limit", 1)),
+                    }
+                    if not self._gate_required(config, "opportunity"):
+                        ContentOpportunityService(self.store).change_status(
+                            user_id, int(selected["id"]), status="approved"
+                        )
+            return output
         if stage == "production":
             opportunity_id = refs.get("opportunity_id") or config.get("opportunity_id")
             if not opportunity_id:
@@ -177,6 +229,83 @@ class AutomationOrchestrator:
             item, created = ProductionQueueService(self.store).create(user_id, int(opportunity_id))
             return {"production_item_id": int(item["id"]), "production_created": created}
         raise AutomationWaiting(f"{stage.title()} requires an explicit existing-service action.")
+
+    @staticmethod
+    def _consume_provider_budget(stage: str, config: dict[str, Any],
+                                 refs: dict[str, Any]) -> None:
+        categories = {
+            "research": "external_api_calls", "competitor": "external_api_calls",
+            "script": "llm_calls", "assets": "llm_calls", "render": "tts_requests",
+            "publish": "upload_attempts", "analytics": "external_api_calls",
+            "learning": "llm_calls",
+        }
+        category = categories.get(stage)
+        if not category:
+            return
+        limits = dict(config.get("budgets") or {})
+        limit_key = {
+            "external_api_calls": "max_external_api_calls",
+            "llm_calls": "max_llm_calls",
+            "upload_attempts": "max_upload_attempts",
+            "tts_requests": "max_tts_requests",
+        }[category]
+        usage = dict(refs.get("provider_usage") or {})
+        total = int(usage.get("provider_calls") or 0)
+        total_limit = limits.get("max_external_api_calls")
+        if total_limit is not None and total >= int(total_limit):
+            raise AutomationError(
+                f"Provider budget exceeded: max_external_api_calls={total_limit}."
+            )
+        current = int(usage.get(category) or 0)
+        limit = limits.get(limit_key)
+        if limit is not None and current >= int(limit):
+            raise AutomationError(f"Provider budget exceeded: {limit_key}={limit}.")
+        usage[category] = current + 1
+        usage["provider_calls"] = total + 1
+        refs["provider_usage"] = usage
+
+    def _enforce_stage_concurrency(self, user_id: int, run_id: int, stage: str,
+                                   config: dict[str, Any]) -> None:
+        limit_key = {
+            "render": "max_concurrent_renders",
+            "publish": "max_concurrent_publishes",
+        }.get(stage)
+        if not limit_key:
+            return
+        limit = max(1, int(config.get(limit_key, 1)))
+        with self.store._connect() as conn:
+            running = int(conn.execute(
+                "SELECT COUNT(*) c FROM automation_steps WHERE user_id=? AND stage=? "
+                "AND status='running' AND run_id<>?",
+                (user_id, stage, run_id),
+            ).fetchone()["c"])
+        if running >= limit:
+            raise AutomationWaiting(f"Concurrency limit reached: {limit_key}={limit}.")
+
+    def _execute_stage(self, user_id: int, stage: str, config: dict[str, Any],
+                       refs: dict[str, Any], handler: Optional[StageHandler]) -> dict[str, Any]:
+        operation = lambda: (
+            handler(user_id, config, refs) if handler
+            else self._default_execute(user_id, stage, config, refs)
+        )
+        if "provider_mode" not in config or stage in {"opportunity", "production"}:
+            return operation()
+        self._consume_provider_budget(stage, config, refs)
+        simulated = lambda: {
+            "provider_mode": str(config["provider_mode"]).upper(),
+            "simulated": True,
+            "stage": stage,
+        }
+        return execute_provider_call(
+            "channel_operator", stage,
+            {"stage": stage, "config": config, "refs": refs},
+            live=operation, mock=simulated,
+            mode=ProviderMode(str(config["provider_mode"]).upper()),
+            category=("llm" if stage in {"script", "assets", "learning"}
+                      else "tts" if stage == "render"
+                      else "upload" if stage == "publish" else "external"),
+            cacheable=stage in {"research", "competitor", "script", "assets", "learning"},
+        )
 
     def _set_waiting(self, user_id: int, run_id: int, stage: str, reason: str) -> dict[str, Any]:
         step = self.store.get_automation_step(user_id, run_id, stage)
@@ -194,6 +323,11 @@ class AutomationOrchestrator:
     def _gate_satisfied(self, user_id: int, run_id: int, gate: str) -> bool:
         event = self.store.latest_automation_approval(user_id, run_id, gate)
         return bool(event and event.get("action") == "approved")
+
+    @staticmethod
+    def _gate_required(config: dict[str, Any], gate: str) -> bool:
+        key = GATE_POLICY_KEYS.get(gate)
+        return True if not key else dict(config.get("approval_policy") or {}).get(key) is not False
 
     def advance(self, user_id: int, run_id: int) -> dict[str, Any]:
         run = self.get(user_id, run_id)
@@ -221,7 +355,7 @@ class AutomationOrchestrator:
             stage = str(step["stage"])
             if step["status"] in {"completed", "skipped"}:
                 gate = GATE_AFTER_STAGE.get(stage)
-                if gate and not self._gate_satisfied(user_id, run_id, gate):
+                if gate and self._gate_required(config, gate) and not self._gate_satisfied(user_id, run_id, gate):
                     return self._set_waiting(
                         user_id, run_id, stage, f"Human {gate} approval is required."
                     )
@@ -244,6 +378,10 @@ class AutomationOrchestrator:
                 self.store.update_automation_run(user_id, run_id, {"refs": refs})
                 completed_count += 1
             else:
+                try:
+                    self._enforce_stage_concurrency(user_id, run_id, stage, config)
+                except AutomationWaiting as exc:
+                    return self._set_waiting(user_id, run_id, stage, str(exc))
                 self.store.update_automation_step(user_id, run_id, stage, {
                     "status": "running", "input_refs": refs,
                     "started_at": step.get("started_at") or self.now(), "error": None,
@@ -254,8 +392,7 @@ class AutomationOrchestrator:
                 })
                 try:
                     handler = self.handlers.get(stage)
-                    output = (handler(user_id, config, refs) if handler
-                              else self._default_execute(user_id, stage, config, refs))
+                    output = self._execute_stage(user_id, stage, config, refs, handler)
                     if not isinstance(output, dict):
                         raise AutomationError("Automation stage output must be a mapping.")
                     refs.update(output)
@@ -278,7 +415,7 @@ class AutomationOrchestrator:
                     return self.get(user_id, run_id)
             executed += 1
             gate = GATE_AFTER_STAGE.get(stage)
-            if gate and not self._gate_satisfied(user_id, run_id, gate):
+            if gate and self._gate_required(config, gate) and not self._gate_satisfied(user_id, run_id, gate):
                 return self._set_waiting(
                     user_id, run_id, stage, f"Human {gate} approval is required."
                 )
@@ -293,7 +430,10 @@ class AutomationOrchestrator:
         else:
             next_step = remaining[0]
             self.store.update_automation_run(user_id, run_id, {
-                "status": "queued" if run["mode"] != "AUTOMATION_WITH_GATES" else "running",
+                "status": (
+                    "running" if run["mode"] in {"AUTOMATION_WITH_GATES", "FULL_AUTONOMOUS"}
+                    else "queued"
+                ),
                 "current_stage": next_step["stage"], "current_step_id": next_step["id"],
                 "progress": round(completed_count / len(PIPELINE_STAGES) * 100, 1),
             })

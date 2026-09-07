@@ -1681,13 +1681,43 @@
         <p class="muted-help">Controlled multi-platform production automation. Opportunity, script, asset, and publish approvals always remain human decisions.</p>
         <div id="publishing-capabilities" class="muted-help">Loading platform capabilities...</div>
         <div class="row" style="align-items:end;margin-top:12px">
-          <div class="field"><label>Mode</label><select id="automation-mode"><option value="MANUAL_STEP">Manual step</option><option value="ASSISTED">Assisted</option><option value="AUTOMATION_WITH_GATES">Automation with gates</option></select></div>
+          <div class="field"><label>Mode</label><select id="automation-mode"><option value="MANUAL_STEP">Manual step</option><option value="ASSISTED">Assisted</option><option value="AUTOMATION_WITH_GATES">Automation with gates</option><option value="FULL_AUTONOMOUS">Full autonomous (policy gated)</option></select></div>
           <div class="field"><label>Platforms</label><label class="muted-help"><input id="automation-youtube" type="checkbox" checked style="width:auto"> YouTube</label><label class="muted-help"><input id="automation-facebook" type="checkbox" style="width:auto"> Facebook</label></div>
           <div class="field"><label>Research</label><label class="muted-help"><input id="automation-research" type="checkbox" checked style="width:auto"> Refresh research</label></div>
           <button class="btn gradient small" id="automation-start" type="button">Start run</button>
         </div>
         <div id="automation-message" class="muted-help"></div>
         <div id="automation-runs" class="muted-help" style="margin-top:14px">No runs loaded.</div>
+        <section id="autonomous-operator-workspace" class="production-asset-panel" style="margin-top:18px">
+          <div class="template-library-heading">
+            <h4>Autonomous Operator</h4>
+            <span id="autonomous-provider-state" class="status-badge pending">DRY RUN</span>
+          </div>
+          <p class="muted-help">Persistent owner-scoped cycles. Approval gates default on; LIVE requires explicit server opt-in and budget.</p>
+          <div class="row" style="align-items:end;flex-wrap:wrap">
+            <div class="field"><label>Channel / project</label><input id="autonomous-channel-key" value="default-channel" maxlength="200"></div>
+            <div class="field"><label>Provider mode</label><select id="autonomous-provider-mode"><option value="MOCK">TEST / MOCK</option><option value="CACHE">CACHE</option><option value="DRY_RUN" selected>DRY RUN</option><option value="LIVE">LIVE</option></select></div>
+            <div class="field"><label>Cadence</label><select id="autonomous-cadence"><option value="hourly">Hourly</option><option value="daily" selected>Daily</option><option value="weekly">Weekly</option></select></div>
+            <div class="field"><label>Local time</label><input id="autonomous-local-time" type="time" value="09:00"></div>
+            <div class="field"><label>Timezone</label><input id="autonomous-timezone" value="Asia/Bangkok"></div>
+          </div>
+          <div class="row" style="gap:12px;flex-wrap:wrap">
+            <label class="muted-help"><input id="autonomous-enabled" type="checkbox" style="width:auto"> Enabled</label>
+            <label class="muted-help"><input id="autonomous-gate-opportunity" type="checkbox" checked style="width:auto"> Opportunity approval</label>
+            <label class="muted-help"><input id="autonomous-gate-script" type="checkbox" checked style="width:auto"> Script approval</label>
+            <label class="muted-help"><input id="autonomous-gate-assets" type="checkbox" checked style="width:auto"> Asset approval</label>
+            <label class="muted-help"><input id="autonomous-gate-publish" type="checkbox" checked style="width:auto"> Publish approval</label>
+          </div>
+          <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:10px">
+            <button class="btn secondary small" id="autonomous-save" type="button">Save policy</button>
+            <button class="btn gradient small" id="autonomous-start" type="button">Start cycle now</button>
+            <button class="btn secondary small" id="autonomous-pause" type="button">Pause automation</button>
+            <button class="btn secondary small" id="autonomous-resume" type="button">Resume automation</button>
+            <button class="btn danger small" id="autonomous-stop" type="button">Stop after current cycle</button>
+          </div>
+          <div id="autonomous-cost" class="muted-help" style="margin-top:10px">Provider cost not loaded.</div>
+          <div id="autonomous-cycles" class="muted-help" style="margin-top:10px">No autonomous cycles loaded.</div>
+        </section>
       </div>
       <div id="production-queue" style="border-top:1px solid var(--border);margin-top:26px;padding-top:20px">
         <div class="template-library-heading">

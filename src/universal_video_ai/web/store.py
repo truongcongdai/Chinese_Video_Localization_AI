@@ -42,6 +42,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     source_channel_title TEXT,
     source_channel_id TEXT,
     source_uploader TEXT,
+    source_external_video_id TEXT,
+    source_platform TEXT,
+    source_logical_id INTEGER,
+    history_archived INTEGER NOT NULL DEFAULT 0,
+    execution_attempt INTEGER NOT NULL DEFAULT 1,
     target_language TEXT NOT NULL,
     source_language TEXT DEFAULT 'auto',
     status TEXT NOT NULL,           -- queued | running | review | done | error
@@ -1274,6 +1279,11 @@ _MIGRATIONS = [
     ("jobs", "source_channel_title", "ALTER TABLE jobs ADD COLUMN source_channel_title TEXT"),
     ("jobs", "source_channel_id", "ALTER TABLE jobs ADD COLUMN source_channel_id TEXT"),
     ("jobs", "source_uploader", "ALTER TABLE jobs ADD COLUMN source_uploader TEXT"),
+    ("jobs", "source_external_video_id", "ALTER TABLE jobs ADD COLUMN source_external_video_id TEXT"),
+    ("jobs", "source_platform", "ALTER TABLE jobs ADD COLUMN source_platform TEXT"),
+    ("jobs", "source_logical_id", "ALTER TABLE jobs ADD COLUMN source_logical_id INTEGER"),
+    ("jobs", "history_archived", "ALTER TABLE jobs ADD COLUMN history_archived INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "execution_attempt", "ALTER TABLE jobs ADD COLUMN execution_attempt INTEGER NOT NULL DEFAULT 1"),
     ("jobs", "logo_path", "ALTER TABLE jobs ADD COLUMN logo_path TEXT"),
     ("jobs", "logo_corner", "ALTER TABLE jobs ADD COLUMN logo_corner TEXT DEFAULT 'bottom_right'"),
     ("jobs", "logo_size_px", "ALTER TABLE jobs ADD COLUMN logo_size_px INTEGER DEFAULT 120"),
@@ -1462,6 +1472,11 @@ class Job:
     subtitle_offset_seconds: float = 0.0
     keep_original_audio: int = 0
     background_music_strategy: str = "deterministic"
+    source_external_video_id: Optional[str] = None
+    source_platform: Optional[str] = None
+    source_logical_id: Optional[int] = None
+    history_archived: int = 0
+    execution_attempt: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -2531,7 +2546,8 @@ class Store:
     def list_jobs_for_user(self, user_id: int, limit: int = 100) -> List[Job]:
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM jobs WHERE user_id = ? AND COALESCE(history_archived,0)=0 "
+                "ORDER BY created_at DESC LIMIT ?",
                 (user_id, limit),
             )
             return [self._row_to_job(row) for row in cur.fetchall()]
@@ -2552,7 +2568,7 @@ class Store:
         Always scoped to `user_id`, so one account can never see or search
         another account's history.
         """
-        clauses = ["user_id = ?"]
+        clauses = ["user_id = ?", "COALESCE(history_archived,0)=0"]
         params: List[Any] = [user_id]
 
         if query:
@@ -3746,6 +3762,26 @@ class Store:
                 (status, now, status, now, status, now, asset_id, item_id, user_id),
             )
             return cur.rowcount > 0
+
+    def archive_job(self, job_id: str, user_id: int) -> bool:
+        """Hide a terminal logical item without deleting its evidence/history."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status,source_logical_id FROM jobs WHERE id=? AND user_id=?",
+                (job_id, user_id),
+            ).fetchone()
+            if not row or row["status"] in {"queued", "running", "review"}:
+                return False
+            conn.execute(
+                "UPDATE jobs SET history_archived=1,updated_at=? WHERE id=? AND user_id=?",
+                (time.time(), job_id, user_id),
+            )
+            if row["source_logical_id"]:
+                conn.execute(
+                    "UPDATE channel_source_videos SET archived=1 WHERE id=? AND user_id=?",
+                    (row["source_logical_id"], user_id),
+                )
+            return True
 
     def supersede_other_production_assets(
         self, user_id: int, item_id: int, *, asset_type: str,

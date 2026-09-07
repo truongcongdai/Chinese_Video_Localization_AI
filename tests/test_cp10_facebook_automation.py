@@ -375,15 +375,17 @@ def test_automation_owner_isolation_modes_and_secret_guard(tmp_path):
     run, _ = service.start(owner, mode="ASSISTED", configuration={"target_platforms": []})
     with pytest.raises(AutomationNotFound):
         service.get(foreign, run["id"])
-    with pytest.raises(AutomationError):
-        service.start(owner, mode="FULL_AUTONOMOUS", configuration={"target_platforms": []})
+    autonomous, created = service.start(
+        owner, mode="FULL_AUTONOMOUS", configuration={"target_platforms": []}
+    )
+    assert created and all(autonomous["configuration"]["approval_policy"].values())
     with pytest.raises(AutomationError, match="credentials"):
         service.start(owner, mode="MANUAL_STEP", configuration={
             "target_platforms": [], "nested": {"access_token": "secret"},
         })
     with pytest.raises(AutomationError, match="references"):
         service.approve(owner, run["id"], "opportunity", refs={"token": "secret"})
-    assert "FULL_AUTONOMOUS" not in {run["mode"] for run in service.list(owner)}
+    assert "FULL_AUTONOMOUS" in {run["mode"] for run in service.list(owner)}
 
 
 def test_automation_routes_auth_models_and_ui_contract():

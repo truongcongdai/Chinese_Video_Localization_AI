@@ -76,6 +76,12 @@ from universal_video_ai.channel_agent.automation import (
     AutomationOrchestrator,
     AutomationWaiting,
 )
+from universal_video_ai.channel_agent.autonomous_operator import (
+    AutonomousChannelOperator,
+    AutonomousOperatorError,
+    AutonomousOperatorNotFound,
+)
+from universal_video_ai.provider_runtime import get_cost_report
 from universal_video_ai.channel_agent.youtube import (
     GoogleOAuthTokenService,
     YouTubeReadOnlyError,
@@ -327,6 +333,27 @@ class AutomationApprovalBody(BaseModel):
     note: Optional[str] = None
 
 
+class AutonomousConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_key: str
+    enabled: bool = False
+    mode: str = "FULL_AUTONOMOUS"
+    provider_mode: str = "DRY_RUN"
+    cadence: str = "daily"
+    local_time: str = "09:00"
+    timezone_name: str = "UTC"
+    missed_run_policy: str = "run_once"
+    configuration: dict[str, Any] = {}
+
+
+class AutonomousCycleBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: Optional[str] = None
+    start_now: bool = True
+
+
 def _store_from_request(request: Request) -> Store:
     store = getattr(request.app.state, "store", None)
     if store is None:
@@ -378,6 +405,15 @@ def _automation_call(operation):
     except AutomationNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except AutomationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _autonomous_call(operation):
+    try:
+        return operation()
+    except AutonomousOperatorNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except AutonomousOperatorError as exc:
         raise HTTPException(409, str(exc)) from exc
 
 
@@ -590,6 +626,10 @@ def _automation_service(store: Store) -> AutomationOrchestrator:
         "script": script, "assets": assets, "render": render,
         "publish": publish, "analytics": analytics, "learning": learning,
     })
+
+
+def _autonomous_service(store: Store) -> AutonomousChannelOperator:
+    return AutonomousChannelOperator(store, _automation_service(store))
 
 
 def _production_asset_call(call: Any) -> Any:
@@ -1593,6 +1633,102 @@ def approve_automation_gate(
     return _automation_call(lambda: _automation_service(store).approve(
         user_id, run_id, stage, refs=body.refs, note=body.note
     ))
+
+
+@router.post("/autonomous/configs")
+def save_autonomous_config(
+    body: AutonomousConfigBody, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _autonomous_call(lambda: _autonomous_service(store).save_config(
+        user_id, body.channel_key, enabled=body.enabled, mode=body.mode,
+        provider_mode=body.provider_mode, cadence=body.cadence,
+        local_time=body.local_time, timezone_name=body.timezone_name,
+        missed_run_policy=body.missed_run_policy, configuration=body.configuration,
+    ))
+
+
+@router.get("/autonomous/configs")
+def autonomous_configs(
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _autonomous_call(lambda: _autonomous_service(store).list_configs(user_id))
+
+
+@router.post("/autonomous/configs/{config_id}/cycles")
+def start_autonomous_cycle(
+    config_id: int, body: AutonomousCycleBody,
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    def operation() -> dict[str, Any]:
+        cycle, created = _autonomous_service(store).start_cycle(
+            user_id, config_id, trigger="manual", idempotency_key=body.idempotency_key,
+            advance=body.start_now,
+        )
+        return {"cycle": cycle, "created": created}
+    return _autonomous_call(operation)
+
+
+@router.post("/autonomous/configs/{config_id}/{action}")
+def control_autonomous_config(
+    config_id: int, action: str,
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    if action not in {"pause", "resume", "stop-after-current"}:
+        raise HTTPException(422, "Action must be pause, resume, or stop-after-current.")
+    enabled = action == "resume"
+    stop_after = action == "stop-after-current"
+    return _autonomous_call(
+        lambda: _autonomous_service(store).set_enabled(
+            user_id, config_id, enabled, stop_after_current=stop_after,
+        )
+    )
+
+
+@router.get("/autonomous/cycles")
+def autonomous_cycles(
+    limit: int = Query(50, ge=1, le=100), user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    return _autonomous_call(lambda: _autonomous_service(store).list_cycles(user_id, limit))
+
+
+@router.get("/autonomous/cycles/{cycle_id}")
+def autonomous_cycle(
+    cycle_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _autonomous_call(lambda: _autonomous_service(store).get_cycle(user_id, cycle_id))
+
+
+@router.post("/autonomous/cycles/{cycle_id}/advance")
+def advance_autonomous_cycle(
+    cycle_id: int, user_id: int = Depends(get_current_user_id),
+    store: Store = Depends(_store_from_request),
+) -> dict[str, Any]:
+    _require_enabled()
+    return _autonomous_call(lambda: _autonomous_service(store).advance_cycle(user_id, cycle_id))
+
+
+@router.post("/autonomous/scheduler/tick")
+def tick_autonomous_scheduler(
+    user_id: int = Depends(get_current_user_id), store: Store = Depends(_store_from_request),
+) -> list[dict[str, Any]]:
+    _require_enabled()
+    service = _autonomous_service(store)
+    return service.run_due(user_id=user_id)
+
+
+@router.get("/autonomous/provider-cost")
+def autonomous_provider_cost(user_id: int = Depends(get_current_user_id)) -> dict[str, Any]:
+    _require_enabled()
+    return get_cost_report().to_dict()
 
 
 @router.get("/production/{item_id}/qa")

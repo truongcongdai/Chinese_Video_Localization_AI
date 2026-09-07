@@ -102,6 +102,10 @@ from universal_video_ai.downloader.channel import (
     ChannelListingService, ChannelVideoCandidate, URLIntent, VideoURLClassifier,
 )
 from universal_video_ai.downloader.platform import Platform
+from universal_video_ai.channel_agent.channel_sources import (
+    ChannelSourceError,
+    ChannelSourceRegistry,
+)
 
 from .store import Store
 from .auth import (
@@ -190,6 +194,7 @@ TOP_UP_PACKAGES = {50: 50_000, 120: 100_000, 300: 250_000, 700: 500_000}
 
 store = Store(_DB_PATH)
 app.state.store = store
+channel_source_registry = ChannelSourceRegistry(store)
 youtube_research_database = DatabaseManager(_DB_PATH)
 youtube_research_database.init_schema()
 app.state.youtube_research_repository = YouTubeResearchRepository(
@@ -568,6 +573,13 @@ class ChannelProcessBody(NewJobBody):
     # retained and deduplicated, so repeated runs continue instead of starting
     # from nine items again.
     deep_scan: bool = True
+
+
+class PipelineRerunBody(BaseModel):
+    mode: str = "RETRY_FROM_FAILED_STAGE"
+    reset_stages: List[str] = Field(default_factory=list)
+    confirm_completed: bool = False
+    repeat_publish: bool = False
 
 
 class RemixPlanBody(BaseModel):
@@ -1447,6 +1459,16 @@ async def _run_job(job_id: str) -> None:
         slot_acquired = True
         await _run_job_unlocked(job_id)
     finally:
+        current = store.get_job(job_id)
+        if current and current.source_logical_id and current.status in {"done", "error"}:
+            channel_source_registry.finish(
+                current.user_id,
+                int(current.source_logical_id),
+                success=current.status == "done",
+                job_id=current.id,
+                local_asset_path=current.source_video_path,
+                error=current.error,
+            )
         if slot_acquired:
             await _release_job_run_slot()
         # Covers normal completion as well as cancellation while waiting for
@@ -4719,6 +4741,17 @@ async def analyze_channel_download(
         "preview": store.list_channel_scan_videos(user_id, canonical_url, limit=50),
         "preview_truncated": total > 50,
     })
+    source_rows = channel_source_registry.discover(
+        user_id,
+        platform=classification.platform.value,
+        channel_id=str(state.get("channel_id") or ""),
+        channel_url=canonical_url,
+        videos=store.list_channel_scan_videos(user_id, canonical_url, limit=0),
+    )
+    scan_preflight = channel_source_registry.preflight(source_rows, retry_failed=True)
+    payload["preflight"] = {
+        key: value for key, value in scan_preflight.items() if key != "eligible"
+    }
     if legacy_catalog_reset:
         payload.setdefault("warnings", []).insert(
             0,
@@ -4822,13 +4855,31 @@ async def process_channel_download(
     if not candidates:
         raise HTTPException(400, "Catalog kênh chưa có video hợp lệ. Hãy chạy Quét sâu toàn bộ trước.")
 
-    skipped_existing: list[str] = []
-    if body.skip_existing:
-        existing = store.existing_source_urls_for_user(
-            user_id, [candidate.source_url for candidate in candidates]
-        )
-        skipped_existing = [candidate.source_url for candidate in candidates if candidate.source_url in existing]
-        candidates = [candidate for candidate in candidates if candidate.source_url not in existing]
+    source_rows = channel_source_registry.discover(
+        user_id,
+        platform=classification.platform.value,
+        channel_id=str((state or {}).get("channel_id") or (scan.channel_id if scan else "")),
+        channel_url=canonical_url,
+        videos=[{
+            "video_id": candidate.video_id,
+            "source_url": candidate.source_url,
+            "title": candidate.title,
+        } for candidate in candidates],
+    )
+    preflight = channel_source_registry.preflight(source_rows, retry_failed=True)
+    eligible_ids = {int(row["id"]) for row in preflight["eligible"]}
+    source_by_external_id = {str(row["external_video_id"]): row for row in source_rows}
+    eligible_candidates = [
+        candidate for candidate in candidates
+        if int(source_by_external_id.get(candidate.video_id, {}).get("id") or 0) in eligible_ids
+    ]
+    skipped_existing = [
+        candidate.source_url for candidate in candidates if candidate not in eligible_candidates
+    ]
+    # CP11 canonical dedup is a safety invariant, not a UI preference.  The
+    # legacy skip_existing flag remains accepted for API compatibility but can
+    # no longer force duplicate downloads of queued/successful logical videos.
+    candidates = eligible_candidates
 
     user = store.get_user_by_id(user_id)
     total_cost = JOB_COST_CREDITS * len(candidates)
@@ -4849,9 +4900,29 @@ async def process_channel_download(
         try:
             payload = dict(base_payload)
             payload["url"] = candidate.source_url
-            single_body = NewJobBody(**payload)
-            job = await create_job(single_body, user_id)
-            job_id = str(job.get("id") or "")
+            source_row = source_by_external_id[candidate.video_id]
+            decision = channel_source_registry.decision(source_row)
+            retried_existing = decision == "RETRYABLE_FAILED" and bool(source_row.get("logical_job_id"))
+            if retried_existing:
+                job_id = str(source_row["logical_job_id"])
+                old_job = store.get_job(job_id)
+                if not old_job or old_job.user_id != user_id or old_job.status != "error":
+                    raise RuntimeError("Retryable source no longer has an owner-scoped failed job.")
+                retried_job = store.retry_job(job_id, user_id)
+                if retried_job is None:
+                    raise RuntimeError("Failed job changed state before retry could start.")
+                if JOB_COST_CREDITS > 0:
+                    store.adjust_credits(user_id, -JOB_COST_CREDITS)
+                _delete_job_artifacts(job_id)
+                channel_source_registry.begin_attempt(
+                    user_id, int(source_row["id"]), mode="AUTO_RETRY_FAILED", job_id=job_id,
+                )
+                task = asyncio.create_task(_run_job(job_id))
+                _running_tasks[job_id] = task
+            else:
+                single_body = NewJobBody(**payload)
+                job = await create_job(single_body, user_id)
+                job_id = str(job.get("id") or "")
             if job_id:
                 store.set_job_source_channel(
                     job_id,
@@ -4861,8 +4932,15 @@ async def process_channel_download(
                     channel_id=str((state or {}).get("channel_id") or (scan.channel_id if scan else "")),
                     uploader=candidate.uploader,
                 )
+                if not retried_existing:
+                    channel_source_registry.link_job(user_id, int(source_row["id"]), job_id)
+                    channel_source_registry.begin_attempt(
+                        user_id, int(source_row["id"]), mode="NEW_DOWNLOAD", job_id=job_id,
+                    )
             created.append({
                 "job_id": job_id,
+                "source_video_id": int(source_row["id"]),
+                "retried": retried_existing,
                 "source_url": candidate.source_url,
                 "source_channel_url": canonical_url,
                 "source_channel_title": str((state or {}).get("channel_title") or (scan.channel_title if scan else "")),
@@ -4897,12 +4975,19 @@ async def process_channel_download(
         "scanned": int(state.get("total_discovered") or len(catalog_rows)),
         "catalog_total": int(state.get("total_discovered") or len(catalog_rows)),
         "newly_discovered": newly_discovered,
+        "preflight": {key: value for key, value in preflight.items() if key != "eligible"},
         "scan_complete": bool(state.get("complete")),
         "has_more": state.get("has_more"),
         "stop_reason": state.get("stop_reason") or "",
         "created_count": len(created),
         "skipped_existing_count": len(skipped_existing),
         "failed_count": len(failed),
+        "downloaded_new": sum(not item["retried"] for item in created),
+        "retried_failed": sum(bool(item["retried"]) for item in created),
+        "skipped_queued": int(preflight["already_queued"]),
+        "skipped_processing": int(preflight["processing"]),
+        "skipped_success": int(preflight["already_successful"]),
+        "failed_again": len(failed),
         "created": created,
         "skipped_existing": skipped_existing,
         "failed": failed,
@@ -6468,6 +6553,10 @@ def _delete_job_artifacts(job_id: str) -> None:
 def delete_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
     task = _running_tasks.get(job_id)
+    if job.source_logical_id:
+        channel_source_registry.skip(
+            user_id, int(job.source_logical_id), reason="deleted by owner"
+        )
     if task:
         task.cancel()
     deleted = store.delete_job(job_id, user_id)
@@ -6562,6 +6651,10 @@ def cancel_job(job_id: str, user_id: int = Depends(get_current_user_id)):
         raise HTTPException(400, "Chỉ có thể dừng job đang chờ, đang chạy hoặc chờ render")
     store.update_job(job_id, status="cancelled", progress_note="Đã dừng theo yêu cầu người dùng")
     task = _running_tasks.get(job_id)
+    if job.source_logical_id:
+        channel_source_registry.skip(
+            user_id, int(job.source_logical_id), reason="cancelled by owner"
+        )
     if task:
         task.cancel()
     return {"ok": True}
@@ -6932,6 +7025,16 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
         raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
 
     retried_job = store.retry_job(job_id, user_id)
+    if retried_job is not None:
+        channel_source_registry.create_job_attempt(
+            user_id, job_id, mode="RETRY_FROM_FAILED_STAGE", reset_stages=[],
+            reused_outputs={"failed_stage": True, "publishing": True}, repeat_publish=False,
+        )
+        if old_job.source_logical_id:
+            channel_source_registry.begin_attempt(
+                user_id, int(old_job.source_logical_id),
+                mode="RETRY_FROM_FAILED_STAGE", job_id=job_id,
+            )
     if retried_job is None:
         raise HTTPException(409, "Job đã được chạy lại hoặc trạng thái đã thay đổi")
     if JOB_COST_CREDITS > 0:
@@ -6953,6 +7056,127 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
         task = asyncio.create_task(_run_job(retried_job.id))
     _running_tasks[retried_job.id] = task
     return retried_job.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/rerun")
+async def rerun_full_pipeline(
+        job_id: str, body: PipelineRerunBody,
+        user_id: int = Depends(get_current_user_id),
+):
+    """Create a new execution attempt while preserving the logical job id."""
+    job = _get_owned_job(job_id, user_id)
+    mode = str(body.mode or "").upper()
+    if mode not in {"RETRY_FROM_FAILED_STAGE", "RESTART_FROM_BEGINNING"}:
+        raise HTTPException(422, "Unknown rerun mode.")
+    if _is_content_os_job(job):
+        raise HTTPException(409, "Content OS items must be restarted from their Production workspace.")
+    if job.status == "done" and not body.confirm_completed:
+        raise HTTPException(409, "Completed items require explicit rerun confirmation.")
+    if mode == "RETRY_FROM_FAILED_STAGE" and job.status != "error":
+        raise HTTPException(409, "Retry-from-failed requires a failed item.")
+    user = store.get_user_by_id(user_id)
+    if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
+        raise HTTPException(402, "Insufficient credits for another execution attempt.")
+
+    allowed_stages = {"download", "transcription", "ocr", "translation", "tts", "render"}
+    reset_stages = list(dict.fromkeys(body.reset_stages or (
+        ["download", "transcription", "ocr", "translation", "tts", "render"]
+        if mode == "RESTART_FROM_BEGINNING" else []
+    )))
+    if any(stage not in allowed_stages for stage in reset_stages):
+        raise HTTPException(422, "A reset stage is not supported.")
+    reused = {
+        "source_video": bool(job.source_video_path) and "download" not in reset_stages,
+        "transcript": bool(job.source_segments_json) and "transcription" not in reset_stages,
+        "translation": bool(job.segments_json) and "translation" not in reset_stages,
+        "render": bool(job.final_video_path) and "render" not in reset_stages,
+        "publishing": not body.repeat_publish,
+    }
+    try:
+        attempt = channel_source_registry.create_job_attempt(
+            user_id, job_id, mode=mode, reset_stages=reset_stages,
+            reused_outputs=reused, repeat_publish=body.repeat_publish,
+        )
+    except ChannelSourceError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if job.source_logical_id:
+        channel_source_registry.begin_attempt(
+            user_id, int(job.source_logical_id), mode=mode, job_id=job_id,
+        )
+    if JOB_COST_CREDITS > 0:
+        store.adjust_credits(user_id, -JOB_COST_CREDITS)
+
+    fields: dict[str, Any] = {
+        "status": "queued", "progress_note": "Full pipeline rerun queued", "error": None,
+    }
+    if "download" in reset_stages:
+        fields["source_video_path"] = None
+    if {"transcription", "ocr"}.intersection(reset_stages):
+        fields.update({"source_segments_json": None, "review_state_json": None})
+    if "translation" in reset_stages:
+        fields.update({"segments_json": None, "review_state_json": None, "qc_warnings_json": None})
+    if "render" in reset_stages:
+        fields.update({
+            "final_video_path": None, "publishing_pack_path": None,
+            "publish_ready_video_path": None, "publishing_pack_error": None,
+            "publishing_pack_status": (
+                "pending" if (job.publishing_config or {}).get("enabled") else "disabled"
+            ),
+        })
+    store.update_job(job_id, **fields)
+    old_task = _running_tasks.get(job_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
+    task = asyncio.create_task(_run_job(job_id))
+    _running_tasks[job_id] = task
+    return {
+        "job": _get_owned_job(job_id, user_id).to_dict(),
+        "attempt": attempt,
+        "reused": reused,
+        "regenerated": reset_stages,
+        "remote_publish_repeated": False,
+        "publish_note": (
+            "Publishing remains a separate approval action even when repeat_publish was requested."
+        ),
+    }
+
+
+@app.get("/api/jobs/{job_id}/attempts")
+def list_job_execution_attempts(job_id: str, user_id: int = Depends(get_current_user_id)):
+    _get_owned_job(job_id, user_id)
+    return channel_source_registry.job_attempts(user_id, job_id)
+
+
+@app.post("/api/jobs/{job_id}/archive")
+def archive_job_history(job_id: str, user_id: int = Depends(get_current_user_id)):
+    _get_owned_job(job_id, user_id)
+    if not store.archive_job(job_id, user_id):
+        raise HTTPException(409, "Only terminal jobs can be archived.")
+    return {"ok": True, "job_id": job_id, "archived": True}
+
+
+@app.get("/api/channel-sources")
+def list_channel_sources(
+        channel_id: Optional[str] = None, user_id: int = Depends(get_current_user_id),
+):
+    return channel_source_registry.list_visible(user_id, channel_id=channel_id)
+
+
+@app.get("/api/channel-sources/{source_id}/attempts")
+def list_channel_source_attempts(source_id: int, user_id: int = Depends(get_current_user_id)):
+    try:
+        return channel_source_registry.attempts(user_id, source_id)
+    except ChannelSourceError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/channel-source-history/compact-legacy")
+def compact_legacy_channel_history(user_id: int = Depends(get_current_user_id)):
+    return channel_source_registry.compact_legacy_failed_jobs(user_id)
 
 
 @app.get("/api/jobs/{job_id}/segments")

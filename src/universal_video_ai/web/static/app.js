@@ -1719,6 +1719,15 @@ function formatChannelScanStatus(result) {
     `mới ${fresh}`,
     state,
   ];
+  const preflight = result.preflight || {};
+  pieces.push(
+    `New ${preflight.new || 0}`,
+    `Queued ${preflight.already_queued || 0}`,
+    `Processing ${preflight.processing || 0}`,
+    `Success ${preflight.already_successful || 0}`,
+    `Retryable ${preflight.failed_retryable || 0}`,
+    `Skipped ${preflight.skipped || 0}`,
+  );
   if (result.channel_title) pieces.push(result.channel_title);
   if (result.stop_reason) pieces.push(`dừng: ${result.stop_reason}`);
   const warning = (result.warnings || []).join(" ");
@@ -2052,6 +2061,12 @@ $("#submit-btn").onclick = async () => {
         }),
       });
       const notes = [
+        `downloaded new ${result.downloaded_new || 0}`,
+        `retried failed ${result.retried_failed || 0}`,
+        `skipped queued ${result.skipped_queued || 0}`,
+        `skipped processing ${result.skipped_processing || 0}`,
+        `skipped success ${result.skipped_success || 0}`,
+        `failed again ${result.failed_again || 0}`,
         `Catalog ${result.catalog_total ?? result.scanned} video`,
         result.newly_discovered ? `mới phát hiện ${result.newly_discovered}` : "",
         result.scan_complete ? "đã quét hết" : "catalog chưa hoàn tất",
@@ -2760,6 +2775,8 @@ async function refreshJobs() {
       <div class="job-main">
         <div class="job-head">
           <div class="job-info">
+            ${job.execution_attempt > 1 ? `<div class="job-meta">Attempts: ${job.execution_attempt}</div>` : ""}
+            ${job.source_external_video_id ? `<div class="job-meta">Source video ID: ${_escapeHtml(job.source_external_video_id)}</div>` : ""}
             <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
             <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}${job.publishing_pack_status && job.publishing_pack_status !== "disabled" ? ` · Publishing: ${_escapeHtml(job.publishing_pack_status)}` : ""}</div>
             ${job.source_channel_url || job.source_channel_title || job.source_uploader ? `<div class="job-meta" style="margin-top:4px">Kênh nguồn: <b>${_escapeHtml(job.source_channel_title || job.source_uploader || "Không rõ")}</b>${job.source_channel_url ? ` · <a href="${_escapeHtml(job.source_channel_url)}" target="_blank" rel="noopener">Mở kênh</a>` : ""}</div>` : ""}
@@ -2773,6 +2790,8 @@ async function refreshJobs() {
           <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
         </div>
         <div class="job-actions">
+          ${!job.is_content_os && ["queued", "error", "review", "done", "cancelled"].includes(job.status) ? `<button class="btn gradient small" data-rerun-all="${job.id}">Run all again</button>` : ""}
+          ${["done", "error", "cancelled"].includes(job.status) ? `<button class="btn secondary small" data-archive="${job.id}">Archive</button>` : ""}
           ${(job.status === "queued" || job.status === "running" || job.status === "review") ? `<button class="btn danger small" data-cancel="${job.id}">Dừng</button>` : ""}
           ${job.status === "review" ? `<button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>` : ""}
           ${job.has_video ? `
@@ -2849,6 +2868,48 @@ async function refreshJobs() {
       try { await api(`/api/jobs/${btn.dataset.retry}/retry`, { method: "POST" }); refreshJobs(); refreshMe(); }
       catch (e) { alert(e.message); }
       finally { btn.disabled = false; }
+    };
+  });
+  list.querySelectorAll("[data-rerun-all]").forEach(btn => {
+    btn.onclick = async () => {
+      const job = window._jobsById[btn.dataset.rerunAll];
+      const accepted = await showConfirmDialog(
+        "Restart full pipeline?",
+        `Item: ${job?.title || job?.source_url || btn.dataset.rerunAll}. Source identity and configuration history are preserved. Download, transcription, OCR, translation, TTS, and render are regenerated. Existing remote publication is NOT repeated.`,
+        "Run all again",
+      );
+      if (!accepted) return;
+      btn.disabled = true;
+      try {
+        await api(`/api/jobs/${btn.dataset.rerunAll}/rerun`, {
+          method: "POST",
+          body: JSON.stringify({
+            mode: "RESTART_FROM_BEGINNING",
+            confirm_completed: job?.status === "done",
+            repeat_publish: false,
+          }),
+        });
+        await refreshJobs();
+        await refreshMe();
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
+  list.querySelectorAll("[data-archive]").forEach(btn => {
+    btn.onclick = async () => {
+      const accepted = await showConfirmDialog(
+        "Archive this item?",
+        "The item is hidden from default history; source identity and nested attempts remain stored.",
+        "Archive",
+      );
+      if (!accepted) return;
+      try {
+        await api(`/api/jobs/${btn.dataset.archive}/archive`, {method: "POST"});
+        await refreshJobs();
+      } catch (error) { alert(error.message); }
     };
   });
   list.querySelectorAll("[data-delete]").forEach(btn => {
@@ -3790,6 +3851,141 @@ async function loadAutomationWorkspace() {
     } catch (error) { $("#automation-message").textContent = error.message; }
   });
   document.querySelectorAll("[data-automation-production]").forEach(button => button.onclick = () => showProductionItem(Number(button.dataset.automationProduction)));
+  await loadAutonomousWorkspace();
+}
+
+let activeAutonomousConfigId = null;
+
+function autonomousPayload() {
+  const targetPlatforms = [];
+  if ($("#automation-youtube").checked) targetPlatforms.push("youtube");
+  if ($("#automation-facebook").checked) targetPlatforms.push("facebook");
+  return {
+    channel_key: $("#autonomous-channel-key").value.trim() || "default-channel",
+    enabled: $("#autonomous-enabled").checked,
+    mode: "FULL_AUTONOMOUS",
+    provider_mode: $("#autonomous-provider-mode").value,
+    cadence: $("#autonomous-cadence").value,
+    local_time: $("#autonomous-local-time").value || "09:00",
+    timezone_name: $("#autonomous-timezone").value.trim() || "UTC",
+    missed_run_policy: "run_once",
+    configuration: {
+      target_platforms: targetPlatforms,
+      research_refresh: true,
+      competitor_refresh: true,
+      max_opportunities: 5,
+      production_limit: 1,
+      max_concurrent_cycles: 1,
+      max_concurrent_downloads: 2,
+      max_concurrent_renders: 1,
+      max_concurrent_publishes: 1,
+      default_publishing_privacy: "private",
+      auto_generate_script: true,
+      auto_generate_assets: true,
+      auto_render_after_approval: true,
+      auto_publish: false,
+      refresh_analytics: true,
+      generate_learning: true,
+      approval_policy: {
+        require_opportunity_approval: $("#autonomous-gate-opportunity").checked,
+        require_script_approval: $("#autonomous-gate-script").checked,
+        require_asset_approval: $("#autonomous-gate-assets").checked,
+        require_publish_approval: $("#autonomous-gate-publish").checked,
+      },
+      budgets: {
+        max_llm_calls: 10,
+        max_external_api_calls: 50,
+        max_tts_requests: 5,
+        max_upload_attempts: 2,
+        max_live_acceptance_calls: 0,
+      },
+    },
+  };
+}
+
+async function saveAutonomousConfig() {
+  const payload = autonomousPayload();
+  if (payload.provider_mode === "LIVE") {
+    const accepted = await showConfirmDialog(
+      "Enable LIVE provider mode?",
+      "LIVE can consume API quota and tokens. Server-side RUN_LIVE_TESTS=1, budgets, rights, and configured approval gates still apply.",
+      "Save LIVE mode",
+    );
+    if (!accepted) throw new Error("LIVE mode was not confirmed.");
+  }
+  const config = await api("/api/channel-agent/autonomous/configs", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+  });
+  activeAutonomousConfigId = config.id;
+  return config;
+}
+
+async function loadAutonomousWorkspace() {
+  const [configs, cycles, cost] = await Promise.all([
+    api("/api/channel-agent/autonomous/configs"),
+    api("/api/channel-agent/autonomous/cycles?limit=20"),
+    api("/api/channel-agent/autonomous/provider-cost"),
+  ]);
+  const config = configs[0];
+  if (config) {
+    activeAutonomousConfigId = config.id;
+    $("#autonomous-channel-key").value = config.channel_key;
+    $("#autonomous-enabled").checked = !!config.enabled;
+    $("#autonomous-provider-mode").value = config.provider_mode;
+    $("#autonomous-cadence").value = config.cadence;
+    $("#autonomous-local-time").value = config.local_time;
+    $("#autonomous-timezone").value = config.timezone_name;
+    const gates = config.configuration?.approval_policy || {};
+    $("#autonomous-gate-opportunity").checked = gates.require_opportunity_approval !== false;
+    $("#autonomous-gate-script").checked = gates.require_script_approval !== false;
+    $("#autonomous-gate-assets").checked = gates.require_asset_approval !== false;
+    $("#autonomous-gate-publish").checked = gates.require_publish_approval !== false;
+    $("#autonomous-provider-state").textContent = config.provider_mode + (config.provider_mode === "MOCK" ? " / TEST" : "");
+  }
+  const byProvider = cost.by_provider || {};
+  $("#autonomous-cost").innerHTML = `<strong>Provider cost:</strong> LLM ${cost.llm_calls || 0} · TTS ${cost.tts_requests || 0} · YouTube ${byProvider.youtube || 0} · Meta ${byProvider.meta || byProvider.facebook || 0} · cache hits ${cost.cache_hits || 0} · mock ${cost.mock_calls || 0} · <strong>LIVE CALLS = ${cost.live_calls || 0}</strong>`
+    + (config ? ` · Next run ${new Date(config.next_run_at * 1000).toLocaleString()}` : "");
+  $("#autonomous-cycles").innerHTML = cycles.length ? cycles.map(cycle => {
+    const usage = cycle.cost_report || {};
+    return `<div class="production-asset-panel"><strong>Cycle #${cycle.id}</strong> · ${escapeHtml(cycle.status)} · ${Number(cycle.progress || 0).toFixed(0)}% · ${escapeHtml(cycle.current_stage || "finished")}`
+      + `<div class="muted-help">Research → Competitor → Opportunity → Production → Script → Assets → Render → Publish → Analytics → Learning</div>`
+      + `<div class="muted-help">Provider calls ${usage.provider_calls || 0}; cache ${usage.cache_hits || 0}; mock ${usage.mock_calls || 0}; live ${usage.live_calls || 0}</div>`
+      + (cycle.error ? `<div class="research-state error">${escapeHtml(cycle.error)}</div>` : "")
+      + (cycle.status !== "completed" ? `<button class="btn secondary small" data-autonomous-advance="${cycle.id}">Resume cycle</button>` : "")
+      + `</div>`;
+  }).join("") : "No autonomous cycles yet.";
+  document.querySelectorAll("[data-autonomous-advance]").forEach(button => button.onclick = async () => {
+    await api(`/api/channel-agent/autonomous/cycles/${button.dataset.autonomousAdvance}/advance`, {method: "POST"});
+    await loadAutonomousWorkspace();
+  });
+}
+
+$("#autonomous-save").onclick = async () => {
+  try {
+    await saveAutonomousConfig();
+    $("#automation-message").textContent = "Autonomous policy saved.";
+    await loadAutonomousWorkspace();
+  } catch (error) { $("#automation-message").textContent = error.message; }
+};
+$("#autonomous-start").onclick = async () => {
+  try {
+    const config = await saveAutonomousConfig();
+    await api(`/api/channel-agent/autonomous/configs/${config.id}/cycles`, {
+      method: "POST", body: JSON.stringify({start_now: true}),
+    });
+    await loadAutomationWorkspace();
+  } catch (error) { $("#automation-message").textContent = error.message; }
+};
+for (const [selector, action] of [["#autonomous-pause", "pause"], ["#autonomous-resume", "resume"], ["#autonomous-stop", "stop-after-current"]]) {
+  $(selector).onclick = async () => {
+    if (!activeAutonomousConfigId) return;
+    try {
+      await api(`/api/channel-agent/autonomous/configs/${activeAutonomousConfigId}/${action}`, {method: "POST"});
+      await loadAutonomousWorkspace();
+    } catch (error) { $("#automation-message").textContent = error.message; }
+  };
 }
 
 async function initChannelAgent() {
