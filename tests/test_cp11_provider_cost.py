@@ -99,3 +99,31 @@ def test_budget_exceeded_stops_before_an_extra_call():
             live=lambda: None, mock=lambda: {"items": []}, budget=budget,
         )
     assert get_cost_report().provider_calls == 1
+
+
+def test_voice_catalog_does_not_synthesize_outside_live_mode(monkeypatch):
+    import importlib
+
+    web_app = importlib.import_module("universal_video_ai.web.app")
+    observed_verify = []
+
+    class FakeRegistry:
+        def list_voices(self, language, *, provider=None, refresh=False, verify=False):
+            observed_verify.append(verify)
+            return []
+
+        def health(self):
+            return []
+
+        def distinct_speaker_count(self, voices):
+            return 0
+
+    registry = FakeRegistry()
+    monkeypatch.setattr(web_app, "get_default_voice_registry", lambda: registry)
+    monkeypatch.setattr(web_app, "default_provider_mode", lambda: ProviderMode.MOCK)
+
+    result = web_app.list_voices(
+        language="vi", provider="edge", refresh=True, user_id=1
+    )
+    assert result["voices"] == []
+    assert observed_verify == [False]

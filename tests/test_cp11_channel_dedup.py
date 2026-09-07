@@ -208,6 +208,7 @@ def test_ui_contract_includes_rerun_attempts_and_batch_summary():
     js = (root / "src/universal_video_ai/web/static/app.js").read_text(encoding="utf-8")
     for text in (
         "Run all again", "RESTART_FROM_BEGINNING", "repeat_publish: false",
+        "Retry failed stage", "RETRY_FROM_FAILED_STAGE",
         "Attempts:", "downloaded new", "retried failed", "skipped success", "failed again",
     ):
         assert text in js

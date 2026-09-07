@@ -2804,7 +2804,7 @@ async function refreshJobs() {
           ${hasSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/subtitles.srt" download>SRT dịch</a>` : ""}
           ${hasSourceSubtitles ? `<a class="btn secondary small" href="/api/jobs/${job.id}/source-subtitles.srt" download>SRT gốc</a>` : ""}
           ${hasSubtitles || hasSourceSubtitles ? `<button class="btn secondary small" data-subtitle-view="${job.id}">Xem phụ đề</button>` : ""}
-          ${job.status === "error" && !job.is_content_os ? `<button class="btn secondary small" data-retry="${job.id}">Thử lại</button>` : ""}
+          ${job.status === "error" && !job.is_content_os ? `<button class="btn secondary small" data-retry="${job.id}">Retry failed stage</button>` : ""}
         </div>
       </div>
       <button class="btn danger small job-delete" data-delete="${job.id}" title="Xoá khỏi lịch sử">Xoá</button>
@@ -2865,7 +2865,14 @@ async function refreshJobs() {
   list.querySelectorAll("[data-retry]").forEach(btn => {
     btn.onclick = async () => {
       btn.disabled = true;
-      try { await api(`/api/jobs/${btn.dataset.retry}/retry`, { method: "POST" }); refreshJobs(); refreshMe(); }
+      try {
+        await api(`/api/jobs/${btn.dataset.retry}/rerun`, {
+          method: "POST",
+          body: JSON.stringify({mode: "RETRY_FROM_FAILED_STAGE", repeat_publish: false}),
+        });
+        refreshJobs();
+        refreshMe();
+      }
       catch (e) { alert(e.message); }
       finally { btn.disabled = false; }
     };

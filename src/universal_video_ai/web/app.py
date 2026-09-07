@@ -102,6 +102,7 @@ from universal_video_ai.downloader.channel import (
     ChannelListingService, ChannelVideoCandidate, URLIntent, VideoURLClassifier,
 )
 from universal_video_ai.downloader.platform import Platform
+from universal_video_ai.provider_runtime import ProviderMode, default_provider_mode
 from universal_video_ai.channel_agent.channel_sources import (
     ChannelSourceError,
     ChannelSourceRegistry,
@@ -6256,10 +6257,12 @@ def list_voices(
             language,
             provider=registry_provider,
             refresh=refresh,
-            # Vietnamese catalog entries are exposed only after a real,
-            # non-empty synthesis succeeds. The singleton registry caches the
-            # result so ordinary catalog refreshes do not regenerate previews.
-            verify=(language or "").lower().split("-", 1)[0] == "vi",
+            # External voice verification synthesizes real audio. Respect the
+            # shared provider boundary so MOCK/CACHE/DRY_RUN never calls Edge.
+            verify=(
+                default_provider_mode() is ProviderMode.LIVE
+                and (language or "").lower().split("-", 1)[0] == "vi"
+            ),
         )
         voices = [item.to_dict() for item in voice_records]
     elif provider == "openai":

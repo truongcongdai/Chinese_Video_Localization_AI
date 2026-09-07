@@ -2,6 +2,14 @@
 
 End-to-end video localization platform: download → transcribe → translate → synthesize → mix → render.
 
+## CP0-CP11 release candidate
+
+For the complete Windows/Ubuntu startup path, configuration classes, provider
+modes, channel deduplication, queue reruns, autonomous operation, backup, and
+troubleshooting, see [CP0-CP11 Release Readiness](docs/RELEASE_READINESS.md),
+the [Operator Runbook](docs/OPERATOR_RUNBOOK.md), and the
+[Release Checklist](docs/RELEASE_CHECKLIST.md).
+
 ## Features
 
 - **Video Download**: Support for multiple platforms (YouTube, TikTok, etc.)

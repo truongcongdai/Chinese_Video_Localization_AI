@@ -4,6 +4,8 @@ yt-dlp>=2024.1.1
 SecretStorage>=3.3.3; sys_platform == "linux"
 playwright>=1.40.0
 python-dotenv>=1.0.1
+# Authenticated encryption for OAuth/social credentials stored in SQLite.
+cryptography>=44.0.0
 demucs
 # NumPy 2.4 lazy dtype loading recurses inside Accelerate under concurrent
 # web workers. Use the CUDA wheel explicitly: installing these packages from

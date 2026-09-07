@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from cryptography.fernet import Fernet
+
 from universal_video_ai.provider_runtime import get_cost_report, reset_cost_report
 
 
@@ -16,6 +18,8 @@ _TEST_RUNTIME_DIR = None
 def pytest_sessionstart(session):
     global _TEST_RUNTIME_DIR
     if os.getenv("RUN_LIVE_TESTS") != "1":
+        # Disposable per-session key exercises encryption without an operator key.
+        os.environ["APP_SECRET_ENCRYPTION_KEY"] = Fernet.generate_key().decode("ascii")
         os.environ["PROVIDER_EXECUTION_MODE"] = "MOCK"
         # App imports initialize Store immediately. Point them at an isolated
         # disposable database before test modules are imported, so regression

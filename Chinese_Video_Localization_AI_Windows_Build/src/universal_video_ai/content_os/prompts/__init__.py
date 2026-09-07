@@ -1,1 +1,0 @@
-"""Content OS prompt templates."""

@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from universal_video_ai.secret_cipher import TokenCipher
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1509,8 +1511,9 @@ class Job:
 
 
 class Store:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, token_cipher: Optional[TokenCipher] = None):
         self.db_path = Path(db_path)
+        self.token_cipher = token_cipher or TokenCipher()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -4562,6 +4565,8 @@ class Store:
             account_name: Optional[str] = None, account_ref: Optional[str] = None,
             scopes: Optional[str] = None,
     ) -> None:
+        encrypted_access = self.token_cipher.encrypt_secret(access_token)
+        encrypted_refresh = self.token_cipher.encrypt_secret(refresh_token)
         now = time.time()
         with self._connect() as conn:
             conn.execute(
@@ -4579,7 +4584,7 @@ class Store:
                     scopes=COALESCE(excluded.scopes, social_accounts.scopes),
                     updated_at=excluded.updated_at
                 """,
-                (user_id, platform, access_token, refresh_token, expires_at,
+                (user_id, platform, encrypted_access, encrypted_refresh, expires_at,
                  account_name, account_ref, scopes, now, now),
             )
 
@@ -4588,6 +4593,7 @@ class Store:
             expires_at: Optional[float], scopes: Optional[str] = None,
     ) -> None:
         """Update an already-owned credential after centralized refresh."""
+        encrypted_access = self.token_cipher.encrypt_secret(access_token)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -4596,21 +4602,55 @@ class Store:
                     scopes = COALESCE(?, scopes), updated_at = ?
                 WHERE user_id = ? AND platform = ?
                 """,
-                (access_token, expires_at, scopes, time.time(), user_id, platform),
+                (encrypted_access, expires_at, scopes, time.time(), user_id, platform),
             )
 
-    def get_social_account(self, user_id: int, platform: str) -> Optional[sqlite3.Row]:
+    def _decrypt_social_account(self, row: sqlite3.Row) -> Dict[str, Any]:
+        account = dict(row)
+        account["access_token"] = self.token_cipher.decrypt_secret(account.get("access_token"))
+        account["refresh_token"] = self.token_cipher.decrypt_secret(account.get("refresh_token"))
+        return account
+
+    def get_social_account(self, user_id: int, platform: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT * FROM social_accounts WHERE user_id = ? AND platform = ?",
                 (user_id, platform),
             )
-            return cur.fetchone()
+            row = cur.fetchone()
+        return self._decrypt_social_account(row) if row else None
 
-    def list_social_accounts(self, user_id: int) -> List[sqlite3.Row]:
+    def list_social_accounts(self, user_id: int) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM social_accounts WHERE user_id = ?", (user_id,))
-            return cur.fetchall()
+            rows = cur.fetchall()
+        return [self._decrypt_social_account(row) for row in rows]
+
+    def migrate_legacy_social_account_tokens(self, user_id: Optional[int] = None) -> int:
+        """Encrypt legacy plaintext tokens in one idempotent transaction."""
+        self.token_cipher.require_key()
+        where = " WHERE user_id = ?" if user_id is not None else ""
+        params: tuple[Any, ...] = (int(user_id),) if user_id is not None else ()
+        migrated = 0
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id, access_token, refresh_token FROM social_accounts" + where,
+                params,
+            ).fetchall()
+            for row in rows:
+                access = row["access_token"]
+                refresh = row["refresh_token"]
+                encrypted_access = self.token_cipher.encrypt_secret(access)
+                encrypted_refresh = self.token_cipher.encrypt_secret(refresh)
+                if encrypted_access == access and encrypted_refresh == refresh:
+                    continue
+                conn.execute(
+                    "UPDATE social_accounts SET access_token=?, refresh_token=?, updated_at=? WHERE id=?",
+                    (encrypted_access, encrypted_refresh, time.time(), row["id"]),
+                )
+                migrated += 1
+        return migrated
 
     def delete_social_account(self, user_id: int, platform: str) -> None:
         with self._connect() as conn:
