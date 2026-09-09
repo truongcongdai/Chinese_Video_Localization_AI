@@ -2555,6 +2555,17 @@ class Store:
             )
             return [self._row_to_job(row) for row in cur.fetchall()]
 
+    def list_retryable_jobs_for_user(self, user_id: int) -> List[Job]:
+        """Snapshot all visible failed/stopped jobs, independent of UI limits."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE user_id = ? "
+                "AND COALESCE(history_archived,0)=0 "
+                "AND status IN ('error', 'cancelled') ORDER BY created_at, id",
+                (user_id,),
+            ).fetchall()
+            return [self._row_to_job(row) for row in rows]
+
     def search_jobs_for_user(
             self,
             user_id: int,

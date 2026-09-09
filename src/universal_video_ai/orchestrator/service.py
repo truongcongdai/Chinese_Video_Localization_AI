@@ -114,7 +114,9 @@ class LocalizationConfig:
     # Place translated captions inside the OCR cover boxes by default, so the
     # new subtitle sits centered in the white box that covers the original
     # hard subtitle.
-    place_subtitles_in_text_cover_boxes: bool = True
+    # Translated captions have a stable reading position; OCR boxes only erase
+    # source text. Following them also follows moving titles and watermarks.
+    place_subtitles_in_text_cover_boxes: bool = False
 
     # Rendering
     render_video: bool = False
@@ -1877,19 +1879,16 @@ class LocalizationService:
                 continue
             clip_path = segments_dir / f"segment_{idx:04d}.wav"
             try:
-                self.tts_service.synthesize(
+                clip_path = Path(self.tts_service.synthesize(
                     seg.text,
                     output_path=clip_path,
                     language=target_language,
                     voice=voice,
-                )
+                ))
             except Exception as exc:
-                self.logger.warning(
-                    "Skipping TTS for segment %d after synthesis failed; subtitles remain: %s",
-                    idx,
-                    exc,
-                )
-                continue
+                raise RuntimeError(
+                    f"TTS incomplete: sentence {idx + 1} has no voice; rendering stopped."
+                ) from exc
             if seg.has_timing:
                 next_start = next((item.start for item in translated_segments[idx + 1:] if item.has_timing), None)
                 clips.append(self._fit_tts_clip_to_window(
@@ -1932,21 +1931,25 @@ class LocalizationService:
             clip_path = segments_dir / f"segment_{idx:04d}.wav"
             try:
                 async with _TTS_SLOTS:
-                    await asyncio.to_thread(
+                    generated_path = await asyncio.to_thread(
                         self.tts_service.synthesize,
                         seg.text,
                         output_path=clip_path,
                         language=target_language,
                         voice=voice,
                     )
+                    clip_path = Path(generated_path)
+                    if not clip_path.is_file() or clip_path.stat().st_size == 0:
+                        raise RuntimeError("TTS provider returned missing or empty audio")
             except Exception as exc:
                 self.logger.warning(
-                    "Skipping TTS for segment %d after synthesis failed; subtitles remain: %s",
+                    "TTS segment %d needs recovery after synthesis failed: %s",
                     idx,
                     exc,
                 )
                 return None
 
+            self._raise_if_cancelled()
             return idx, seg, clip_path
 
         # Run TTS synthesis in parallel with concurrency control
@@ -1957,11 +1960,33 @@ class LocalizationService:
         results = await asyncio.gather(*tasks)
 
         completed = [item for item in results if item is not None]
+        expected = {idx for idx, seg in enumerate(translated_segments) if seg.text.strip()}
+        missing = expected - {item[0] for item in completed}
+        # A later recovery pass gives the remote provider time to recover and
+        # never regenerates successful sentences. Keep exactly the same voice.
+        if missing:
+            self._raise_if_cancelled()
+            self.logger.warning("Recovering %d missing TTS sentence(s)", len(missing))
+            for idx in sorted(missing):
+                result = await synthesize_segment(idx, translated_segments[idx])
+                if result is not None:
+                    completed.append(result)
+        self._raise_if_cancelled()
+        missing = expected - {item[0] for item in completed}
+        if missing:
+            labels = ", ".join(str(idx + 1) for idx in sorted(missing))
+            raise RuntimeError(
+                f"TTS incomplete: no voice for sentence(s) {labels}. "
+                "Rendering stopped; retry to recover missing voice."
+            )
+        completed.sort(key=lambda item: item[0])
         clips, playback_segments = self._schedule_tts_clips(
             completed,
             total_duration=total_duration,
         )
         self._last_tts_playback_segments = playback_segments
+        if len(playback_segments) != len(expected):
+            raise RuntimeError("TTS incomplete: invalid audio clips; rendering stopped.")
 
         tts_coverage = validate_timeline_coverage(
             translated_segments,

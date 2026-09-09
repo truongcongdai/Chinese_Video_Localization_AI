@@ -341,6 +341,14 @@ def test_downstream_assets_qa_package_and_separate_rights(tmp_path: Path) -> Non
     assert qa["passed"] and _task(store, user, item, "QA")["status"] == "completed"
     assert ProductionQueueService(store).get(user, item)["status"] == "completed"
 
+    # A completed QA task must not authorize a replacement script together
+    # with visual/voice/metadata plans approved against the previous version.
+    replacement = service.assemble_script(user, item)["asset"]
+    _approve(service, user, item, replacement)
+    after = service.package(user, item)
+    assert not after["asset_ready"] and after["qa_status"] == "failed"
+    assert any("superseded Script Draft" in reason for reason in after["reasons"])
+
 
 def test_visual_plan_rejects_competitor_media_strategy_after_one_repair(tmp_path: Path) -> None:
     store, user, _, item = _item(tmp_path)

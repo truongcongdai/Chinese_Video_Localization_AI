@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import hashlib
+import json
 import os
 import random
 import shutil
@@ -248,6 +250,10 @@ class EdgeTTS:
 
         primary_voice = voice or self.config.voice
         voices = [primary_voice]
+        fingerprint = hashlib.sha256(json.dumps(
+            ["edge-v1", cleaned_text, primary_voice, rate, pitch], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        receipt_path = output_path.with_suffix(output_path.suffix + ".tts.json")
 
         self.logger.info(
             "EdgeTTS request: chars=%d voice=%s output=%s text=%r",
@@ -261,6 +267,17 @@ class EdgeTTS:
 
         # Keep one Edge websocket request active at a time in this Python process.
         with _EDGE_TTS_LOCK:
+            # A file alone is not a checkpoint: it may contain a partial reply
+            # or audio for an older translation/voice using the same filename.
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if (receipt.get("fingerprint") == fingerprint and output_path.is_file()
+                        and receipt.get("sha256") == hashlib.sha256(output_path.read_bytes()).hexdigest()):
+                    _validate_audio_file(output_path, self.logger)
+                    self.logger.info("EdgeTTS reusing verified voice: %s", output_path.name)
+                    return output_path
+            except (OSError, ValueError, RuntimeError, AttributeError):
+                pass
             for voice_index, effective_voice in enumerate(voices):
                 attempts_for_voice = self.max_retries if voice_index == len(voices) - 1 else min(2, self.max_retries)
                 self.logger.info(
@@ -301,7 +318,7 @@ class EdgeTTS:
 
                         if result.returncode != 0:
                             last_error = (
-                                (result.stderr or result.stdout or "unknown error").strip()
+                                (result.stderr or result.stdout or "unknown error").strip().splitlines()[-1][:800]
                             )
                             raise RuntimeError(last_error)
 
@@ -309,6 +326,15 @@ class EdgeTTS:
                         output_size = temp_output.stat().st_size
 
                         temp_output.replace(output_path)
+                        try:
+                            receipt_tmp = receipt_path.with_suffix(".json.part")
+                            receipt_tmp.write_text(json.dumps({
+                                "fingerprint": fingerprint,
+                                "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                            }), encoding="utf-8")
+                            receipt_tmp.replace(receipt_path)
+                        except OSError:
+                            self.logger.warning("Could not save TTS checkpoint for %s", output_path.name)
                         self.logger.info(
                             "EdgeTTS synthesis complete: %s (%d bytes, %.3fs)",
                             output_path,

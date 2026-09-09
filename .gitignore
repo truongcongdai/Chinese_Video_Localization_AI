@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 
 .env
+# Runtime credentials and copied browser/database state must stay local.
+config/secret_key
+scripts/local_data/
+database.sqlite3
 venv
 BUILD_EXE_GUIDE.md
 Chinese_Video_Localization_AI_Windows_Build.zip

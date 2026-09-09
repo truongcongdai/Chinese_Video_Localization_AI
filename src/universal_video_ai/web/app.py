@@ -108,7 +108,7 @@ from universal_video_ai.channel_agent.channel_sources import (
     ChannelSourceRegistry,
 )
 
-from .store import Store
+from .store import Job, Store
 from .auth import (
     COOKIE_NAME, hash_password, verify_password,
     create_session_cookie_value, get_current_user_id,
@@ -581,6 +581,10 @@ class PipelineRerunBody(BaseModel):
     reset_stages: List[str] = Field(default_factory=list)
     confirm_completed: bool = False
     repeat_publish: bool = False
+
+
+class BulkRerunBody(BaseModel):
+    job_ids: List[str] = Field(min_length=1, max_length=100)
 
 
 class RemixPlanBody(BaseModel):
@@ -1381,17 +1385,21 @@ def _build_service_for_job(job):
         ocr_languages=ocr_languages,
         global_subtitle_offset=global_subtitle_offset,
         logger=logger,
-        progress_callback=lambda percent, message: store.update_job(
-            job.id, progress_note=f"[{percent}%] {message}"
+        progress_callback=lambda percent, message: (
+            None if _is_job_cancelled(job.id, job.execution_attempt)
+            else store.update_job(job.id, progress_note=f"[{percent}%] {message}")
         ),
-        cancellation_checker=lambda: _is_job_cancelled(job.id),
+        cancellation_checker=lambda: _is_job_cancelled(job.id, job.execution_attempt),
         user_id=job.user_id,
     )
 
 
-def _is_job_cancelled(job_id: str) -> bool:
+def _is_job_cancelled(job_id: str, execution_attempt: Optional[int] = None) -> bool:
     job = store.get_job(job_id)
-    return bool(job and job.status == "cancelled")
+    return (
+        job is None or job.status == "cancelled"
+        or (execution_attempt is not None and job.execution_attempt != execution_attempt)
+    )
 
 
 def _is_content_os_job(job) -> bool:
@@ -1704,8 +1712,9 @@ def _generate_publishing_pack_for_result(job_id: str, job, result):
 
 def _finish_job_from_result(job_id: str, job, result) -> None:
     current = store.get_job(job_id)
-    if current and current.status == "cancelled":
-        logger.info("Job %s produced a result after cancellation; leaving it cancelled", job_id)
+    if (current is None or current.status == "cancelled"
+            or current.execution_attempt != job.execution_attempt):
+        logger.info("Ignoring result from cancelled or superseded attempt for job %s", job_id)
         return
     if result.final_video_path and Path(result.final_video_path).exists():
         title = (result.translated_text or job.source_url)[:80]
@@ -7009,6 +7018,57 @@ def get_quality_review(job_id: str, user_id: int = Depends(get_current_user_id))
         raise HTTPException(422, str(exc)) from exc
 
 
+def _schedule_job_rerun(job: Job) -> asyncio.Task:
+    if job.source_language.startswith("creator"):
+        body = CreatorJobBody(
+            topic=job.source_url.removeprefix("creator:").strip(),
+            target_language=job.target_language,
+            image_provider=job.source_language.partition(":")[2] or "stock",
+        )
+        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, job.id, body))
+    else:
+        task = asyncio.create_task(_run_job(job.id))
+    _running_tasks[job.id] = task
+    return task
+
+
+@app.post("/api/jobs/retry-all-incomplete")
+async def retry_all_incomplete_jobs(user_id: int = Depends(get_current_user_id)) -> dict[str, Any]:
+    """Retry every owned failed/stopped item, not only the current history page."""
+    ids = [job.id for job in store.list_retryable_jobs_for_user(user_id)
+           if not _is_content_os_job(job)]
+    result: dict[str, Any] = {"queued": [], "skipped": [], "errors": []}
+    for offset in range(0, len(ids), 100):
+        batch = await rerun_selected_jobs(BulkRerunBody(job_ids=ids[offset:offset + 100]), user_id)
+        for key in result:
+            result[key].extend(batch[key])
+    return result
+
+
+@app.post("/api/jobs/bulk-rerun")
+async def rerun_selected_jobs(
+        body: BulkRerunBody, user_id: int = Depends(get_current_user_id),
+) -> dict[str, Any]:
+    """Enqueue selected stopped jobs without waiting for their pipelines."""
+    job_ids = list(dict.fromkeys(body.job_ids))
+    # Validate ownership for the whole selection before changing any job.
+    jobs = [_get_owned_job(job_id, user_id) for job_id in job_ids]
+    queued, skipped, errors = [], [], []
+    for job in jobs:
+        if job.status not in {"cancelled", "error", "review"} or _is_content_os_job(job):
+            skipped.append({"job_id": job.id, "reason": "Job is not a stopped localization/creator item."})
+            continue
+        try:
+            await rerun_full_pipeline(
+                job.id, PipelineRerunBody(mode="RESTART_FROM_BEGINNING"), user_id=user_id,
+            )
+        except HTTPException as exc:
+            errors.append({"job_id": job.id, "reason": str(exc.detail), "status_code": exc.status_code})
+        else:
+            queued.append(job.id)
+    return {"queued": queued, "skipped": skipped, "errors": errors}
+
+
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     """Run a failed command again in the same history entry/job id."""
@@ -7047,17 +7107,7 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     # Reset state atomically first; no second request can delete artifacts
     # after the replacement task has started.
     _delete_job_artifacts(job_id)
-    if old_job.source_language.startswith("creator"):
-        topic = old_job.source_url.removeprefix("creator:").strip()
-        image_provider = old_job.source_language.partition(":")[2] or "stock"
-        retry_body = CreatorJobBody(
-            topic=topic, target_language=old_job.target_language,
-            image_provider=image_provider,
-        )
-        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, retried_job.id, retry_body))
-    else:
-        task = asyncio.create_task(_run_job(retried_job.id))
-    _running_tasks[retried_job.id] = task
+    _schedule_job_rerun(retried_job)
     return retried_job.to_dict()
 
 
@@ -7073,6 +7123,11 @@ async def rerun_full_pipeline(
         raise HTTPException(422, "Unknown rerun mode.")
     if _is_content_os_job(job):
         raise HTTPException(409, "Content OS items must be restarted from their Production workspace.")
+    if job.status not in {"cancelled", "error", "review", "done"}:
+        raise HTTPException(409, "Only stopped or completed items can be rerun.")
+    old_task = _running_tasks.get(job_id)
+    if old_task and not old_task.done():
+        raise HTTPException(409, "The previous worker is still stopping; try again shortly.")
     if job.status == "done" and not body.confirm_completed:
         raise HTTPException(409, "Completed items require explicit rerun confirmation.")
     if mode == "RETRY_FROM_FAILED_STAGE" and job.status != "error":
@@ -7127,15 +7182,7 @@ async def rerun_full_pipeline(
             ),
         })
     store.update_job(job_id, **fields)
-    old_task = _running_tasks.get(job_id)
-    if old_task and not old_task.done():
-        old_task.cancel()
-        try:
-            await old_task
-        except asyncio.CancelledError:
-            pass
-    task = asyncio.create_task(_run_job(job_id))
-    _running_tasks[job_id] = task
+    _schedule_job_rerun(_get_owned_job(job_id, user_id))
     return {
         "job": _get_owned_job(job_id, user_id).to_dict(),
         "attempt": attempt,

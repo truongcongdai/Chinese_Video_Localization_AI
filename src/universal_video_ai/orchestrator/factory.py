@@ -54,7 +54,7 @@ def create_localization_service(
         render_config: Optional[RenderConfig] = None,
         enable_text_cover: bool = True,
         ocr_languages: tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL,
-        text_cover_samples_per_segment: int = 2,
+        text_cover_samples_per_segment: int = LocalizationConfig.text_cover_samples_per_segment,
         watermark_exclude_regions_fractional: tuple[tuple[float, float, float, float], ...] = (
             (0.65, 0.00, 1.00, 0.35),
             (0.80, 0.72, 1.0, 1.0),

@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import logging
+import hashlib
 from dataclasses import dataclass
 
 from .tts import TTS  # type: ignore
@@ -44,13 +45,23 @@ class TTSService:
             self.logger.error("TTSService.synthesize: no backend configured")
             raise TTSBackendUnavailable("No TTS backend configured")
 
+        # Use the full text and backend identity; a 50-character prefix can
+        # substitute a different sentence's voice without any error.
+        identity = hashlib.sha256(
+            repr((self.backend, language, voice, text)).encode("utf-8")
+        ).hexdigest()
         # Check cache first
         if self.cache:
-            cache_key = self.cache.make_key("tts", language, voice or "default", text[:50])
-            cached_path_str = self.cache.get(cache_key)
-            if cached_path_str and Path(cached_path_str).exists():
-                self.logger.debug("TTS cache HIT for %s voice=%s", language, voice)
-                return Path(cached_path_str)
+            cache_key = self.cache.make_key("tts-v2", identity)
+            cached = self.cache.get(cache_key)
+            if isinstance(cached, dict):
+                try:
+                    path = Path(cached["path"])
+                    if path.stat().st_size > 0 and hashlib.sha256(path.read_bytes()).hexdigest() == cached["sha256"]:
+                        self.logger.debug("TTS cache HIT for %s voice=%s", language, voice)
+                        return path
+                except (OSError, KeyError, TypeError):
+                    pass
 
         self.logger.info("TTSService.synthesize: language=%s voice=%s", language, voice)
         try:
@@ -64,8 +75,12 @@ class TTSService:
 
             # Cache result
             if self.cache:
-                cache_key = self.cache.make_key("tts", language, voice or "default", text[:50])
-                self.cache.set(cache_key, str(result), ttl_seconds=86400 * 7)
+                cache_key = self.cache.make_key("tts-v2", identity)
+                path = Path(result)
+                self.cache.set(cache_key, {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }, ttl_seconds=86400 * 7)
 
             return result
         except SynthesisError:

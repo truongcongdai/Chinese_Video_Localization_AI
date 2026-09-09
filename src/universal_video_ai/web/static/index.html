@@ -7,6 +7,7 @@
 <meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/app.css?v=20260729">
+<link rel="stylesheet" href="/assets/workspace.css?v=20260909">
 </head>
 <body>
 
@@ -1911,24 +1912,29 @@
     </div>
   </div>
 
-  <div class="card">
-    <h3 style="margin-top:0">Lịch sử</h3>
+  <div class="card history-panel">
+    <div class="history-heading">
+      <div><span class="history-eyebrow">WORKSPACE / VIDEOS</span><h3>Lịch sử xử lý</h3>
+        <p class="muted-help">Theo dõi tiến độ, xem thành phẩm và khôi phục video bị gián đoạn.</p></div>
+      <button class="btn primary small" id="history-retry-all" title="Chạy lại mọi video lỗi hoặc đã dừng, kể cả ngoài bộ lọc hiện tại">Chạy lại tất cả lỗi / đã dừng</button>
+    </div>
     <div class="history-toolbar">
-      <input id="history-search" placeholder="Tìm theo tên hoặc link...">
-      <select id="history-status-filter">
+      <input id="history-search" aria-label="Tìm video" placeholder="Tìm tên video hoặc đường dẫn…">
+      <select id="history-status-filter" aria-label="Trạng thái video">
         <option value="">Tất cả trạng thái</option>
         <option value="done">Hoàn tất</option>
         <option value="running">Đang chạy</option>
         <option value="queued">Đang chờ</option>
         <option value="review">Chờ chỉnh phụ đề</option>
         <option value="error">Lỗi</option>
+        <option value="cancelled">Đã dừng</option>
       </select>
-      <div><label>Từ ngày</label><input type="date" id="history-date-from"></div>
-      <div><label>Đến ngày</label><input type="date" id="history-date-to"></div>
-      <button class="btn secondary small" id="history-clear-btn">🔄 Xoá lọc</button>
+      <input type="date" id="history-date" aria-label="Ngày tạo video" title="Lọc đúng ngày được chọn theo giờ máy của bạn">
+      <button class="btn secondary small" id="history-clear-btn">Xoá bộ lọc</button>
     </div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
+    <div class="history-selection-bar">
       <label style="margin:0"><input type="checkbox" id="history-select-all" style="width:auto"> Chọn tất cả</label>
+      <button class="btn secondary small" id="history-retry-selected" disabled title="Chỉ chạy lại video lỗi hoặc đã dừng mà bạn tích chọn">Thử lại đã chọn</button>
       <button class="btn secondary small" id="history-bulk-download" disabled>Tải ZIP mục đã chọn</button>
       <button class="btn danger small" id="history-bulk-delete" disabled>🗑️ Xoá mục đã chọn</button>
       <span id="history-selected-count" style="font-size:12px;color:var(--text-dim)"></span>
@@ -2139,6 +2145,6 @@
 <script src="/assets/content_brain_ui.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
 <script src="/assets/content_opportunity_ui.js?v=20260821-channel-agent-cp5-opportunities1" defer></script>
 <script src="/assets/content_production_ui.js?v=20260904-channel-agent-cp7a-production1" defer></script>
-<script src="/assets/app.js?v=20260904-channel-agent-cp7a-production1" defer></script>
+<script src="/assets/app.js?v=20260909-voice-history2" defer></script>
 </body>
 </html>

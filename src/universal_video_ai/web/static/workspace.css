@@ -1,0 +1,50 @@
+/* Quiet surfaces and clear hierarchy for the working dashboard. */
+#app-view { --radius: 12px; --shadow: 0 2px 8px rgb(0 0 0 / 12%); }
+#app-view .card { background: #151a23; border-color: #2b3341; box-shadow: var(--shadow); }
+#app-view header { background: #121720; box-shadow: none; }
+#app-view header h1 { background: none; -webkit-text-fill-color: var(--text); }
+#app-view .result-column { position: static; max-height: none; overflow: visible; }
+#app-view .card:hover { transform: none; box-shadow: var(--shadow); }
+#app-view .card::before { display: none; }
+#app-view .btn { box-shadow: none; }
+#app-view .btn:hover { transform: none; }
+#app-view .btn.gradient { background: var(--accent); }
+.history-panel { padding: 22px; scroll-margin-top: 130px; }
+.history-panel a:not(.btn) { color: #a6c5ff; text-underline-offset: 3px; }
+.history-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.history-eyebrow { color: #9aabca; font-size: 10px; letter-spacing: .14em; font-weight: 600; }
+.history-heading h3 { margin: 6px 0 5px; font-size: 22px; letter-spacing: -.025em; }
+.history-heading p { margin: 0; max-width: 48ch; line-height: 1.6; }
+.history-panel .history-toolbar { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(140px, .8fr); align-items: center; gap: 10px; margin-bottom: 14px; }
+.history-panel .history-toolbar input, .history-panel .history-toolbar select { width: 100%; min-width: 0; margin: 0; height: 40px; padding: 8px 10px; background: #10151e; border-radius: 8px; }
+.history-panel input[type=date] { color-scheme: dark; }
+.history-selection-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.history-selection-bar label { display: flex; align-items: center; gap: 7px; margin-right: auto !important; font-size: 12px; }
+.history-selection-bar .btn.small { padding: 7px 9px; font-size: 11px; }
+.history-panel .job { padding: 18px 0; gap: 10px; align-items: start; }
+.history-panel .job .job-head { align-items: start; }
+.history-panel .job .job-url { white-space: normal; overflow-wrap: anywhere; font-size: 14px; font-weight: 600; line-height: 1.5; }
+.history-panel .job .job-url.playable { text-decoration: none; color: #c5d1ff; }
+.history-panel .job-meta { line-height: 1.6; overflow-wrap: anywhere; }
+.history-panel .job-actions { gap: 6px; }
+.history-panel .job-actions .btn { font-size: 11px; padding: 6px 9px; border-radius: 6px; }
+.history-panel .job-delete { align-self: start; min-height: 0; height: auto; padding: 6px 8px; font-size: 11px; background: transparent; border: 1px solid #62343e; color: #f6a8b0; }
+.history-panel .badge { white-space: nowrap; text-transform: none; font-weight: 500; box-shadow: none; animation: none; border-radius: 6px; }
+.history-panel .badge:hover { transform: none; }
+.history-panel .badge.done { background: #133b32; color: #86dec0; }
+.history-panel .badge.error { background: #45272e; color: #ffb2bb; }
+.history-panel .badge.cancelled, .history-panel .badge.queued { background: #2b3341; color: #c2ccdc; }
+.history-panel .badge.running { background: #233658; color: #a9ceff; }
+.history-panel .badge.review { background: #463b23; color: #f1d39b; }
+.history-panel #empty-history { padding: 28px 10px; line-height: 1.7; color: var(--text-dim); text-align: center; }
+.history-panel :focus-visible { outline: 2px solid #a5b4fc; outline-offset: 3px; }
+@media (max-width: 520px) {
+  .history-panel { padding: 16px; }
+  .history-panel .history-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .history-heading > .btn { width: 100%; }
+  .history-panel .job { grid-template-columns: auto minmax(0, 1fr); }
+  .history-panel .job-delete { grid-column: 2; justify-self: end; width: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #app-view *, .history-panel * { animation: none !important; transition: none !important; }
+}

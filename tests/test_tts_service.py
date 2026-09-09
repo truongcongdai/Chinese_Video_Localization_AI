@@ -30,3 +30,35 @@ def test_tts_service_no_backend_raises(tmp_path: Path):
     svc = TTSService(backend=None)
     with pytest.raises(TTSBackendUnavailable):
         svc.synthesize("hello", tmp_path / "output.wav")
+
+
+def test_cache_uses_full_text_and_rejects_overwritten_audio(tmp_path):
+    class Cache:
+        def __init__(self):
+            self.data = {}
+        def make_key(self, *parts):
+            return ":".join(parts)
+        def get(self, key):
+            return self.data.get(key)
+        def set(self, key, value, **kwargs):
+            self.data[key] = value
+    class Backend:
+        def __init__(self):
+            self.calls = []
+        def synthesize(self, text, output_path, **kwargs):
+            self.calls.append(text)
+            output_path.write_bytes(text.encode())
+            return output_path
+    backend = Backend()
+    service = TTSService(backend=backend, cache=Cache())
+    first = "a" * 60 + "first"
+    second = "a" * 60 + "second"
+    output = tmp_path / "same.wav"
+    service.synthesize(first, output_path=output)
+    service.synthesize(first, output_path=output)
+    assert backend.calls == [first]
+    service.synthesize(second, output_path=output)
+    assert output.read_bytes() == second.encode()
+    service.synthesize(first, output_path=output)
+    assert backend.calls == [first, second, first]
+    assert output.read_bytes() == first.encode()

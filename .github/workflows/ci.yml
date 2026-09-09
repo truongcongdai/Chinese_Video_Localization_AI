@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, dai2, "feature/**"]
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
@@ -62,6 +62,9 @@ jobs:
           python -m compileall -q src tests
           node --check src/universal_video_ai/web/static/app.js
           node --check src/universal_video_ai/web/static/i18n.js
+
+      - name: Run UI behavior tests
+        run: node --test tests/*.js
 
       - name: Run unit tests
         run: |

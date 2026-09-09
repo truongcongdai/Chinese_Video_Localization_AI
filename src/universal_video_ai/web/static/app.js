@@ -8,6 +8,7 @@ let pollTimer = null;
 let pollTimer2 = null;
 let selectedTopupPackage = null;
 let selectedHistoryJobs = new Set();
+let historyBulkRerunBusy = false;
 let latestResultJobId = null;
 let _confirmResolver = null;
 
@@ -2655,7 +2656,7 @@ const STATUS_LABEL = { queued: "Đang chờ", running: "Đang xử lý", review:
 
 function _dateToUnix(dateStr, endOfDay) {
   if (!dateStr) return null;
-  const d = new Date(dateStr + (endOfDay ? "T23:59:59" : "T00:00:00"));
+  const d = new Date(dateStr + (endOfDay ? "T23:59:59.999" : "T00:00:00"));
   return d.getTime() / 1000;
 }
 
@@ -2708,8 +2709,8 @@ function updateStats(jobs) {
 async function refreshJobs() {
   const q = $("#history-search").value.trim();
   const status = $("#history-status-filter").value;
-  const dateFrom = _dateToUnix($("#history-date-from").value, false);
-  const dateTo = _dateToUnix($("#history-date-to").value, true);
+  const dateFrom = _dateToUnix($("#history-date").value, false);
+  const dateTo = _dateToUnix($("#history-date").value, true);
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (status) params.set("status", status);
@@ -2790,7 +2791,6 @@ async function refreshJobs() {
           <span class="badge ${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
         </div>
         <div class="job-actions">
-          ${!job.is_content_os && ["queued", "error", "review", "done", "cancelled"].includes(job.status) ? `<button class="btn gradient small" data-rerun-all="${job.id}">Run all again</button>` : ""}
           ${["done", "error", "cancelled"].includes(job.status) ? `<button class="btn secondary small" data-archive="${job.id}">Archive</button>` : ""}
           ${(job.status === "queued" || job.status === "running" || job.status === "review") ? `<button class="btn danger small" data-cancel="${job.id}">Dừng</button>` : ""}
           ${job.status === "review" ? `<button class="btn small" data-review="${job.id}">Chỉnh sửa phụ đề &amp; Render</button>` : ""}
@@ -2877,34 +2877,6 @@ async function refreshJobs() {
       finally { btn.disabled = false; }
     };
   });
-  list.querySelectorAll("[data-rerun-all]").forEach(btn => {
-    btn.onclick = async () => {
-      const job = window._jobsById[btn.dataset.rerunAll];
-      const accepted = await showConfirmDialog(
-        "Restart full pipeline?",
-        `Item: ${job?.title || job?.source_url || btn.dataset.rerunAll}. Source identity and configuration history are preserved. Download, transcription, OCR, translation, TTS, and render are regenerated. Existing remote publication is NOT repeated.`,
-        "Run all again",
-      );
-      if (!accepted) return;
-      btn.disabled = true;
-      try {
-        await api(`/api/jobs/${btn.dataset.rerunAll}/rerun`, {
-          method: "POST",
-          body: JSON.stringify({
-            mode: "RESTART_FROM_BEGINNING",
-            confirm_completed: job?.status === "done",
-            repeat_publish: false,
-          }),
-        });
-        await refreshJobs();
-        await refreshMe();
-      } catch (error) {
-        alert(error.message);
-      } finally {
-        btn.disabled = false;
-      }
-    };
-  });
   list.querySelectorAll("[data-archive]").forEach(btn => {
     btn.onclick = async () => {
       const accepted = await showConfirmDialog(
@@ -2944,6 +2916,12 @@ async function refreshJobs() {
 }
 
 function updateHistorySelection(jobs = []) {
+  const rerunCount = selectedStoppedHistoryJobs().length;
+  $("#history-retry-all").disabled = historyBulkRerunBusy;
+  $("#history-retry-selected").disabled = historyBulkRerunBusy || rerunCount === 0;
+  $("#history-retry-selected").textContent = historyBulkRerunBusy
+    ? "Đang đưa vào hàng đợi..."
+    : `Thử lại đã chọn${rerunCount ? ` (${rerunCount})` : ""}`;
   const visibleIds = jobs.map(j => j.id);
   const selectedVisible = visibleIds.filter(id => selectedHistoryJobs.has(id)).length;
   $("#history-selected-count").textContent = selectedHistoryJobs.size ? `${selectedHistoryJobs.size} mục đã chọn` : "";
@@ -2952,6 +2930,67 @@ function updateHistorySelection(jobs = []) {
   $("#history-select-all").checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
   $("#history-select-all").indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
 }
+
+function selectedStoppedHistoryJobs() {
+  return Object.values(window._jobsById || {}).filter(job =>
+    selectedHistoryJobs.has(job.id) && !job.is_content_os
+    && ["cancelled", "error"].includes(job.status));
+}
+
+async function rerunSelectedHistoryJobs(allIncomplete = false) {
+  if (historyBulkRerunBusy) return;
+  const jobs = selectedStoppedHistoryJobs();
+  if (!allIncomplete && !jobs.length) return;
+  historyBulkRerunBusy = true;
+  updateHistorySelection(Object.values(window._jobsById || {}));
+  try {
+    const accepted = await showConfirmDialog(
+      allIncomplete ? "Chạy lại tất cả video lỗi / đã dừng?" : `Thử lại ${jobs.length} video đã chọn?`,
+      allIncomplete
+        ? "Áp dụng cho toàn bộ lịch sử của bạn, kể cả video không hiện trong bộ lọc. Giữ cấu hình; không chạy lại video hoàn tất/chờ duyệt và không tự đăng bài."
+        : "Chạy lại video lỗi hoặc đã dừng được tích chọn. Giữ cấu hình và lịch sử; không tự đăng bài.",
+      "Đưa vào hàng đợi",
+    );
+    if (!accepted) return;
+    let queued = 0;
+    let skipped = 0;
+    const errors = [];
+    if (allIncomplete) {
+      const result = await api("/api/jobs/retry-all-incomplete", {method: "POST"});
+      for (const id of result.queued || []) selectedHistoryJobs.delete(id);
+      queued = (result.queued || []).length;
+      skipped = (result.skipped || []).length;
+      for (const error of result.errors || []) errors.push(`${error.job_id}: ${error.reason}`);
+    }
+    // Each request enqueues immediately using RESTART_FROM_BEGINNING.
+    // Chunk large selections to the API limit; do not wait for video completion.
+    for (let offset = 0; !allIncomplete && offset < jobs.length; offset += 100) {
+      const result = await api("/api/jobs/bulk-rerun", {
+        method: "POST",
+        body: JSON.stringify({job_ids: jobs.slice(offset, offset + 100).map(job => job.id)}),
+      });
+      for (const id of result.queued || []) selectedHistoryJobs.delete(id);
+      queued += (result.queued || []).length;
+      skipped += (result.skipped || []).length;
+      for (const error of result.errors || []) {
+        const job = jobs.find(item => item.id === error.job_id);
+        errors.push(`${job?.title || error.job_id}: ${error.reason}`);
+      }
+    }
+    alert(`Đã đưa ${queued} video vào hàng đợi. Bỏ qua ${skipped} mục. Lỗi: ${errors.length}.`
+      + (errors.length ? "\n" + errors.join("\n") : ""));
+    await refreshMe();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    historyBulkRerunBusy = false;
+    updateHistorySelection(Object.values(window._jobsById || {}));
+    await refreshJobs();
+  }
+}
+
+$("#history-retry-selected").onclick = () => rerunSelectedHistoryJobs(false);
+$("#history-retry-all").onclick = () => rerunSelectedHistoryJobs(true);
 
 $("#history-select-all").onchange = () => {
   const ids = Object.keys(window._jobsById || {});
@@ -3017,12 +3056,10 @@ $("#history-search").addEventListener("input", () => {
   _historySearchDebounce = setTimeout(refreshJobs, 300);
 });
 $("#history-status-filter").onchange = refreshJobs;
-$("#history-date-from").onchange = refreshJobs;
-$("#history-date-to").onchange = refreshJobs;
+$("#history-date").onchange = refreshJobs;
 $("#history-clear-btn").onclick = () => {
   $("#history-search").value = "";
-  $("#history-date-from").value = "";
-  $("#history-date-to").value = "";
+  $("#history-date").value = "";
   $("#history-status-filter").value = "";
   refreshJobs();
 };

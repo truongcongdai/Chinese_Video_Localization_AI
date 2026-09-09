@@ -53,6 +53,9 @@ __all__ = [
 
 _logger = logging.getLogger(__name__)
 
+# Exclude title/corner UI while allowing dialogue around the frame centre.
+DEFAULT_SUBTITLE_CANDIDATE_REGION = (0.06, 0.25, 0.94, 0.96)
+
 
 def _resolve_ocr_device(torch_module, requested_device: Optional[str]) -> str:
     """Resolve a portable EasyOCR device setting to a concrete device."""
@@ -254,24 +257,24 @@ class OnScreenTextDetector:
             return False
 
     def _detect_boxes_in_frame(self, frame_path: Path) -> List[Tuple[int, int, int, int]]:
-        """Run OCR on one frame; return list of (x0, y0, x1, y1) axis-aligned boxes."""
+        """Detect text geometry without requiring readable OCR transcription."""
         reader = self._get_reader()
         try:
-            results = reader.readtext(str(frame_path))
+            horizontal_batches, free_batches = reader.detect(str(frame_path))
         except Exception as exc:
-            self.logger.warning("OCR failed on frame %s: %s", frame_path, exc)
+            self.logger.warning("Text detection failed on frame %s: %s", frame_path, exc)
             return []
 
         boxes: List[Tuple[int, int, int, int]] = []
-        for detection in results:
-            # easyocr returns (points, text, confidence); points = 4 (x, y) corners
-            points, _text, confidence = detection
-            if confidence < 0.35:
-                continue
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
-            boxes.append((int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))))
-        return boxes
+        for horizontal in horizontal_batches:
+            for x0, x1, y0, y1 in horizontal:
+                boxes.append((int(x0), int(y0), int(x1), int(y1)))
+        for polygons in free_batches:
+            for points in polygons:
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                boxes.append((int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))))
+        return [box for box in boxes if box[2] > box[0] and box[3] > box[1]]
 
     def _read_text_in_frame(
         self,
@@ -880,14 +883,14 @@ class OnScreenTextDetector:
     def _subtitle_presence_score(
         self,
         frame_path: Path,
-        region_fractional: Tuple[float, float, float, float] = (0.08, 0.55, 0.92, 0.96),
+        region_fractional: Tuple[float, float, float, float] = DEFAULT_SUBTITLE_CANDIDATE_REGION,
     ) -> float:
-        """Measure likely white hard-sub text in the subtitle band.
+        """Measure likely bright or coloured hard-sub text in the subtitle band.
 
         A plain bright-pixel ratio is not enough: jewelry, table edges, lamps,
         and pale clothing can occupy the lower half of short-drama frames and
         make subtitles appear "present" before any burned-in subtitle is
-        actually visible. This score looks for small, high-contrast, white-ish
+        actually visible. This score looks for small, high-contrast
         connected components that line up horizontally like subtitle glyphs.
         """
         try:
@@ -906,12 +909,9 @@ class OnScreenTextDetector:
                     return 0.0
                 crop = rgb[y0:y1, x0:x1]
 
-                bright = (
-                    (crop[:, :, 0] > 180)
-                    & (crop[:, :, 1] > 180)
-                    & (crop[:, :, 2] > 180)
-                    & ((crop.max(axis=2) - crop.min(axis=2)) < 90)
-                ).astype("uint8") * 255
+                # Include yellow/red/cyan captions; keep the component shape,
+                # alignment and contrast checks below to reject bright objects.
+                bright = (crop.max(axis=2) > 180).astype("uint8") * 255
                 if not int(bright.any()):
                     return 0.0
 
@@ -1035,9 +1035,7 @@ class OnScreenTextDetector:
         max_single_box_height_ratio: float = 0.3,
         max_lines_per_region: float = 2.4,
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
-        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.06, 0.55, 0.94, 0.96,
-        ),
+        subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = DEFAULT_SUBTITLE_CANDIDATE_REGION,
         fill_undetected_windows: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -1063,13 +1061,9 @@ class OnScreenTextDetector:
             not-yet-merged OCR boxes near that cluster), which is what a
             translated overlay's font size should match.
 
-          Pass 2 (apply): for each window, keep only the OCR boxes that
-            fall within that learned band (plus a tolerance, so a wrapped
-            2-line caption isn't excluded) and union just those into the
-            window's cover box. Stray text elsewhere on screen (character
-            dialogue graphics, watermarks, UI text) no longer pollutes the
-            box, and legitimate subtitle text isn't dropped just because it
-            isn't in a hardcoded region.
+          Pass 2 (apply): learn the local band from each window's own boxes
+            so moving subtitles are not discarded by the global band. Union
+            nearby lines, keeping the candidate-area and size guards.
 
         Implausibly large individual boxes (bigger than a real subtitle
         line could be) are dropped before either pass, and a window's final
@@ -1117,8 +1111,7 @@ class OnScreenTextDetector:
             frame. OCR text whose center is in the extreme corners/top UI
             is ignored before band clustering, because persistent labels,
             watermarks, and counters can otherwise out-vote the real
-            subtitle. If this filter would remove every box, detection
-            falls back to the unfiltered boxes for compatibility.
+            subtitle. If this filter removes every box, return no regions.
         :param fill_undetected_windows: when a window's own sampled frames
             produced NO in-band OCR box (e.g. the on-screen text was on
             screen too briefly, in motion, or just missed by OCR on the
@@ -1156,7 +1149,6 @@ class OnScreenTextDetector:
 
         # ---- Pass 1: sample every window's frames once, keep raw per-window boxes ----
         per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]], float]] = []
-        fallback_per_window_boxes: List[Tuple[float, float, List[Tuple[int, int, int, int]]]] = []
         candidate_filter_active = bool(subtitle_candidate_region_fractional and frame_w and frame_h)
 
         with tempfile.TemporaryDirectory(prefix="ocr_frames_") as tmp:
@@ -1183,7 +1175,7 @@ class OnScreenTextDetector:
                         max_presence_score,
                         self._subtitle_presence_score_for_region(
                             frame_path,
-                            subtitle_candidate_region_fractional or (0.06, 0.55, 0.94, 0.96),
+                            subtitle_candidate_region_fractional or DEFAULT_SUBTITLE_CANDIDATE_REGION,
                         ),
                     )
                     raw_boxes.extend(self._detect_boxes_in_frame(frame_path))
@@ -1194,7 +1186,6 @@ class OnScreenTextDetector:
                 )
                 if exclude_px:
                     raw_boxes = self._drop_excluded_boxes(raw_boxes, exclude_px)
-                fallback_per_window_boxes.append((start, end, list(raw_boxes)))
                 if candidate_filter_active and subtitle_candidate_region_fractional and frame_w and frame_h:
                     candidate_boxes = self._keep_candidate_subtitle_boxes(
                         raw_boxes, frame_w, frame_h, subtitle_candidate_region_fractional
@@ -1224,26 +1215,37 @@ class OnScreenTextDetector:
             )
             return regions
 
-        band_half = band_tolerance * typical_line_height
-        max_region_height = int(round(max_lines_per_region * typical_line_height))
-
         # ---- Pass 2: prefer each window's own horizontal subtitle boxes,
         # then fall back to the learned band only when that window has no
         # direct subtitle-shaped OCR hit. Some short-drama sources move
         # captions around the frame; forcing every cue into one global band
         # makes the cover box miss the original text.
         undetected_windows: List[Tuple[float, float, float]] = []
-        # Track the x-extent actually seen in windows that DID have a hit,
-        # so any undetected window can fall back to "the typical horizontal
-        # extent of this video's subtitle line" rather than being skipped.
-        detected_x0s: List[int] = []
-        detected_x1s: List[int] = []
-        detected_heights: List[int] = []
 
         for (start, end, boxes, presence_score) in per_window_boxes:
+            local_candidates = self._keep_horizontal_subtitle_line_boxes(boxes) or boxes
+            # Prefer dialogue-sized central text when title/watermark and
+            # dialogue coexist. Never merge a large title into the subtitle
+            # rectangle just because it falls within the vertical tolerance.
+            if frame_w:
+                dialogue = [b for b in local_candidates
+                            if 0.2 * frame_w <= (b[0] + b[2]) / 2 <= 0.8 * frame_w
+                            and (b[3] - b[1]) <= 1.6 * typical_line_height]
+                if dialogue:
+                    local_candidates = dialogue
+            established = [b for b in local_candidates
+                           if abs((b[1] + b[3]) / 2 - band_center) <= typical_line_height]
+            if established:
+                local_candidates = established
+            local_center, local_height = self._learn_subtitle_band(local_candidates)
+            if local_center is None or local_height is None:
+                undetected_windows.append((start, end, presence_score))
+                continue
+            band_half = band_tolerance * local_height
+            max_region_height = int(round(max_lines_per_region * local_height))
             band_boxes = [
-                b for b in boxes
-                if abs(((b[1] + b[3]) / 2.0) - band_center) <= band_half
+                b for b in local_candidates
+                if abs(((b[1] + b[3]) / 2.0) - local_center) <= band_half
             ]
             local_boxes = self._keep_horizontal_subtitle_line_boxes(band_boxes)
             in_band = local_boxes or band_boxes
@@ -1268,39 +1270,25 @@ class OnScreenTextDetector:
                     y0 = max(0, min(y0, frame_h - max_region_height))
                     y1 = y0 + max_region_height
 
-            detected_x0s.append(x0)
-            detected_x1s.append(x1)
-            detected_heights.append(y1 - y0)
-
             regions.append(
                 TextRegion(start=start, end=end, x=x0, y=y0, width=int(x1 - x0), height=int(y1 - y0))
             )
 
-        # ---- Fallback pass: cover windows OCR missed on their own sampled
-        # frames, using the union x-range + median height of windows that
-        # WERE detected. We deliberately use the union (widest observed
-        # left edge to widest observed right edge) rather than an average,
-        # so the fallback box errs toward over-covering the band instead of
-        # leaving a sliver of original text peeking out — for a cover box,
-        # too wide is a minor cosmetic issue, too narrow reproduces the bug
-        # this fallback exists to fix.
-        if fill_undetected_windows and undetected_windows and detected_x0s:
-            fb_x0 = max(0, min(detected_x0s))
-            fb_x1 = max(detected_x1s)
-            if frame_w is not None:
-                fb_x1 = min(fb_x1, frame_w)
-            sorted_h = sorted(detected_heights)
-            fb_height = sorted_h[len(sorted_h) // 2]
-
-            fb_y0 = int(round(band_center - fb_height / 2.0))
-            fb_y1 = fb_y0 + fb_height
-            if frame_h is not None:
-                fb_y0 = max(0, min(fb_y0, frame_h - fb_height))
-                fb_y1 = fb_y0 + fb_height
+        # Use the nearest direct detection's position when OCR misses a cue.
+        # Union widths only within that band, never across different layouts.
+        if fill_undetected_windows and undetected_windows and regions:
+            direct_regions = list(regions)
 
             for (start, end, presence_score) in undetected_windows:
                 if presence_score < 0.012:
                     continue
+                nearest = min(direct_regions, key=lambda r: abs((r.start + r.end) - (start + end)))
+                nearby_band = [r for r in direct_regions if abs(
+                    (r.y + r.height / 2.0) - (nearest.y + nearest.height / 2.0)
+                ) <= max(r.height, nearest.height)]
+                fb_x0 = min(r.x for r in nearby_band)
+                fb_x1 = max(r.x + r.width for r in nearby_band)
+                fb_y0, fb_y1 = nearest.y, nearest.y + nearest.height
                 regions.append(
                     TextRegion(
                         start=start, end=end,
@@ -1316,7 +1304,7 @@ class OnScreenTextDetector:
             "%d window(s) had no direct OCR hit and were %s)",
             len(regions), len(windows), band_center, typical_line_height,
             len(undetected_windows),
-            "filled via fallback" if (fill_undetected_windows and detected_x0s) else "skipped",
+            "eligible for fallback" if (fill_undetected_windows and regions) else "skipped",
         )
         return regions
 

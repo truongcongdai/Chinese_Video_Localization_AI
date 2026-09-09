@@ -168,7 +168,7 @@ def test_localization_service_with_rendering(tmp_path: Path):
     tts_audio = tmp_path / "tts_audio.wav"
     tts_audio.write_bytes(b"tts")
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     # Mock subtitles
@@ -253,7 +253,7 @@ def test_localization_service_uses_ass_for_karaoke_rendering(tmp_path: Path):
 
     translate_service.translate.return_value = "Xin chào thế giới"
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     segments = [TimelineSegment(start_time=0.0, end_time=5.0, text="Hello")]
@@ -316,7 +316,8 @@ def test_localization_service_uses_ass_for_karaoke_rendering(tmp_path: Path):
         assert renderer.render.call_args.kwargs["subtitle_segments"] is None
 
 
-def test_text_cover_places_ass_captions_in_cover_box_by_default(tmp_path: Path):
+@pytest.mark.parametrize("in_place", [False, True])
+def test_text_cover_uses_fixed_captions_unless_explicitly_enabled(tmp_path: Path, in_place):
     download_result = MagicMock(spec=DownloadResult)
     download_result.video_path = tmp_path / "video.mp4"
 
@@ -336,7 +337,8 @@ def test_text_cover_places_ass_captions_in_cover_box_by_default(tmp_path: Path):
     service = LocalizationService(
         downloader=MagicMock(spec=DownloadService),
         timeline=timeline,
-        config=LocalizationConfig(generate_subtitles=True, enable_text_cover=True),
+        config=LocalizationConfig(generate_subtitles=True, enable_text_cover=True,
+                                  place_subtitles_in_text_cover_boxes=in_place),
     )
     service._build_text_overlays = MagicMock(return_value=[
         TextOverlay(start=0.0, end=1.0, x=10, y=20, width=200, height=80, text="Xin chào", font_size=36)
@@ -356,10 +358,10 @@ def test_text_cover_places_ass_captions_in_cover_box_by_default(tmp_path: Path):
     result = asyncio.run(service._finalize(prepared))
 
     assert timeline.generate_ass_karaoke.call_count == 2
-    assert timeline.generate_ass_karaoke.call_args.kwargs["positions"] == {
-        (0.0, 1.0): (110, 60)
-    }
-    assert timeline.generate_ass_karaoke.call_args.kwargs["font_size"] == 36
+    assert timeline.generate_ass_karaoke.call_args.kwargs["positions"] == (
+        {(0.0, 1.0): (110, 60)} if in_place else None
+    )
+    assert timeline.generate_ass_karaoke.call_args.kwargs["font_size"] == (36 if in_place else None)
     assert result.text_overlays is not None
     assert result.text_overlays[0].text == ""
 
@@ -377,7 +379,7 @@ def test_replace_source_audio_uses_demucs_non_vocal_bed(tmp_path: Path):
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
     mixer = MagicMock(spec=MixerService)
     mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
@@ -432,7 +434,7 @@ def test_replace_source_audio_without_demucs_does_not_mix_original_voice(tmp_pat
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
     mixer = MagicMock(spec=MixerService)
     mixer.build_dubbed_track.side_effect = lambda clips, total_duration, output_path: output_path.write_bytes(b"dub")
@@ -637,7 +639,7 @@ def test_burned_subtitle_alignment_does_not_shift_tts_audio_clock(tmp_path: Path
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     mixer = MagicMock(spec=MixerService)
@@ -706,7 +708,7 @@ def test_small_global_subtitle_offset_also_syncs_tts_clock(tmp_path: Path):
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     mixer = MagicMock(spec=MixerService)
@@ -778,7 +780,7 @@ def test_global_subtitle_offset_is_applied_once(tmp_path: Path):
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     mixer = MagicMock(spec=MixerService)
@@ -833,7 +835,7 @@ def test_per_cue_source_subtitle_timing_drives_subtitle_and_tts_clock(tmp_path: 
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     mixer = MagicMock(spec=MixerService)
@@ -909,7 +911,7 @@ def test_small_detected_offset_moves_first_subtitle_and_tts_segment(tmp_path: Pa
 
     tts_service = MagicMock(spec=TTSService)
     tts_service.synthesize.side_effect = (
-        lambda text, output_path, language, voice=None: output_path.write_bytes(b"tts")
+        lambda text, output_path, language, voice=None: (output_path.write_bytes(b"tts"), output_path)[1]
     )
 
     mixer = MagicMock(spec=MixerService)
