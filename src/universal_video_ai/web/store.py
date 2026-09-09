@@ -1520,6 +1520,7 @@ class Store:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA secure_delete=ON")
         return conn
 
     def _init_schema(self) -> None:
@@ -1996,10 +1997,18 @@ class Store:
         now = time.time()
         provider = provider.strip().lower()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT * FROM user_provider_settings WHERE user_id = ? AND provider = ?",
                 (user_id, provider),
             ).fetchone()
+            api_key = self.token_cipher.encrypt_secret(
+                api_key if api_key is not None else (existing["api_key"] if existing else None)
+            )
+            api_secret = self.token_cipher.encrypt_secret(
+                api_secret if api_secret is not None else (existing["api_secret"] if existing else None)
+            )
+            encrypted_extra = self.token_cipher.encrypt_secret(json.dumps(extra or {}, ensure_ascii=False))
             if existing:
                 conn.execute(
                     "UPDATE user_provider_settings SET api_key = COALESCE(?, api_key), "
@@ -2007,7 +2016,7 @@ class Store:
                     "extra_json = ?, updated_at = ? WHERE user_id = ? AND provider = ?",
                     (
                         api_key, api_secret, default_model, default_voice,
-                        json.dumps(extra or {}, ensure_ascii=False), now, user_id, provider,
+                        encrypted_extra, now, user_id, provider,
                     ),
                 )
             else:
@@ -2017,7 +2026,7 @@ class Store:
                     "VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         user_id, provider, api_key, api_secret, default_model, default_voice,
-                        json.dumps(extra or {}, ensure_ascii=False), now, now,
+                        encrypted_extra, now, now,
                     ),
                 )
 
@@ -2037,8 +2046,10 @@ class Store:
         if not row:
             return None
         data = dict(row)
+        data["api_key"] = self.token_cipher.decrypt_secret(data["api_key"])
+        data["api_secret"] = self.token_cipher.decrypt_secret(data["api_secret"])
         try:
-            data["extra"] = json.loads(data.pop("extra_json") or "{}")
+            data["extra"] = json.loads(self.token_cipher.decrypt_secret(data.pop("extra_json")) or "{}")
         except json.JSONDecodeError:
             data["extra"] = {}
         return data
@@ -2053,9 +2064,13 @@ class Store:
         for row in rows:
             data = dict(row)
             try:
-                data["extra"] = json.loads(data.pop("extra_json") or "{}")
+                data["extra"] = json.loads(self.token_cipher.decrypt_secret(data.pop("extra_json")) or "{}")
             except json.JSONDecodeError:
                 data["extra"] = {}
+            from universal_video_ai.provider_runtime import _safe_normalize
+            data["extra"] = _safe_normalize(data["extra"])
+            data["api_key"] = "********" if data.get("api_key") else None
+            data.pop("api_secret", None)
             settings.append(data)
         return settings
 
@@ -4580,6 +4595,14 @@ class Store:
         encrypted_refresh = self.token_cipher.encrypt_secret(refresh_token)
         now = time.time()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if refresh_token is None:
+                previous = conn.execute(
+                    "SELECT refresh_token FROM social_accounts WHERE user_id=? AND platform=?",
+                    (user_id, platform),
+                ).fetchone()
+                if previous:
+                    encrypted_refresh = self.token_cipher.encrypt_secret(previous["refresh_token"])
             conn.execute(
                 """
                 INSERT INTO social_accounts
@@ -4606,14 +4629,20 @@ class Store:
         """Update an already-owned credential after centralized refresh."""
         encrypted_access = self.token_cipher.encrypt_secret(access_token)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT refresh_token FROM social_accounts WHERE user_id=? AND platform=?",
+                (user_id, platform),
+            ).fetchone()
+            encrypted_refresh = self.token_cipher.encrypt_secret(row["refresh_token"]) if row else None
             conn.execute(
                 """
                 UPDATE social_accounts
-                SET access_token = ?, expires_at = ?,
+                SET access_token = ?, refresh_token = ?, expires_at = ?,
                     scopes = COALESCE(?, scopes), updated_at = ?
                 WHERE user_id = ? AND platform = ?
                 """,
-                (encrypted_access, expires_at, scopes, time.time(), user_id, platform),
+                (encrypted_access, encrypted_refresh, expires_at, scopes, time.time(), user_id, platform),
             )
 
     def _decrypt_social_account(self, row: sqlite3.Row) -> Dict[str, Any]:
@@ -4633,34 +4662,44 @@ class Store:
 
     def list_social_accounts(self, user_id: int) -> List[Dict[str, Any]]:
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM social_accounts WHERE user_id = ?", (user_id,))
+            cur = conn.execute(
+                "SELECT id,user_id,platform,expires_at,account_name,account_ref,scopes,created_at,updated_at "
+                "FROM social_accounts WHERE user_id = ?", (user_id,)
+            )
             rows = cur.fetchall()
-        return [self._decrypt_social_account(row) for row in rows]
+        return [dict(row) for row in rows]
 
     def migrate_legacy_social_account_tokens(self, user_id: Optional[int] = None) -> int:
-        """Encrypt legacy plaintext tokens in one idempotent transaction."""
+        """Encrypt social tokens and provider credentials in one idempotent transaction."""
         self.token_cipher.require_key()
         where = " WHERE user_id = ?" if user_id is not None else ""
         params: tuple[Any, ...] = (int(user_id),) if user_id is not None else ()
         migrated = 0
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                "SELECT id, access_token, refresh_token FROM social_accounts" + where,
-                params,
-            ).fetchall()
-            for row in rows:
-                access = row["access_token"]
-                refresh = row["refresh_token"]
-                encrypted_access = self.token_cipher.encrypt_secret(access)
-                encrypted_refresh = self.token_cipher.encrypt_secret(refresh)
-                if encrypted_access == access and encrypted_refresh == refresh:
-                    continue
-                conn.execute(
-                    "UPDATE social_accounts SET access_token=?, refresh_token=?, updated_at=? WHERE id=?",
-                    (encrypted_access, encrypted_refresh, time.time(), row["id"]),
-                )
-                migrated += 1
+            for table, fields in (
+                ("social_accounts", ("access_token", "refresh_token")),
+                ("user_provider_settings", ("api_key", "api_secret", "extra_json")),
+            ):
+                rows = conn.execute(
+                    f"SELECT id, {', '.join(fields)} FROM {table}" + where, params
+                ).fetchall()
+                for row in rows:
+                    previous = tuple(row[field] for field in fields)
+                    encrypted = tuple(self.token_cipher.encrypt_secret(value) for value in previous)
+                    if encrypted == previous:
+                        continue
+                    assignments = ", ".join(f"{field}=?" for field in fields)
+                    conn.execute(
+                        f"UPDATE {table} SET {assignments}, updated_at=? WHERE id=?",
+                        (*encrypted, time.time(), row["id"]),
+                    )
+                    migrated += 1
+        with self._connect() as conn:
+            conn.execute("VACUUM")
+            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint[0]:
+                raise RuntimeError("Token migration requires stopped database writers; WAL checkpoint is busy.")
         return migrated
 
     def delete_social_account(self, user_id: int, platform: str) -> None:

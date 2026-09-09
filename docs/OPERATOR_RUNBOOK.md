@@ -86,3 +86,36 @@ OAuth owner, and rights are reviewed. `research_only` is never equivalent to
 `rights_ready`. Competitor media and voices are not automatically reused or
 cloned. Queue reruns never republish automatically. Public publishing requires
 an explicit action, cleared rights, and the configured approval gate.
+
+## Encrypted credential operations
+
+Read [credential storage and migration](CREDENTIAL_STORAGE.md) before connecting
+accounts, upgrading a legacy database, restoring a backup, or rotating exposed
+sessions. Configure the same master key for every restart; test migration on a
+copy and keep the key backup separate from database backups.
+
+## Download capacity enforcement (RC repair)
+
+Download capacity is owner-scoped within one SQLite deployment, matching the
+existing owner scope of cycle/render/publish limits. Multiple saved channel
+configs for one owner share the lowest configured download limit; paused configs
+still constrain unfinished work. Different owners have separate capacity.
+The setting is applied at `DownloadService.download`, including channel queue,
+retry, and Run All Again paths. Autonomous handlers bind their database/owner
+context before invoking existing services. Competitor research remains metadata-only.
+
+An atomic OS-lock claim precedes execution. Excess calls wait without creating
+a failed attempt. Completion and exceptions release capacity; cancellation keeps
+the slot until the underlying synchronous download actually stops. A cancelled
+waiter never invokes a downloader. A worker crash releases its kernel locks;
+lock marker files do not consume capacity and must not be deleted while workers
+are running. Existing queue restart reconciliation marks interrupted attempts for
+bounded retry, preserving logical source identity and history. Existing channel
+dedup prevents queue re-submission of queued, processing, and successful videos.
+
+Lowering a cap below current active downloads is rejected until they finish.
+All workers must share the same canonical database path on a local filesystem
+with working advisory locks. The supported web deployment is one application
+process; a distributed/network-filesystem scheduler remains outside this release.
+Without an autonomous config, the shared service retains a defensive ceiling of
+20 per owner in addition to the existing pipeline's download rate limits.

@@ -39,7 +39,7 @@ GATE_POLICY_KEYS = {
 }
 MAX_RETRIES = 3
 FORBIDDEN_CONFIG_KEYS = frozenset({
-    "access_token", "refresh_token", "token", "client_secret", "app_secret", "password", "authorization",
+    "access_token", "refresh_token", "token", "client_secret", "app_secret", "password", "authorization", "api_key", "cookie", "cookies", "appsecret_proof", "secret",
 })
 
 
@@ -60,7 +60,9 @@ StageHandler = Callable[[int, dict[str, Any], dict[str, Any]], dict[str, Any]]
 
 def _contains_secret(value: Any) -> bool:
     if isinstance(value, dict):
-        return any(str(key).casefold() in FORBIDDEN_CONFIG_KEYS or _contains_secret(item)
+        return any((str(key).strip().casefold() in FORBIDDEN_CONFIG_KEYS
+                    or str(key).strip().casefold().endswith(("_token", "_secret", "_password", "_api_key"))
+                    or _contains_secret(item))
                    for key, item in value.items())
     if isinstance(value, list):
         return any(_contains_secret(item) for item in value)
@@ -284,10 +286,11 @@ class AutomationOrchestrator:
 
     def _execute_stage(self, user_id: int, stage: str, config: dict[str, Any],
                        refs: dict[str, Any], handler: Optional[StageHandler]) -> dict[str, Any]:
-        operation = lambda: (
-            handler(user_id, config, refs) if handler
-            else self._default_execute(user_id, stage, config, refs)
-        )
+        def operation():
+            from universal_video_ai.downloader.concurrency import download_scope
+            with download_scope(self.store.db_path, user_id, config.get("max_concurrent_downloads", 20)):
+                return (handler(user_id, config, refs) if handler
+                        else self._default_execute(user_id, stage, config, refs))
         if "provider_mode" not in config or stage in {"opportunity", "production"}:
             return operation()
         self._consume_provider_budget(stage, config, refs)
@@ -395,6 +398,8 @@ class AutomationOrchestrator:
                     output = self._execute_stage(user_id, stage, config, refs, handler)
                     if not isinstance(output, dict):
                         raise AutomationError("Automation stage output must be a mapping.")
+                    if _contains_secret(output):
+                        raise AutomationError("Automation output cannot contain credentials or tokens.")
                     refs.update(output)
                     self.store.update_automation_step(user_id, run_id, stage, {
                         "status": "completed", "output_refs": output,

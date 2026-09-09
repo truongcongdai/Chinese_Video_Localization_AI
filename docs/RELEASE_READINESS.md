@@ -52,7 +52,8 @@ are selected.
 
 ## Configuration classes
 
-- Required: `WEB_SESSION_SECRET`, writable `WEB_DB_PATH`, `TEMP_DIR`, and
+- Required: `WEB_SESSION_SECRET`, `APP_SECRET_ENCRYPTION_KEY` for credentials,
+  writable `WEB_DB_PATH`, `TEMP_DIR`, and
   `OUTPUT_DIR`.
 - Optional local services: `REDIS_URL`, `OLLAMA_BASE_URL`,
   `CHANNEL_AGENT_OLLAMA_ENABLED`, and `PIPER_VOICE_DIR`.
@@ -159,3 +160,13 @@ Source paths, subprocess argument lists, `pathlib`, temporary directories,
 SQLite, Redis, Ollama URLs, FFmpeg, and yt-dlp are portable across Windows and
 Ubuntu. A source audit is not a live Ubuntu test. Run the checklist on the
 actual Ubuntu host before production acceptance.
+
+## RC blocker repair
+
+Credential encryption, explicit legacy migration, and historical session rotation
+are documented in [credential storage](CREDENTIAL_STORAGE.md). The exact shared
+download-capacity semantics and restart behavior are in the
+[operator runbook](OPERATOR_RUNBOOK.md#download-capacity-enforcement-rc-repair).
+Runtime data is removed from the index with `git rm --cached`, preserving local
+files. The intentionally shipped `web/static/demo-localization.mp4` remains as
+the landing-page demo referenced by `index.html`; there are no committed DB fixtures.

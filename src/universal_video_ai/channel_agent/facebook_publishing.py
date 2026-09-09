@@ -32,12 +32,8 @@ class FacebookPublishingNotFound(FacebookPublishingError):
 
 def _safe_provider_state(value: Any) -> Any:
     """Remove credentials if a provider unexpectedly echoes them."""
-    if isinstance(value, dict):
-        return {key: _safe_provider_state(item) for key, item in value.items()
-                if key.casefold() not in {"access_token", "token", "appsecret_proof"}}
-    if isinstance(value, list):
-        return [_safe_provider_state(item) for item in value]
-    return value
+    from universal_video_ai.provider_runtime import _safe_normalize
+    return _safe_normalize(value)
 
 
 class MetaGraphPublisher:

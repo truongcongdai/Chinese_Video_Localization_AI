@@ -39,10 +39,10 @@ class TokenCipher:
             try:
                 encoded = key.encode("ascii") if isinstance(key, str) else key
                 self._fernet = Fernet(encoded)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError):
                 raise SecretCipherConfigurationError(
                     f"{SECRET_ENCRYPTION_KEY_ENV} must be a URL-safe base64 Fernet key."
-                ) from exc
+                ) from None
 
     @property
     def configured(self) -> bool:
@@ -68,16 +68,19 @@ class TokenCipher:
         token = self.require_key().encrypt(value.encode("utf-8")).decode("ascii")
         return ENCRYPTED_SECRET_PREFIX + token
 
-    def decrypt_secret(self, value: Optional[str]) -> Optional[str]:
+    def decrypt_secret(self, value: Optional[str], *, allow_legacy: bool = False) -> Optional[str]:
         if value is None or value == "":
             return value
         if not self.is_encrypted(value):
-            # Temporary read compatibility for explicit legacy migration.
-            return value
+            if allow_legacy:
+                return value
+            raise SecretCipherConfigurationError(
+                "Legacy credentials require migration with scripts/migrate_social_tokens.py."
+            )
         payload = value[len(ENCRYPTED_SECRET_PREFIX):]
         try:
             return self.require_key().decrypt(payload.encode("ascii")).decode("utf-8")
-        except (InvalidToken, UnicodeError, ValueError) as exc:
+        except (InvalidToken, UnicodeError, ValueError):
             raise SecretCipherIntegrityError(
                 "Stored credential failed authenticated decryption."
-            ) from exc
+            ) from None

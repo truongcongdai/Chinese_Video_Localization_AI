@@ -85,3 +85,36 @@ Fresh initialization, repeated initialization, and two initializations of a
 temporary copy of `local_data/database.sqlite3` passed. Required CP11 tables
 were present, `PRAGMA integrity_check` returned `ok`, foreign-key checks returned
 zero errors, and the original runtime database SHA-256 remained unchanged.
+
+## Release blocker revalidation: 2026-09-09
+
+The complete regression now passes **1000 tests**, with **5 skipped**, zero
+failures/collection errors and **LIVE_PROVIDER_CALLS=0**. The skips cover two
+environment-specific Content OS checks, one FFmpeg renderer test, and unavailable
+optional DeepL/Azure backends. This is offline acceptance, not provider approval.
+
+Encryption tests cover raw SQLite storage, access/refresh/provider credentials,
+random IVs, wrong keys/tampering, duplicate-encryption protection, atomic rollback,
+owner-scoped/idempotent legacy migration, mocked refresh after migrating a copy,
+and API/log/cache/config redaction. Download tests execute the real shared service
+boundary with controlled handlers, queued excess calls, completion/failure/cancel
+release, retries, owner isolation, lower-cap protection, and a killed worker process.
+
+The offline validator passed:
+- Fresh and repeated web DB initialization; compatible legacy migration on copies.
+- Two web database copies; one old Telegram schema preserved without migration.
+- Integrity, foreign keys, and unchanged logical row counts.
+- Windows startup with a temporary encryption key and with no key.
+- Zero OpenAPI method/path collisions, compileall, all 9 JS syntax checks.
+- No executable shell=True calls in the audited source/scripts.
+- Zero unintended tracked runtime/build artifacts.
+- All three original database hashes and all 275 untracked local files preserved.
+
+The validator can be repeated after committing with:
+```powershell
+python scripts/release_validation.py --runtime-baseline temp/release_acceptance/runtime_hashes.json --artifact-manifest temp/release_acceptance/artifacts.json --output temp/release_acceptance/validation-postcommit.json
+```
+
+The local acceptance manifests contain paths/hashes only and remain ignored.
+They were captured before repair; the validator verifies them before and after
+running. It never opens the original runtime databases through SQLite.

@@ -1,37 +1,43 @@
+# Python and test output
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/venv/
+/.venv/
 
-.env
-# Runtime credentials and copied browser/database state must stay local.
-config/secret_key
-scripts/local_data/
-database.sqlite3
-venv
-BUILD_EXE_GUIDE.md
-Chinese_Video_Localization_AI_Windows_Build.zip
-Chinese_Video_Localization_AI_Windows_Build/
-build_exe.bat
-build_exe.spec
-build_nuitka.bat
-prepare_for_windows_build.sh
-scripts/verify_web_environment.py
-src/universal_video_ai/downloader/channel.py
-src/universal_video_ai/publishing/
-src/universal_video_ai/render/branding.py
-tests/test_channel_download_mode.py
-tests/test_channel_store_dedup.py
-tests/test_douyin_deep_scan.py
-tests/test_reup_ai_publishing_pack.py
-tests/test_translation_adaptation_resilience.py
+# Local secrets and runtime data (source/fixtures are deliberately not ignored)
+/.env
+/.env.*
+!/.env.example
+/config/secret_key
+/database.sqlite3*
+/scripts/database.sqlite3*
+/scripts/local_data/
+/scripts/downloads/
+/src/universal_video_ai/temp/
+/logs/
+/temp/
+/local_data/*
+!/local_data/.gitkeep
+/cookies/
+*.download-slots/
 
+# Generated packages and dependency caches
+/build/
+/dist/
+/node_modules/
+/.npm/
+/Chinese_Video_Localization_AI_Windows_Build/
+/Chinese_Video_Localization_AI_Windows_Build.zip
 
-logs/*
-temp/*
-local_data/*
-!local_data/.gitkeep
-cookies/*
-
+# Editor state
 .idea/
 .vscode/
-
 *.log

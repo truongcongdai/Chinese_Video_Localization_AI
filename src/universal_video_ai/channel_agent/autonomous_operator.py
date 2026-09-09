@@ -238,17 +238,22 @@ class AutonomousChannelOperator:
         normalized = self._normalize(configuration)
         now = self.now()
         next_run_at = self.next_run(cadence, local_time, timezone_name, now)
-        with self.store._connect() as conn:
-            conn.execute(
-                "INSERT INTO autonomous_channel_configs "
-                "(user_id,channel_key,enabled,mode,provider_mode,cadence,local_time,timezone_name,missed_run_policy,next_run_at,configuration_json,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,channel_key) DO UPDATE SET "
-                "enabled=excluded.enabled,mode=excluded.mode,provider_mode=excluded.provider_mode,cadence=excluded.cadence,"
-                "local_time=excluded.local_time,timezone_name=excluded.timezone_name,missed_run_policy=excluded.missed_run_policy,"
-                "next_run_at=excluded.next_run_at,configuration_json=excluded.configuration_json,updated_at=excluded.updated_at",
-                (user_id, channel_key, int(enabled), mode, provider_mode, cadence, local_time,
-                 timezone_name, missed_run_policy, next_run_at, _json(normalized), now, now),
-            )
+        from universal_video_ai.downloader.concurrency import DownloadSlots
+        slots = DownloadSlots(self.store.db_path, user_id)
+        with slots.configuration_lock():
+            if slots.active_count() > normalized["max_concurrent_downloads"]:
+                raise AutonomousOperatorError("Wait for active downloads before lowering their concurrency limit.")
+            with self.store._connect() as conn:
+                conn.execute(
+                    "INSERT INTO autonomous_channel_configs "
+                    "(user_id,channel_key,enabled,mode,provider_mode,cadence,local_time,timezone_name,missed_run_policy,next_run_at,configuration_json,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,channel_key) DO UPDATE SET "
+                    "enabled=excluded.enabled,mode=excluded.mode,provider_mode=excluded.provider_mode,cadence=excluded.cadence,"
+                    "local_time=excluded.local_time,timezone_name=excluded.timezone_name,missed_run_policy=excluded.missed_run_policy,"
+                    "next_run_at=excluded.next_run_at,configuration_json=excluded.configuration_json,updated_at=excluded.updated_at",
+                    (user_id, channel_key, int(enabled), mode, provider_mode, cadence, local_time,
+                     timezone_name, missed_run_policy, next_run_at, _json(normalized), now, now),
+                )
         return self.get_config(user_id, channel_key)
 
     def _config_row(self, row: Any) -> dict[str, Any]:

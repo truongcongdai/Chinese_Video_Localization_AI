@@ -219,3 +219,12 @@ Check the base URL in `.env`: `OLLAMA_BASE_URL=http://127.0.0.1:11434`
 ## License
 
 See LICENSE file for details.
+
+## Release credential configuration
+
+Before connecting social/provider accounts, configure `APP_SECRET_ENCRYPTION_KEY`.
+Follow [credential storage and migration](docs/CREDENTIAL_STORAGE.md) to generate
+and back up the key and migrate a stopped database COPY first. Missing keys and
+legacy plaintext credentials fail explicitly; no new plaintext secrets are stored.
+See [release readiness](docs/RELEASE_READINESS.md) and the
+[operator runbook](docs/OPERATOR_RUNBOOK.md) for the CP0-CP11 RC acceptance path.

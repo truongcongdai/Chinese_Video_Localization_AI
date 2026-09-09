@@ -48,6 +48,8 @@ def main() -> None:
         "universal_video_ai.web.app:app",
         host="0.0.0.0",
         port=port,
+        # OAuth callback URLs contain one-use authorization codes.
+        access_log=False,
         log_level=os.environ.get("LOG_LEVEL", "info").lower(),
     )
 

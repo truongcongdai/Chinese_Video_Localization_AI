@@ -96,6 +96,7 @@ from universal_video_ai.config import (
 )
 from universal_video_ai.analytics.youtube_research import YtDlpYouTubeResearchCollector
 from universal_video_ai.database import DatabaseManager, YouTubeResearchRepository
+from universal_video_ai.secret_cipher import SecretCipherError
 from universal_video_ai.social import get_uploader
 from universal_video_ai.downloader.youtube import YouTubeTools, YouTubeDownloadBody, YouTubeMetadataResponse
 from universal_video_ai.downloader.channel import (
@@ -6214,6 +6215,7 @@ def save_provider_settings(body: ProviderSettingsBody, user_id: int = Depends(ge
     if provider not in PROVIDER_CATALOG:
         raise HTTPException(400, "Provider không hợp lệ")
     meta = PROVIDER_CATALOG[provider]
+    store.token_cipher.require_key()
     current = store.get_provider_settings(user_id, provider)
     api_key = body.api_key.strip() if body.api_key and body.api_key.strip() else None
     if meta["requires_key"] and not api_key and not (current and current.get("api_key")):
@@ -7547,7 +7549,7 @@ def _resolve_publish_credentials(user_id: int, platform: str) -> tuple[Optional[
         try:
             access_token = oauth_module.GoogleOAuth().refresh_access_token(row["refresh_token"])
         except Exception:
-            logger.exception("Failed to refresh YouTube token for user %s", user_id)
+            logger.warning("Failed to refresh YouTube token for user %s", user_id)
     return access_token, row["account_ref"]
 
 
@@ -7555,6 +7557,11 @@ def _resolve_publish_credentials(user_id: int, platform: str) -> tuple[Optional[
 
 def _redirect_uri(request: Request, platform: str) -> str:
     return str(request.base_url).rstrip("/") + f"/api/social/callback/{platform}"
+
+
+@app.exception_handler(SecretCipherError)
+async def secret_cipher_error_handler(request: Request, exc: SecretCipherError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.get("/api/social/connections")
@@ -7582,6 +7589,7 @@ def connect_social(platform: str, request: Request, user_id: int = Depends(get_c
     if not client.is_configured():
         raise HTTPException(400, client.not_configured_message())
 
+    store.token_cipher.require_key()
     state = oauth_module.new_state()
     store.create_oauth_state(state, user_id, platform)
     redirect_uri = _redirect_uri(request, platform)
@@ -7610,7 +7618,7 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
         "}}, 1200);</script></div></body></html>"
     )
     if error:
-        return HTMLResponse(close_html.format(message=f"Đã huỷ kết nối: {error}"))
+        return HTMLResponse(close_html.format(message="OAuth connection was cancelled or denied."))
 
     state_row = store.consume_oauth_state(state)
     if not state_row or state_row["platform"] != platform:
@@ -7622,6 +7630,7 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
     try:
         client = oauth_module.get_oauth_client(platform)
         redirect_uri = _redirect_uri(request, platform)
+        store.token_cipher.require_key()
         result = client.exchange_code(code, redirect_uri)
         store.upsert_social_account(
             user_id, platform,
@@ -7633,8 +7642,10 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
         label = result.account_name or "tài khoản của bạn"
         return HTMLResponse(
             close_html.format(message=f"✓ Đã kết nối {platform} ({label}). Có thể đóng cửa sổ này."))
-    except Exception as exc:
-        logger.exception("OAuth callback failed for platform=%s", platform)
+    except SecretCipherError as exc:
+        return HTMLResponse(close_html.format(message=str(exc)), status_code=503)
+    except Exception:
+        logger.warning("OAuth callback failed for platform=%s", platform)
         return HTMLResponse(
             close_html.format(
                 message="Kết nối thất bại. Vui lòng thử lại hoặc kiểm tra cấu hình OAuth."

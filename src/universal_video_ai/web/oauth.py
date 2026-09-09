@@ -26,13 +26,45 @@ code, is the bottleneck.
 from __future__ import annotations
 
 import os
+import logging
+from functools import wraps
 import secrets
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+from requests import RequestException
+
+
+class _OAuthLogFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage().casefold()
+        if any(marker in message for marker in (
+            "access_token", "refresh_token", "client_secret", "/oauth/", "/token?",
+        )):
+            record.msg = "OAuth HTTP diagnostic redacted."
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+# HTTP debug diagnostics can include Graph OAuth query parameters.
+for _logger_name in ("urllib3.connectionpool", "requests.packages.urllib3.connectionpool"):
+    logging.getLogger(_logger_name).addFilter(_OAuthLogFilter())
+
+
+def _safe_oauth_errors(operation):
+    @wraps(operation)
+    def wrapped(*args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except RequestException:
+            raise ValueError("OAuth provider request failed; check connection and provider configuration.") from None
+    return wrapped
+
 
 __all__ = [
     "PlatformOAuth", "GoogleOAuth", "FacebookOAuth", "TikTokOAuth",
@@ -57,8 +89,8 @@ def qr_code_url(target_url: str, size: int = 220) -> str:
 
 @dataclass
 class ConnectResult:
-    access_token: Optional[str]
-    refresh_token: Optional[str]
+    access_token: Optional[str] = field(repr=False)
+    refresh_token: Optional[str] = field(repr=False)
     expires_at: Optional[float]
     account_name: Optional[str]
     account_ref: Optional[str]
@@ -74,6 +106,7 @@ class PlatformOAuth:
     def authorize_url(self, redirect_uri: str, state: str) -> str:
         raise NotImplementedError
 
+    @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         raise NotImplementedError
 
@@ -116,6 +149,7 @@ class GoogleOAuth(PlatformOAuth):
         }
         return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
+    @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         resp = requests.post(self.TOKEN_URL, data={
             "client_id": os.environ["GOOGLE_CLIENT_ID"],
@@ -157,6 +191,7 @@ class GoogleOAuth(PlatformOAuth):
     def refresh_access_token(self, refresh_token: str) -> str:
         return self.refresh_access_token_details(refresh_token)["access_token"]
 
+    @_safe_oauth_errors
     def refresh_access_token_details(self, refresh_token: str) -> dict:
         resp = requests.post(self.TOKEN_URL, data={
             "client_id": os.environ["GOOGLE_CLIENT_ID"],
@@ -199,6 +234,7 @@ class FacebookOAuth(PlatformOAuth):
         }
         return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
+    @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         resp = requests.get(self.TOKEN_URL, params={
             "client_id": os.environ["FACEBOOK_APP_ID"],
@@ -215,7 +251,7 @@ class FacebookOAuth(PlatformOAuth):
         # model; a future version could let the user pick among several).
         pages_resp = requests.get(
             "https://graph.facebook.com/v19.0/me/accounts",
-            params={"access_token": user_token},
+            headers={"Authorization": f"Bearer {user_token}"},
             timeout=30,
         ).json()
         pages = pages_resp.get("data") or []
@@ -265,6 +301,7 @@ class TikTokOAuth(PlatformOAuth):
         }
         return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
+    @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         resp = requests.post(self.TOKEN_URL, data={
             "client_key": os.environ["TIKTOK_CLIENT_KEY"],

@@ -32,7 +32,12 @@ class DownloadService:
         self.use_cache = use_cache
         self.cache = get_download_cache() if use_cache else None
 
-    def download(
+    def download(self, url: str, output_dir: Path, *, cancel_event=None) -> DownloadResult:
+        from .concurrency import download_slot
+        with download_slot(self.user_id, cancel_event=cancel_event):
+            return self._download(url, output_dir)
+
+    def _download(
 
         self,
 

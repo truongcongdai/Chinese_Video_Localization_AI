@@ -302,7 +302,7 @@ class GoogleOAuthTokenService:
             refreshed = self._oauth_factory().refresh_access_token_details(str(refresh_token))
         except Exception as exc:
             logger.warning("YouTube OAuth refresh failed for user_id=%s", user_id)
-            raise YouTubeAuthorizationError() from exc
+            raise YouTubeAuthorizationError() from None
         token = refreshed.get("access_token")
         if not token:
             raise YouTubeAuthorizationError()

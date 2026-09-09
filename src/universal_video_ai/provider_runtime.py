@@ -70,7 +70,7 @@ class ProviderCostReport:
 _LOCK = threading.Lock()
 _REPORT = ProviderCostReport()
 _MEMORY_CACHE: Dict[str, Any] = {}
-_SECRET_KEYS = {"access_token", "refresh_token", "authorization", "password", "secret", "api_key"}
+_SECRET_KEYS = {"access_token", "refresh_token", "authorization", "password", "secret", "api_key", "token", "cookie", "cookies", "appsecret_proof"}
 
 
 def default_provider_mode() -> ProviderMode:
@@ -209,7 +209,7 @@ def execute_provider_call(
         result = mock()
         if cacheable:
             with _LOCK:
-                _MEMORY_CACHE[key] = result
+                _MEMORY_CACHE[key] = _safe_normalize(result)
         return result
     if selected is ProviderMode.DRY_RUN:
         with _LOCK:
@@ -219,5 +219,5 @@ def execute_provider_call(
     with _LOCK:
         _REPORT.live_calls += 1
         if selected is ProviderMode.CACHE and cacheable:
-            _MEMORY_CACHE[key] = result
+            _MEMORY_CACHE[key] = _safe_normalize(result)
     return result
