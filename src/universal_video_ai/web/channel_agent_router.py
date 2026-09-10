@@ -1177,7 +1177,7 @@ def resume_script_generation(
 ) -> dict[str, Any]:
     _require_enabled()
     return _production_asset_call(
-        lambda: _production_asset_service(store).resume_script(user_id, item_id))
+        lambda: _production_asset_service(store).queue_resume_script(user_id, item_id))
 
 
 @router.post("/production/{item_id}/assets/script/drafts")

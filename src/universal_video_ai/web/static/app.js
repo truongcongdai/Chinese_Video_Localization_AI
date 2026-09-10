@@ -6,6 +6,9 @@ let currentJobId = null;
 let selectedPlatforms = new Set();
 let pollTimer = null;
 let pollTimer2 = null;
+let productionGenerationPollTimer = null;
+let productionGenerationPollItemId = null;
+let productionGenerationPollInFlight = false;
 let selectedTopupPackage = null;
 let selectedHistoryJobs = new Set();
 let historyBulkRerunBusy = false;
@@ -5132,18 +5135,35 @@ function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publis
   const latest = ContentProductionUI.latestByType(assets);
   const blueprint = latest["script_blueprint:"];
   const sections = ContentProductionUI.sectionRows(blueprint, assets);
+  const activeBatch = (jobs || []).find(job =>
+    job.job_type === "script_resume" && ["queued", "running", "paused"].includes(job.status));
+  const allSectionsAcceptable = sections.length > 0 && sections.every(section => section.acceptable);
+  const batchStates = activeBatch?.request?.section_states || {};
+  const visibleSections = sections.map(section => {
+    const state = batchStates[String(section.section_index)]?.state;
+    if (!state || !["ACTIVE", "FAILED_RETRYABLE", "FAILED_TERMINAL"].includes(state)) {
+      return section;
+    }
+    return {...section, status: state.toLowerCase(), action: "resume"};
+  });
+  const batchCounts = sections.reduce((counts, section) => {
+    const state = batchStates[String(section.section_index)]?.state
+      || (section.acceptable ? "COMPLETE" : section.status === "partial" ? "PARTIAL" : "MISSING");
+    counts[state] = (counts[state] || 0) + 1;
+    return counts;
+  }, {});
   const sectionTable = sections.length ? channelAgentTable(
     ["#", "Title", "Words", "Duration", "Complete", "Version", "Status", "Actions"],
-    sections.map(section => [
+    visibleSections.map(section => [
       section.section_index, section.title,
       String(section.actual_words) + " / " + String(section.target_words),
       String(section.estimated_duration_minutes) + " / " + String(section.target_duration_minutes) + " min",
       String(section.completion_percentage) + "%",
       section.version ? "v" + String(section.version) : "-",
-      String(section.status).toUpperCase(),
+      ContentProductionUI.sectionStatusLabel(section),
       '<button class="btn secondary small" data-production-section="' + section.section_index
-        + '" data-section-action="' + (section.assetId ? "regenerate" : "generate") + '">'
-        + (section.assetId ? "Regenerate" : "Generate") + "</button>",
+        + '" data-section-action="' + section.action + '">'
+        + (section.action === "resume" ? "Resume" : "Regenerate") + "</button>",
     ]), [7]
   ) : '<p class="muted-help">Generate a blueprint to create section budgets.</p>';
   const versionRow = asset => [
@@ -5222,8 +5242,10 @@ function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publis
     + escapeHtml(JSON.stringify(assetPackage || {}, null, 2)) + "</pre></details>"
     + '<div class="button-row">'
     + '<button class="btn gradient small" id="production-generate-blueprint">Generate Blueprint</button> '
-    + '<button class="btn secondary small" id="production-resume-script">Resume Missing Sections</button> '
-    + '<button class="btn secondary small" id="production-assemble-script">Assemble Draft</button> '
+    + '<button class="btn secondary small" id="production-resume-script" '
+      + (activeBatch || allSectionsAcceptable ? "disabled" : "") + '>' + (activeBatch ? "Resume in progress..." : allSectionsAcceptable ? "All Sections Ready" : "Resume Missing Sections") + '</button> '
+    + '<button class="btn secondary small" id="production-assemble-script" '
+      + (allSectionsAcceptable ? "" : "disabled") + '>Assemble Draft</button> '
     + '<button class="btn secondary small" data-production-generate-asset="visual-plan">Visual Plan</button> '
     + '<button class="btn secondary small" data-production-generate-asset="voice-plan">Voice Plan</button> '
     + '<button class="btn secondary small" data-production-generate-asset="thumbnail-brief">Thumbnail Brief</button> '
@@ -5238,6 +5260,15 @@ function productionAssetWorkspace(assets, jobs, assetPackage, renderJobs, publis
     + "<h4>Script Sections</h4>" + sectionTable
     + versionPanels
     + "<h4>Generation progress</h4>"
+    + (activeBatch
+      ? '<p class="production-generation-progress"><strong>Generating script sections</strong> | Section: '
+        + String(activeBatch.current_section || "-") + " / " + String(activeBatch.total_sections)
+        + " | Completed: " + String(activeBatch.completed_sections || 0)
+        + " | Partial: " + String(batchCounts.PARTIAL || 0)
+        + " | Missing: " + String((batchCounts.MISSING || 0) + (batchCounts.FAILED_RETRYABLE || 0))
+        + " | Current: Section " + String(activeBatch.current_section || "-")
+        + " | Progress: " + String(activeBatch.progress || 0) + "%</p>"
+      : "")
     + (jobRows.length ? channelAgentTable(
       ["Job", "Type", "Status", "Stage", "Section", "Completed", "Progress", "Error"],
       jobRows) : '<p class="muted-help">No persistent generation jobs yet.</p>')
@@ -5349,6 +5380,11 @@ async function showProductionItem(id) {
     () => api("/api/channel-agent/production/" + id + "/qa", {method: "POST"}), id);
   document.querySelectorAll("[data-production-section]").forEach(button => {
     button.onclick = () => runProductionAssetAction(button, () => {
+      if (button.dataset.sectionAction === "resume") {
+        return api("/api/channel-agent/production/" + id + "/assets/script/resume", {
+          method: "POST",
+        });
+      }
       const suffix = button.dataset.sectionAction === "regenerate" ? "/regenerate" : "";
       return api("/api/channel-agent/production/" + id + "/assets/script/sections/"
         + button.dataset.productionSection + suffix, {
@@ -5457,6 +5493,7 @@ async function showProductionItem(id) {
         + encodeURIComponent(button.dataset.learningRecommendation) + "/" + button.dataset.learningAction,
       {method: "POST", body: JSON.stringify({})}), id);
   });
+  syncProductionGenerationPolling(id, jobs);
 
   $("#production-item-save").onclick = async () => {
     try {
@@ -5513,6 +5550,42 @@ async function showProductionItem(id) {
       } catch (error) { $("#production-message").textContent = error.message; }
     };
   });
+}
+
+function syncProductionGenerationPolling(id, jobs) {
+  const active = (jobs || []).some(job =>
+    job.job_type === "script_resume" && ["queued", "running", "paused"].includes(job.status));
+  if (!active) {
+    if (productionGenerationPollItemId === id && productionGenerationPollTimer) {
+      clearInterval(productionGenerationPollTimer);
+      productionGenerationPollTimer = null;
+      productionGenerationPollItemId = null;
+    }
+    return;
+  }
+  if (productionGenerationPollTimer && productionGenerationPollItemId === id) return;
+  if (productionGenerationPollTimer) clearInterval(productionGenerationPollTimer);
+  productionGenerationPollItemId = id;
+  productionGenerationPollTimer = setInterval(async () => {
+    if (productionGenerationPollInFlight) return;
+    productionGenerationPollInFlight = true;
+    try {
+      const latestJobs = await api("/api/channel-agent/production/" + id + "/generation-jobs");
+      const stillActive = latestJobs.some(job =>
+        job.job_type === "script_resume" && ["queued", "running", "paused"].includes(job.status));
+      if (!stillActive) {
+        clearInterval(productionGenerationPollTimer);
+        productionGenerationPollTimer = null;
+        productionGenerationPollItemId = null;
+      }
+      await showProductionItem(id);
+      await loadProductionQueue();
+    } catch (error) {
+      $("#production-message").textContent = error.message;
+    } finally {
+      productionGenerationPollInFlight = false;
+    }
+  }, 3000);
 }
 
 $("#production-refresh-list").onclick = loadProductionQueue;

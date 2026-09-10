@@ -58,16 +58,34 @@
     return blueprint.payload.sections.map(section => {
       const key = "script_section:" + String(section.section_index).padStart(2, "0");
       const asset = latest[key];
+      const acceptable = Boolean(asset?.payload?.budget_acceptable);
+      const status = !asset
+        ? "missing"
+        : acceptable && asset.status === "approved"
+          ? "approved"
+          : acceptable
+            ? "draft_acceptable"
+            : "partial";
       return {
         ...section,
         assetId: asset?.id || null,
         version: asset?.version || null,
-        status: asset?.status || "missing",
+        status,
+        acceptable,
+        action: !asset ? "generate" : !acceptable ? "resume" : "regenerate",
         actual_words: asset?.payload?.actual_words || 0,
         estimated_duration_minutes: asset?.payload?.estimated_duration_minutes || 0,
         completion_percentage: asset?.payload?.completion_percentage || 0,
       };
     });
+  }
+
+  function sectionStatusLabel(section) {
+    if (section.status === "draft_acceptable") return "DRAFT/ACCEPTABLE";
+    if (section.status === "active") return "GENERATING";
+    if (section.status === "failed_retryable") return "FAILED/RETRYABLE";
+    if (section.status === "failed_terminal") return "FAILED/TERMINAL";
+    return String(section.status || "missing").toUpperCase();
   }
 
   function readinessLabel(assetPackage) {
@@ -82,6 +100,6 @@
 
   return Object.freeze({
     activeStatuses, itemTransitions, listQuery, progressLabel, taskActions,
-    latestByType, sectionRows, readinessLabel,
+    latestByType, sectionRows, sectionStatusLabel, readinessLabel,
   });
 }));

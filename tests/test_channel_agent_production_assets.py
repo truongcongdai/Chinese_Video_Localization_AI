@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import inspect
+import math
 import re
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,7 @@ from universal_video_ai.channel_agent.production_assets import (
     ProductionAssetService,
     ProductionGenerationError,
     count_words,
+    is_section_acceptable,
 )
 from universal_video_ai.channel_agent.providers import OllamaProviderError
 from universal_video_ai.web.auth import get_current_user_id
@@ -144,6 +148,25 @@ def _approve(service: ProductionAssetService, user: int, item: int, asset: dict)
     return service.review_asset(user, item, asset["id"], decision="approved")
 
 
+def _insert_partial(store: Store, user: int, item: int, blueprint: dict,
+                    index: int, words: int = 225) -> dict:
+    section = blueprint["payload"]["sections"][index - 1]
+    return store.insert_production_asset(
+        user, item, asset_type="script_section", asset_key=f"{index:02d}",
+        payload={
+            "schema_version": "cp7a-v1", "blueprint_asset_id": blueprint["id"],
+            "blueprint_version": blueprint["version"], "section_index": index,
+            "title": section["title"], "content": _words(words, f"partial{index}_"),
+            "target_words": section["target_words"], "actual_words": words,
+            "target_duration_minutes": section["target_duration_minutes"],
+            "estimated_duration_minutes": round(words / 145, 2),
+            "completion_percentage": round(words / section["target_words"] * 100, 1),
+            "budget_acceptable": False, "continuation_attempts": 0,
+            "continuation_failures": [],
+        },
+    )
+
+
 def test_additive_schema_is_fresh_and_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "schema.sqlite3"
     Store(path)
@@ -206,6 +229,136 @@ def test_section_budget_versioning_resume_and_assembly(tmp_path: Path) -> None:
     assert draft["payload"]["actual_total_words"] >= 6960
     assert draft["payload"]["budget_acceptable"]
     assert _task(store, user, item, "SCRIPT")["status"] == "ready"
+
+
+def test_resume_batch_processes_partial_then_missing_in_order(tmp_path: Path) -> None:
+    store, user, _, item = _item(tmp_path)
+    service = ProductionAssetService(store, FakeProvider())
+    blueprint = service.generate_blueprint(user, item, duration_minutes=75)["asset"]
+    first = service.generate_section(user, item, 1, blueprint_asset_id=blueprint["id"])["asset"]
+    partial = _insert_partial(store, user, item, blueprint, 2)
+
+    result = service.resume_script(user, item)
+
+    assert result["preserved_sections"] == [1]
+    assert result["generated_sections"] == list(range(2, 11))
+    assert first["version"] == 1 and partial["version"] == 1
+    assert len(service.list_assets(user, item, asset_type="script_section", asset_key="02")) == 2
+    assert not [
+        job for job in service.list_jobs(user, item)
+        if job["job_type"] == "script_section"
+        and job["request"].get("section_index", 0) >= 2
+    ]
+    assert service.get_job(user, item, result["generation_job"]["id"])["status"] == "completed"
+    assert service.assemble_script(user, item)["asset"]["payload"]["budget_acceptable"]
+
+
+def test_resume_batch_duplicate_click_reuses_active_job(tmp_path: Path) -> None:
+    store, user, _, item = _item(tmp_path)
+
+    class SlowProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.block = False
+
+        def generate_structured(self, **kwargs):
+            if self.block and '"paragraphs"' in kwargs["user_prompt"]:
+                self.started.set()
+                self.release.wait(2)
+            return super().generate_structured(**kwargs)
+
+    provider = SlowProvider()
+    service = ProductionAssetService(store, provider)
+    blueprint = service.generate_blueprint(user, item, duration_minutes=75)["asset"]
+    provider.block = True
+    first = service.queue_resume_script(user, item)
+    assert provider.started.wait(2)
+    second = service.queue_resume_script(user, item)
+    provider.release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = service.get_job(user, item, first["generation_job"]["id"])
+        if job["status"] not in {"queued", "running", "paused"}:
+            break
+        time.sleep(.02)
+
+    assert first["generation_job"]["id"] == second["generation_job"]["id"]
+    jobs = service.list_jobs(user, item)
+    assert len([job for job in jobs if job["job_type"] == "script_resume"]) == 1
+    assert service.get_job(user, item, first["generation_job"]["id"])["status"] == "completed"
+
+
+def test_restart_recovers_persisted_resume_batch(tmp_path: Path) -> None:
+    store, user, _, item = _item(tmp_path)
+    provider = FakeProvider()
+    service = ProductionAssetService(store, provider)
+    blueprint = service.generate_blueprint(user, item, duration_minutes=75)["asset"]
+    job = store.get_or_create_active_production_generation_job(
+        user, item, job_type="script_resume", total_sections=10,
+        request={"blueprint_asset_id": blueprint["id"],
+                 "blueprint_version": blueprint["version"],
+                 "section_states": {}, "failures": []},
+    )
+    assert job["_created"]
+    restarted = ProductionAssetService(Store(store.db_path), FakeProvider())
+    restarted.list_jobs(user, item)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        current = restarted.get_job(user, item, job["id"])
+        if current["status"] not in {"queued", "running", "paused"}:
+            break
+        time.sleep(.02)
+    current = restarted.get_job(user, item, job["id"])
+    assert current["status"] == "completed"
+    assert current["completed_sections"] == 10
+    assert current["request"]["section_states"]["10"]["state"] == "COMPLETE"
+
+
+def test_section_acceptance_and_assemble_guard_use_one_policy(tmp_path: Path) -> None:
+    store, user, _, item = _item(tmp_path)
+    service = ProductionAssetService(store, FakeProvider())
+    blueprint = service.generate_blueprint(user, item, duration_minutes=75)["asset"]
+    _insert_partial(store, user, item, blueprint, 1)
+
+    assert is_section_acceptable(908, 1088)
+    assert not is_section_acceptable(225, 1088)
+    with pytest.raises(ProductionAssetError, match="Section 1 is missing or below"):
+        service.assemble_script(user, item)
+
+
+def test_continuation_uses_larger_bounded_chunks_without_duplicate_prose(tmp_path: Path) -> None:
+    class ChunkProvider(FakeProvider):
+        def generate_structured(self, **kwargs):
+            prompt = kwargs["user_prompt"]
+            self.calls += 1
+            if "Create exactly" in prompt:
+                count = int(re.search(r"Create exactly (\d+)", prompt).group(1))
+                return json.dumps({"sections": [{
+                    "title": f"Section {i}", "purpose": f"Purpose {i}",
+                    "content_goal": f"Goal {i}", "key_points": [f"Point {i}"],
+                    "transition_guidance": f"Transition {i}",
+                } for i in range(1, count + 1)]})
+            if "additional" in prompt:
+                marker = chr(96 + self.calls)
+                return json.dumps({"content": _words(300, f"continuation{marker}")})
+            return json.dumps({"paragraphs": [
+                _words(75, f"opening{self.calls}_{part}_")
+                for part in ("a", "b", "c", "d")
+            ]})
+
+    store, user, _, item = _item(tmp_path)
+    provider = ChunkProvider()
+    service = ProductionAssetService(store, provider, max_continuations=5)
+    blueprint = service.generate_blueprint(user, item, duration_minutes=75)["asset"]
+    asset = service.generate_section(user, item, 1, blueprint_asset_id=blueprint["id"])["asset"]
+
+    payload = asset["payload"]
+    assert payload["actual_words"] >= math.ceil(payload["target_words"] * .8)
+    assert payload["continuation_attempts"] == 2
+    assert payload["content"].count("continuationc") == 300
+    assert payload["content"].count("continuationd") == 300
 
 
 def test_explicit_approval_completes_script_and_preserves_superseded_history(tmp_path: Path) -> None:

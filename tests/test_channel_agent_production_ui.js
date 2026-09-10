@@ -82,6 +82,31 @@ test("CP7A section rows retain latest versions and budget metrics", () => {
   assert.equal(rows[1].status, "missing");
 });
 
+test("CP7A section rows distinguish partial from acceptable and approved", () => {
+  const blueprint = {id: 20, payload: {sections: [
+    {section_index: 1, title: "Opening", target_words: 1088, target_duration_minutes: 7},
+    {section_index: 2, title: "Conflict", target_words: 1088, target_duration_minutes: 7},
+    {section_index: 3, title: "End", target_words: 1088, target_duration_minutes: 7},
+  ]}};
+  const rows = UI.sectionRows(blueprint, [
+    {id: 10, asset_type: "script_section", asset_key: "01", version: 2, status: "draft",
+      payload: {blueprint_asset_id: 20, actual_words: 225, completion_percentage: 20.7}},
+    {id: 11, asset_type: "script_section", asset_key: "02", version: 1, status: "draft",
+      payload: {blueprint_asset_id: 20, actual_words: 908, completion_percentage: 83.5,
+        budget_acceptable: true}},
+    {id: 12, asset_type: "script_section", asset_key: "03", version: 1, status: "approved",
+      payload: {blueprint_asset_id: 20, actual_words: 1088, completion_percentage: 100,
+        budget_acceptable: true}},
+  ]);
+  assert.equal(rows[0].status, "partial");
+  assert.equal(rows[0].action, "resume");
+  assert.equal(UI.sectionStatusLabel(rows[0]), "PARTIAL");
+  assert.equal(rows[1].status, "draft_acceptable");
+  assert.equal(UI.sectionStatusLabel(rows[1]), "DRAFT/ACCEPTABLE");
+  assert.equal(rows[1].action, "regenerate");
+  assert.equal(UI.sectionStatusLabel(rows[2]), "APPROVED");
+});
+
 test("CP7A readiness keeps asset and rights state separate", () => {
   const label = UI.readinessLabel({
     planning_ready: true, asset_ready: true, qa_status: "approved",
@@ -114,4 +139,7 @@ test("Production Queue integrates CP7A controls without client user_id", () => {
   );
   assert.doesNotMatch(section, /user_id/);
   assert.doesNotMatch(section, /final TTS created|render final|publish video/i);
+  assert.match(appSource, /Resume in progress/);
+  assert.match(appSource, /syncProductionGenerationPolling/);
+  assert.match(appSource, /productionGenerationPollInFlight/);
 });

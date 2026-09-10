@@ -3714,6 +3714,24 @@ class Store:
             result["request"] = {}
         return result
 
+    @staticmethod
+    def _generation_job_request_matches(row: Any, request: Dict[str, Any]) -> bool:
+        try:
+            stored = json.loads(row["request_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stored = {}
+        matches = (
+            int(stored.get("blueprint_asset_id") or 0)
+            == int(request.get("blueprint_asset_id") or 0)
+            and int(stored.get("blueprint_version") or 0)
+            == int(request.get("blueprint_version") or 0)
+        )
+        if "section_index" in request:
+            matches = matches and int(stored.get("section_index") or 0) == int(
+                request.get("section_index") or 0
+            )
+        return matches
+
     def insert_production_asset(
         self, user_id: int, item_id: int, *, asset_type: str,
         asset_key: str = "", status: str = "draft", payload: Dict[str, Any],
@@ -3849,6 +3867,51 @@ class Store:
             job_id = int(cur.lastrowid)
         return self.get_production_generation_job(user_id, item_id, job_id)
 
+    def get_or_create_active_production_generation_job(
+        self, user_id: int, item_id: int, *, job_type: str,
+        total_sections: int = 0, request: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Atomically reuse or create one active compatible generation job."""
+        request = dict(request or {})
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner = conn.execute(
+                "SELECT 1 FROM production_items WHERE id=? AND user_id=?", (item_id, user_id)
+            ).fetchone()
+            if not owner:
+                return {}
+            rows = conn.execute(
+                "SELECT * FROM production_generation_jobs "
+                "WHERE user_id=? AND production_item_id=? AND job_type=? "
+                "AND status IN ('queued','running','paused') "
+                "ORDER BY created_at DESC,id DESC",
+                (user_id, item_id, job_type),
+            ).fetchall()
+            existing = next(
+                (row for row in rows if self._generation_job_request_matches(row, request)),
+                None,
+            )
+            created = existing is None
+            if existing:
+                job_id = int(existing["id"])
+            else:
+                cur = conn.execute(
+                    """INSERT INTO production_generation_jobs
+                    (user_id,production_item_id,job_type,status,current_stage,total_sections,
+                     completed_sections,progress,request_json,created_at,updated_at)
+                    VALUES (?,?,?,'queued','queued',?,0,0,?,?,?)""",
+                    (
+                        user_id, item_id, job_type, max(0, int(total_sections)),
+                        json.dumps(request, ensure_ascii=False, sort_keys=True), now, now,
+                    ),
+                )
+                job_id = int(cur.lastrowid)
+        result = self.get_production_generation_job(user_id, item_id, job_id)
+        if result:
+            result["_created"] = created
+        return result or {}
+
     def get_production_generation_job(
         self, user_id: int, item_id: int, job_id: int,
     ) -> Optional[Dict[str, Any]]:
@@ -3876,8 +3939,13 @@ class Store:
         allowed = {
             "status", "current_stage", "current_section", "total_sections",
             "completed_sections", "progress", "error", "started_at", "completed_at",
+            "request",
         }
         payload = {key: value for key, value in data.items() if key in allowed}
+        if "request" in payload:
+            payload["request_json"] = json.dumps(
+                payload.pop("request"), ensure_ascii=False, sort_keys=True,
+            )
         if not payload:
             return bool(self.get_production_generation_job(user_id, item_id, job_id))
         payload["updated_at"] = time.time()

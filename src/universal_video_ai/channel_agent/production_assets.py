@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -17,7 +18,7 @@ ASSET_TYPES = {
     "voice_plan", "thumbnail_brief", "metadata_package",
 }
 ASSET_STATUSES = {"draft", "review", "approved", "rejected", "superseded"}
-JOB_STATUSES = {"queued", "running", "paused", "completed", "failed", "cancelled"}
+JOB_STATUSES = {"queued", "running", "paused", "partial", "completed", "failed", "cancelled"}
 APPROVABLE_ASSETS = {
     "script_draft": "SCRIPT", "visual_plan": "VISUAL_PLAN",
     "voice_plan": "VOICE_PLAN", "thumbnail_brief": "THUMBNAIL",
@@ -33,6 +34,8 @@ PROHIBITED_REUSE = (
     "remove watermark", "download competitor shorts", "download competitor reels",
 )
 WORD_RE = re.compile(r"\b[^\W_]+(?:['?-][^\W_]+)*\b", re.UNICODE)
+_RESUME_WORKERS: dict[int, threading.Thread] = {}
+_RESUME_WORKERS_LOCK = threading.Lock()
 
 
 class ProductionAssetError(RuntimeError):
@@ -49,6 +52,15 @@ class ProductionGenerationError(ProductionAssetError):
 
 def count_words(text: str) -> int:
     return len(WORD_RE.findall(text or ""))
+
+
+def is_section_acceptable(
+    actual_words: int, target_words: int, minimum_word_ratio: float = .80,
+) -> bool:
+    """The single CP7A section acceptance policy used by all consumers."""
+    target = max(0, int(target_words))
+    actual = max(0, int(actual_words))
+    return target == 0 or actual >= math.ceil(target * min(1., max(.5, float(minimum_word_ratio))))
 
 
 def _json_text(value: Any) -> str:
@@ -121,7 +133,13 @@ class ProductionAssetService:
 
     def list_jobs(self, user_id: int, item_id: int) -> list[dict[str, Any]]:
         self._item(user_id, item_id)
-        return self.store.list_production_generation_jobs(user_id, item_id)
+        jobs = self.store.list_production_generation_jobs(user_id, item_id)
+        for job in jobs:
+            if job["job_type"] == "script_resume" and job["status"] in {
+                "queued", "running", "paused"
+            }:
+                self._ensure_resume_worker(user_id, item_id, int(job["id"]))
+        return jobs
 
     def get_job(self, user_id: int, item_id: int, job_id: int) -> dict[str, Any]:
         self._item(user_id, item_id)
@@ -292,8 +310,8 @@ class ProductionAssetService:
         content = str(value.get("content") or "").strip() if isinstance(value, dict) else ""
         if not content and isinstance(value, dict) and isinstance(value.get("paragraphs"), list):
             paragraphs = [str(row).strip() for row in value["paragraphs"] if str(row).strip()]
-            if not 1 <= len(paragraphs) <= 6:
-                raise ValueError("paragraphs must contain 1-6 strings")
+            if not 1 <= len(paragraphs) <= 8:
+                raise ValueError("paragraphs must contain 1-8 strings")
             content = "\n\n".join(paragraphs)
         if not content:
             raise ValueError("content or paragraphs is required")
@@ -310,6 +328,136 @@ class ProductionAssetService:
                 additions.append(paragraph.strip())
         return existing.rstrip() + ("\n\n" + "\n\n".join(additions) if additions else "")
 
+    def _section_asset(self, user_id: int, item_id: int, index: int,
+                       blueprint_id: int) -> Optional[dict[str, Any]]:
+        versions = self.store.list_production_assets(
+            user_id, item_id, asset_type="script_section", asset_key=f"{index:02d}"
+        )
+        return next((
+            row for row in versions
+            if row["status"] not in {"rejected", "superseded"}
+            and int(row["payload"].get("blueprint_asset_id") or 0) == blueprint_id
+        ), None)
+
+    def section_state(self, user_id: int, item_id: int, section: dict[str, Any],
+                      blueprint_id: int, *, active: bool = False) -> str:
+        if active:
+            return "ACTIVE"
+        asset = self._section_asset(
+            user_id, item_id, int(section["section_index"]), blueprint_id
+        )
+        if not asset:
+            return "MISSING"
+        payload = asset["payload"]
+        actual = count_words(str(payload.get("content") or ""))
+        acceptable = is_section_acceptable(
+            actual, int(section["target_words"]), self.minimum_word_ratio
+        )
+        if asset["status"] == "approved" and acceptable:
+            return "APPROVED"
+        if acceptable:
+            return "COMPLETE"
+        return "PARTIAL"
+
+    def _section_content(
+        self, item: dict[str, Any], section: dict[str, Any], learning: dict[str, Any],
+        *, initial_content: str = "", initial_attempts: int = 0,
+        prior_failures: Optional[list[str]] = None,
+        on_progress: Optional[Callable[[str, int, list[str]], None]] = None,
+    ) -> tuple[str, int, list[str]]:
+        target = int(section["target_words"])
+        content = str(initial_content or "").strip()
+        attempts = max(0, int(initial_attempts))
+        continuation_failures = list(prior_failures or [])
+        minimum = math.ceil(target * self.minimum_word_ratio)
+
+        if not content:
+            value = self._structured(
+                system="Write original Vietnamese narration. Return JSON only.",
+                prompt=("Return exactly {\"paragraphs\":[\"...\",\"...\"]}. "
+                        f"Write a substantial first chunk of about 280-380 Vietnamese words "
+                        f"for this {target}-word section, using 5-8 coherent paragraphs. "
+                        "Close the JSON object after the prose. Do not conclude the overall "
+                        "section if more narration will be needed. Stay on topic, avoid "
+                        "repetition, and do not copy source material.\nSection:\n"
+                        + _json_text(section)
+                        + "\nProduction brief:\n" + _json_text(item["production_brief"])
+                        + "\nOwner learning for NEW generation only:\n" + _json_text(learning)),
+                num_predict=min(max(self.section_num_predict, 1400), 2400),
+                validator=self._section_response,
+            )
+            content = value["content"]
+            if on_progress:
+                on_progress(content, attempts, continuation_failures)
+
+        while count_words(content) < minimum and attempts < self.max_continuations:
+            attempts += 1
+            missing = max(1, minimum - count_words(content))
+            try:
+                extra = self._structured(
+                    system="Continue original Vietnamese narration without repetition. JSON only.",
+                    prompt=("Return exactly {\"paragraphs\":[\"...\",\"...\"]} with 5-8 "
+                            "new coherent paragraph strings of about 45-70 Vietnamese words "
+                            f"each, contributing toward {missing} additional words. "
+                            "Close the JSON object after the prose. Continue naturally from "
+                            "the ending, do not restart or repeat, and do not copy source "
+                            "material. Existing ending:\n" + content[-3500:]
+                            + "\nSection goal:\n" + _json_text(section)),
+                    num_predict=min(max(self.section_num_predict, 1400), 2400),
+                    validator=self._section_response,
+                )
+            except ProductionGenerationError as exc:
+                continuation_failures.append(str(exc)[:500])
+                continue
+            updated = self._append_unique(content, extra["content"])
+            if updated == content:
+                continuation_failures.append("Continuation returned no new paragraphs.")
+            content = updated
+            if on_progress:
+                on_progress(content, attempts, continuation_failures)
+        return content, attempts, continuation_failures
+
+    def _section_payload(self, blueprint: dict[str, Any], section: dict[str, Any],
+                         content: str, attempts: int, failures: list[str],
+                         learning: dict[str, Any]) -> dict[str, Any]:
+        actual = count_words(content)
+        target = int(section["target_words"])
+        return {
+            "schema_version": "cp7a-v1", "blueprint_asset_id": int(blueprint["id"]),
+            "blueprint_version": int(blueprint["version"]),
+            "section_index": int(section["section_index"]), "title": section["title"],
+            "content": content, "target_words": target, "actual_words": actual,
+            "target_duration_minutes": section["target_duration_minutes"],
+            "estimated_duration_minutes": round(
+                actual / int(blueprint["payload"]["narration_wpm"]), 2),
+            "completion_percentage": round(actual / target * 100, 1) if target else 100.,
+            "budget_acceptable": is_section_acceptable(
+                actual, target, self.minimum_word_ratio
+            ),
+            "continuation_attempts": attempts, "continuation_failures": failures,
+            "learning_profile_version": learning.get("profile_version"),
+        }
+
+    def _persist_section(self, user_id: int, item_id: int, blueprint: dict[str, Any],
+                         section: dict[str, Any], content: str, attempts: int,
+                         failures: list[str], learning: dict[str, Any],
+                         existing: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+        payload = self._section_payload(
+            blueprint, section, content, attempts, failures, learning
+        )
+        if existing and str(existing["payload"].get("content") or "").strip() == content.strip():
+            return existing
+        asset = self.store.insert_production_asset(
+            user_id, item_id, asset_type="script_section",
+            asset_key=f"{int(section['section_index']):02d}", payload=payload,
+        )
+        if asset:
+            self.store.add_production_event(
+                user_id, item_id, event_type="production_asset_generated",
+                note=f"script_section {int(section['section_index']):02d} v{asset['version']} created",
+            )
+        return asset
+
     def generate_section(self, user_id: int, item_id: int, section_index: int, *,
                          blueprint_asset_id: Optional[int] = None) -> dict[str, Any]:
         item = self._item(user_id, item_id)
@@ -320,9 +468,19 @@ class ProductionAssetService:
             raise ProductionAssetError("Selected asset is not a Script Blueprint.")
         section = self._blueprint_section(blueprint, int(section_index))
         target, key = int(section["target_words"]), f"{int(section_index):02d}"
-        job = self._new_job(user_id, item_id, "script_section", total_sections=1,
-                            request={"section_index": section_index,
-                                     "blueprint_asset_id": blueprint["id"]})
+        job = self.store.get_or_create_active_production_generation_job(
+            user_id, item_id, job_type="script_section", total_sections=1,
+            request={
+                "section_index": int(section_index),
+                "blueprint_asset_id": int(blueprint["id"]),
+                "blueprint_version": int(blueprint["version"]),
+            },
+        )
+        if not job:
+            raise ProductionAssetNotFound("Production item not found.")
+        created = bool(job.pop("_created", True))
+        if not created:
+            return {"generation_job": self.get_job(user_id, item_id, int(job["id"]))}
         self._update_job(
             user_id, item_id, int(job["id"]), current_section=int(section_index)
         )
@@ -330,16 +488,16 @@ class ProductionAssetService:
         def operation() -> dict[str, Any]:
             value = self._structured(
                 system="Write original Vietnamese narration. Return JSON only.",
-                prompt=("Return exactly {\"paragraphs\":[\"...\",\"...\",\"...\",\"...\"]}. "
-                        "Write exactly four paragraph strings of about 35-50 Vietnamese words each "
+                prompt=("Return exactly {\"paragraphs\":[\"...\",\"...\"]}. "
+                        "Write 5-8 coherent paragraph strings of about 45-70 Vietnamese words each "
                         f"as the first chunk of this {target}-word section. "
-                        "Close the array and JSON object after paragraph four. "
+                        "Close the array and JSON object after the prose. "
                         "Do not conclude the overall section if more narration will be needed. "
                         "Stay on topic; use paragraphs; avoid repetition and "
                         "source copying.\nSection:\n" + _json_text(section)
                         + "\nProduction brief:\n" + _json_text(item["production_brief"])
                         + "\nOwner learning for NEW generation only:\n" + _json_text(learning)),
-                num_predict=min(self.section_num_predict, 900),
+                num_predict=min(max(self.section_num_predict, 1400), 2400),
                 validator=self._section_response)
             content, attempts = value["content"], 0
             continuation_failures: list[str] = []
@@ -350,20 +508,22 @@ class ProductionAssetService:
                 try:
                     extra = self._structured(
                         system="Continue original Vietnamese narration without repetition. JSON only.",
-                        prompt=("Return exactly {\"paragraphs\":[\"...\",\"...\",\"...\",\"...\"]} "
-                                "with exactly four new paragraph strings of about 35-50 Vietnamese words "
+                        prompt=("Return exactly {\"paragraphs\":[\"...\",\"...\"]} "
+                                "with 5-8 new coherent paragraph strings of about 45-70 Vietnamese words "
                                 f"each, contributing toward {missing} additional words. "
-                                "Close the array and JSON object after paragraph four. Continue naturally; "
+                                "Close the array and JSON object after the prose. Continue naturally; "
                                 "do not restart or repeat. Existing ending:\n"
                                 + content[-3000:] + "\nGoal:\n" + _json_text(section)),
-                        num_predict=min(self.section_num_predict, 900),
+                        num_predict=min(max(self.section_num_predict, 1400), 2400),
                         validator=self._section_response)
                 except ProductionGenerationError as exc:
                     continuation_failures.append(str(exc)[:500])
                     continue
                 content = self._append_unique(content, extra["content"])
             actual = count_words(content)
-            acceptable = actual >= minimum
+            acceptable = is_section_acceptable(
+                actual, target, self.minimum_word_ratio
+            )
             payload = {
                 "schema_version": "cp7a-v1", "blueprint_asset_id": int(blueprint["id"]),
                 "blueprint_version": int(blueprint["version"]), "section_index": section_index,
@@ -396,38 +556,255 @@ class ProductionAssetService:
     def resume_script(self, user_id: int, item_id: int) -> dict[str, Any]:
         blueprint = self._current_blueprint(user_id, item_id)
         sections = blueprint["payload"].get("sections") or []
-        job = self._new_job(user_id, item_id, "script_resume", total_sections=len(sections),
-                            request={"blueprint_asset_id": blueprint["id"]})
+        request = {
+            "blueprint_asset_id": int(blueprint["id"]),
+            "blueprint_version": int(blueprint["version"]),
+            "section_states": {},
+            "failures": [],
+        }
+        job = self.store.get_or_create_active_production_generation_job(
+            user_id, item_id, job_type="script_resume",
+            total_sections=len(sections), request=request,
+        )
+        if not job:
+            raise ProductionAssetNotFound("Production item not found.")
+        job.pop("_created", None)
+        result = self._process_resume_job(user_id, item_id, job)
+        result["generation_job"] = self.get_job(user_id, item_id, int(job["id"]))
+        return result
+
+    def queue_resume_script(self, user_id: int, item_id: int) -> dict[str, Any]:
+        blueprint = self._current_blueprint(user_id, item_id)
+        sections = blueprint["payload"].get("sections") or []
+        base_request = {
+            "blueprint_asset_id": int(blueprint["id"]),
+            "blueprint_version": int(blueprint["version"]),
+            "section_states": {},
+            "failures": [],
+        }
+        prior = next((
+            row for row in self.store.list_production_generation_jobs(user_id, item_id)
+            if row["job_type"] == "script_resume"
+            and row["status"] in {"partial", "failed"}
+            and int(row["request"].get("blueprint_asset_id") or 0) == int(blueprint["id"])
+            and int(row["request"].get("blueprint_version") or 0) == int(blueprint["version"])
+            and row["request"].get("current_content")
+        ), None)
+        if prior:
+            base_request.update({
+                "current_section": prior["request"].get("current_section"),
+                "current_content": prior["request"].get("current_content"),
+                "current_continuation_attempt": 0,
+            })
+        job = self.store.get_or_create_active_production_generation_job(
+            user_id, item_id, job_type="script_resume",
+            total_sections=len(sections),
+            request=base_request,
+        )
+        if not job:
+            raise ProductionAssetNotFound("Production item not found.")
+        job.pop("_created", None)
+        self._ensure_resume_worker(user_id, item_id, int(job["id"]))
+        return {"generation_job": self.get_job(user_id, item_id, int(job["id"]))}
+
+    def _ensure_resume_worker(self, user_id: int, item_id: int, job_id: int) -> None:
+        with _RESUME_WORKERS_LOCK:
+            worker = _RESUME_WORKERS.get(job_id)
+            if worker and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._resume_worker, args=(user_id, item_id, job_id),
+                name=f"cp7a-resume-{job_id}", daemon=True,
+            )
+            _RESUME_WORKERS[job_id] = worker
+            worker.start()
+
+    def _resume_worker(self, user_id: int, item_id: int, job_id: int) -> None:
+        try:
+            job = self.get_job(user_id, item_id, job_id)
+            self._process_resume_job(user_id, item_id, job)
+        except Exception:
+            # The job itself is updated by _process_resume_job. A worker must
+            # not turn an already-persisted failure into an uncaught thread.
+            pass
+        finally:
+            with _RESUME_WORKERS_LOCK:
+                _RESUME_WORKERS.pop(job_id, None)
+
+    def _process_resume_job(self, user_id: int, item_id: int,
+                            job: dict[str, Any]) -> dict[str, Any]:
+        blueprint_id = int(job["request"].get("blueprint_asset_id") or 0)
+        blueprint = self.get_asset(user_id, item_id, blueprint_id)
+        if blueprint["asset_type"] != "script_blueprint":
+            raise ProductionAssetError("Selected asset is not a Script Blueprint.")
+        sections = blueprint["payload"].get("sections") or []
         job_id = int(job["id"])
-        self._update_job(user_id, item_id, job_id, status="running",
-                         current_stage="sections", started_at=time.time())
-        skipped, generated = [], []
+        request = dict(job["request"] or {})
+        states = dict(request.get("section_states") or {})
+        failures = list(request.get("failures") or [])
+        learning = self._learning_context(user_id, "script_section")
+        generated, preserved = [], []
+        self._update_job(
+            user_id, item_id, job_id, status="running", current_stage="sections",
+            started_at=job.get("started_at") or time.time(), error=None,
+        )
         try:
             for section in sections:
                 index = int(section["section_index"])
-                versions = self.store.list_production_assets(
-                    user_id, item_id, asset_type="script_section", asset_key=f"{index:02d}")
-                current = next((row for row in versions
-                    if row["status"] not in {"rejected", "superseded"}
-                    and row["payload"].get("blueprint_asset_id") == blueprint["id"]
-                    and row["payload"].get("budget_acceptable")), None)
-                if current:
-                    skipped.append(index)
-                else:
-                    self.generate_section(user_id, item_id, index,
-                                          blueprint_asset_id=int(blueprint["id"]))
-                    generated.append(index)
-                done = len(skipped) + len(generated)
-                self._update_job(user_id, item_id, job_id, current_section=index,
-                    completed_sections=done, progress=round(done / len(sections) * 100, 1))
+                key = str(index)
+                current = self._section_asset(user_id, item_id, index, blueprint_id)
+                current_state = self.section_state(
+                    user_id, item_id, section, blueprint_id
+                )
+                if current_state in {"COMPLETE", "APPROVED"}:
+                    states[key] = {
+                        "state": current_state,
+                        "actual_words": count_words(str(current["payload"].get("content") or "")),
+                        "target_words": int(section["target_words"]),
+                    }
+                    preserved.append(index)
+                    self._persist_resume_progress(
+                        user_id, item_id, job_id, request, states, failures,
+                        index, len(preserved) + len(generated), len(sections),
+                    )
+                    continue
+
+                work_content = (
+                    str(request.get("current_content") or "")
+                    if int(request.get("current_section") or 0) == index else ""
+                )
+                if current and not work_content:
+                    work_content = str(current["payload"].get("content") or "")
+                attempts = (
+                    int(request.get("current_continuation_attempt") or 0)
+                    if int(request.get("current_section") or 0) == index else 0
+                )
+                states[key] = {
+                    "state": "ACTIVE", "actual_words": count_words(work_content),
+                    "target_words": int(section["target_words"]),
+                    "continuation_attempt": attempts, "failures": [],
+                }
+                self._persist_resume_progress(
+                    user_id, item_id, job_id, request, states, failures,
+                    index, len(preserved) + len(generated), len(sections),
+                    stage="generating",
+                )
+
+                def on_progress(content: str, attempt: int, errors: list[str],
+                                section_index: int = index) -> None:
+                    request["current_section"] = section_index
+                    request["current_content"] = content
+                    request["current_continuation_attempt"] = attempt
+                    states[str(section_index)] = {
+                        "state": "ACTIVE", "actual_words": count_words(content),
+                        "target_words": int(section["target_words"]),
+                        "continuation_attempt": attempt, "failures": errors[-8:],
+                    }
+                    self._persist_resume_progress(
+                        user_id, item_id, job_id, request, states, failures,
+                        section_index, len(preserved) + len(generated), len(sections),
+                        stage="continuing",
+                    )
+
+                try:
+                    content, attempts, continuation_failures = self._section_content(
+                        self._item(user_id, item_id), section, learning,
+                        initial_content=work_content, initial_attempts=attempts,
+                        on_progress=on_progress,
+                    )
+                    asset = self._persist_section(
+                        user_id, item_id, blueprint, section, content, attempts,
+                        continuation_failures, learning, existing=current,
+                    )
+                    if not asset:
+                        raise ProductionAssetNotFound("Production item not found.")
+                    actual = int(asset["payload"]["actual_words"])
+                    acceptable = is_section_acceptable(
+                        actual, int(section["target_words"]), self.minimum_word_ratio
+                    )
+                    state = "COMPLETE" if acceptable else "PARTIAL"
+                    states[key] = {
+                        "state": state, "actual_words": actual,
+                        "target_words": int(section["target_words"]),
+                        "continuation_attempt": attempts,
+                        "failures": continuation_failures[-8:],
+                    }
+                    request["current_content"] = ""
+                    request["current_continuation_attempt"] = 0
+                    if acceptable:
+                        generated.append(index)
+                    else:
+                        failures.append(
+                            f"Section {index} reached {actual}/{section['target_words']} "
+                            f"words after {attempts} bounded continuation attempts."
+                        )
+                except (OllamaProviderError, ProductionGenerationError) as exc:
+                    message = str(exc)[:500]
+                    failures.append(f"Section {index}: {message}")
+                    states[key] = {
+                        "state": "FAILED_RETRYABLE",
+                        "actual_words": count_words(work_content),
+                        "target_words": int(section["target_words"]),
+                        "continuation_attempt": attempts,
+                        "failures": [message],
+                    }
+                except ProductionAssetError as exc:
+                    message = str(exc)[:500]
+                    failures.append(f"Section {index}: {message}")
+                    states[key] = {
+                        "state": "FAILED_TERMINAL",
+                        "actual_words": count_words(work_content),
+                        "target_words": int(section["target_words"]),
+                        "continuation_attempt": attempts,
+                        "failures": [message],
+                    }
+                self._persist_resume_progress(
+                    user_id, item_id, job_id, request, states, failures,
+                    index, len(preserved) + len(generated), len(sections),
+                    stage="sections",
+                )
         except Exception as exc:
-            self._update_job(user_id, item_id, job_id, status="failed", current_stage="failed",
-                             error=str(exc)[:1000], completed_at=time.time())
+            self._update_job(
+                user_id, item_id, job_id, status="failed", current_stage="failed",
+                error=str(exc)[:1000], completed_at=time.time(),
+            )
             raise
-        self._update_job(user_id, item_id, job_id, status="completed",
-                         current_stage="completed", progress=100., completed_at=time.time())
-        return {"generation_job": self.get_job(user_id, item_id, job_id),
-                "generated_sections": generated, "preserved_sections": skipped}
+
+        terminal = any(value.get("state") == "FAILED_TERMINAL" for value in states.values())
+        retryable = any(value.get("state") == "FAILED_RETRYABLE" for value in states.values())
+        incomplete = any(value.get("state") in {
+            "PARTIAL", "MISSING", "ACTIVE", "FAILED_RETRYABLE", "FAILED_TERMINAL"
+        } for value in states.values()) or len(states) < len(sections)
+        status = "failed" if terminal else ("partial" if incomplete or retryable else "completed")
+        self._update_job(
+            user_id, item_id, job_id, status=status,
+            current_stage=("failed" if terminal else status),
+            completed_sections=len(preserved) + len(generated),
+            progress=round((len(preserved) + len(generated)) / len(sections) * 100, 1)
+            if sections else 100.,
+            error=("; ".join(failures[-4:])[:1000] if failures else None),
+            completed_at=time.time(),
+            request={**request, "section_states": states, "failures": failures[-20:]},
+        )
+        return {
+            "generated_sections": generated, "preserved_sections": preserved,
+            "section_states": states,
+        }
+
+    def _persist_resume_progress(
+        self, user_id: int, item_id: int, job_id: int, request: dict[str, Any],
+        states: dict[str, Any], failures: list[str], current_section: int,
+        completed: int, total: int, *, stage: str = "sections",
+    ) -> None:
+        request["current_section"] = current_section
+        request["section_states"] = states
+        request["failures"] = failures[-20:]
+        self._update_job(
+            user_id, item_id, job_id, current_section=current_section,
+            completed_sections=completed,
+            progress=round(completed / total * 100, 1) if total else 100.,
+            current_stage=stage, request=request,
+        )
 
     def assemble_script(self, user_id: int, item_id: int) -> dict[str, Any]:
         self._item(user_id, item_id)
@@ -440,7 +817,10 @@ class ProductionAssetService:
             current = next((row for row in versions
                 if row["status"] not in {"rejected", "superseded"}
                 and row["payload"].get("blueprint_asset_id") == blueprint["id"]
-                and row["payload"].get("budget_acceptable")), None)
+                and is_section_acceptable(
+                    count_words(str(row["payload"].get("content") or "")),
+                    int(section["target_words"]), self.minimum_word_ratio,
+                )), None)
             if not current:
                 raise ProductionAssetError(f"Section {index} is missing or below its word budget.")
             selected.append(current)
@@ -459,7 +839,9 @@ class ProductionAssetService:
             "section_count": len(selected),
             "source_section_versions": [{"section_index": row["payload"]["section_index"],
                 "asset_id": row["id"], "version": row["version"]} for row in selected],
-            "budget_acceptable": actual >= math.ceil(target * self.minimum_word_ratio),
+            "budget_acceptable": is_section_acceptable(
+                actual, target, self.minimum_word_ratio
+            ),
         }
         asset = self.store.insert_production_asset(
             user_id, item_id, asset_type="script_draft", payload=payload)
@@ -648,13 +1030,28 @@ class ProductionAssetService:
         for source in sources:
             row = self.store.get_production_asset(
                 user_id, item_id, int(source.get("asset_id") or 0))
+            section = self._blueprint_section(
+                blueprint, int(source.get("section_index") or 0)
+            )
+            target_words = int(
+                section.get("target_words")
+                or row["payload"].get("target_words")
+                or 0
+            ) if row else 0
+            section_acceptable = (
+                is_section_acceptable(
+                    count_words(str(row["payload"].get("content") or "")),
+                    target_words, self.minimum_word_ratio,
+                )
+                if target_words else bool(row and row["payload"].get("budget_acceptable"))
+            )
             if (not row or row["asset_type"] != "script_section"
                     or int(row["version"]) != int(source.get("version") or 0)
                     or int(row["payload"].get("section_index") or 0)
                         != int(source.get("section_index") or 0)
                     or int(row["payload"].get("blueprint_asset_id") or 0)
                         != int(blueprint["id"])
-                    or not row["payload"].get("budget_acceptable")):
+                    or not section_acceptable):
                 raise ProductionAssetError("Script Draft references an invalid section version.")
 
     def _complete_task_for_asset(self, user_id: int, item_id: int,
@@ -703,7 +1100,11 @@ class ProductionAssetService:
                 "Only draft or review asset versions can be rejected."
             )
         if decision == "approved" and asset["asset_type"] == "script_draft":
-            if not asset["payload"].get("budget_acceptable"):
+            if not is_section_acceptable(
+                int(asset["payload"].get("actual_total_words") or 0),
+                int(asset["payload"].get("target_total_words") or 0),
+                self.minimum_word_ratio,
+            ):
                 raise ProductionAssetError("Script Draft does not meet the minimum word budget.")
             self._validate_draft_sources(user_id, item_id, asset["payload"])
         elif decision == "approved":
@@ -778,7 +1179,11 @@ class ProductionAssetService:
                 reasons.append(f"approved {asset_type} is missing")
         script = approved.get("script_draft")
         if script:
-            if not script["payload"].get("budget_acceptable"):
+            if not is_section_acceptable(
+                int(script["payload"].get("actual_total_words") or 0),
+                int(script["payload"].get("target_total_words") or 0),
+                self.minimum_word_ratio,
+            ):
                 reasons.append("script word budget is below the minimum")
             try:
                 self._validate_draft_sources(user_id, item_id, script["payload"])
@@ -839,7 +1244,11 @@ class ProductionAssetService:
         return {"status": "approved" if passed else "failed", "passed": passed,
             "reasons": reasons, "checks": {
                 "approved_script": "script_draft" in approved,
-                "word_budget": bool(script and script["payload"].get("budget_acceptable")),
+                "word_budget": bool(script and is_section_acceptable(
+                    int(script["payload"].get("actual_total_words") or 0),
+                    int(script["payload"].get("target_total_words") or 0),
+                    self.minimum_word_ratio,
+                )),
                 "required_sections": bool(
                     script and not any("section" in reason.casefold() for reason in reasons)),
                 "visual_plan_safe": valid["visual_plan"],
