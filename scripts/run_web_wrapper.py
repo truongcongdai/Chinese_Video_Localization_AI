@@ -6,6 +6,11 @@ import sys
 import os
 from pathlib import Path
 
+# Child Python entry points (Demucs/Edge TTS) must be able to print Unicode
+# file names even when this executable starts from a legacy Windows console.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+os.environ.setdefault("PYTHONUTF8", "1")
+
 # Add src directory to sys.path
 script_dir = Path(__file__).parent.resolve()
 src_dir = script_dir.parent / "src"

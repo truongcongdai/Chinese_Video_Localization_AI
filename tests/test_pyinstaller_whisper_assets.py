@@ -4,8 +4,8 @@ from pathlib import Path
 def test_pyinstaller_spec_collects_whisper_runtime_assets():
     spec = Path("build_exe.spec").read_text(encoding="utf-8")
 
-    assert 'collect_data_files("whisper", includes=["assets/*"])' in spec
-    assert 'Path(source).name == "mel_filters.npz"' in spec
+    assert 'Path(whisper.__file__).resolve().parent / "assets" / "mel_filters.npz"' in spec
+    assert 'datas.append((str(whisper_asset), "whisper/assets"))' in spec
     assert "'whisper'" in spec
     assert "'openai.whisper'" not in spec
 

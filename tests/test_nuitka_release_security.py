@@ -89,7 +89,9 @@ def test_nuitka_pipeline_caches_dependency_installation():
 
     assert "build-dependencies.sha256" in script
     assert "Dependency cache hit" in script
-    assert "pip install --no-deps -e ." in script
+    assert '$env:PYTHONPATH = Join-Path $ProjectRoot "src"' in script
+    assert '$env:NUITKA_CACHE_DIR = Join-Path $OutputRoot "nuitka-cache"' in script
+    assert "pip install --no-deps -e ." not in script
     assert '"setup.py"' in script
     assert "Where-Object { Test-Path" in script
     assert "Join-Path $ProjectRoot $_" in script

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -196,6 +197,14 @@ class DemucsProcessor:
         return cmd
 
     def _run_checked(self, cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+        # Demucs itself prints the input path before processing it.  On a
+        # Vietnamese Windows installation a detached/frozen process can still
+        # inherit cp1252, which crashes before inference when that path contains
+        # Chinese/Vietnamese characters.  Set the child interpreter explicitly;
+        # decoding stdout as UTF-8 in this process is too late to prevent that.
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -204,6 +213,7 @@ class DemucsProcessor:
             errors="replace",
             check=False,
             timeout=timeout,
+            env=child_env,
         )
         if result.returncode != 0:
             error_msg = result.stderr or result.stdout or "unknown error"

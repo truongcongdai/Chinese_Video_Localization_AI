@@ -1763,12 +1763,12 @@ class LocalizationService:
                     voice=voice,
                 )
             except Exception as exc:
-                self.logger.warning(
-                    "Skipping TTS for segment %d after synthesis failed; subtitles remain: %s",
+                self.logger.error(
+                    "TTS failed for segment %d; refusing to create an incomplete dub: %s",
                     idx,
                     exc,
                 )
-                continue
+                raise RuntimeError(f"TTS segment {idx + 1} failed: {exc}") from exc
             if seg.has_timing:
                 next_start = next((item.start for item in translated_segments[idx + 1:] if item.has_timing), None)
                 clips.append(self._fit_tts_clip_to_window(
@@ -1802,6 +1802,7 @@ class LocalizationService:
         """
         segments_dir = output_dir / "tts_segments"
         segments_dir.mkdir(parents=True, exist_ok=True)
+        failures: List[Tuple[int, Exception]] = []
 
         async def synthesize_segment(idx: int, seg: TranscriptSegment) -> Optional[Tuple[int, TranscriptSegment, Path]]:
             """Synthesize a single segment with concurrency control."""
@@ -1819,11 +1820,12 @@ class LocalizationService:
                         voice=voice,
                     )
             except Exception as exc:
-                self.logger.warning(
-                    "Skipping TTS for segment %d after synthesis failed; subtitles remain: %s",
+                self.logger.error(
+                    "TTS failed for segment %d; the incomplete dub will not be rendered: %s",
                     idx,
                     exc,
                 )
+                failures.append((idx, exc))
                 return None
 
             return idx, seg, clip_path
@@ -1834,6 +1836,14 @@ class LocalizationService:
             for idx, seg in enumerate(translated_segments)
         ]
         results = await asyncio.gather(*tasks)
+
+        if failures:
+            failed_numbers = ", ".join(str(index + 1) for index, _exc in failures[:12])
+            detail = str(failures[0][1])
+            raise RuntimeError(
+                f"Không tạo được voice cho {len(failures)} đoạn (đoạn {failed_numbers}). "
+                f"Lỗi đầu tiên: {detail}"
+            )
 
         completed = [item for item in results if item is not None]
         clips, playback_segments = self._schedule_tts_clips(
@@ -2042,14 +2052,9 @@ class LocalizationService:
             )
             detector = OnScreenTextDetector(languages=resolved_ocr_languages)
         windows = [(s.start, s.end) for s in source_segments]
-        learning_count = max(1, int(self.config.text_cover_learning_windows))
-        learning_windows = sorted(
-            windows, key=lambda item: item[1] - item[0], reverse=True
-        )[:learning_count]
-
         try:
-            learned_regions = tuple(detector.detect_regions_for_windows(
-                video_path, learning_windows,
+            detected_regions = list(detector.detect_regions_for_windows(
+                video_path, windows,
                 samples_per_window=self.config.text_cover_samples_per_segment,
                 exclude_regions_fractional=self.config.watermark_exclude_regions_fractional,
                 fill_undetected_windows=False,
@@ -2060,23 +2065,22 @@ class LocalizationService:
             )
             return None
 
-        if not learned_regions:
+        if not detected_regions:
             self.logger.info("LocalizationService: no on-screen text detected; skipping text-cover overlays")
             return None
 
-        largest = max(learned_regions, key=lambda region: region.width * region.height)
-        regions = [
-            TextRegion(
-                start=start, end=end,
-                x=largest.x, y=largest.y,
-                width=largest.width, height=largest.height,
-            )
-            for start, end in windows
-        ]
+        # Preserve per-cue geometry.  Reusing the largest OCR result for every
+        # cue allowed a single merged title/background detection to create a
+        # white rectangle covering most of the video.  Missing low-contrast
+        # cues are filled from their nearest time-local subtitle band instead.
+        regions = self._fill_missing_text_regions(
+            windows,
+            detected_regions,
+            detector.last_typical_line_height,
+        )
         self.logger.info(
-            "LocalizationService: learned one %dx%d subtitle cover from %d cue(s); "
-            "reusing it across %d cue(s)",
-            largest.width, largest.height, len(learning_windows), len(windows),
+            "LocalizationService: detected %d subtitle cover(s) and resolved %d/%d cue(s)",
+            len(detected_regions), len(regions), len(windows),
         )
 
         # Match detected regions back to the translated sentence at the same

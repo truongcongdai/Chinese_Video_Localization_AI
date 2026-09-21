@@ -133,6 +133,8 @@ def test_wav_command_uses_demucs_default_format_and_segment_flag(tmp_path: Path,
     assert cmd[cmd.index("--segment") + 1] == "12"
     assert captured["kwargs"]["encoding"] == "utf-8"
     assert captured["kwargs"]["errors"] == "replace"
+    assert captured["kwargs"]["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert captured["kwargs"]["env"]["PYTHONUTF8"] == "1"
 
 
 def test_mp3_command_uses_demucs_mp3_flag(tmp_path: Path, monkeypatch):

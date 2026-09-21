@@ -93,9 +93,30 @@ def test_default_render_does_not_add_platform_watermark(tmp_path: Path):
     cmd = Renderer()._build_command(video, audio, output)
 
     assert "-filter_complex" not in cmd
-    assert "-filter_complex_script" not in cmd
+    assert "-/filter:v" not in cmd
     assert "overlay=" not in " ".join(cmd)
     assert cmd[cmd.index("-c:v") + 1] == "copy"
+
+
+def test_text_overlay_escapes_windows_font_path():
+    renderer = Renderer()
+    overlay = TextOverlay(
+        start=0,
+        end=1,
+        x=10,
+        y=20,
+        width=200,
+        height=40,
+        text="Xin chao",
+        font_path=r"C:\Windows\Fonts\arial.ttf",
+        font_size=24,
+    )
+
+    filters = renderer._build_text_overlay_filters([overlay], frame_w=640, frame_h=360)
+    graph = ",".join(filters)
+
+    assert r"fontfile='C\:\\Windows\\Fonts\\arial.ttf'" in graph
+    assert r"fontfile='C:\Windows" not in graph
 
 
 def test_user_logo_overlay_is_opt_in_brand_watermark(tmp_path: Path):
@@ -340,3 +361,33 @@ def test_ffmpeg_timeout_allows_active_progress(monkeypatch):
 
     assert returncode == 0
     assert "frame=500" in stderr_text
+
+
+def test_long_video_filter_chain_uses_filter_file_argument(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.mp3"
+    output = tmp_path / "output.mp4"
+    renderer = Renderer()
+    long_filter = "drawtext=text='" + ("x" * 13000) + "'"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video), "-i", str(audio),
+        "-map", "1:a", "-map", "0:v", "-vf", long_filter,
+        "-c:v", "libx264", str(output),
+    ]
+
+    rewritten, cleanup_paths = renderer._externalize_long_filter_args(cmd)
+
+    try:
+        assert "-/filter:v" in rewritten
+        assert "-vf" not in rewritten
+        assert rewritten[rewritten.index("-map") + 1] == "1:a"
+        video_map_index = rewritten.index("-map", rewritten.index("-map") + 1)
+        assert rewritten[video_map_index + 1] == "0:v"
+        script_path = Path(rewritten[rewritten.index("-/filter:v") + 1])
+        assert script_path in cleanup_paths
+        script_text = script_path.read_text(encoding="utf-8")
+        assert script_text.startswith("drawtext=")
+        assert script_text.endswith("'")
+    finally:
+        for path in cleanup_paths:
+            path.unlink(missing_ok=True)

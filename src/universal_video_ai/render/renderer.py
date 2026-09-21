@@ -6,7 +6,7 @@ from pathlib import Path
 import logging
 import shutil
 import subprocess
-import sys
+import tempfile
 import time
 from typing import List, Optional, Tuple
 
@@ -419,7 +419,7 @@ class Renderer:
 
             cleanup_enable_expr = f"between(t\\,{cleanup_start:.3f}\\,{cleanup_end:.3f})"
             font_path = overlay.font_path or self.config.default_overlay_font_path
-            font_clause = f"fontfile='{font_path}':" if font_path else ""
+            font_clause = f"fontfile={_escape_filter_path(str(font_path))}:" if font_path else ""
 
             # Clean the original glyphs before the replacement box is painted.
             # delogo works as a local adaptive blur/inpaint approximation and is
@@ -1173,23 +1173,13 @@ class Renderer:
         """
         import threading
 
-        # On Windows, use shell=True to bypass MAX_PATH (260 char) limit
-        # when command line is very long (e.g., many text overlays)
-        use_shell = sys.platform == 'win32'
-        if use_shell:
-            # Convert list to string for shell execution
-            cmd_str = subprocess.list2cmdline(cmd)
-            process = subprocess.Popen(
-                cmd_str,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-                shell=True,
-            )
-        else:
+        cmd, cleanup_paths = self._externalize_long_filter_args(cmd)
+
+        # Pass the argv vector directly on every platform.  ``shell=True``
+        # does not bypass Windows path limits; it adds cmd.exe quoting and a
+        # much smaller command-line limit, which is especially harmful for
+        # subtitle filter graphs containing Unicode and punctuation.
+        try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -1199,6 +1189,13 @@ class Renderer:
                 errors='replace',
                 bufsize=1,
             )
+        except Exception:
+            for path in cleanup_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
 
         stderr_lines: List[str] = []
         last_heartbeat = time.monotonic()
@@ -1240,4 +1237,68 @@ class Renderer:
         reader_thread.join(timeout=5.0)
         with lock:
             stderr_text = "".join(stderr_lines) or "unknown error"
+        for path in cleanup_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception as exc:
+                self.logger.debug("Could not remove temporary FFmpeg filter script %s: %s", path, exc)
         return returncode, stderr_text
+
+    def _externalize_long_filter_args(self, cmd: List[str]) -> Tuple[List[str], List[Path]]:
+        """
+        Move large FFmpeg filter graphs out of argv and into script files.
+
+        Windows has a hard command-line length limit. Large OCR text-cover
+        jobs can generate dozens of drawtext/drawbox filters, which easily
+        trips that limit before FFmpeg even starts. FFmpeg supports reading
+        both simple and complex filter graphs from files, keeping argv short
+        while preserving the exact same filter contents.
+        """
+        # Keep this comfortably below the Windows command-line ceiling because
+        # paths, quoting, and environment details also count toward CreateProcess.
+        # In practice long Unicode drawtext chains can trip WinError 206 below
+        # the documented limit, so externalize early.
+        command_text = subprocess.list2cmdline(cmd)
+        if len(command_text) < 12000:
+            return cmd, []
+
+        rewritten = list(cmd)
+        cleanup_paths: List[Path] = []
+
+        for index, arg in enumerate(list(rewritten[:-1])):
+            if arg not in {"-vf", "-filter_complex"}:
+                continue
+            graph_index = index + 1
+            if graph_index >= len(rewritten):
+                continue
+            graph = rewritten[graph_index]
+            if len(graph) < 2048 and len(subprocess.list2cmdline(rewritten)) < 12000:
+                continue
+
+            script_path = self._write_filter_script(graph)
+            cleanup_paths.append(script_path)
+            rewritten[index] = "-/filter:v" if arg == "-vf" else "-/filter_complex"
+            rewritten[graph_index] = str(script_path)
+            self.logger.info(
+                "FFmpeg command is too long for argv; moved %s graph (%d chars) to %s",
+                arg,
+                len(graph),
+                script_path,
+            )
+
+        return rewritten, cleanup_paths
+
+    def _write_filter_script(self, graph: str) -> Path:
+        script_dir = TEMP_DIR / "ffmpeg_filter_scripts"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".ffgraph",
+            prefix="render_",
+            dir=script_dir,
+            delete=False,
+        )
+        with handle:
+            handle.write(graph)
+        return Path(handle.name)

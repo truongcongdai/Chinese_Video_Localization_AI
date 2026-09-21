@@ -1070,7 +1070,7 @@ def test_static_watermarks_are_detected_even_when_subtitle_cover_is_disabled(tmp
     detector.detect_persistent_text_regions.assert_called_once()
 
 
-def test_text_cover_learns_largest_box_once_and_reuses_it(tmp_path: Path):
+def test_text_cover_preserves_per_cue_geometry_and_interpolates_missing_cue(tmp_path: Path):
     detector = MagicMock()
     detector.last_typical_line_height = 30
     detector.detect_regions_for_windows.return_value = [
@@ -1095,9 +1095,13 @@ def test_text_cover_learns_largest_box_once_and_reuses_it(tmp_path: Path):
     overlays = service._build_text_overlays(tmp_path / "video.mp4", source, translated, "zh")
 
     assert overlays is not None and len(overlays) == 3
-    assert {(item.x, item.y, item.width, item.height) for item in overlays} == {(80, 590, 500, 70)}
+    assert (overlays[0].x, overlays[0].y, overlays[0].width, overlays[0].height) == (100, 600, 300, 50)
+    assert (overlays[2].x, overlays[2].y, overlays[2].width, overlays[2].height) == (80, 590, 500, 70)
+    assert 80 <= overlays[1].x <= 100
+    assert 590 <= overlays[1].y <= 600
+    assert overlays[1].width < 500
     detector.detect_regions_for_windows.assert_called_once()
-    assert detector.detect_regions_for_windows.call_args.args[1] == [(4.0, 8.0), (0.0, 2.0)]
+    assert detector.detect_regions_for_windows.call_args.args[1] == [(0.0, 2.0), (2.0, 3.0), (4.0, 8.0)]
 
 
 def test_missing_visual_windows_are_interpolated_into_one_canonical_clock():

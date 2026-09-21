@@ -31,3 +31,44 @@ cookies/*
 .vscode/
 
 *.log
+# Python virtual environments
+.venv/
+.venv-build/
+venv/
+
+# Build and packaging output
+build/
+dist/
+*.dist/
+*.build/
+*.onefile-build/
+*.spec.log
+*.zip
+*.rar
+*.7z
+
+# Runtime data, caches, databases, and user/browser state
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db-*
+local_data/*
+!local_data/.gitkeep
+scripts/local_data/*
+!scripts/local_data/.gitkeep
+cookies/*
+logs/*
+temp/*
+output/*
+web_jobs/*
+
+# Generated media/artifacts
+*.mp4
+*.wav
+*.mp3
+*.srt
+*.ass
+*.png
+*.jpg
+*.jpeg

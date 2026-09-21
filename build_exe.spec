@@ -31,13 +31,17 @@ datas = [
 # openai-whisper imports its Python package as ``whisper`` and loads the mel
 # filter bank from package data at runtime. Hidden imports alone do not copy
 # ``whisper/assets/mel_filters.npz`` into PyInstaller's temporary _MEI folder.
-whisper_datas = collect_data_files("whisper", includes=["assets/*"])
-if not any(Path(source).name == "mel_filters.npz" for source, _destination in whisper_datas):
+import whisper
+whisper_asset = Path(whisper.__file__).resolve().parent / "assets" / "mel_filters.npz"
+if not whisper_asset.is_file():
     raise RuntimeError(
         "PyInstaller cannot find whisper/assets/mel_filters.npz. "
         "Install openai-whisper in the build environment before packaging."
     )
-datas += whisper_datas
+# Use an explicit destination.  Depending on the PyInstaller hook version,
+# collect_data_files previously flattened this file and Whisper consequently
+# looked for it in a non-existent ``_MEI.../whisper/assets`` directory.
+datas.append((str(whisper_asset), "whisper/assets"))
 
 # Collect hidden imports for heavy dependencies
 hiddenimports = [

@@ -89,9 +89,11 @@ if ($CachedDependencyHash -ne $DependencyHash) {
 } else {
     Write-Host "Dependency cache hit: requirements unchanged."
 }
-# Refresh only this project's editable metadata without resolving the complete
-# dependency graph on every build.
-& $Python -m pip install --no-deps -e .
+# Compile the checked-out source directly.  An editable pip install is neither
+# required by Nuitka nor desirable in a release build: on Windows pip can spend
+# many minutes scanning stale compiler output before it creates the .pth file.
+$env:PYTHONPATH = Join-Path $ProjectRoot "src"
+$env:NUITKA_CACHE_DIR = Join-Path $OutputRoot "nuitka-cache"
 
 # Fail before the expensive compile if Whisper's runtime data is incomplete.
 $WhisperAsset = & $Python -c "import pathlib, whisper; print(pathlib.Path(whisper.__file__).resolve().parent / 'assets' / 'mel_filters.npz')"
@@ -106,6 +108,9 @@ $env:WEB_DB_PATH = Join-Path $PreflightData "database.sqlite3"
 $env:YOUTUBE_RESEARCH_ENABLED = "false"
 $env:CONTENT_OS_ENABLED = "false"
 $env:PATH = "$FfmpegBin;$env:PATH"
+# Never write preflight bytecode beside live application modules.  A running
+# desktop server may have those __pycache__ files open on Windows.
+$env:PYTHONPYCACHEPREFIX = Join-Path $OutputRoot "preflight-pycache"
 & $Python -m compileall -q src packaging scripts
 if ($LASTEXITCODE -ne 0) {
     throw "Python compile preflight thất bại."
@@ -157,6 +162,11 @@ $env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightCache
 if ($LASTEXITCODE -ne 0) {
     throw "Không tải được Chromium dùng cho tính năng Douyin/browser."
 }
+
+# MSVC can run out of heap while optimizing very large generated C modules
+# from typed SDK packages. Keep the generated C unoptimized and give the
+# compiler more heap; the application hot paths remain Python/runtime-bound.
+$env:_CL_ = "/Od /Zm2000"
 
 # Transformers' developer CLI is not used at runtime. Nuitka 4.1.3's
 # transformers plugin corrupts an f-string while rewriting this module;

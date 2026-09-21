@@ -78,14 +78,14 @@ def test_history_bulk_download_and_status_filter_are_available() -> None:
     assert '$("#history-bulk-download").disabled = selectedHistoryJobs.size === 0;' in app_js
     assert 'data-cancel="${job.id}"' in app_js
     assert '/cancel`' in app_js
-    assert 'app.js?v=20260826-split-upload' in html
+    assert 'app.js?v=20260914-editorial-workbench' in html
 
 
 def test_workbench_visual_system_is_loaded() -> None:
     html = _read_static_file("index.html")
     css = _read_static_file("app.css")
 
-    assert "app.css?v=20260826-language-size" in html
+    assert "app.css?v=20260914-editorial-workbench" in html
     assert 'class="app-identity"' in html
     assert "Workbench UI" in css
     assert "--accent:#c84a30" in css
@@ -121,7 +121,7 @@ def test_remix_panel_is_toggleable_and_cache_busted() -> None:
     assert "function syncRemixPanel()" in app_js
     assert '$("#remix-panel").classList.toggle("hidden", !ev.target.checked);' not in app_js
     assert 'subtitle_offset_seconds: parseFloat($("#subtitle-offset-input").value) || 0' in app_js
-    assert 'app.js?v=20260826-split-upload' in html
+    assert 'app.js?v=20260914-editorial-workbench' in html
 
 
 def test_history_does_not_render_redundant_statistics_dashboard() -> None:
