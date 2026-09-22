@@ -136,6 +136,7 @@ class LocalizationConfig:
         # to beat real subtitles in the OCR density vote because they are
         # present in every sampled frame. Exclude only that corner, leaving
         # upper-centre captions detectable.
+        (0.00, 0.00, 0.35, 0.35),
         (0.65, 0.00, 1.00, 0.35),
         # Common Douyin/TikTok watermark/account area.
         (0.80, 0.72, 1.0, 1.0),

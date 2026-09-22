@@ -401,7 +401,7 @@ class OnScreenTextDetector:
         video_path: Path,
         at_seconds: float,
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.06, 0.55, 0.94, 0.96,
+            0.14, 0.20, 0.86, 0.96,
         ),
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
     ) -> str:
@@ -440,7 +440,7 @@ class OnScreenTextDetector:
         min_score: float = 0.72,
         min_matches: int = 2,
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.06, 0.55, 0.94, 0.96,
+            0.14, 0.20, 0.86, 0.96,
         ),
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
         use_text_ocr_fallback: bool = False,
@@ -572,7 +572,7 @@ class OnScreenTextDetector:
         min_ocr_match_score: float = 0.68,
         max_subtitle_early_start: float = 0.15,
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.06, 0.55, 0.94, 0.96,
+            0.14, 0.20, 0.86, 0.96,
         ),
     ) -> List[Optional[SubtitleTimingWindow]]:
         """Detect per-cue hard-sub timing windows near ASR segments.
@@ -602,7 +602,7 @@ class OnScreenTextDetector:
                 return 0.0
             frame_cache[key] = self._subtitle_presence_score_for_region(
                 frame_path,
-                region_fractional=subtitle_candidate_region_fractional or (0.06, 0.55, 0.94, 0.96),
+                region_fractional=subtitle_candidate_region_fractional or (0.14, 0.20, 0.86, 0.96),
             )
             return frame_cache[key]
 
@@ -1123,7 +1123,7 @@ class OnScreenTextDetector:
         max_lines_per_region: float = 2.4,
         exclude_regions_fractional: Sequence[Tuple[float, float, float, float]] = (),
         subtitle_candidate_region_fractional: Optional[Tuple[float, float, float, float]] = (
-            0.06, 0.55, 0.94, 0.96,
+            0.14, 0.20, 0.86, 0.96,
         ),
         fill_undetected_windows: bool = True,
     ) -> List[TextRegion]:
@@ -1263,7 +1263,7 @@ class OnScreenTextDetector:
                         max_presence_score,
                         self._subtitle_presence_score_for_region(
                             frame_path,
-                            subtitle_candidate_region_fractional or (0.06, 0.55, 0.94, 0.96),
+                            subtitle_candidate_region_fractional or (0.14, 0.20, 0.86, 0.96),
                         ),
                     )
                     raw_boxes.extend(self._detect_boxes_in_frame(frame_path))

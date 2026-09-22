@@ -72,3 +72,6 @@ web_jobs/*
 *.png
 *.jpg
 *.jpeg
+
+# Vendor binaries (too large for GitHub)
+vendor/

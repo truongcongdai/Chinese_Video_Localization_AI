@@ -54,7 +54,8 @@ def create_localization_service(
         ocr_languages: tuple[str, ...] = ocr_language_map.AUTO_OCR_SENTINEL,
         text_cover_samples_per_segment: int = 2,
         watermark_exclude_regions_fractional: tuple[tuple[float, float, float, float], ...] = (
-            (0.65, 0.00, 1.00, 0.35),
+            (0.00, 0.00, 0.35, 0.35),
+        (0.65, 0.00, 1.00, 0.35),
             (0.80, 0.72, 1.0, 1.0),
         ),
         global_subtitle_offset: float = 0.0,

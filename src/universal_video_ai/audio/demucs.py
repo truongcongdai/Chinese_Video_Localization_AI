@@ -196,6 +196,36 @@ class DemucsProcessor:
         cmd.extend(str(path) for path in audio_paths)
         return cmd
 
+    @staticmethod
+    def _needs_safe_input_name(audio_path: Path) -> bool:
+        """Return whether Demucs must not receive ``audio_path`` verbatim.
+
+        Demucs derives an output *directory component* from the input stem.
+        On Windows, platform titles can contain Unicode and exceed the 255
+        character component limit, even if the full input path itself was
+        accepted by ffmpeg. Stage only those unsafe names under a short,
+        ASCII filename before launching Demucs.
+        """
+        return not audio_path.stem.isascii() or len(audio_path.stem) > 80
+
+    def _stage_safe_input(self, audio_path: Path, output_dir: Path) -> tuple[Path, Optional[Path]]:
+        """Create a short ASCII hard-link/copy for an unsafe Demucs input."""
+        if not self._needs_safe_input_name(audio_path):
+            return audio_path, None
+
+        safe_stem = f"input_{hashlib.sha256(str(audio_path).encode('utf-8')).hexdigest()[:16]}"
+        stage_dir = output_dir / ".demucs_input"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        staged = stage_dir / f"{safe_stem}{audio_path.suffix.lower() or '.wav'}"
+        if staged.exists():
+            return staged, None
+        try:
+            os.link(audio_path, staged)
+        except OSError:
+            shutil.copy2(audio_path, staged)
+        self.logger.info("Staged Demucs input with safe Windows name: %s", staged.name)
+        return staged, staged
+
     def _run_checked(self, cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         # Demucs itself prints the input path before processing it.  On a
         # Vietnamese Windows installation a detached/frozen process can still
@@ -328,6 +358,8 @@ class DemucsProcessor:
 
         output_dir = self.get_output_dir(audio_path, output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        source_fingerprint = self._source_fingerprint(audio_path)
+        audio_path, _staged_input = self._stage_safe_input(audio_path, output_dir)
 
         self.logger.info("Separating audio %s using Demucs model=%s", audio_path, self.config.model)
 
@@ -335,7 +367,6 @@ class DemucsProcessor:
         # stem set instead of spending minutes running the identical model
         # again. _find_stem_files validates every expected artifact first, so
         # an interrupted/partial run still falls through to normal processing.
-        source_fingerprint = self._source_fingerprint(audio_path)
         cached_output = self._find_stem_files(output_dir, audio_path.stem)
         manifest = self._cache_manifest_path(output_dir, audio_path.stem)
         cached_fingerprint = None
