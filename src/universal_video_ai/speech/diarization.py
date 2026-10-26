@@ -2,17 +2,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from importlib.metadata import PackageNotFoundError, version
 import logging
 import math
+import os
 from pathlib import Path
 import threading
 from typing import Protocol, Sequence
 
 from universal_video_ai.segment import TranscriptSegment
 
-__all__ = ["SpeakerTurn", "Diarizer", "PyannoteDiarizer", "assign_speakers"]
+__all__ = ["SpeakerTurn", "Diarizer", "PyannoteDiarizer", "assign_speakers", "diarization_readiness"]
 _logger = logging.getLogger(__name__)
 _INFERENCE_LOCK = threading.Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _local_model_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else _PROJECT_ROOT / path
+
+
+def diarization_readiness() -> dict:
+    """Lightweight setup check; actual model loading happens only during a job."""
+    try:
+        version("pyannote.audio")
+        installed = True
+    except PackageNotFoundError:
+        installed = False
+    configured = os.getenv("DIARIZATION_MODEL_PATH", "").strip()
+    model_ready = bool(configured) and (_local_model_path(configured) / "config.yaml").is_file()
+    return {"installed": installed, "model_configured": bool(configured),
+            "model_ready": model_ready, "ready": installed and model_ready}
 
 
 @dataclass(frozen=True)
@@ -56,12 +77,12 @@ def assign_speakers(segments: Sequence[TranscriptSegment], turns: Sequence[Speak
 class PyannoteDiarizer:
     def __init__(self, model_path: str, *, device: str = "cpu", max_speakers: int = 8) -> None:
         self.configured = bool(model_path.strip())
-        self.model_path = Path(model_path).expanduser()
+        self.model_path = _local_model_path(model_path) if self.configured else Path()
         self.device = device
         self.max_speakers = max_speakers
 
     def diarize(self, audio_path: Path) -> list[SpeakerTurn]:
-        if not self.configured or not self.model_path.is_dir():
+        if not self.configured or not (self.model_path / "config.yaml").is_file():
             raise RuntimeError("Download an accepted pyannote community-1 model locally and set DIARIZATION_MODEL_PATH.")
         try:
             import torch

@@ -355,6 +355,10 @@ class ReupRuntime:
             try:
                 if run["status"] == "queued":
                     config = run["config"]
+                    if config["speaker_mode"] == "auto":
+                        from universal_video_ai.speech.diarization import diarization_readiness
+                        if not diarization_readiness()["ready"]:
+                            raise ValueError("Automatic speaker detection is not configured. Install pyannote.audio and set DIARIZATION_MODEL_PATH, or switch to manual speaker assignment.")
                     body = {"url": run["source_url"], "target_language": config["target_language"],
                             "max_concurrent": 1, "processing_mode": "fast", "review_before_render": config["speaker_mode"] == "manual",
                             "speaker_config": {"mode": config["speaker_mode"], "voices": config["speaker_voices"], "max_speakers": 2},
@@ -470,6 +474,10 @@ def install_reup_routes(app: FastAPI, store: Store, submit: Callable, output_dir
     def save_profile(body: ReupProfileBody, user_id: int = Depends(get_current_user_id)) -> dict:
         account = store.get_social_account(user_id, "youtube")
         value = body.model_dump()
+        if value["enabled"] and value["speaker_mode"] == "auto":
+            from universal_video_ai.speech.diarization import diarization_readiness
+            if not diarization_readiness()["ready"]:
+                raise HTTPException(400, "Automatic speaker detection needs pyannote.audio and a local model. Check the speaker setup panel or choose manual assignment.")
         if account and not value["channel_id"]:
             value["channel_id"] = account["account_ref"] or ""
         if value["enabled"] and value["automation"] == "auto" and (

@@ -2007,7 +2007,7 @@ $("#submit-btn").onclick = async () => {
     $("#submit-error").textContent = "Chọn ảnh logo trước (hoặc bỏ tick 'Chèn logo')";
     return;
   }
-  const reviewMode = $("#review-mode-checkbox").checked;
+  const reviewMode = $("#review-mode-checkbox").checked || $("#speaker-mode-select").value === "manual";
   if (channelModeEnabled() && reviewMode) {
     $("#submit-error").textContent = "Xử lý toàn bộ kênh không hỗ trợ dừng từng video để sửa phụ đề thủ công.";
     return;

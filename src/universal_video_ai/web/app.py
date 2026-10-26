@@ -5142,16 +5142,14 @@ async def upload_video(
 def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> Dict[str, Any]:
     issues: List[Dict[str, str]] = []
     if body.speaker_config and body.speaker_config.mode == "auto":
-        from importlib.metadata import PackageNotFoundError, version
-        try:
-            version("pyannote.audio")
-        except PackageNotFoundError:
+        from universal_video_ai.speech.diarization import diarization_readiness
+        readiness = diarization_readiness()
+        if not readiness["installed"]:
             issues.append({"severity": "error", "code": "diarization_unavailable",
                            "message": "Cài requirements-diarization.txt trước khi bật nhận diện người nói tự động."})
-        model_dir = os.getenv("DIARIZATION_MODEL_PATH", "").strip()
-        if not model_dir or not Path(model_dir).expanduser().is_dir():
+        if not readiness["model_ready"]:
             issues.append({"severity": "error", "code": "diarization_model_missing",
-                           "message": "Tải model pyannote local và cấu hình DIARIZATION_MODEL_PATH, hoặc chọn gán giọng thủ công."})
+                           "message": "Cấu hình DIARIZATION_MODEL_PATH đến thư mục model pyannote có config.yaml, hoặc chọn gán người nói thủ công."})
     raw_url = (body.url or "").strip()
     url = _extract_first_video_url(raw_url)
     if not url:
@@ -5338,6 +5336,12 @@ def _check_ollama_for_translation(requested_model: Optional[str] = None) -> tupl
 @app.post("/api/jobs/preflight")
 def preflight_job(body: JobPreflightBody, user_id: int = Depends(get_current_user_id)):
     return _job_preflight_report(user_id, body, url_count=body.url_count)
+
+
+@app.get("/api/speakers/readiness")
+def speaker_readiness(user_id: int = Depends(get_current_user_id)):
+    from universal_video_ai.speech.diarization import diarization_readiness
+    return diarization_readiness()
 
 
 @app.post("/api/creator/jobs")

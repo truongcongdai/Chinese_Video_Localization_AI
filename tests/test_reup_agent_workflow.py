@@ -112,6 +112,22 @@ def test_auto_profile_rejects_unconfirmed_rights_and_invalid_timezone():
         ReupProfileBody(topic="topic", timezone="not-a-zone")
 
 
+def test_periodic_auto_speaker_profile_requires_local_setup(setup, tmp_path, monkeypatch):
+    store, owner, _ = setup
+    app = FastAPI()
+    async def submit(*args):
+        raise AssertionError("must not submit before speaker setup")
+    install_reup_routes(app, store, submit, tmp_path)
+    app.dependency_overrides[get_current_user_id] = lambda: owner
+    from universal_video_ai.speech import diarization
+    monkeypatch.setattr(diarization, "diarization_readiness", lambda: {"ready": False})
+    payload = config(enabled=True, speaker_mode="auto", source_urls=[candidate()["url"]],
+                     speaker_voices={"speaker_0": "voice-a", "speaker_1": "voice-b"})
+    response = TestClient(app).put("/api/reup-agent/profile", json=payload)
+    assert response.status_code == 400
+    assert not ReupRepository(store).profile(owner)
+
+
 def test_api_owner_isolation_and_strict_profile_body(setup, tmp_path):
     store, owner, other = setup
     app = FastAPI()

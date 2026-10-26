@@ -8,6 +8,28 @@ For a low-VRAM computer, install `requirements-reup.txt` in a fresh virtual envi
 
 Two-speaker automatic detection is optional. Install `requirements-diarization.txt`, accept the model's terms, save a compatible `pyannote/speaker-diarization-community-1` model to a local directory, and set `DIARIZATION_MODEL_PATH` to that directory. The app never downloads the model on startup. `DIARIZATION_DEVICE=cpu` avoids using the 1660 Super for diarization. Choose **Tự nhận diện (local)** and map `speaker_0` and `speaker_1` to installed Edge TTS voice IDs. Speaker turns are assigned by overlap with timed dialogue. Mixed/uncertain turns are flagged for subtitle review; one ASR sentence is not falsely split into two different text lines. **Gán thủ công** stops for subtitle review so the operator can enter speaker IDs before rendering. For a long video, local diarization can use significant RAM and time.
 
+### Set up automatic speaker detection
+
+Run these commands from the checkout that starts the web app, using **the same Python environment** as `scripts/run_web.py`:
+
+```bash
+python -m pip install -r requirements-diarization.txt
+git lfs install
+mkdir -p local_data/models
+git clone https://hf.co/pyannote/speaker-diarization-community-1 local_data/models/pyannote-speaker-diarization-community-1
+```
+
+Before cloning, sign in on the [Community-1 model page](https://huggingface.co/pyannote/speaker-diarization-community-1) and accept its access conditions. Git may request your Hugging Face username and access token. Never put the token in the Reup Agent form or commit it to Git. The clone must contain `config.yaml` and downloaded model weights, not Git LFS pointer files.
+
+Add to the checkout's `.env` (or the `.env` it links to), then restart the web process:
+
+```dotenv
+DIARIZATION_MODEL_PATH=local_data/models/pyannote-speaker-diarization-community-1
+DIARIZATION_DEVICE=cpu
+```
+
+Open **Xử lý video → Nhận diện người nói**. The page checks whether the Python package and `config.yaml` are available before enabling periodic work with automatic detection. This quick check does not run inference; validate a short sample job before relying on it. Until the setup is complete, choose **Gán khi duyệt phụ đề** or **Một giọng**. Manual speaker assignment needs a review step and cannot be combined with autonomous upload.
+
 ## Source to upload
 
 1. Connect the intended YouTube channel using the existing account settings. Confirm that source rights permit reuse and publication. The profile's rights check is required before autonomous upload.

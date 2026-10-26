@@ -7,11 +7,61 @@
   const lines = id => el(id).value.split("\n").map(s => s.trim()).filter(Boolean);
   let profile = {};
   let shortPlan = null;
-  const message = text => { el("reup-message").textContent = text; };
+  let speakerReadiness = null;
+  let reviewBeforeManual = null;
+  const message = (text, error = false) => {
+    const target = el("reup-message");
+    target.textContent = text;
+    target.classList.toggle("hidden", !text);
+    target.classList.toggle("is-error", error);
+  };
   async function busy(button, operation) {
     button.disabled = true;
-    try { await operation(); } catch (error) { message(error.message || String(error)); }
+    try { await operation(); } catch (error) { message(error.message || String(error), true); }
     finally { button.disabled = false; }
+  }
+  function setupMarkup(status) {
+    if (status?.ready) return "<strong>Nhận diện tự động đã sẵn sàng</strong>Model local và pyannote.audio đã được tìm thấy. Hãy xem lại phụ đề sau khi xử lý.";
+    const steps = [];
+    if (!status?.installed) steps.push("Cài thư viện trong môi trường đang chạy app: <code>python -m pip install -r requirements-diarization.txt</code>.");
+    if (!status?.model_ready) steps.push('Chấp nhận điều khoản <a href="https://huggingface.co/pyannote/speaker-diarization-community-1" target="_blank" rel="noopener noreferrer">model Community-1</a>, tải model bằng Git LFS, rồi đặt <code>DIARIZATION_MODEL_PATH</code> trong <code>.env</code> đến thư mục có <code>config.yaml</code>. Khởi động lại app.');
+    return `<strong>Chưa thể tự nhận diện người nói</strong><ol>${steps.map(step => `<li>${step}</li>`).join("")}</ol><p>Để xử lý ngay, chọn “Gán khi duyệt phụ đề”.</p>`;
+  }
+  function renderSpeakerReadiness() {
+    for (const [selectId, targetId] of [["reup-speakers", "reup-speaker-readiness"], ["speaker-mode-select", "speaker-auto-readiness"]]) {
+      const target = el(targetId);
+      const select = el(selectId);
+      if (!target || !select) continue;
+      const mode = select.value;
+      target.classList.toggle("hidden", mode === "single");
+      target.classList.toggle("is-ready", mode === "manual" || !!speakerReadiness?.ready);
+      if (mode === "manual") target.innerHTML = "<strong>Gán người nói khi duyệt phụ đề</strong>Job sẽ dừng ở bước duyệt để bạn gán người 1 hoặc người 2 cho từng câu trước khi render.";
+      if (mode === "auto") target.innerHTML = speakerReadiness ? setupMarkup(speakerReadiness) : "Đang kiểm tra model nhận diện người nói...";
+    }
+  }
+  async function loadSpeakerReadiness() {
+    speakerReadiness = await api("/api/speakers/readiness");
+    renderSpeakerReadiness();
+  }
+  function updateConditionalFields() {
+    const manualSpeakers = el("reup-speakers").value === "manual";
+    const autoOption = el("reup-automation").querySelector('option[value="auto"]');
+    autoOption.disabled = manualSpeakers;
+    if (manualSpeakers && el("reup-automation").value === "auto") el("reup-automation").value = "assisted";
+    el("reup-voice1-field").classList.toggle("hidden", el("reup-speakers").value === "single");
+    const needsModel = el("reup-short").checked || el("reup-metadata").value === "ollama";
+    el("reup-short-options").classList.toggle("hidden", !needsModel);
+    el("reup-short-duration-field").classList.toggle("hidden", !el("reup-short").checked);
+    el("reup-schedule-settings").classList.toggle("hidden", el("reup-publish").value !== "schedule");
+    el("reup-automation-help").textContent = ({
+      manual: "Nguồn mới sẽ chờ bạn bấm Xử lý. Video cũng chờ duyệt trước khi đăng.",
+      assisted: "Hệ thống xử lý nguồn, sau đó chờ bạn xem gói đăng và duyệt.",
+      auto: "Video sẽ được đăng theo quyền riêng tư và lịch đã chọn sau khi xử lý."
+    })[el("reup-automation").value] || "";
+    const enabled = el("reup-enabled").checked;
+    el("reup-profile-state").textContent = enabled ? "Đang chọn bật quét định kỳ" : "Chưa bật quét định kỳ";
+    el("reup-profile-state").classList.toggle("is-enabled", enabled);
+    renderSpeakerReadiness();
   }
   function fill(value) {
     profile = value || {};
@@ -27,9 +77,15 @@
     el("reup-short").checked = !!profile.make_short;
     el("reup-voice0").value = profile.speaker_voices?.speaker_0 || "vi-VN-NamMinhNeural";
     el("reup-voice1").value = profile.speaker_voices?.speaker_1 || "vi-VN-HoaiMyNeural";
+    updateConditionalFields();
   }
   async function refreshRuns() {
     const runs = await api("/api/reup-agent/runs");
+    el("reup-run-count").textContent = `${runs.length} nguồn`;
+    const statusLabel = {discovered:"Mới tìm thấy", queued:"Đang xếp hàng", localizing:"Đang bản địa hóa",
+      packaging:"Đang tạo gói đăng", ready:"Chờ duyệt đăng", publishing:"Đang tải lên",
+      processing:"YouTube đang xử lý", scheduled:"Đã hẹn giờ", uploaded_private:"Đã tải lên riêng tư",
+      published:"Đã đăng", failed:"Cần xử lý lỗi", paused:"Đã tạm dừng", cancelled:"Đã hủy"};
     const actions = run => {
       const state = run.status;
       const options = [];
@@ -40,10 +96,18 @@
       if (state === "paused") options.push(["resume","Tiếp tục"]);
       if (["queued","localizing","packaging","ready"].includes(state)) options.push(["pause","Dừng sau bước hiện tại"]);
       if (["discovered","queued","localizing","ready","failed","paused"].includes(state)) options.push(["cancel","Hủy luồng"]);
-      const preview = ["ready","published","uploaded_private","scheduled"].includes(state) ? `<button class="btn secondary small" data-reup-preview="${escape(run.id)}">Xem gói đăng</button> ` : "";
-      return preview + options.map(([action,label]) => `<button class="btn secondary small" data-reup-id="${escape(run.id)}" data-reup-action="${action}">${label}</button>`).join(" ");
+      const preview = ["ready","published","uploaded_private","scheduled"].includes(state) ? `<button type="button" class="btn secondary small" data-reup-preview="${escape(run.id)}">Xem gói đăng</button>` : "";
+      return preview + options.map(([action,label]) => `<button type="button" class="btn secondary small" data-reup-id="${escape(run.id)}" data-reup-action="${action}">${label}</button>`).join("");
     };
-    el("reup-runs").innerHTML = runs.length ? `<table><thead><tr><th>Nguồn / Job</th><th>Trạng thái</th><th>Thao tác</th></tr></thead><tbody>${runs.map(run => `<tr><td>${escape(run.title || run.source_key)}<br><a href="${escape(run.source_url)}" target="_blank" rel="noopener noreferrer">Xem nguồn</a>${run.job_id ? `<br>Job: ${escape(run.job_id)}` : ""}${run.refs?.short_id ? `<br><a href="/api/jobs/${escape(run.job_id)}/shorts/${escape(run.refs.short_id)}/video" target="_blank" rel="noopener">Xem short</a>` : ""}</td><td>${escape(run.status)}${run.refs?.metrics ? `<br>Lượt xem: ${escape(run.refs.metrics.views ?? "chưa có")} · Like: ${escape(run.refs.metrics.likes ?? "chưa có")}` : ""}${run.refs?.title ? `<br>${escape(run.refs.title)}` : ""}${run.error ? `<br>${escape(run.error)}` : ""}</td><td>${actions(run)}</td></tr>`).join("")}</tbody></table>` : "Chưa có nguồn. Lưu cấu hình rồi tìm nguồn ngay.";
+    el("reup-runs").innerHTML = runs.length ? runs.map(run => {
+      const statusClass = ["published","scheduled","uploaded_private"].includes(run.status) ? "is-good" :
+        ["failed","cancelled"].includes(run.status) ? "is-error" : ["ready","paused"].includes(run.status) ? "is-warn" : "";
+      const meta = [`<a href="${escape(run.source_url)}" target="_blank" rel="noopener noreferrer">Mở video nguồn ↗</a>`,
+        run.job_id ? `Job: ${escape(run.job_id)}` : "",
+        run.refs?.short_id ? `<a href="/api/jobs/${escape(run.job_id)}/shorts/${escape(run.refs.short_id)}/video" target="_blank" rel="noopener noreferrer">Xem short ↗</a>` : "",
+        run.refs?.metrics ? `${escape(run.refs.metrics.views ?? "—")} lượt xem · ${escape(run.refs.metrics.likes ?? "—")} lượt thích` : ""].filter(Boolean).join("");
+      return `<article class="reup-run-card"><div class="reup-run-head"><div><strong>${escape(run.title || run.source_key)}</strong><div class="reup-run-meta">${meta}</div></div><span class="reup-status ${statusClass}">${escape(statusLabel[run.status] || run.status)}</span></div>${run.refs?.title ? `<div class="reup-run-meta">Tiêu đề dự kiến: ${escape(run.refs.title)}</div>` : ""}${run.error ? `<p class="reup-run-error">${escape(run.error)}</p>` : ""}<div class="reup-run-actions">${actions(run)}</div></article>`;
+    }).join("") : `<div class="reup-empty">Chưa có nguồn nào. Lưu cấu hình rồi chọn “Tìm nguồn ngay”.</div>`;
     el("reup-runs").querySelectorAll("[data-reup-action]").forEach(button => {
       button.onclick = () => busy(button, async () => {
         const row = await api(`/api/reup-agent/runs/${button.dataset.reupId}/${button.dataset.reupAction}`, {method:"POST"});
@@ -54,14 +118,17 @@
     el("reup-runs").querySelectorAll("[data-reup-preview]").forEach(button => {
       button.onclick = () => busy(button, async () => {
         const data = await api(`/api/reup-agent/runs/${button.dataset.reupPreview}/package`);
-        el("reup-package-preview").innerHTML = `<div class="card"><h4>${escape(data.title)}</h4><img src="${escape(data.thumbnail_url)}" alt="Thumbnail sắp đăng" style="max-width:320px;width:100%"><p style="white-space:pre-wrap">${escape(data.description)}</p><p>Hashtag: ${escape((data.hashtags || []).join(" "))}</p><p>Tags: ${escape((data.tags || []).join(", "))}</p></div>`;
+        el("reup-package-preview").innerHTML = `<h4>${escape(data.title)}</h4><img src="${escape(data.thumbnail_url)}" alt="Thumbnail sắp đăng"><p>${escape(data.description)}</p><p>Hashtag: ${escape((data.hashtags || []).join(" "))}</p><p>Tags: ${escape((data.tags || []).join(", "))}</p>`;
       });
     });
   }
   el("reup-load").onclick = event => busy(event.currentTarget, async () => {
-    fill(await api("/api/reup-agent/profile")); await refreshRuns(); message("Đã nạp cấu hình.");
+    fill(await api("/api/reup-agent/profile"));
+    await Promise.all([refreshRuns(), loadSpeakerReadiness()]);
+    message("Đã nạp cấu hình và trạng thái người nói.");
   });
   el("reup-save").onclick = event => busy(event.currentTarget, async () => {
+    if (el("reup-speakers").value === "auto") await loadSpeakerReadiness();
     const value = {...profile, topic:el("reup-topic").value.trim(), channel_id:el("reup-channel").value.trim(),
       keywords:lines("reup-keywords"), exclude_keywords:lines("reup-exclude"), source_urls:lines("reup-sources"),
       platforms:["youtube","bilibili","douyin"].filter(p => el(`reup-${p}`).checked),
@@ -71,6 +138,13 @@
       daily_limit:Number(el("reup-limit").value), scan_interval_minutes:Number(el("reup-interval").value),
       speaker_mode:el("reup-speakers").value, speaker_voices:{speaker_0:el("reup-voice0").value.trim(),speaker_1:el("reup-voice1").value.trim()},
       metadata_provider:el("reup-metadata").value, make_short:el("reup-short").checked,short_seconds:Number(el("reup-short-seconds").value),llm_model:el("reup-model").value.trim()};
+    if (!value.topic) throw new Error("Nhập chủ đề kênh trước khi lưu.");
+    if (value.enabled && value.speaker_mode === "auto" && !speakerReadiness?.ready)
+      throw new Error("Nhận diện tự động chưa sẵn sàng. Làm theo hướng dẫn ở bước Xử lý video hoặc chọn gán khi duyệt phụ đề.");
+    if (value.automation === "auto" && value.speaker_mode === "manual")
+      throw new Error("Gán người nói thủ công cần chế độ xử lý có bước duyệt.");
+    if ((value.metadata_provider === "ollama" || (value.enabled && value.make_short)) && !value.llm_model)
+      throw new Error("Nhập tên model Ollama đã cài để dùng AI cho metadata hoặc short tự động.");
     fill(await api("/api/reup-agent/profile", {method:"PUT",body:JSON.stringify(value)}));
     message("Đã lưu. Chỉ quét định kỳ khi bật cấu hình; chế độ duyệt đăng sẽ chờ bạn duyệt từng video.");
   });
@@ -121,4 +195,24 @@
     const video = document.createElement("video"); video.controls = true; video.src = result.video_url; video.style.maxWidth = "100%";
     el("short-result").replaceChildren(video); message("Đã dựng short riêng; video dài vẫn giữ nguyên trong lịch sử.");
   });
+  for (const id of ["reup-speakers", "reup-short", "reup-metadata", "reup-publish", "reup-automation", "reup-enabled"])
+    el(id).addEventListener("change", updateConditionalFields);
+  el("speaker-mode-select")?.addEventListener("change", () => {
+    const review = el("review-mode-checkbox");
+    if (el("speaker-mode-select").value === "manual") {
+      if (reviewBeforeManual === null) reviewBeforeManual = review.checked;
+      review.checked = true;
+      review.disabled = true;
+    } else if (reviewBeforeManual !== null) {
+      review.disabled = false;
+      review.checked = reviewBeforeManual;
+      reviewBeforeManual = null;
+    }
+    renderSpeakerReadiness();
+    if (el("speaker-mode-select").value === "auto") loadSpeakerReadiness().catch(() => {});
+  });
+  document.querySelector('.feature-tab[data-feature="reup-agent"]')?.addEventListener("click", () => {
+    if (!el("app-view").classList.contains("hidden")) el("reup-load").click();
+  });
+  updateConditionalFields();
 })();
