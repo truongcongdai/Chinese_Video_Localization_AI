@@ -75,7 +75,7 @@ class SegmentAdapter:
             return source_segments
 
         draft_segments = [
-            TranscriptSegment(start=segment.start, end=segment.end, text="")
+            TranscriptSegment(start=segment.start, end=segment.end, text="", speaker_id=segment.speaker_id, speaker_review=segment.speaker_review)
             for segment in source_segments
         ]
         provider = (self.config.provider or "").strip().lower()
@@ -114,7 +114,7 @@ class SegmentAdapter:
                 start=source.start,
                 end=source.end,
                 text=text.strip(),
-            )
+                speaker_id=source.speaker_id, speaker_review=source.speaker_review)
             for source, text in zip(source_segments, translated_texts)
         ]
 
@@ -177,7 +177,7 @@ class SegmentAdapter:
             self.logger.warning("Contextual adapter output barely changed draft; keeping base translation: %s", unchanged_issue)
             return translated_segments
         return [
-            TranscriptSegment(start=segment.start, end=segment.end, text=text.strip() or segment.text)
+            TranscriptSegment(start=segment.start, end=segment.end, text=text.strip() or segment.text, speaker_id=segment.speaker_id, speaker_review=segment.speaker_review)
             for segment, text in zip(translated_segments, adapted_texts)
         ]
 

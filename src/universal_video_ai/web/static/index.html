@@ -264,6 +264,10 @@
       <span>YT</span>
       <span>YouTube Research</span>
     </button>
+    <button class="feature-tab" data-feature="reup-agent">
+      <span>♻️</span>
+      <span>Reup Agent</span>
+    </button>
     <button class="feature-tab hidden" data-feature="channel-agent">
       <span>🧭</span>
       <span>AI Channel Agent</span>
@@ -465,6 +469,13 @@
         <label>Giọng đọc</label>
         <select id="voice-select"><option value="">Mặc định</option></select>
         <div id="voice-select-help" style="font-size:12px;color:var(--text-dim);margin-top:5px">Danh sách voice thay đổi theo ngôn ngữ, provider và kết nối đã lưu.</div>
+        <label style="margin-top:10px">Người nói trong video</label>
+        <select id="speaker-mode-select"><option value="single">Một giọng (như hiện tại)</option><option value="auto">Tự nhận diện người nói (model local)</option><option value="manual">Gán người nói khi duyệt phụ đề</option></select>
+        <label>Giọng cho người 1 / người 2</label>
+        <input id="speaker-voice-0" value="vi-VN-NamMinhNeural" placeholder="Voice ID người 1">
+        <input id="speaker-voice-1" value="vi-VN-HoaiMyNeural" placeholder="Voice ID người 2">
+        <div class="muted-help">Dùng Voice ID phù hợp ngôn ngữ và provider đã chọn. Chế độ tự nhận diện mặc định tối đa 2 người; không ép video một người thành hai.</div>
+
         <div class="voice-preview-row">
           <button class="btn secondary small" id="voice-preview-btn" type="button">▶ Nghe thử giọng</button>
           <button class="btn secondary small" id="voice-refresh-btn" type="button">↻ Làm mới giọng</button>
@@ -1508,7 +1519,63 @@
     </div>
   </div>
 
-  <!-- AI Channel Agent CP1 Panel -->
+  <!-- Source-based Reup Agent -->
+  <div class="feature-panel" data-feature="reup-agent">
+    <div class="card" id="reup-agent-panel">
+      <h3 class="section-title">Reup Agent — video nguồn → bản địa hóa → YouTube</h3>
+      <p class="muted-help">Theo dõi nguồn và chủ đề của kênh. Dùng video nguồn để bản địa hóa và đăng theo cấu hình.</p>
+      <div class="row">
+        <div class="field" style="flex:1"><label>Chủ đề kênh</label><input id="reup-topic" placeholder="Ví dụ: phim ngắn gia đình"></div>
+        <div class="field" style="flex:1"><label>ID kênh YouTube đích (để trống: lấy kết nối hiện tại)</label><input id="reup-channel"></div>
+      </div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>Từ khóa tìm kiếm (mỗi dòng một từ, có thể nhập tiếng Trung)</label><textarea id="reup-keywords" rows="3"></textarea></div>
+        <div class="field" style="flex:1"><label>Từ khóa loại trừ (mỗi dòng một từ)</label><textarea id="reup-exclude" rows="3"></textarea></div>
+      </div>
+      <div class="field"><label>Link video hoặc kênh nguồn theo dõi (mỗi dòng một link HTTPS)</label><textarea id="reup-sources" rows="3"></textarea></div>
+      <div class="row" style="gap:15px"><label><input type="checkbox" id="reup-youtube"> Tìm YouTube</label><label><input type="checkbox" id="reup-bilibili"> Tìm Bilibili</label><label><input type="checkbox" id="reup-douyin"> Tìm Douyin</label></div>
+      <p class="muted-help">Douyin có thể cần cookie và trình duyệt Playwright đã cài. Nếu tìm kiếm bị chặn, dùng link video/kênh nguồn; hệ thống không vượt CAPTCHA.</p>
+      <div class="row">
+        <div class="field"><label>Chế độ</label><select id="reup-automation"><option value="assisted">Tự xử lý, duyệt trước khi đăng</option><option value="manual">Bấm xử lý từng nguồn</option><option value="auto">Tự xử lý và đăng theo cấu hình</option></select></div>
+        <div class="field"><label>Đăng YouTube</label><select id="reup-publish"><option value="private">Tải lên private</option><option value="immediate">Công khai ngay</option><option value="schedule">Hẹn giờ trên YouTube</option></select></div>
+        <div class="field"><label>Video tối đa/ngày</label><input type="number" id="reup-limit" min="1" max="10" value="1"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Múi giờ</label><input id="reup-timezone" value="Asia/Bangkok"></div>
+        <div class="field"><label>Giờ đăng</label><input type="time" id="reup-time" value="18:00"></div>
+        <div class="field"><label>Quét mỗi (phút)</label><input type="number" id="reup-interval" value="60" min="15" max="1440"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Người nói</label><select id="reup-speakers"><option value="single">Một giọng</option><option value="auto">Tự nhận diện (local)</option><option value="manual">Gán thủ công khi duyệt sub</option></select></div>
+        <div class="field"><label>Giọng người 1</label><input id="reup-voice0" value="vi-VN-NamMinhNeural"></div>
+        <div class="field"><label>Giọng người 2</label><input id="reup-voice1" value="vi-VN-HoaiMyNeural"></div>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="reup-short"> Tạo short tóm tắt nhiều tình tiết</label>
+        <div class="field"><label>Thời lượng short (giây)</label><input type="number" id="reup-short-seconds" value="60" min="10" max="180"></div>
+        <div class="field"><label>Model Ollama đã cài (dùng chọn tình tiết)</label><input id="reup-model" placeholder="Tên model local của bạn"></div>
+      </div>
+      <div class="field"><label>Tạo title, mô tả, hashtag</label><select id="reup-metadata"><option value="none">Cơ bản, không cần LLM</option><option value="ollama">AI local bằng model Ollama đã chọn</option></select></div>
+      <label><input type="checkbox" id="reup-rights"> Tôi xác nhận có quyền sử dụng các nguồn đã cấu hình.</label><br>
+      <label><input type="checkbox" id="reup-enabled"> Bật quét và xử lý định kỳ theo cấu hình này</label>
+      <div class="row" style="margin-top:12px;gap:8px"><button class="btn secondary" id="reup-load">Nạp cấu hình / làm mới</button><button class="btn gradient" id="reup-save">Lưu cấu hình</button><button class="btn secondary" id="reup-scan">Tìm nguồn ngay</button></div>
+      <div id="reup-message" class="muted-help" aria-live="polite"></div>
+      <div id="reup-runs" style="overflow:auto;margin-top:12px"></div>
+      <div id="reup-package-preview" style="margin-top:12px"></div>
+      <details style="margin-top:20px"><summary>Tạo một short từ video dài đã xử lý</summary>
+        <p class="muted-help">Nhập mã job trong lịch sử. Chọn model local để AI chọn tình tiết; để trống sẽ tạo gợi ý highlight cần bạn duyệt.</p>
+        <input id="short-job-id" placeholder="Mã job đã hoàn thành">
+        <button class="btn secondary" id="short-plan-btn">Lập timeline xem trước</button>
+        <video id="short-source-preview" controls preload="none" style="max-width:100%"></video>
+        <div id="short-cuts-table" style="overflow:auto"></div>
+        <button class="btn secondary small" id="short-add-cut">Thêm cảnh</button>
+        <button class="btn gradient" id="short-render-btn">Dựng short theo timeline đã duyệt</button>
+        <div id="short-result"></div>
+      </details>
+    </div>
+  </div>
+
+  <!-- Original AI Channel Agent creator -->
   <div class="feature-panel" data-feature="channel-agent">
     <div class="card">
       <div class="template-library-heading">
@@ -2146,5 +2213,6 @@
 <script src="/assets/content_opportunity_ui.js?v=20260821-channel-agent-cp5-opportunities1" defer></script>
 <script src="/assets/content_production_ui.js?v=20260904-channel-agent-cp7a-production1" defer></script>
 <script src="/assets/app.js?v=20260909-voice-history2" defer></script>
+<script src="/assets/reup_agent_ui.js?v=20261026" defer></script>
 </body>
 </html>

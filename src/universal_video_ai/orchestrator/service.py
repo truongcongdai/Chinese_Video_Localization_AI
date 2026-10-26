@@ -19,6 +19,7 @@ from universal_video_ai.audio.pipeline import AudioPipelineResult
 from universal_video_ai.audio.audio_result import AudioResult
 from universal_video_ai.audio.background_music import BackgroundMusicLibrary
 from universal_video_ai.segment import TranscriptSegment
+from universal_video_ai.speech.diarization import Diarizer
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.translate.adapt import SegmentAdapter
 from universal_video_ai.translate.speech_fit import SpeechFitConfig, fit_translated_segments
@@ -80,6 +81,8 @@ class LocalizationConfig:
     # tts.voice_for_language()'s default for target_language, unchanged
     # from before this option existed.
     tts_voice: Optional[str] = None
+    speaker_mode: str = "single"
+    speaker_voices: Optional[Dict[str, str]] = None
     # Fit each generated WAV to its real timeline slot instead of letting the
     # mixer truncate words at the nominal subtitle end.  The clip duration is
     # measured after synthesis; modest atempo compression is preferred, then
@@ -276,13 +279,13 @@ def prepared_localization_to_dict(prepared: PreparedLocalization) -> Dict[str, A
         "target_language": prepared.target_language,
         "output_dir": str(prepared.output_dir),
         "source_segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in prepared.source_segments
+            s.to_dict() for s in prepared.source_segments
         ],
         "translated_segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.translated_segments or [])
+            s.to_dict() for s in (prepared.translated_segments or [])
         ],
         "tts_segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.tts_segments or [])
+            s.to_dict() for s in (prepared.tts_segments or [])
         ],
         "translated_text": prepared.translated_text,
     }
@@ -309,15 +312,15 @@ def prepared_localization_from_dict(data: Dict[str, Any]) -> PreparedLocalizatio
         detected_language=data.get("detected_language"),
     )
     source_segments = [
-        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        TranscriptSegment.from_dict(s)
         for s in data.get("source_segments", [])
     ]
     translated_segments = [
-        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        TranscriptSegment.from_dict(s)
         for s in data.get("translated_segments", [])
     ] or None
     tts_segments = [
-        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        TranscriptSegment.from_dict(s)
         for s in data.get("tts_segments", [])
     ] or None
     return PreparedLocalization(
@@ -380,6 +383,7 @@ class LocalizationService:
             cancellation_checker: Optional[Callable[[], bool]] = None,
             user_id: Optional[int] = None,
             use_download_cache: bool = True,
+            diarizer: Optional[Diarizer] = None,
     ) -> None:
         self.downloader = downloader or DownloadService(user_id=user_id, use_cache=use_download_cache)
         self.translate_service = translate_service
@@ -395,6 +399,7 @@ class LocalizationService:
         self.progress_callback = progress_callback
         self.cancellation_checker = cancellation_checker
         self.user_id = user_id
+        self.diarizer = diarizer
         self._last_subtitle_alignment_estimate = None
         self._used_source_subtitle_timing = False
 
@@ -601,6 +606,16 @@ class LocalizationService:
                 sum(1 for item in source_evidence if item.detector == "ocr"),
             )
         audio_source_segments = [item.as_segment() for item in source_evidence]
+        if self.config.speaker_mode == "auto":
+            if self.diarizer is None:
+                raise RuntimeError("Automatic speaker detection is not configured.")
+            from universal_video_ai.speech.diarization import assign_speakers
+            self._progress(40, "Đang nhận diện người nói...")
+            async with _TRANSCRIPTION_SLOTS:
+                turns = await asyncio.to_thread(self.diarizer.diarize, audio_result.audio_result.audio_path)
+            audio_source_segments = assign_speakers(audio_source_segments, turns)
+            if not turns:
+                raise RuntimeError("Speaker detection found no speech; use manual review or single voice.")
         self._source_evidence = source_evidence
 
         self._last_subtitle_alignment_estimate = None
@@ -856,7 +871,7 @@ class LocalizationService:
         if not text_segments or not timing_segments or len(text_segments) != len(timing_segments):
             return text_segments
         return [
-            TranscriptSegment(start=timing.start, end=timing.end, text=text.text)
+            TranscriptSegment(start=timing.start, end=timing.end, text=text.text, speaker_id=text.speaker_id, speaker_review=text.speaker_review)
             for text, timing in zip(text_segments, timing_segments)
         ]
 
@@ -874,7 +889,7 @@ class LocalizationService:
                 start=max(0.0, s.start - padding),
                 end=min(audio_duration, s.end + padding),
                 text=s.text,
-            )
+                speaker_id=s.speaker_id, speaker_review=s.speaker_review)
             for s in sorted(segments, key=lambda item: item.start)
         ]
 
@@ -888,12 +903,12 @@ class LocalizationService:
                 start=previous.start,
                 end=max(previous.start, boundary),
                 text=previous.text,
-            )
+                speaker_id=previous.speaker_id, speaker_review=previous.speaker_review)
             padded[idx] = TranscriptSegment(
                 start=min(current.end, boundary),
                 end=current.end,
                 text=current.text,
-            )
+                speaker_id=current.speaker_id, speaker_review=current.speaker_review)
         return padded
 
     def _maybe_apply_audio_sync_offset(
@@ -921,7 +936,7 @@ class LocalizationService:
                 start=max(0.0, min(audio_duration, s.start + offset)),
                 end=max(0.0, min(audio_duration, s.end + offset)),
                 text=s.text,
-            )
+                speaker_id=s.speaker_id, speaker_review=s.speaker_review)
             for s in segments
         ]
 
@@ -957,7 +972,7 @@ class LocalizationService:
                     start=max(0.0, min(audio_duration, s.start + offset)),
                     end=max(0.0, min(audio_duration, s.end + offset)),
                     text=s.text,
-                )
+                 speaker_id=s.speaker_id, speaker_review=s.speaker_review)
                 for s in source_segments
             ]
 
@@ -1085,7 +1100,7 @@ class LocalizationService:
                                 start=window.start if window is not None else s.start,
                                 end=window.end if window is not None else s.end,
                                 text=s.text,
-                            )
+                             speaker_id=s.speaker_id, speaker_review=s.speaker_review)
                             for s, window in zip(source_segments, windows)
                         ]
                     self.logger.info(
@@ -1131,7 +1146,7 @@ class LocalizationService:
                 start=max(0.0, min(audio_duration, s.start + self._segment_alignment_offset(s, estimate))),
                 end=max(0.0, min(audio_duration, s.end + self._segment_alignment_offset(s, estimate))),
                 text=s.text,
-            )
+                speaker_id=s.speaker_id, speaker_review=s.speaker_review)
             for s in source_segments
         ]
 
@@ -1845,10 +1860,20 @@ class LocalizationService:
                     idx,
                 )
             clips.append(TimedAudioClip(start=start, end=end, audio_path=fitted_path))
-            playback.append(TranscriptSegment(start=start, end=end, text=seg.text))
+            playback.append(TranscriptSegment(start=start, end=end, text=seg.text, speaker_id=seg.speaker_id, speaker_review=seg.speaker_review))
             previous_end = end
 
         return clips, playback
+
+    def _voice_for_segment(self, segment: TranscriptSegment, fallback: Optional[str]) -> Optional[str]:
+        if self.config.speaker_mode == "single":
+            return fallback
+        mapping = self.config.speaker_voices or {}
+        if segment.speaker_id and segment.speaker_id in mapping:
+            return mapping[segment.speaker_id]
+        if segment.speaker_id:
+            raise RuntimeError(f"No voice assigned to {segment.speaker_id}; assign it in speaker settings.")
+        return fallback
 
     def _synthesize_timed_track(
         self,
@@ -1883,7 +1908,7 @@ class LocalizationService:
                     seg.text,
                     output_path=clip_path,
                     language=target_language,
-                    voice=voice,
+                    voice=self._voice_for_segment(seg, voice),
                 ))
             except Exception as exc:
                 raise RuntimeError(
@@ -1936,7 +1961,7 @@ class LocalizationService:
                         seg.text,
                         output_path=clip_path,
                         language=target_language,
-                        voice=voice,
+                        voice=self._voice_for_segment(seg, voice),
                     )
                     clip_path = Path(generated_path)
                     if not clip_path.is_file() or clip_path.stat().st_size == 0:

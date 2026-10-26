@@ -160,7 +160,7 @@ class TranslateService:
             if any(text is None for text in translated_texts):
                 raise TranslationFailed("Translation backend left one or more segments untranslated")
             return [
-                TranscriptSegment(start=seg.start, end=seg.end, text=translated_text)
+                TranscriptSegment(start=seg.start, end=seg.end, text=translated_text, speaker_id=seg.speaker_id, speaker_review=seg.speaker_review)
                 for seg, translated_text in zip(segments, translated_texts)
             ]
 
@@ -176,6 +176,6 @@ class TranslateService:
         translated_texts = await asyncio.gather(*(translate_one(seg) for seg in segments))
 
         return [
-            TranscriptSegment(start=seg.start, end=seg.end, text=translated_text)
+            TranscriptSegment(start=seg.start, end=seg.end, text=translated_text, speaker_id=seg.speaker_id, speaker_review=seg.speaker_review)
             for seg, translated_text in zip(segments, translated_texts)
         ]

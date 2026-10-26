@@ -8,6 +8,7 @@ your own platform credentials) publish straight to TikTok/Facebook/YouTube.
 Run with: python scripts/run_web.py
 """
 from __future__ import annotations
+from typing import Literal
 
 import asyncio
 import json
@@ -43,7 +44,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from universal_video_ai.orchestrator.factory import create_localization_service
 from universal_video_ai.orchestrator.service import (
@@ -487,6 +488,21 @@ class RegisterBody(BaseModel):
     referral_code: Optional[str] = None  # whoever invited this person, if anyone
 
 
+class SpeakerConfigBody(BaseModel):
+    mode: Literal["single", "manual", "auto"] = "single"
+    voices: Dict[str, str] = Field(default_factory=dict, max_length=16)
+    max_speakers: int = Field(default=2, ge=1, le=8)
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> "SpeakerConfigBody":
+        if any(not key.strip() or len(key) > 64 or not voice.strip() or len(voice) > 256
+               for key, voice in self.voices.items()):
+            raise ValueError("Speaker IDs and voice IDs must be nonempty and bounded.")
+        if self.mode == "auto" and any(f"speaker_{i}" not in self.voices for i in range(self.max_speakers)):
+            raise ValueError("Assign a voice for each possible detected speaker.")
+        return self
+
+
 class NewJobBody(BaseModel):
     url: str
     target_language: str = "vi"
@@ -505,6 +521,7 @@ class NewJobBody(BaseModel):
     publishing_config: Optional[Dict[str, Any]] = None
     # Explicit Edge-TTS voice id from GET /api/voices, e.g.
     # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
+    speaker_config: Optional[SpeakerConfigBody] = None
     tts_voice: Optional[str] = None
     tts_provider: str = "edge"
     tts_style: str = "natural"
@@ -664,6 +681,8 @@ class SegmentBody(BaseModel):
     start: float
     end: float
     text: str
+    speaker_id: Optional[str] = Field(default=None, max_length=64)
+    speaker_review: bool = False
 
 
 class UpdateSegmentsBody(BaseModel):
@@ -1366,6 +1385,7 @@ def _build_service_for_job(job):
         target_language=job.target_language,
         run_tts=True,
         tts_voice=job.tts_voice,
+        speaker_config=getattr(job, "speaker_config", None),
         tts_provider=tts_provider,
         tts_provider_api_key=provider_settings.get("api_key") if provider_settings else None,
         tts_provider_model=getattr(job, "tts_model", None)
@@ -1512,7 +1532,7 @@ async def _run_job_unlocked(job_id: str) -> None:
             service = _build_service_for_job(job)
             job_output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
 
-            if job.review_mode:
+            if job.review_mode or (getattr(job, "speaker_config", None) or {}).get("mode") == "auto":
                 # Stop after translation and wait for the person to review/edit
                 # the translated sentences via PUT .../segments, then
                 # POST .../render (-> _run_render_from_review) to continue.
@@ -1520,15 +1540,19 @@ async def _run_job_unlocked(job_id: str) -> None:
                 prepared = await service.prepare_for_review(
                     job.source_url, job_output_dir, target_language=job.target_language
                 )
+                if not job.review_mode and not any(s.speaker_review for s in prepared.source_segments):
+                    result = await service.finalize_from_review(prepared)
+                    await asyncio.to_thread(_finish_job_from_result, job_id, job, result)
+                    return
                 segments = prepared.translated_segments or [
                     {"start": 0.0, "end": 0.0, "text": prepared.translated_text or ""}
                 ]
                 segments_payload = (
-                    [{"start": s.start, "end": s.end, "text": s.text} for s in prepared.translated_segments]
+                    [s.to_dict() for s in prepared.translated_segments]
                     if prepared.translated_segments else segments
                 )
                 source_segments_payload = [
-                    {"start": s.start, "end": s.end, "text": s.text} for s in prepared.source_segments
+                    s.to_dict() for s in prepared.source_segments
                 ]
                 store.set_job_source_segments(job_id, source_segments_payload)
                 store.set_job_segments(job_id, segments_payload)
@@ -1632,7 +1656,9 @@ def _publishing_llm_client_for_job(job, config: PublishingPackConfig) -> Publish
     elif selected == "ollama":
         llm_config = PublishingLLMConfig(
             provider="ollama",
-            model=_env_first("PUBLISHING_OLLAMA_MODEL", "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL,
+            model=config.local_model or _env_first("PUBLISHING_OLLAMA_MODEL", "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL,
+            ollama_keep_alive=0 if config.local_model else None,
+            ollama_num_gpu=0 if config.local_model else None,
             base_url=_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434",
             timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
         )
@@ -1666,11 +1692,11 @@ def _generate_publishing_pack_for_result(job_id: str, job, result):
             "raw_metadata": getattr(download, "raw_metadata", {}) or {},
         }
         translated_segments = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            s.to_dict()
             for s in (getattr(result, "translated_segments", None) or [])
         ]
         source_segments = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            s.to_dict()
             for s in (getattr(result, "source_segments", None) or [])
         ]
         service = PublishingPackService(
@@ -1722,18 +1748,18 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         source_segments = []
         if getattr(result, "source_segments", None):
             source_segments = [
-                {"start": s.start, "end": s.end, "text": s.text}
+                s.to_dict()
                 for s in result.source_segments
                 if getattr(s, "has_timing", False)
             ]
         elif result.audio_pipeline_result and result.audio_pipeline_result.segments:
             source_segments = [
-                {"start": s.start, "end": s.end, "text": s.text}
+                s.to_dict()
                 for s in result.audio_pipeline_result.segments
                 if getattr(s, "has_timing", False)
             ]
         translated_segments = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            s.to_dict()
             for s in (result.translated_segments or [])
             if getattr(s, "has_timing", False)
         ]
@@ -1802,7 +1828,7 @@ async def _run_render_from_review(job_id: str) -> None:
 
         segments_data = json.loads(job.segments_json) if job.segments_json else []
         edited_segments = [
-                              TranscriptSegment(start=s["start"], end=s["end"], text=s["text"]) for s in segments_data
+                              TranscriptSegment.from_dict(s) for s in segments_data
                           ] or None
 
         result = await service.finalize_from_review(prepared, edited_segments)
@@ -4522,6 +4548,18 @@ async def remix_plan(body: RemixPlanBody, user_id: int = Depends(get_current_use
 
 @app.post("/api/jobs")
 async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_id)):
+    return await _submit_localization(body, user_id)
+
+
+async def _submit_localization(body: NewJobBody, user_id: int, job_id: Optional[str] = None):
+    if job_id:
+        existing = store.get_job(job_id)
+        if existing:
+            if existing.user_id != user_id:
+                raise HTTPException(404, "Job not found")
+            if existing.status == "queued" and job_id not in _running_tasks:
+                _running_tasks[job_id] = asyncio.create_task(_run_job(job_id))
+            return existing.to_dict()
     normalized_url = _extract_first_video_url(body.url)
     classification = await asyncio.to_thread(_video_url_classifier.classify, normalized_url)
     if classification.platform.value in {"youtube", "tiktok", "douyin"}:
@@ -4623,8 +4661,10 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         logo_size_px=body.logo_size_px or 120,
         branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
         publishing_config=PublishingPackConfig.from_dict(body.publishing_config).to_dict() if body.publishing_config else None,
+        job_id=job_id,
         tts_voice=body.tts_voice or None,
-        review_mode=body.review_before_render,
+        speaker_config=body.speaker_config.model_dump() if body.speaker_config else None,
+        review_mode=body.review_before_render or bool(body.speaker_config and body.speaker_config.mode == "manual"),
         animated_subtitle_config=body.animated_subtitle_config,
         video_template_config=body.video_template_config,
         transform_config=body.transform_config,
@@ -5017,6 +5057,7 @@ async def upload_video(
         logo_size_px: int = Form(120),
         branding_config: Optional[str] = Form(None),
         publishing_config: Optional[str] = Form(None),
+        speaker_config: Optional[str] = Form(None),
         tts_voice: Optional[str] = Form(None),
         review_before_render: bool = Form(False),
         animated_subtitle_config: Optional[str] = Form(None),
@@ -5062,7 +5103,8 @@ async def upload_video(
         template_config = json.loads(video_template_config) if video_template_config else None
         branding_data = BrandingConfig.from_dict(json.loads(branding_config)).to_dict() if branding_config else None
         publishing_data = PublishingPackConfig.from_dict(json.loads(publishing_config)).to_dict() if publishing_config else None
-    except json.JSONDecodeError:
+        speaker_data = SpeakerConfigBody(**json.loads(speaker_config)).model_dump() if speaker_config else None
+    except (json.JSONDecodeError, ValueError, TypeError):
         raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
 
     # Create job with file:// URL
@@ -5077,8 +5119,9 @@ async def upload_video(
         logo_size_px=logo_size_px,
         branding_config=branding_data,
         publishing_config=publishing_data,
+        speaker_config=speaker_data,
         tts_voice=tts_voice,
-        review_mode=review_before_render,
+        review_mode=review_before_render or bool(speaker_data and speaker_data["mode"] == "manual"),
         animated_subtitle_config=animated_config,
         video_template_config=template_config,
         keep_original_audio=keep_original_audio,
@@ -5098,6 +5141,17 @@ async def upload_video(
 
 def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> Dict[str, Any]:
     issues: List[Dict[str, str]] = []
+    if body.speaker_config and body.speaker_config.mode == "auto":
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            version("pyannote.audio")
+        except PackageNotFoundError:
+            issues.append({"severity": "error", "code": "diarization_unavailable",
+                           "message": "Cài requirements-diarization.txt trước khi bật nhận diện người nói tự động."})
+        model_dir = os.getenv("DIARIZATION_MODEL_PATH", "").strip()
+        if not model_dir or not Path(model_dir).expanduser().is_dir():
+            issues.append({"severity": "error", "code": "diarization_model_missing",
+                           "message": "Tải model pyannote local và cấu hình DIARIZATION_MODEL_PATH, hoặc chọn gán giọng thủ công."})
     raw_url = (body.url or "").strip()
     url = _extract_first_video_url(raw_url)
     if not url:
@@ -7068,6 +7122,11 @@ async def rerun_selected_jobs(
             errors.append({"job_id": job.id, "reason": str(exc.detail), "status_code": exc.status_code})
         else:
             queued.append(job.id)
+    # Start queued workers before returning, without waiting for their work.
+    # Python 3.14's wait_for can await this coroutine inline, so callers no
+    # longer necessarily provide an intervening event-loop turn.
+    if queued:
+        await asyncio.sleep(0)
     return {"queued": queued, "skipped": skipped, "errors": errors}
 
 
@@ -7275,7 +7334,17 @@ def update_job_segments(job_id: str, body: UpdateSegmentsBody, user_id: int = De
     job = _get_owned_job(job_id, user_id)
     if job.status != "review":
         raise HTTPException(400, "Job này không ở trạng thái chờ chỉnh sửa phụ đề")
-    store.set_job_segments(job_id, [s.model_dump() for s in body.segments])
+    existing = json.loads(job.segments_json or "[]")
+    updated = []
+    for i, segment in enumerate(body.segments):
+        payload = segment.model_dump()
+        if "speaker_id" not in segment.model_fields_set and i < len(existing):
+            old = existing[i]
+            if old.get("start") == segment.start and old.get("end") == segment.end:
+                payload["speaker_id"] = old.get("speaker_id")
+                payload["speaker_review"] = old.get("speaker_review", False)
+        updated.append(payload)
+    store.set_job_segments(job_id, updated)
     return {"ok": True}
 
 
@@ -7898,3 +7967,14 @@ app.state.youtube_research_submit_localization = _submit_research_localization
 app.include_router(youtube_research_router)
 app.include_router(content_os_router)
 app.include_router(channel_agent_router)
+
+# Additive source-based automation. Legacy Creator and Channel Agent routes
+# keep their existing behavior; reup uses the same validated job submission.
+from universal_video_ai.web.reup_router import install_reup_routes
+
+
+async def _submit_reup_localization(payload: dict, user_id: int, job_id: str) -> dict:
+    return await _submit_localization(NewJobBody(**payload), user_id, job_id)
+
+
+reup_runtime = install_reup_routes(app, store, _submit_reup_localization, Path(TEMP_DIR) / "reup_shorts")

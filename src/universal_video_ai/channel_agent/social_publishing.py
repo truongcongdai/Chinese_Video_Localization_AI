@@ -11,7 +11,7 @@ from universal_video_ai.web.store import Store
 
 PUBLISHING_STATES = frozenset({
     "draft", "queued", "uploading", "processing", "scheduled",
-    "published", "failed", "cancelled",
+    "published", "uploaded_private", "failed", "cancelled",
 })
 
 

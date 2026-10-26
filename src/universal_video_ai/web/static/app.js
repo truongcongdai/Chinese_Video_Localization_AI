@@ -2021,6 +2021,11 @@ $("#submit-btn").onclick = async () => {
     target_language: $("#lang-select").value,
     source_language: $("#source-lang-select").value,
     tts_voice: $("#voice-select").value || null,
+    speaker_config: {
+      mode: $("#speaker-mode-select").value,
+      voices: {speaker_0: $("#speaker-voice-0").value.trim(), speaker_1: $("#speaker-voice-1").value.trim()},
+      max_speakers: 2,
+    },
     tts_provider: $("#tts-provider-select").value,
     tts_style: $("#tts-style-select").value,
     tts_model: $("#tts-model-select").value || null,
@@ -3110,12 +3115,15 @@ async function openReview(jobId) {
   $("#review-segments-list").innerHTML = segments.map((s, i) => `
     <div class="review-segment" data-segment-row="${i}" data-start="${s.start}" data-end="${s.end}">
       <div class="seg-time">${_fmtTime(s.start)} → ${_fmtTime(s.end)}</div>
+      <label>Người nói ${s.speaker_review ? " · cần kiểm tra" : ""}
+        <input class="review-speaker" maxlength="64" value="${_escapeHtml(s.speaker_id || '')}" placeholder="speaker_0 / speaker_1 (để trống: giọng mặc định)">
+      </label>
       <textarea data-idx="${i}" data-start="${s.start}" data-end="${s.end}">${_escapeHtml(s.text)}</textarea>
     </div>
   `).join("");
   $("#review-segments-list").querySelectorAll("[data-segment-row]").forEach(row => {
     row.onclick = ev => {
-      if (ev.target.tagName === "TEXTAREA") return;
+      if (["TEXTAREA", "INPUT", "SELECT"].includes(ev.target.tagName)) return;
       sourceVideo.currentTime = Number(row.dataset.start);
       sourceVideo.play().catch(() => {});
     };
@@ -3140,6 +3148,8 @@ function _fmtTime(seconds) {
 function _collectReviewSegments() {
   return Array.from($("#review-segments-list").querySelectorAll("textarea")).map(ta => ({
     start: parseFloat(ta.dataset.start), end: parseFloat(ta.dataset.end), text: ta.value,
+    speaker_id: ta.closest(".review-segment").querySelector(".review-speaker").value.trim() || null,
+    speaker_review: false,
   }));
 }
 

@@ -174,5 +174,5 @@ def fit_translated_segments(
     result: list[TranscriptSegment] = []
     for segment in segments:
         text = fit_segment_text(segment.text, segment.duration, config)
-        result.append(TranscriptSegment(start=segment.start, end=segment.end, text=text or segment.text))
+        result.append(TranscriptSegment(start=segment.start, end=segment.end, text=text or segment.text, speaker_id=segment.speaker_id, speaker_review=segment.speaker_review))
     return result

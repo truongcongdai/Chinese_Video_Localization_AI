@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     publishing_pack_status TEXT DEFAULT 'disabled',
     publishing_pack_error TEXT,
     tts_voice TEXT,
+    speaker_config TEXT,
     review_mode INTEGER NOT NULL DEFAULT 0,
     review_state_json TEXT,
     segments_json TEXT,
@@ -1297,6 +1298,7 @@ _MIGRATIONS = [
     ("jobs", "publishing_pack_error", "ALTER TABLE jobs ADD COLUMN publishing_pack_error TEXT"),
     # TTS voice override (None = pick the language's default voice, see
     # tts.voices.VOICE_OPTIONS).
+    ("jobs", "speaker_config", "ALTER TABLE jobs ADD COLUMN speaker_config TEXT"),
     ("jobs", "tts_voice", "ALTER TABLE jobs ADD COLUMN tts_voice TEXT"),
     # "Chỉnh sửa phụ đề trước khi render" opt-in: when set, the job stops
     # at status='review' after translation instead of rendering straight
@@ -1449,6 +1451,7 @@ class Job:
     publish_ready_video_path: Optional[str] = None
     publishing_pack_status: str = "disabled"
     publishing_pack_error: Optional[str] = None
+    speaker_config: Optional[Dict[str, Any]] = None
     tts_voice: Optional[str] = None
     review_mode: int = 0
     review_state_json: Optional[str] = None
@@ -1769,8 +1772,10 @@ class Store:
             subtitle_offset_seconds: float = 0.0,
             keep_original_audio: int = 0,
             background_music_strategy: str = "deterministic",
+            speaker_config: Optional[Dict[str, Any]] = None,
+            job_id: Optional[str] = None,
     ) -> Job:
-        job_id = uuid.uuid4().hex[:12]
+        job_id = job_id or uuid.uuid4().hex[:12]
         now = time.time()
         job = Job(
             id=job_id, user_id=user_id, source_url=source_url,
@@ -1782,7 +1787,7 @@ class Store:
             branding_config=branding_config,
             publishing_config=publishing_config,
             publishing_pack_status=("pending" if (publishing_config or {}).get("enabled") else "disabled"),
-            tts_voice=tts_voice, review_mode=int(review_mode),
+            tts_voice=tts_voice, review_mode=int(review_mode), speaker_config=speaker_config,
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
@@ -1808,7 +1813,7 @@ class Store:
             "progress_note", "error", "title", "final_video_path", "logo_path", "logo_corner",
             "logo_size_px", "branding_config", "publishing_config", "publishing_pack_path",
             "publish_ready_video_path", "publishing_pack_status", "publishing_pack_error",
-            "tts_voice", "review_mode", "review_state_json", "segments_json",
+            "speaker_config", "tts_voice", "review_mode", "review_state_json", "segments_json",
             "qc_warnings_json", "created_at", "updated_at", "animated_subtitle_config",
             "video_template_config", "transform_config", "source_video_path", "source_segments_json",
             "processing_mode", "tts_provider", "tts_style", "translation_mode", "translation_tone",
@@ -1823,7 +1828,7 @@ class Store:
             json.dumps(job.branding_config, ensure_ascii=False) if job.branding_config else None,
             json.dumps(job.publishing_config, ensure_ascii=False) if job.publishing_config else None,
             job.publishing_pack_path, job.publish_ready_video_path, job.publishing_pack_status,
-            job.publishing_pack_error, job.tts_voice, job.review_mode, job.review_state_json,
+            job.publishing_pack_error, json.dumps(job.speaker_config) if job.speaker_config else None, job.tts_voice, job.review_mode, job.review_state_json,
             job.segments_json, job.qc_warnings_json,
             job.created_at, job.updated_at,
             json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
@@ -2293,6 +2298,8 @@ class Store:
         if unknown:
             for key in unknown:
                 row_dict.pop(key, None)
+        if row_dict.get("speaker_config"):
+            row_dict["speaker_config"] = json.loads(row_dict["speaker_config"])
         # Deserialize JSON fields
         if row_dict.get("animated_subtitle_config"):
             row_dict["animated_subtitle_config"] = json.loads(row_dict["animated_subtitle_config"])

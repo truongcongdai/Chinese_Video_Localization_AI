@@ -18,6 +18,8 @@ class PublishingLLMConfig:
     model: Optional[str] = None
     base_url: Optional[str] = None
     timeout_seconds: int = 180
+    ollama_keep_alive: Optional[int] = None
+    ollama_num_gpu: Optional[int] = None
 
 
 class PublishingLLMClient:
@@ -92,6 +94,10 @@ class PublishingLLMClient:
 
     def _ollama(self, prompt: str) -> str:
         base = (self.config.base_url or "http://127.0.0.1:11434").rstrip("/")
+        options = {"temperature": 0.35}
+        if self.config.ollama_num_gpu is not None:
+            options["num_gpu"] = self.config.ollama_num_gpu
+        extra = {"keep_alive": self.config.ollama_keep_alive} if self.config.ollama_keep_alive is not None else {}
         response = requests.post(
             f"{base}/api/chat",
             json={
@@ -102,7 +108,8 @@ class PublishingLLMClient:
                 ],
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.35},
+                "options": options,
+                **extra,
             },
             timeout=self.config.timeout_seconds,
         )

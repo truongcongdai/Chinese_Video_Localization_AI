@@ -102,10 +102,21 @@ class TestAgentReachProvider:
             assert result["stdout"] == "test output"
 
     def test_parse_agent_reach_output_placeholder(self):
-        """Test that parse_agent_reach_output returns empty list (placeholder)."""
+        """Unstructured output cannot be treated as video metadata."""
         provider = AgentReachProvider()
         results = provider._parse_agent_reach_output("mock output", "youtube")
         assert results == []
+
+    def test_parse_structured_results_without_accepting_local_urls(self):
+        provider = AgentReachProvider()
+        results = provider._parse_agent_reach_output(
+            '{"items":[{"url":"https://www.youtube.com/watch?v=abcdefghijk",'
+            '"title":"Example","view_count":"32"},'
+            '{"url":"file:///etc/passwd","title":"unsafe"}]}', "youtube"
+        )
+        assert len(results) == 1
+        assert results[0].view_count == 32
+        assert results[0].title == "Example"
 
     def test_provider_name(self):
         """Test provider name property."""
