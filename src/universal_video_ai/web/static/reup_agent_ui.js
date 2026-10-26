@@ -24,6 +24,7 @@
     if (status?.ready) return "<strong>Nhận diện tự động đã sẵn sàng</strong>Model local và pyannote.audio đã được tìm thấy. Hãy xem lại phụ đề sau khi xử lý.";
     const steps = [];
     if (!status?.installed) steps.push("Cài thư viện trong môi trường đang chạy app: <code>python -m pip install -r requirements-diarization.txt</code>.");
+    if (status?.installed && !status?.audio_decoder_ready) steps.push('TorchCodec chưa đọc được âm thanh. Với Torch CUDA 12.8 trên Linux, cài bản giải mã CPU chính thức: <code>python -m pip install --no-deps --force-reinstall "torchcodec==0.17.0+cpu" --index-url https://download.pytorch.org/whl/cpu</code>.');
     if (!status?.model_ready) steps.push('Chấp nhận điều khoản <a href="https://huggingface.co/pyannote/speaker-diarization-community-1" target="_blank" rel="noopener noreferrer">model Community-1</a>, tải model bằng Git LFS, rồi đặt <code>DIARIZATION_MODEL_PATH</code> trong <code>.env</code> đến thư mục có <code>config.yaml</code>. Khởi động lại app.');
     return `<strong>Chưa thể tự nhận diện người nói</strong><ol>${steps.map(step => `<li>${step}</li>`).join("")}</ol><p>Để xử lý ngay, chọn “Gán khi duyệt phụ đề”.</p>`;
   }

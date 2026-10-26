@@ -5147,6 +5147,9 @@ def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> 
         if not readiness["installed"]:
             issues.append({"severity": "error", "code": "diarization_unavailable",
                            "message": "Cài requirements-diarization.txt trước khi bật nhận diện người nói tự động."})
+        elif not readiness["audio_decoder_ready"]:
+            issues.append({"severity": "error", "code": "diarization_decoder_unavailable",
+                           "message": "TorchCodec chưa giải mã được âm thanh. Kiểm tra bản CPU phù hợp trong hướng dẫn Reup Agent."})
         if not readiness["model_ready"]:
             issues.append({"severity": "error", "code": "diarization_model_missing",
                            "message": "Cấu hình DIARIZATION_MODEL_PATH đến thư mục model pyannote có config.yaml, hoặc chọn gán người nói thủ công."})

@@ -82,14 +82,18 @@ def test_diarization_readiness_checks_active_environment_and_model_config(tmp_pa
         raise PackageNotFoundError(name)
     monkeypatch.setattr(diarization_module, "version", missing_package)
     assert diarization_readiness() == {
-        "installed": False, "model_configured": False, "model_ready": False, "ready": False
+        "installed": False, "model_configured": False, "model_ready": False,
+        "audio_decoder_ready": False, "ready": False
     }
     model = tmp_path / "model"
     model.mkdir()
     monkeypatch.setenv("DIARIZATION_MODEL_PATH", str(model))
     monkeypatch.setattr(diarization_module, "version", lambda name: "4.0.0")
+    monkeypatch.setattr(diarization_module, "_audio_decoder_available", lambda: False)
     assert not diarization_readiness()["ready"]
     (model / "config.yaml").write_text("pipeline: {}", encoding="utf-8")
+    assert not diarization_readiness()["ready"]
+    monkeypatch.setattr(diarization_module, "_audio_decoder_available", lambda: True)
     assert diarization_readiness()["ready"]
     monkeypatch.setattr(diarization_module, "_PROJECT_ROOT", tmp_path)
     monkeypatch.setenv("DIARIZATION_MODEL_PATH", "model")

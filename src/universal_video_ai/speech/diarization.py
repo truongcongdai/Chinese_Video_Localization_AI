@@ -23,6 +23,14 @@ def _local_model_path(value: str) -> Path:
     return path if path.is_absolute() else _PROJECT_ROOT / path
 
 
+def _audio_decoder_available() -> bool:
+    try:
+        from torchcodec.decoders import AudioDecoder  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def diarization_readiness() -> dict:
     """Lightweight setup check; actual model loading happens only during a job."""
     try:
@@ -32,8 +40,10 @@ def diarization_readiness() -> dict:
         installed = False
     configured = os.getenv("DIARIZATION_MODEL_PATH", "").strip()
     model_ready = bool(configured) and (_local_model_path(configured) / "config.yaml").is_file()
+    decoder_ready = installed and _audio_decoder_available()
     return {"installed": installed, "model_configured": bool(configured),
-            "model_ready": model_ready, "ready": installed and model_ready}
+            "model_ready": model_ready, "audio_decoder_ready": decoder_ready,
+            "ready": installed and model_ready and decoder_ready}
 
 
 @dataclass(frozen=True)

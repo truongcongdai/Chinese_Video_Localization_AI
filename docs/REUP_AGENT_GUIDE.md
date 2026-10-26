@@ -19,6 +19,13 @@ mkdir -p local_data/models
 git clone https://hf.co/pyannote/speaker-diarization-community-1 local_data/models/pyannote-speaker-diarization-community-1
 ```
 
+On Linux with the project's Torch CUDA 12.8 environment, PyPI may install a TorchCodec wheel that requires CUDA 13 (`libnvrtc.so.13`). If the speaker readiness panel reports an audio decoder error, replace only TorchCodec with its [official CPU wheel](https://github.com/meta-pytorch/torchcodec#cpu-only-installation); diarization already runs on CPU with the setting below:
+
+```bash
+python -m pip install --no-deps --force-reinstall 'torchcodec==0.17.0+cpu' --index-url https://download.pytorch.org/whl/cpu
+python -c 'from torchcodec.decoders import AudioDecoder; print("Audio decoder OK")'
+```
+
 Before cloning, sign in on the [Community-1 model page](https://huggingface.co/pyannote/speaker-diarization-community-1) and accept its access conditions. Git may request your Hugging Face username and access token. Never put the token in the Reup Agent form or commit it to Git. The clone must contain `config.yaml` and downloaded model weights, not Git LFS pointer files.
 
 Add to the checkout's `.env` (or the `.env` it links to), then restart the web process:
