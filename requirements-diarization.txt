@@ -1,3 +1,6 @@
 # Optional local speaker detection; install only after choosing a compatible
 # torch/torchaudio build for the machine. No model is downloaded by startup.
+# Match the Reup profile so this optional install does not upgrade NumPy past
+# the version used by the existing localization stack.
+numpy>=1.26,<2.3
 pyannote.audio>=4.0,<5
