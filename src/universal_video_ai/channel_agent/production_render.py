@@ -19,6 +19,7 @@ from universal_video_ai.timeline.service import TimelineService
 from universal_video_ai.tts.registry import RegistryTTSBackend
 from universal_video_ai.tts.service import TTSService
 from universal_video_ai.web.store import Store
+from universal_video_ai.channel_agent.coordination import reserve_provider_call
 
 
 class ProductionRenderError(RuntimeError):
@@ -273,6 +274,7 @@ class ProductionRenderService:
             for index, segment in enumerate(script_segments):
                 clip_path = clips_dir / f"section_{index + 1:03d}.wav"
                 if not clip_path.exists() or clip_path.stat().st_size <= 0:
+                    reserve_provider_call("tts_requests")
                     self.tts_service.synthesize(
                         segment.text,
                         language=voice_language,

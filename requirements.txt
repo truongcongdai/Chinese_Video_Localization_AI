@@ -15,11 +15,7 @@ numpy>=1.26,<2.3
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 torchaudio==2.11.0+cu128
-# Local CPU/CUDA image generation for creator scenes (SD-Turbo).
-diffusers>=0.39.0
-transformers>=5.0.0
-accelerate>=1.14.0
-safetensors>=0.8.0
+# AI image creation is optional: pip install -r requirements-creator.txt
 openai-whisper
 edge-tts>=7.2.8
 redis>=5.0.0

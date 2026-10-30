@@ -12,6 +12,10 @@ the [Operator Runbook](docs/OPERATOR_RUNBOOK.md), and the
 
 ## Features
 
+The new [Reup Agent guide](docs/REUP_AGENT_GUIDE.md) covers source discovery,
+two-speaker subtitles and voices, extractive shorts, publishing controls, and
+the low-VRAM installation profile. The existing AI creator remains available.
+
 - **Video Download**: Support for multiple platforms (YouTube, TikTok, etc.)
 - **Audio Extraction**: High-quality WAV extraction using FFmpeg
 - **Audio Separation**: Stem separation (vocals, drums, bass, other) using Demucs

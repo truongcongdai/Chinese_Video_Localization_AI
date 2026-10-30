@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List
+from typing import Iterator, List
 
 import requests
 
@@ -15,6 +15,31 @@ logger = logging.getLogger(__name__)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status&uploadType=multipart"
+
+__all__ = ["YouTubeUploader"]
+
+
+class _MultipartVideoBody:
+    """Bound memory for the legacy private-upload path without changing its API."""
+
+    def __init__(self, path: Path, metadata: dict, boundary: str) -> None:
+        self.path = path
+        self.prefix = (
+            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(metadata)}\r\n"
+            f"--{boundary}\r\nContent-Type: video/mp4\r\n\r\n"
+        ).encode("utf-8")
+        self.suffix = f"\r\n--{boundary}--".encode("utf-8")
+
+    def __len__(self) -> int:
+        return len(self.prefix) + self.path.stat().st_size + len(self.suffix)
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self.prefix
+        with self.path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                yield chunk
+        yield self.suffix
 
 
 class YouTubeUploader(SocialUploader):
@@ -58,15 +83,8 @@ class YouTubeUploader(SocialUploader):
                 "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False},
             }
 
-            with open(video_path, "rb") as f:
-                video_bytes = f.read()
-
             boundary = "vaiupload"
-            body = (
-                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-                f"{json.dumps(metadata)}\r\n"
-                f"--{boundary}\r\nContent-Type: video/mp4\r\n\r\n"
-            ).encode("utf-8") + video_bytes + f"\r\n--{boundary}--".encode("utf-8")
+            body = _MultipartVideoBody(Path(video_path), metadata, boundary)
 
             resp = requests.post(
                 UPLOAD_URL,

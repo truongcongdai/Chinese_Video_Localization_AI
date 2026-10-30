@@ -6,7 +6,7 @@ based on various metrics like views, likes, comments, and recency.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 from universal_video_ai.trends.models import TrendItemCandidate
 
@@ -55,7 +55,9 @@ def calculate_trend_score(
     if item.published_at:
         try:
             pub_date = datetime.fromisoformat(item.published_at.replace("Z", "+00:00"))
-            days_old = (datetime.utcnow() - pub_date).days
+            if pub_date.tzinfo is None:
+                pub_date = pub_date.replace(tzinfo=timezone.utc)
+            days_old = max(0.0, (datetime.now(timezone.utc) - pub_date).total_seconds() / 86400)
             # Decay score over 30 days
             recency_score = max(0.0, 1.0 - (days_old / 30.0))
         except Exception as exc:

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 import asyncio
 from email.utils import parsedate_to_datetime
 import logging
@@ -165,6 +167,7 @@ class TranslatorFactory:
                     self.cfg = cfg
                     self.logger = logger
                     self._direct_client = None
+                    self._scoped_client = ContextVar("google_translation_client", default=None)
                     self._request_lock = asyncio.Lock()
                     self._last_request_at = 0.0
                     self._minimum_request_interval = 1.0
@@ -206,15 +209,14 @@ class TranslatorFactory:
                     """
                     import httpx
 
-                    if self._direct_client is None:
-                        timeout = httpx.Timeout(30.0, connect=12.0)
-                        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
-                        self._direct_client = httpx.AsyncClient(timeout=timeout, limits=limits)
+                    client = self._scoped_client.get() or self._direct_client
+                    if client is None:
+                        raise RuntimeError("Translation requires an owned client scope")
                     async with self._request_lock:
                         await self._wait_for_request_slot()
                         # POST keeps subtitle text out of logs and avoids huge,
                         # percent-encoded query strings for CJK batch payloads.
-                        response = await self._direct_client.post(
+                        response = await client.post(
                             "https://translate.googleapis.com/translate_a/single",
                             data={
                                 "client": "gtx",
@@ -236,7 +238,28 @@ class TranslatorFactory:
                         raise TranslationError("Google returned an empty translation")
                     return translated
 
+                @asynccontextmanager
+                async def _client_scope(self):
+                    import httpx
+                    if self._scoped_client.get() is not None or self._direct_client is not None:
+                        yield
+                        return
+                    client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(30.0, connect=12.0),
+                        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                    )
+                    token = self._scoped_client.set(client)
+                    try:
+                        yield
+                    finally:
+                        self._scoped_client.reset(token)
+                        await client.aclose()
+
                 async def translate(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
+                    async with self._client_scope():
+                        return await self._translate_with_retries(text, src_lang, dest_lang)
+
+                async def _translate_with_retries(self, text: str, src_lang: Optional[str] = None, dest_lang: Optional[str] = None) -> str:
                     import httpx
 
                     dest = dest_lang or self.cfg.dest_lang or "en"
@@ -304,6 +327,13 @@ class TranslatorFactory:
                     ) from last_error
 
                 async def translate_batch(
+                    self, texts: list[str], src_lang: Optional[str] = None,
+                    dest_lang: Optional[str] = None,
+                ) -> list[str]:
+                    async with self._client_scope():
+                        return await self._translate_batch(texts, src_lang, dest_lang)
+
+                async def _translate_batch(
                     self, texts: list[str], src_lang: Optional[str] = None,
                     dest_lang: Optional[str] = None,
                 ) -> list[str]:

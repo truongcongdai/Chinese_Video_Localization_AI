@@ -29,14 +29,38 @@ import os
 import secrets
 import urllib.parse
 from dataclasses import dataclass
-from typing import Optional
+from functools import wraps
+from typing import Callable, Optional, ParamSpec, TypeVar
 
 import requests
 
 __all__ = [
     "IdentityOAuth", "GoogleIdentityOAuth", "GitHubIdentityOAuth", "FacebookIdentityOAuth",
-    "IdentityResult", "get_identity_oauth_client", "new_state",
+    "IdentityResult", "IdentityOAuthError", "get_identity_oauth_client", "new_state",
 ]
+
+
+class IdentityOAuthError(ValueError):
+    """A provider exchange failed without exposing request credentials."""
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _safe_identity_errors(operation: Callable[_P, _R]) -> Callable[_P, _R]:
+    @wraps(operation)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return operation(*args, **kwargs)
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            # HTTPError URLs can contain Facebook's app secret and auth code;
+            # JSON/parser errors can include provider response contents too.
+            raise IdentityOAuthError(
+                "Identity provider request failed; check connection and provider configuration."
+            ) from None
+
+    return wrapped
 
 
 def new_state() -> str:
@@ -48,6 +72,8 @@ class IdentityResult:
     provider_user_id: str            # stable unique id from the provider (never changes, unlike email)
     email: Optional[str]
     display_name: Optional[str]
+    # Callers must never treat an email alone as proof of account ownership.
+    email_verified: bool = False
 
 
 class IdentityOAuth:
@@ -94,6 +120,7 @@ class GoogleIdentityOAuth(IdentityOAuth):
         }
         return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
+    @_safe_identity_errors
     def exchange_code(self, code: str, redirect_uri: str) -> IdentityResult:
         resp = requests.post(self.TOKEN_URL, data={
             "client_id": os.environ["GOOGLE_CLIENT_ID"],
@@ -105,13 +132,18 @@ class GoogleIdentityOAuth(IdentityOAuth):
         resp.raise_for_status()
         access_token = resp.json()["access_token"]
 
-        info = requests.get(
+        info_resp = requests.get(
             self.USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
-        ).json()
+        )
+        info_resp.raise_for_status()
+        info = info_resp.json()
+        email = info.get("email")
+        email_verified = info.get("email_verified") is True and isinstance(email, str) and bool(email.strip())
         return IdentityResult(
             provider_user_id=info["sub"],
-            email=info.get("email"),
+            email=email.strip() if email_verified else None,
             display_name=info.get("name") or info.get("email"),
+            email_verified=email_verified,
         )
 
 
@@ -139,6 +171,7 @@ class GitHubIdentityOAuth(IdentityOAuth):
         }
         return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
+    @_safe_identity_errors
     def exchange_code(self, code: str, redirect_uri: str) -> IdentityResult:
         resp = requests.post(
             self.TOKEN_URL,
@@ -155,24 +188,37 @@ class GitHubIdentityOAuth(IdentityOAuth):
         access_token = resp.json()["access_token"]
 
         auth_header = {"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"}
-        profile = requests.get("https://api.github.com/user", headers=auth_header, timeout=15).json()
+        profile_resp = requests.get("https://api.github.com/user", headers=auth_header, timeout=15)
+        profile_resp.raise_for_status()
+        profile = profile_resp.json()
 
-        email = profile.get("email")
-        if not email:
-            # GitHub only includes `email` on /user if the user made it
-            # public; otherwise it has to be fetched from /user/emails and
-            # the "primary, verified" one picked out.
-            try:
-                emails = requests.get("https://api.github.com/user/emails", headers=auth_header, timeout=15).json()
-                primary = next((e for e in emails if e.get("primary") and e.get("verified")), None)
-                email = (primary or (emails[0] if emails else {})).get("email")
-            except Exception:
-                pass
+        # /user's public email has no verification claim. Always consult the
+        # email endpoint, and never fall back to an unverified address.
+        email = None
+        try:
+            emails_resp = requests.get("https://api.github.com/user/emails", headers=auth_header, timeout=15)
+            emails_resp.raise_for_status()
+            emails = emails_resp.json()
+            verified = [
+                entry for entry in emails
+                if isinstance(entry, dict) and entry.get("verified") is True
+                and isinstance(entry.get("email"), str) and entry["email"].strip()
+            ]
+            selected = next((entry for entry in verified if entry.get("primary") is True), None)
+            if selected is None and verified:
+                selected = verified[0]
+            if selected is not None:
+                email = selected["email"].strip()
+        except (requests.RequestException, ValueError, TypeError):
+            # Provider id still authenticates an existing identity when the
+            # optional email endpoint is unavailable. No public-email fallback.
+            pass
 
         return IdentityResult(
             provider_user_id=str(profile["id"]),
             email=email,
             display_name=profile.get("name") or profile.get("login"),
+            email_verified=email is not None,
         )
 
 
@@ -202,6 +248,7 @@ class FacebookIdentityOAuth(IdentityOAuth):
         }
         return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
+    @_safe_identity_errors
     def exchange_code(self, code: str, redirect_uri: str) -> IdentityResult:
         resp = requests.get(self.TOKEN_URL, params={
             "client_id": os.environ["FACEBOOK_APP_ID"],
@@ -212,11 +259,13 @@ class FacebookIdentityOAuth(IdentityOAuth):
         resp.raise_for_status()
         access_token = resp.json()["access_token"]
 
-        profile = requests.get(
+        profile_resp = requests.get(
             "https://graph.facebook.com/me",
             params={"fields": "id,name,email", "access_token": access_token},
             timeout=15,
-        ).json()
+        )
+        profile_resp.raise_for_status()
+        profile = profile_resp.json()
         return IdentityResult(
             provider_user_id=profile["id"],
             email=profile.get("email"),

@@ -506,6 +506,9 @@ def _feedback_learning_service(store: Store) -> FeedbackLearningService:
 
 
 def _automation_service(store: Store) -> AutomationOrchestrator:
+    from universal_video_ai.channel_agent.social_publishing import (
+        COMPLETED_PUBLISHING_STATES, matches_publish_request,
+    )
     def research(user_id: int, config: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
         result = _trend_service(store).scan(user_id)
         return {"trend_scan_id": result.get("scan_id"), "research_result": result}
@@ -564,35 +567,38 @@ def _automation_service(store: Store) -> AutomationOrchestrator:
         results: dict[str, Any] = {}
         for platform in config.get("target_platforms") or []:
             prior = next((row for row in existing if row.get("platform") == platform
-                          and row.get("status") != "cancelled"), None)
-            if prior:
+                          and matches_publish_request(store, user_id, row, render_id, config)), None)
+            if prior and prior.get("status") in COMPLETED_PUBLISHING_STATES and prior.get("external_video_id"):
                 results[platform] = {"job_id": int(prior["id"]), "status": prior["status"], "reused": True}
                 continue
             try:
                 if platform == "youtube":
                     privacy = str(config.get("default_publishing_privacy", "private"))
                     service: Any = ProductionPublishingService(store)
-                    job = service.submit(
+                    job = prior or service.submit(
                         user_id, item_id, render_job_id=render_id, privacy=privacy,
                         schedule_local=config.get("schedule_local"),
                         schedule_timezone=config.get("schedule_timezone"), dry_run=False,
                         confirm_publish=True,
                         confirm_public=bool(config.get("confirm_public", False)),
+                        metadata_asset_id=config.get("metadata_asset_id"),
                     )
                 else:
                     service = FacebookPublishingService(store)
-                    job = service.submit(
+                    job = prior or service.submit(
                         user_id, item_id, render_job_id=render_id,
                         destination_type=str(config.get("facebook_destination", "page_video")),
                         schedule_local=config.get("schedule_local"),
                         schedule_timezone=config.get("schedule_timezone"), dry_run=False,
                         confirm_publish=True,
+                        metadata_asset_id=config.get("metadata_asset_id"),
                     )
                 result = service.run(user_id, item_id, int(job["id"]))
                 results[platform] = {"job_id": int(result["id"]), "status": result["status"]}
             except Exception as exc:
                 failed = next((row for row in store.list_production_publishing_jobs(user_id, item_id)
-                               if row.get("platform") == platform), None)
+                               if row.get("platform") == platform
+                               and matches_publish_request(store, user_id, row, render_id, config)), None)
                 results[platform] = {
                     "job_id": int(failed["id"]) if failed else None,
                     "status": failed["status"] if failed else "failed", "error": str(exc),

@@ -143,9 +143,9 @@ class BaseAgent(ABC):
             self.logger.info(f"LLM call successful: provider={effective_provider}, model={self.llm_model}")
             return result
             
-        except Exception as e:
-            self.logger.warning(f"LLM call failed: {e}, falling back to mock output")
-            return self._mock_output()
+        except Exception:
+            self.logger.exception("LLM provider call failed for %s", self.agent_name)
+            raise
     
     def _mock_output(self) -> Dict[str, Any]:
         """

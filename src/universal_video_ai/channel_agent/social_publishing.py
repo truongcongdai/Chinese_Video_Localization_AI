@@ -11,8 +11,31 @@ from universal_video_ai.web.store import Store
 
 PUBLISHING_STATES = frozenset({
     "draft", "queued", "uploading", "processing", "scheduled",
-    "published", "failed", "cancelled",
+    "published", "uploaded_private", "failed", "cancelled", "outcome_unknown",
 })
+COMPLETED_PUBLISHING_STATES = frozenset({"published", "uploaded_private", "scheduled"})
+
+
+def matches_publish_request(store: Store, user_id: int, job: dict[str, Any],
+                            render_id: int, config: dict[str, Any]) -> bool:
+    """A platform match alone says nothing about the approved destination/artifact."""
+    if job.get("dry_run") or job.get("status") == "cancelled":
+        return False
+    if int(job.get("render_job_id") or 0) != render_id:
+        return False
+    account = store.get_social_account(user_id, str(job.get("platform")))
+    if not account or str(account["account_ref"]) != str(job.get("channel_id")):
+        return False
+    if config.get("metadata_asset_id") and job.get("metadata_asset_id") != config["metadata_asset_id"]:
+        return False
+    if job.get("platform") == "youtube":
+        if job.get("privacy") != config.get("default_publishing_privacy", "private"):
+            return False
+    elif job.get("platform") == "facebook":
+        if job.get("package", {}).get("destination_type") != config.get("facebook_destination", "page_video"):
+            return False
+    return (job.get("schedule_local") == config.get("schedule_local")
+            and job.get("schedule_timezone") == config.get("schedule_timezone"))
 
 
 class SocialPublishingError(RuntimeError):

@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Optional
+from universal_video_ai.sqlite_runtime import ClosingConnection
 
 __all__ = ["SQLiteCache"]
 
@@ -40,7 +41,7 @@ class SQLiteCache:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(str(self.path), timeout=15.0)
+        return sqlite3.connect(str(self.path), timeout=15.0, factory=ClosingConnection)
 
     def set(self, key: str, value: Any, ttl_seconds: int = 86400) -> bool:
         try:

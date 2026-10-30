@@ -390,11 +390,14 @@ class TelegramBot:
                 video_size_mb = result.final_video_path.stat().st_size / (1024 * 1024)
                 if video_size_mb <= 50:
                     try:
-                        self.adapter.send_video(
+                        deliver = getattr(self.adapter, "send_video_async", self.adapter.send_video)
+                        delivery = deliver(
                             chat_id,
                             result.final_video_path,
                             caption=f"✓ {result.final_video_path.name}",
                         )
+                        if inspect.isawaitable(delivery):
+                            await delivery
                     except Exception as exc:
                         self.logger.exception("Failed to send video to chat=%s: %s", chat_id, exc)
                         self.adapter.send_message(

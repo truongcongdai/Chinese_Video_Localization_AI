@@ -6,11 +6,13 @@ Redis-based caching layer with in-memory fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Any, Optional
 import logging
 import json
 import hashlib
 import time
+import threading
 
 __all__ = ["RedisCache", "CacheEntry"]
 
@@ -43,17 +45,26 @@ class RedisCache:
             url: str = "redis://127.0.0.1:6379/0",
             fallback: bool = True,
             logger: Optional[logging.Logger] = None,
+            max_memory_entries: int = 256,
+            max_memory_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         self.url = url
         self.logger = logger or _logger
-        self._fallback_dict: dict[str, tuple[Any, float]] = {}  # key -> (value, expiry_time)
+        self._fallback_dict: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
+        self._memory_lock = threading.RLock()
+        self.max_memory_entries = max(1, int(max_memory_entries))
+        self.max_memory_bytes = max(1, int(max_memory_bytes))
+        self._memory_bytes = 0
         self._redis_client = None
         self._use_fallback = False
 
         # Try to connect to Redis
         try:
             import redis
-            self._redis_client = redis.from_url(url, decode_responses=True)
+            self._redis_client = redis.from_url(
+                url, decode_responses=True, socket_connect_timeout=2.0,
+                socket_timeout=2.0,
+            )
             self._redis_client.ping()
             self.logger.info("✓ Connected to Redis at %s", url)
         except Exception as exc:
@@ -68,7 +79,23 @@ class RedisCache:
         """Set cache entry with TTL."""
         try:
             if self._use_fallback or not self._redis_client:
-                self._fallback_dict[key] = (value, time.time() + ttl_seconds)
+                # Store an immutable snapshot with measurable payload size.
+                # The entry limit also bounds Python object/key overhead.
+                serialized = json.dumps(value).encode("utf-8")
+                now = time.monotonic()
+                with self._memory_lock:
+                    self._remove_memory_entry(key)
+                    if ttl_seconds <= 0 or len(serialized) > self.max_memory_bytes:
+                        return False
+                    for expired in [k for k, (_, end) in self._fallback_dict.items() if end <= now]:
+                        self._remove_memory_entry(expired)
+                    while self._fallback_dict and (
+                        len(self._fallback_dict) >= self.max_memory_entries
+                        or self._memory_bytes + len(serialized) > self.max_memory_bytes
+                    ):
+                        self._remove_memory_entry(next(iter(self._fallback_dict)))
+                    self._fallback_dict[key] = (serialized, now + ttl_seconds)
+                    self._memory_bytes += len(serialized)
                 self.logger.debug("Cache SET (memory): key=%s ttl=%d", key, ttl_seconds)
                 return True
 
@@ -85,13 +112,15 @@ class RedisCache:
         """Get cache entry."""
         try:
             if self._use_fallback or not self._redis_client:
-                if key in self._fallback_dict:
-                    value, expiry = self._fallback_dict[key]
-                    if time.time() < expiry:
-                        self.logger.debug("Cache GET (memory HIT): key=%s", key)
-                        return value
-                    else:
-                        del self._fallback_dict[key]
+                with self._memory_lock:
+                    item = self._fallback_dict.get(key)
+                    if item is not None:
+                        value, expiry = item
+                        if time.monotonic() < expiry:
+                            self._fallback_dict.move_to_end(key)
+                            self.logger.debug("Cache GET (memory HIT): key=%s", key)
+                            return json.loads(value)
+                        self._remove_memory_entry(key)
                 self.logger.debug("Cache GET (memory MISS): key=%s", key)
                 return None
 
@@ -111,8 +140,8 @@ class RedisCache:
         """Delete cache entry."""
         try:
             if self._use_fallback or not self._redis_client:
-                if key in self._fallback_dict:
-                    del self._fallback_dict[key]
+                with self._memory_lock:
+                    self._remove_memory_entry(key)
                 return True
 
             self._redis_client.delete(key)
@@ -125,7 +154,9 @@ class RedisCache:
         """Clear all cache entries."""
         try:
             if self._use_fallback or not self._redis_client:
-                self._fallback_dict.clear()
+                with self._memory_lock:
+                    self._fallback_dict.clear()
+                    self._memory_bytes = 0
                 self.logger.info("✓ Cache cleared (memory)")
                 return True
 
@@ -135,6 +166,12 @@ class RedisCache:
         except Exception as exc:
             self.logger.error("Cache clear failed: %s", exc)
             return False
+
+    def _remove_memory_entry(self, key: str) -> None:
+        """Remove an entry while holding the memory lock."""
+        item = self._fallback_dict.pop(key, None)
+        if item is not None:
+            self._memory_bytes -= len(item[0])
 
     def make_key(self, prefix: str, *parts: str) -> str:
         """Create cache key from parts."""

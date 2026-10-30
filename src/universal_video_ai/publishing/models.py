@@ -27,6 +27,7 @@ class PublishingPackConfig:
     use_publish_ready_for_social_publish: bool = True
     playlist_url: Optional[str] = None
     custom_instructions: Optional[str] = None
+    local_model: Optional[str] = None
 
     @classmethod
     def from_dict(cls, raw: Optional[Dict[str, Any]]) -> "PublishingPackConfig":
@@ -76,6 +77,7 @@ class PublishingPackConfig:
             use_publish_ready_for_social_publish=bool(self.use_publish_ready_for_social_publish),
             playlist_url=playlist_url,
             custom_instructions=custom,
+            local_model=str(self.local_model or "").strip()[:200] or None,
         )
 
     def to_dict(self) -> Dict[str, Any]:

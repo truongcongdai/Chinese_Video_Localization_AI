@@ -252,11 +252,13 @@ class GoogleOAuthTokenService:
         self,
         store: OAuthAccountStore,
         *,
-        oauth_factory: Callable[[], GoogleOAuth] = GoogleOAuth,
+        oauth_factory: Optional[Callable[[], GoogleOAuth]] = None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._store = store
-        self._oauth_factory = oauth_factory
+        self._oauth_factory = oauth_factory or (lambda: GoogleOAuth(
+            credentials=getattr(store, "get_social_app_credentials", lambda platform: {})("youtube")
+        ))
         self._now = now
 
     def connection_status(self, user_id: int) -> YouTubeConnectionStatus:
@@ -298,6 +300,8 @@ class GoogleOAuthTokenService:
         refresh_token = _row_value(row, "refresh_token")
         if not refresh_token:
             raise YouTubeAuthorizationError()
+        from universal_video_ai.channel_agent.coordination import reserve_provider_call
+        reserve_provider_call("external_api_calls")
         try:
             refreshed = self._oauth_factory().refresh_access_token_details(str(refresh_token))
         except Exception as exc:
@@ -350,6 +354,8 @@ class YouTubeReadOnlyService:
 
     def _get_json(self, user_id: int, url: str, params: dict[str, Any], *, analytics: bool = False) -> dict[str, Any]:
         token = self._tokens.get_valid_access_token(user_id)
+        from universal_video_ai.channel_agent.coordination import reserve_provider_call
+        reserve_provider_call("external_api_calls")
         try:
             response = self._http.get(
                 url,

@@ -15,7 +15,7 @@ class RateLimiter:
         max_concurrent: int = 3,
         delay_between_requests: float = 2.0,
     ):
-        self.max_requests_per_minute = max_requests_per_minute
+        self.max_requests_per_minute = max(1, max_requests_per_minute)
         self.max_concurrent = max_concurrent
         self.delay_between_requests = delay_between_requests
         
@@ -36,52 +36,41 @@ class RateLimiter:
         """Wait until a download slot is available and rate limit allows it."""
         # Wait for concurrent slot
         await self.concurrent_semaphore.acquire()
-        
-        # Apply rate limiting
-        await self._wait_for_rate_limit(user_id)
+        try:
+            await self._wait_for_rate_limit(user_id)
+        except BaseException:
+            self.concurrent_semaphore.release()
+            raise
+        with self.concurrent_lock:
+            self.active_downloads += 1
     
     def release(self) -> None:
         """Release a download slot."""
+        with self.concurrent_lock:
+            self.active_downloads -= 1
         self.concurrent_semaphore.release()
     
     async def _wait_for_rate_limit(self, user_id: Optional[int] = None) -> None:
         """Wait until rate limits allow the request."""
-        now = time.time()
-        
-        # Check global rate limit
-        with self.global_lock:
-            # Remove requests older than 1 minute
-            while self.global_requests and now - self.global_requests[0] > 60:
-                self.global_requests.popleft()
-            
-            # If at limit, wait
-            if len(self.global_requests) >= self.max_requests_per_minute:
-                wait_time = 60 - (now - self.global_requests[0])
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                    now = time.time()
-            
-            # Add current request
-            self.global_requests.append(now)
-        
-        # Check per-user rate limit
-        if user_id is not None:
-           with self.user_locks[user_id]:
-                user_queue = self.user_requests[user_id]
-                
-                # Remove old requests
-                while user_queue and now - user_queue[0] > 60:
-                    user_queue.popleft()
-                
-                # If at limit, wait
-                if len(user_queue) >= self.max_requests_per_minute:
-                    wait_time = 60 - (now - user_queue[0])
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-                        now = time.time()
-                
-                # Add current request
-                user_queue.append(now)
+        while True:
+            # Reserve global and user quota together. No thread lock survives
+            # an await; competing requests recheck after waking up.
+            with self.global_lock:
+                now = time.monotonic()
+                queues = [self.global_requests]
+                if user_id is not None:
+                    queues.append(self.user_requests[user_id])
+                wait_time = 0.0
+                for queue in queues:
+                    while queue and now - queue[0] >= 60:
+                        queue.popleft()
+                    if len(queue) >= self.max_requests_per_minute:
+                        wait_time = max(wait_time, 60 - (now - queue[0]))
+                if wait_time <= 0:
+                    for queue in queues:
+                        queue.append(now)
+                    break
+            await asyncio.sleep(wait_time)
         
         # Add delay between requests
         if self.delay_between_requests > 0:
@@ -89,7 +78,7 @@ class RateLimiter:
     
     def get_stats(self) -> dict:
         """Get current rate limiter statistics."""
-        now = time.time()
+        now = time.monotonic()
         
         with self.global_lock:
             global_count = len([t for t in self.global_requests if now - t <= 60])

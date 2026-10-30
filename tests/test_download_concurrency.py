@@ -131,7 +131,11 @@ def test_autonomous_handler_binds_database_owner_and_limit(tmp_path, monkeypatch
         return "downloaded"
     monkeypatch.setattr(DownloadService, "_download", underlying)
     handler = lambda u, c, r: {"result": DownloadService(u, use_cache=False).download("owned-video", tmp_path)}
-    assert operator.orchestrator._execute_stage(owner, "assets", {"max_concurrent_downloads": 1}, {}, handler) == {"result": "downloaded"}
+    from universal_video_ai.channel_agent.coordination import ExecutionLease
+    run, _ = operator.orchestrator.start(owner, mode="MANUAL_STEP", configuration={})
+    with ExecutionLease(store.db_path, owner, f"automation:{run['id']}") as lease:
+        assert operator.orchestrator._execute_stage(owner, "assets", {"max_concurrent_downloads": 1}, {}, handler,
+                                                     lease=lease, run_id=run['id']) == {"result": "downloaded"}
     assert observed == [1]
     with download_scope(store.db_path, owner, 1), pytest.raises(ValueError, match="owner"):
         DownloadService(foreign, use_cache=False).download("foreign", tmp_path)

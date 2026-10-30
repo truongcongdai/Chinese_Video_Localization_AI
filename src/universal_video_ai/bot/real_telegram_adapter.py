@@ -32,6 +32,7 @@ class RealTelegramAdapter:
         self._handlers: dict[str, Callable[[int, List[str]], None]] = {}
         self._application: Optional[Application] = None
         self._running = False
+        self._delivery_tasks: set = set()
 
     def register_command(self, command: str, handler: Callable[[int, List[str]], None]) -> None:
         """Register a command handler."""
@@ -45,7 +46,7 @@ class RealTelegramAdapter:
             try:
                 loop = asyncio.get_running_loop()
                 # If loop is already running, create a task
-                asyncio.create_task(self._application.bot.send_message(chat_id=chat_id, text=text))
+                self._track_delivery(self._application.bot.send_message(chat_id=chat_id, text=text))
             except RuntimeError:
                 # No running loop, create one
                 loop = asyncio.new_event_loop()
@@ -66,9 +67,20 @@ class RealTelegramAdapter:
 
         import asyncio
 
-        async def _send():
-            with open(video_path, "rb") as f:
-                await self._application.bot.send_video(
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.send_video_async(chat_id, video_path, caption))
+        else:
+            self._track_delivery(self.send_video_async(chat_id, video_path, caption), chat_id=chat_id)
+
+    async def send_video_async(self, chat_id: int, video_path,
+                               caption: Optional[str] = None) -> None:
+        """Await delivery so localization can report upload failures to its user."""
+        if not self._application:
+            raise RuntimeError("Telegram application is not initialized")
+        with open(video_path, "rb") as f:
+            await self._application.bot.send_video(
                     chat_id=chat_id,
                     video=f,
                     caption=caption,
@@ -82,13 +94,24 @@ class RealTelegramAdapter:
                     connect_timeout=30,
                 )
 
-        try:
-            loop = asyncio.get_running_loop()
-            asyncio.create_task(_send())
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(_send())
+    def _track_delivery(self, operation, *, chat_id: Optional[int] = None) -> None:
+        """Observe compatibility API tasks; do not lose errors to the event loop."""
+        import asyncio
+        task = asyncio.create_task(operation)
+        self._delivery_tasks.add(task)
+
+        def completed(done):
+            self._delivery_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                self.logger.error("Telegram delivery failed: %s", error)
+                if chat_id is not None and self._application:
+                    self._track_delivery(self._application.bot.send_message(
+                        chat_id=chat_id, text="⚠️ Video ready but failed to send via Telegram. Please retry delivery."
+                    ))
+        task.add_done_callback(completed)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming Telegram command."""
@@ -103,7 +126,7 @@ class RealTelegramAdapter:
         if not parts:
             return
         
-        command = parts[0].lstrip('/')  # Remove leading slash
+        command = parts[0].lstrip('/').split('@', 1)[0].casefold()
         args = parts[1:] if len(parts) > 1 else []
         
         self.logger.info("Received command: %s from chat_id: %s", command, chat_id)

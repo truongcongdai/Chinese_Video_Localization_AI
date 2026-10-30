@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from pathlib import Path
 import time
 from typing import Any, Optional
@@ -20,6 +21,7 @@ from universal_video_ai.channel_agent.social_publishing import (
 )
 from universal_video_ai.channel_agent.youtube import GoogleOAuthTokenService, YouTubeReadOnlyService
 from universal_video_ai.web.store import Store
+from universal_video_ai.channel_agent.coordination import reserve_provider_call
 
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 PRIVACY_VALUES = {"private", "unlisted", "public"}
@@ -57,30 +59,73 @@ class YouTubeResumablePublisher:
             status["privacyStatus"] = "private"
             status["publishAt"] = job["schedule_utc"]
         body = {"snippet": {"title": job["title"], "description": job["description"], "tags": job["tags"], "categoryId": "22", "defaultLanguage": "vi"}, "status": status}
+        reserve_provider_call("external_api_calls")
         response = self.http.post(self.INIT_URL, params={"uploadType": "resumable", "part": "snippet,status"}, headers={"Authorization": f"Bearer {self._token(user_id)}", "Content-Type": "application/json; charset=UTF-8", "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(job["upload_size"])}, json=body, timeout=self.timeout)
         if response.status_code not in {200, 201} or not response.headers.get("Location"):
             raise ProductionPublishingError(f"YouTube could not create a resumable upload session (HTTP {response.status_code}).")
         return str(response.headers["Location"])
 
     def upload(self, user_id: int, session_uri: str, video_path: str, size: int) -> dict:
-        headers = {"Authorization": f"Bearer {self._token(user_id)}", "Content-Type": "video/mp4", "Content-Length": str(size), "Content-Range": f"bytes 0-{size - 1}/{size}"}
-        last_error: Optional[Exception] = None
-        for _ in range(3):
-            try:
-                with Path(video_path).open("rb") as stream:
-                    response = self.http.put(session_uri, headers=headers, data=stream, timeout=self.timeout)
+        """Query the persisted session before sending bounded chunks.
+
+        A final response can be lost even though YouTube accepted the file.
+        Querying first also recovers that video ID without uploading twice.
+        """
+        path = Path(video_path)
+        if size <= 0 or path.stat().st_size != size:
+            raise ProductionPublishingError("Upload file size changed or is empty.")
+        chunk_size = 8 * 1024 * 1024  # multiple of YouTube's 256 KiB unit
+        retryable = {408, 429, 500, 502, 503, 504}
+        offset, failures, query = 0, 0, True
+        with path.open("rb") as stream:
+            while failures < 3:
+                headers = {"Authorization": f"Bearer {self._token(user_id)}"}
+                if query:
+                    data = b""
+                    headers.update({"Content-Length": "0", "Content-Range": f"bytes */{size}"})
+                else:
+                    stream.seek(offset)
+                    data = stream.read(min(chunk_size, size - offset))
+                    headers.update({"Content-Type": "video/mp4", "Content-Length": str(len(data)),
+                                    "Content-Range": f"bytes {offset}-{offset + len(data) - 1}/{size}"})
+                try:
+                    reserve_provider_call("external_api_calls")
+                    response = self.http.put(session_uri, headers=headers, data=data, timeout=self.timeout)
+                except requests.RequestException:
+                    failures += 1
+                    query = True
+                    time.sleep(min(2 ** (failures - 1), 4))
+                    continue
                 if response.status_code in {200, 201}:
                     payload = self._payload(response)
-                    if payload.get("id"): return payload
+                    if payload.get("id"):
+                        return payload
+                    raise ProductionPublishingError("YouTube completed upload without a video ID.")
                 if response.status_code == 308:
+                    received = response.headers.get("Range", "")
+                    match = re.fullmatch(r"bytes=0-(\d+)", received)
+                    if received and not match:
+                        raise ProductionPublishingError("YouTube returned an invalid upload offset.")
+                    confirmed = int(match[1]) + 1 if match else 0
+                    if confirmed > size:
+                        raise ProductionPublishingError("YouTube upload offset exceeds file size.")
+                    progressed = confirmed > offset
+                    if not query and not progressed or confirmed == size:
+                        failures += 1
+                    elif progressed:
+                        failures = 0
+                    offset = confirmed
+                    query = offset == size
                     continue
-                if response.status_code not in {408, 429, 500, 502, 503, 504}:
+                if response.status_code not in retryable:
                     raise ProductionPublishingError(f"YouTube upload failed (HTTP {response.status_code}).")
-            except requests.RequestException as exc:
-                last_error = exc
-        raise ProductionPublishingError("YouTube resumable upload was interrupted; retry will resume the persisted job.") from last_error
+                failures += 1
+                query = True
+                time.sleep(min(2 ** (failures - 1), 4))
+        raise ProductionPublishingError("YouTube upload interrupted; retry will query the persisted session.")
 
     def status(self, user_id: int, video_id: str) -> dict:
+        reserve_provider_call("external_api_calls")
         response = self.http.get(self.VIDEO_URL, params={"part": "status,processingDetails", "id": video_id}, headers={"Authorization": f"Bearer {self._token(user_id)}"}, timeout=self.timeout)
         payload = self._payload(response)
         items = payload.get("items") or []
@@ -90,6 +135,7 @@ class YouTubeResumablePublisher:
 
     def thumbnail(self, user_id: int, video_id: str, path: str) -> None:
         with Path(path).open("rb") as stream:
+            reserve_provider_call("external_api_calls")
             response = self.http.post(self.THUMBNAIL_URL, params={"videoId": video_id}, headers={"Authorization": f"Bearer {self._token(user_id)}", "Content-Type": "application/octet-stream"}, data=stream, timeout=self.timeout)
         if response.status_code not in {200, 201}: raise ProductionPublishingError("YouTube thumbnail upload failed.")
 
@@ -190,29 +236,52 @@ class ProductionPublishingService(SocialPublishingService):
     def get(self, user_id: int, item_id: int, job_id: int) -> dict: return self._job(user_id, item_id, job_id)
 
     def run(self, user_id: int, item_id: int, job_id: int) -> dict:
+        from universal_video_ai.channel_agent.coordination import ExecutionBusy, ExecutionLease
+        self._job(user_id, item_id, job_id)
+        try:
+            with ExecutionLease(self.store.db_path, user_id, f"publish:{job_id}") as lease:
+                return self._run(user_id, item_id, job_id, lease)
+        except ExecutionBusy as exc:
+            raise ProductionPublishingError(str(exc)) from exc
+
+    def _run(self, user_id: int, item_id: int, job_id: int, lease: Any) -> dict:
+        from universal_video_ai.channel_agent.coordination import reserve_provider_call
         job = self._job(user_id, item_id, job_id, private=True)
         if job["dry_run"]: return self._job(user_id, item_id, job_id)
         if job["status"] == "cancelled": raise ProductionPublishingError("Cancelled publishing jobs cannot run.")
         try:
-            if job.get("external_video_id"): return self.refresh(user_id, item_id, job_id)
+            if job.get("external_video_id"):
+                self._upload_thumbnail(user_id, item_id, job_id, job)
+                return self.refresh(user_id, item_id, job_id)
             session = job.get("upload_session_uri")
             if not session:
                 session = self.publisher.begin(user_id, job)
+                lease.assert_owned()
                 self.store.update_production_publishing_job(user_id, item_id, job_id, {"status": "uploading", "progress": 5, "upload_session_uri": session, "error": None})
+            reserve_provider_call("upload_attempts")
             payload = self.publisher.upload(user_id, session, job["package"]["video_path"], int(job["upload_size"]))
+            lease.assert_owned()
             video_id = str(payload["id"])
             self.store.update_production_publishing_job(user_id, item_id, job_id, {"external_video_id": video_id, "external_url": f"https://www.youtube.com/watch?v={video_id}", "status": "processing", "progress": 90, "upload_offset": job["upload_size"]})
             self.persist_result(user_id, job_id, PublishingResult(
                 platform=self.platform, status="processing", external_id=video_id,
                 external_url=f"https://www.youtube.com/watch?v={video_id}", provider_state=payload,
             ))
-            if job.get("thumbnail_path"):
-                self.publisher.thumbnail(user_id, video_id, job["thumbnail_path"])
-                self.store.update_production_publishing_job(user_id, item_id, job_id, {"thumbnail_status": "uploaded"})
+            self._upload_thumbnail(user_id, item_id, job_id, {**job, "external_video_id": video_id})
             return self.refresh(user_id, item_id, job_id)
         except Exception as exc:
+            lease.assert_owned()
             self.store.update_production_publishing_job(user_id, item_id, job_id, {"status": "failed", "error": str(exc)})
             raise
+
+    def _upload_thumbnail(self, user_id: int, item_id: int, job_id: int, job: dict) -> None:
+        if job.get("thumbnail_path") and job.get("thumbnail_status") != "uploaded":
+            try:
+                self.publisher.thumbnail(user_id, job["external_video_id"], job["thumbnail_path"])
+            except Exception:
+                self.store.update_production_publishing_job(user_id, item_id, job_id, {"thumbnail_status": "failed"})
+                raise
+            self.store.update_production_publishing_job(user_id, item_id, job_id, {"thumbnail_status": "uploaded"})
 
     def refresh(self, user_id: int, item_id: int, job_id: int) -> dict:
         job = self._job(user_id, item_id, job_id, private=True)
@@ -221,11 +290,14 @@ class ProductionPublishingService(SocialPublishingService):
         status, processing = remote.get("status") or {}, remote.get("processingDetails") or {}
         upload = processing.get("processingStatus")
         if upload == "failed" or status.get("uploadStatus") in {"failed", "rejected", "deleted"}: local = "failed"
-        elif job.get("schedule_utc") and self.now() < datetime.fromisoformat(job["schedule_utc"].replace("Z", "+00:00")): local = "scheduled"
-        elif status.get("uploadStatus") in {"processed", "uploaded"} and upload in {None, "succeeded"}: local = "published"
+        elif status.get("privacyStatus") == "private" and status.get("publishAt") and self.now() < datetime.fromisoformat(status["publishAt"].replace("Z", "+00:00")): local = "scheduled"
+        elif status.get("uploadStatus") in {"processed", "uploaded"} and upload in {None, "succeeded"}:
+            local = "published" if status.get("privacyStatus") in {"public", "unlisted"} else "uploaded_private"
         else: local = "processing"
-        values: dict[str, Any] = {"status": local, "remote_status": remote, "progress": 100 if local in {"scheduled", "published"} else 95, "error": None}
-        if local == "published": values["published_at"] = time.time()
+        values: dict[str, Any] = {"status": local, "remote_status": remote, "progress": 100 if local in {"scheduled", "published", "uploaded_private"} else 95, "error": None}
+        if local == "uploaded_private" and job.get("schedule_utc") and self.now() >= datetime.fromisoformat(job["schedule_utc"].replace("Z", "+00:00")):
+            values["error"] = "Scheduled time passed but YouTube still reports private; check YouTube Studio."
+        if local == "published" and not job.get("published_at"): values["published_at"] = self.now().timestamp()
         self.store.update_production_publishing_job(user_id, item_id, job_id, values)
         self.persist_result(user_id, job_id, PublishingResult(
             platform=self.platform, status=local, external_id=job.get("external_video_id"),

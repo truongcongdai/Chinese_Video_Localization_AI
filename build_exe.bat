@@ -45,10 +45,8 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [4/5] Copying additional files...
-if exist ".env" (
-    copy ".env" "dist\ChineseVideoLocalizationAI\.env"
-    echo Copied .env file
-) else (
+copy ".env.example" "dist\ChineseVideoLocalizationAI\.env.example"
+echo Copied configuration template; configure local secrets after installation. else (
     echo WARNING: .env file not found, using .env.example
     copy ".env.example" "dist\ChineseVideoLocalizationAI\.env"
 )

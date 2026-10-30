@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 from universal_video_ai.channel_agent.production import ProductionNotFound, ProductionQueueService
 from universal_video_ai.channel_agent.providers import AIProvider, OllamaProviderError
 from universal_video_ai.web.store import Store
+from universal_video_ai.channel_agent.coordination import reserve_provider_call
 
 ASSET_TYPES = {
     "script_blueprint", "script_section", "script_draft", "visual_plan",
@@ -186,6 +187,7 @@ class ProductionAssetService:
         request = prompt
         for attempt in range(2):
             try:
+                reserve_provider_call("llm_calls")
                 raw = self.provider.generate_structured(
                     system_prompt=system, user_prompt=request,
                     temperature=self.temperature if not attempt else self.repair_temperature,

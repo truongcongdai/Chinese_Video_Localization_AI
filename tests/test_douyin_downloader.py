@@ -262,3 +262,43 @@ def test_direct_stream_retries_interruption_from_received_byte(tmp_path, monkeyp
     assert size == 6
     assert output_path.read_bytes() == b"abcdef"
     assert calls[1][1]["headers"]["Range"] == "bytes=3-"
+
+
+def test_playback_metadata_keeps_exact_identity_and_rejects_placeholders():
+    from universal_video_ai.downloader.douyin import douyin_media_items
+    payload = {'data': [{'aweme_info': {'aweme_id': '123', 'desc': '舞蹈', 'video': {
+        'play_addr': {'url_list': ['https://lf3-static.bytednsdoc.com/obj/nulog', 'http://127.0.0.1/private', 'https://v3.douyinvod.com/video.mp4']}}}},
+        {'aweme_info': {'aweme_id': '456', 'desc': 'photo', 'images': [{}], 'video': {'play_addr': {'url_list': ['https://v3.douyinvod.com/photo.mp4']}}}}]}
+    items = douyin_media_items(payload)
+    assert len(items) == 1 and items[0]['id'] == '123'
+    assert items[0]['urls'] == ['https://v3.douyinvod.com/video.mp4']
+
+
+def test_real_download_service_reuses_search_playback_in_the_owners_session(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    from universal_video_ai.downloader.service import DownloadService
+    from universal_video_ai.reup.source_sessions import SourceSessions
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        pytest.skip('ffmpeg and ffprobe required')
+    sample = tmp_path / 'fixture.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x160:rate=15',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '1', '-c:v', 'libx264',
+                    '-preset', 'ultrafast', '-c:a', 'aac', str(sample)], check=True, timeout=20)
+    body = sample.read_bytes()
+    sessions = SourceSessions(tmp_path / 'sessions')
+    sessions.save_media(1, {'aweme_id': '123456789', 'desc': '舞蹈', 'video': {'duration': 1000,
+        'play_addr': {'url_list': ['https://v3.douyinvod.com/fixture.mp4']}}})
+    calls = []
+    def get(url, **kwargs):
+        assert url == 'https://v3.douyinvod.com/fixture.mp4'
+        calls.append(url)
+        return _StreamingResponse(200, {'Content-Length': str(len(body))}, [body])
+    monkeypatch.setattr('universal_video_ai.downloader.douyin.requests.get', get)
+    monkeypatch.setattr('universal_video_ai.downloader.douyin._cookiefile_for', lambda *a: None)
+    monkeypatch.setattr(sessions, 'browser_context', lambda *a, **kw: pytest.fail('Do not reopen detail API after search supplied playable media'))
+    with sessions.download_scope(1):
+        result = DownloadService(use_cache=False).download('https://www.douyin.com/video/123456789', tmp_path / 'download')
+    assert result.success and result.video_path.read_bytes() == body
+    assert result.duration == 1 and result.title == '舞蹈' and len(calls) == 1
+    assert not sessions.read_media(2, '123456789')

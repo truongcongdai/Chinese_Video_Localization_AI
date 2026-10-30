@@ -11,6 +11,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from universal_video_ai.sqlite_runtime import ClosingConnection
 from .models import (
     ContentOSChannel,
     ContentOSProject,
@@ -42,7 +43,7 @@ class ContentOSRepository:
     def _connect(self):
         """Get database connection using web store pattern."""
         import sqlite3
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), factory=ClosingConnection, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
     
@@ -458,6 +459,15 @@ class ContentOSRepository:
                     (user_id, limit),
                 )
             return [ContentOSRun(**dict(row)) for row in cur.fetchall()]
+
+    def claim_production(self, run_id: int, user_id: int) -> bool:
+        """Serialize production continuations across request-created workflows."""
+        with self._connect() as conn:
+            cur = conn.execute("""UPDATE content_os_runs SET status='running', updated_at=?
+                WHERE id=? AND user_id=? AND status IN ('approved','paused','awaiting_approval')
+                AND current_stage IN ('ready_for_localization','awaiting_storyboard_approval')""",
+                (time.time(), run_id, user_id))
+            return cur.rowcount == 1
     
     # ==================== Steps ====================
     

@@ -7,7 +7,8 @@
 <meta name="description" content="Dịch, lồng tiếng và xuất video cho TikTok, YouTube Shorts và Instagram Reels.">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/app.css?v=20260729">
-<link rel="stylesheet" href="/assets/workspace.css?v=20260909">
+<link rel="stylesheet" href="/assets/workspace.css?v=20261027-strategy">
+<link rel="stylesheet" href="/assets/reup_agent.css?v=20261028-source-recheck">
 </head>
 <body>
 
@@ -256,6 +257,10 @@
       <span>🎬</span>
       <span>Dịch Video</span>
     </button>
+    <button class="feature-tab" data-feature="social-accounts" type="button">
+      <span>🔗</span>
+      <span>Tài khoản social</span>
+    </button>
     <button class="feature-tab" data-feature="trend">
       <span>🔍</span>
       <span>Quét Trend</span>
@@ -263,6 +268,10 @@
     <button class="feature-tab" data-feature="youtube-research">
       <span>YT</span>
       <span>YouTube Research</span>
+    </button>
+    <button class="feature-tab" data-feature="reup-agent">
+      <span>♻️</span>
+      <span>Reup Agent</span>
     </button>
     <button class="feature-tab hidden" data-feature="channel-agent">
       <span>🧭</span>
@@ -465,6 +474,14 @@
         <label>Giọng đọc</label>
         <select id="voice-select"><option value="">Mặc định</option></select>
         <div id="voice-select-help" style="font-size:12px;color:var(--text-dim);margin-top:5px">Danh sách voice thay đổi theo ngôn ngữ, provider và kết nối đã lưu.</div>
+        <label style="margin-top:10px">Người nói trong video</label>
+        <select id="speaker-mode-select"><option value="single">Một giọng (như hiện tại)</option><option value="auto">Tự nhận diện người nói (model local)</option><option value="manual">Gán người nói khi duyệt phụ đề</option></select>
+        <div id="speaker-auto-readiness" class="reup-readiness hidden" role="status" aria-live="polite"></div>
+        <label>Giọng cho người 1 / người 2</label>
+        <input id="speaker-voice-0" value="vi-VN-NamMinhNeural" placeholder="Voice ID người 1">
+        <input id="speaker-voice-1" value="vi-VN-HoaiMyNeural" placeholder="Voice ID người 2">
+        <div class="muted-help">Dùng Voice ID phù hợp ngôn ngữ và provider đã chọn. Chế độ tự nhận diện mặc định tối đa 2 người; không ép video một người thành hai.</div>
+
         <div class="voice-preview-row">
           <button class="btn secondary small" id="voice-preview-btn" type="button">▶ Nghe thử giọng</button>
           <button class="btn secondary small" id="voice-refresh-btn" type="button">↻ Làm mới giọng</button>
@@ -1084,6 +1101,11 @@
       </div>
     </details>
 
+    <section class="social-publishing-section" aria-labelledby="localization-social-heading">
+      <h3 id="localization-social-heading">Tài khoản &amp; đăng video</h3>
+      <p class="muted-help">Kết nối Facebook Page, YouTube hoặc TikTok ngay tại đây. Khi xử lý xong, bấm “Đăng lên mạng xã hội” cạnh video kết quả hoặc trong lịch sử để đăng ngay hay hẹn giờ.</p>
+      <div data-social-connections aria-live="polite"></div>
+    </section>
     <div class="localization-summary" id="localization-summary">
       <div><small>Video</small><strong id="summary-video-count">0 link</strong></div>
       <div><small>Ngôn ngữ</small><strong id="summary-language">—</strong></div>
@@ -1106,6 +1128,33 @@
     </section>
     <div id="submit-error" role="alert" style="color: var(--err); font-size: 13px; margin-top: 8px;"></div>
   </div>
+  </div>
+
+  <div class="feature-panel" data-feature="social-accounts">
+    <div class="card">
+      <div class="social-section-heading">
+        <div>
+          <h3 class="section-title">Tài khoản social</h3>
+          <p class="muted-help">Đăng nhập và cấp quyền để đăng video bằng tài khoản của bạn. Kết nối này dùng chung cho Dịch Video, Reup Agent và các luồng đăng video.</p>
+        </div>
+        <button class="btn secondary small" id="social-refresh-btn" type="button">Làm mới kết nối</button>
+      </div>
+      <div data-social-connections aria-live="polite"></div>
+      <details id="social-app-settings" class="social-publishing-section hidden">
+        <summary>Thiết lập kết nối · dành cho quản trị viên</summary>
+        <p class="muted-help">Thiết lập ứng dụng một lần cho cả hệ thống ngay tại đây. Người dùng chỉ bấm Đăng nhập để mở trang Facebook, YouTube hoặc TikTok và cấp quyền bằng tài khoản của mình.</p>
+        <form id="social-app-form">
+          <div class="field"><label for="social-app-platform">Nền tảng</label><select id="social-app-platform"><option value="youtube">YouTube</option><option value="facebook">Facebook Page</option><option value="tiktok">TikTok</option></select></div>
+          <div class="field"><label id="social-app-id-label" for="social-app-id">Client ID</label><input id="social-app-id" required autocomplete="off" maxlength="500"></div>
+          <div class="field"><label for="social-app-secret">Khóa bí mật ứng dụng</label><input id="social-app-secret" type="password" autocomplete="new-password" maxlength="4096" placeholder="Để trống để giữ khóa đã lưu"></div>
+          <div class="field"><label for="social-app-redirect">Địa chỉ chuyển về · thêm vào cấu hình ứng dụng trên nền tảng</label><input id="social-app-redirect" readonly></div>
+          <p class="muted-help"><a id="social-app-dashboard" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Mở trang quản lý ứng dụng</a>. Đăng ký ứng dụng và cấp quyền đăng video theo hướng dẫn của nền tảng, sau đó lưu mã ứng dụng và khóa tại đây.</p>
+          <button class="btn gradient small" id="social-app-save" type="submit">Lưu thiết lập kết nối</button>
+          <p id="social-app-status" class="muted-help" role="status"></p>
+        </form>
+      </details>
+      <p class="muted-help">Sau khi kết nối, mở video đã xử lý trong lịch sử và bấm “Đăng lên mạng xã hội” để chọn nền tảng, nhập tiêu đề, mô tả và hẹn giờ. YouTube hiện tải lên ở chế độ riêng tư; bạn có thể công khai trong YouTube Studio.</p>
+    </div>
   </div>
 
   <!-- Affiliate Panel -->
@@ -1508,7 +1557,92 @@
     </div>
   </div>
 
-  <!-- AI Channel Agent CP1 Panel -->
+  <!-- Channel analysis, social research, and automatic reup -->
+  <div class="feature-panel" data-feature="reup-agent">
+    <div class="card reup-shell" id="reup-agent-panel">
+      <header class="reup-header">
+        <div><span class="reup-eyebrow">TRỢ LÝ PHÁT TRIỂN KÊNH</span><h2>Reup Agent</h2><p>Phân tích kênh của bạn → khảo sát trend social → tự tìm video để reup.</p></div>
+        <div class="reup-header-actions"><span id="reup-profile-state" class="reup-profile-state">Chạy theo yêu cầu</span><button class="btn secondary small" id="reup-stop-agent" type="button" disabled>Tắt chạy định kỳ</button><button class="btn secondary small" id="reup-load" type="button">Tải lại</button></div>
+      </header>
+
+      <nav class="reup-stepper" aria-label="Quy trình Reup Agent">
+        <button type="button" class="reup-step is-active" data-reup-step="1" aria-current="step" aria-controls="reup-step-1"><span>1</span><div><strong>Kết nối kênh</strong><small>Chọn nơi đăng video</small></div></button>
+        <button type="button" class="reup-step" data-reup-step="2" aria-controls="reup-step-2"><span>2</span><div><strong>Chiến lược cho kênh</strong><small>Phân tích &amp; khảo sát trend</small></div></button>
+        <button type="button" class="reup-step" data-reup-step="3" aria-controls="reup-step-3"><span>3</span><div><strong>Bắt đầu chạy</strong><small>Chọn cách xử lý và đăng</small></div></button>
+        <button type="button" class="reup-step" data-reup-step="4" aria-controls="reup-step-4"><span>4</span><div><strong>Theo dõi video</strong><small>Xem tiến độ và duyệt đăng</small></div><span id="reup-pending-badge" class="reup-pending-badge hidden"></span></button>
+      </nav>
+      <div id="reup-message" class="reup-message hidden" role="status" aria-live="polite"></div>
+
+      <section class="reup-page" id="reup-step-1" data-reup-panel="1" aria-labelledby="reup-channel-heading">
+        <div class="reup-page-heading"><span class="reup-eyebrow">BƯỚC 1 / 4</span><h3 id="reup-channel-heading" tabindex="-1">Bắt đầu từ kênh của bạn</h3><p>Agent tự kiểm tra video đã đăng, xác định hướng nội dung và khảo sát các nền tảng social.</p></div>
+        <div class="reup-channel-card" id="reup-channel-card">
+          <span class="reup-youtube-icon" aria-hidden="true">▶</span>
+          <div class="reup-channel-identity"><span class="reup-overline">KÊNH ĐĂNG VIDEO · YOUTUBE</span><strong id="reup-channel-name">Đang kiểm tra kết nối…</strong><p id="reup-channel-help">Thông tin tài khoản của bạn sẽ hiện ở đây.</p></div>
+          <button class="btn secondary" id="reup-connect-youtube" type="button">Đăng nhập YouTube</button>
+        </div>
+        <button class="btn secondary small hidden" id="reup-open-social-setup" type="button">Mở thiết lập tài khoản social</button>
+        <details class="reup-options" id="reup-source-connections">
+          <summary><strong>Đăng nhập nguồn video</strong><span>Douyin · TikTok · Bilibili</span></summary>
+          <div class="reup-options-body"><p class="reup-help">Phiên nguồn được giữ theo tài khoản ứng dụng. Nếu tìm kiếm yêu cầu CAPTCHA, chọn Xác minh tìm kiếm để mở đúng trang đang bị chặn. Bạn hoàn tất xác minh trong cửa sổ đó; Agent đọc và lưu danh sách video ngay trong cùng cửa sổ.</p><div id="reup-source-sessions" class="reup-source-sessions" aria-live="polite"></div></div>
+        </details>
+        <input type="hidden" id="reup-channel">
+        <div class="reup-setup-grid">
+          <div class="field"><label for="reup-market-region">Khán giả của bạn ở đâu?</label><select id="reup-market-region"><option value="VN">Việt Nam</option><option value="US">Hoa Kỳ</option><option value="TH">Thái Lan</option><option value="JP">Nhật Bản</option><option value="KR">Hàn Quốc</option></select><small>Agent dùng thị trường này để tìm chủ đề được quan tâm.</small></div>
+          <div class="field"><label>Khảo sát xu hướng trên</label><div class="reup-platforms"><label><input type="checkbox" id="reup-douyin" checked>Douyin</label><label><input type="checkbox" id="reup-tiktok" checked>TikTok</label><label><input type="checkbox" id="reup-youtube" checked>YouTube</label><label><input type="checkbox" id="reup-bilibili" checked>Bilibili</label></div><small>Agent tự tìm chủ đề, từ khóa và video phù hợp trên các nền tảng đã chọn.</small></div>
+        </div>
+        <div class="reup-grid two reup-channel-paths"><div class="reup-callout"><p><strong>Kênh đã có video</strong>Quét video đã đăng → phân tích chủ đề đang có khán giả → tìm video và trend tương tự trên social.</p></div><div class="reup-callout"><p><strong>Kênh chưa có video</strong>Khảo sát trend social → đề xuất hướng nội dung có tín hiệu quan tâm → lên chiến lược xây kênh mới.</p></div></div>
+        <div class="reup-page-footer"><p id="reup-connect-next-help">Kết nối kênh để tiếp tục.</p><button class="btn gradient" id="reup-analyze" type="button" disabled>Phân tích kênh &amp; khảo sát trend →</button></div>
+      </section>
+
+      <section class="reup-page hidden" id="reup-step-2" data-reup-panel="2" aria-labelledby="reup-strategy-heading">
+        <div class="reup-page-heading"><span class="reup-eyebrow">BƯỚC 2 / 4</span><h3 id="reup-strategy-heading" tabindex="-1">Chiến lược phát triển kênh của bạn</h3><p id="reup-content-help">Agent tự chọn hướng phù hợp nhất từ dữ liệu đã quét. Bạn có thể xem căn cứ hoặc chọn hướng khác.</p></div>
+        <div class="reup-direction-toolbar"><p class="reup-help">Chủ đề, từ khóa tìm kiếm và video đều do Agent tìm tự động.</p><button class="btn secondary small" id="reup-reanalyze" type="button">Phân tích lại</button></div>
+        <div id="reup-strategy-status" class="reup-analysis-status" role="status" aria-live="polite">Chưa phân tích kênh.</div>
+        <div id="reup-market-coverage" class="reup-help"></div>
+        <div id="reup-strategy-result" class="reup-strategy-result"></div>
+        <div id="reup-strategy-plan" class="reup-strategy-plan hidden"></div>
+        <input type="hidden" id="reup-strategy-direction">
+        <div class="reup-page-footer"><button class="btn secondary" type="button" data-reup-back="1">← Kênh của tôi</button><button class="btn gradient" id="reup-direction-next" type="button" disabled>Dùng chiến lược Agent đề xuất →</button></div>
+      </section>
+
+      <section class="reup-page hidden" id="reup-step-3" data-reup-panel="3" aria-labelledby="reup-start-heading">
+        <div class="reup-page-heading"><span class="reup-eyebrow">BƯỚC 3 / 4</span><h3 id="reup-start-heading" tabindex="-1">Bạn muốn Agent làm đến bước nào?</h3><p>Mặc định, Agent xử lý video rồi chờ bạn xem và duyệt trước khi đăng.</p></div>
+        <div class="reup-start-grid">
+          <div>
+            <div class="field"><label for="reup-automation">Cách thực hiện</label><select id="reup-automation"><option value="assisted">Xử lý video, tôi duyệt trước khi đăng</option><option value="auto">Xử lý và tự đăng theo cài đặt</option><option value="manual">Chỉ tìm nguồn, tôi chọn video để xử lý</option></select><small id="reup-automation-help"></small></div>
+            <div class="reup-grid two"><div class="field"><label for="reup-publish">Khi đăng lên YouTube</label><select id="reup-publish"><option value="private">Để riêng tư, chỉ mình tôi xem</option><option value="immediate">Công khai video</option><option value="schedule">Hẹn giờ công khai</option></select></div><div class="field"><label for="reup-limit">Tối đa video / ngày</label><input type="number" id="reup-limit" min="1" max="10" value="1"></div></div>
+            <div class="field hidden" id="reup-schedule-settings"><label for="reup-time">Giờ công khai video</label><input type="time" id="reup-time" value="18:00"><small id="reup-schedule-zone">Theo múi giờ Asia/Bangkok.</small></div>
+            <label class="reup-toggle"><input type="checkbox" id="reup-enabled"><span><strong>Tự tìm thêm video định kỳ</strong><small>Tắt để chỉ chạy một lượt khi bấm bắt đầu.</small></span></label>
+            <label class="reup-consent"><input type="checkbox" id="reup-rights"><span>Tôi có quyền sử dụng các video nguồn được chọn.</span></label>
+          </div>
+          <aside class="reup-run-summary" aria-label="Tóm tắt lượt chạy"><span class="reup-overline">LƯỢT CHẠY CỦA BẠN</span><h4 id="reup-summary-topic">Chưa chọn chủ đề</h4><dl><div><dt>Đăng lên</dt><dd id="reup-summary-channel">—</dd></div><div><dt>Tìm nguồn từ</dt><dd id="reup-summary-platforms">—</dd></div><div><dt>Giới hạn mỗi ngày</dt><dd id="reup-summary-limit">1 video</dd></div><div><dt>Sau khi xử lý</dt><dd id="reup-summary-action">Chờ bạn duyệt đăng</dd></div></dl><p id="reup-summary-output">Video được lồng tiếng và chuẩn bị tiêu đề, mô tả trước khi đăng.</p></aside>
+        </div>
+        <details class="reup-options" id="reup-processing-options"><summary><strong>Giọng đọc &amp; video ngắn</strong><span>Dùng mặc định hoặc tùy chỉnh</span></summary><div class="reup-options-body">
+          <div class="reup-grid three"><div class="field"><label for="reup-speakers">Người nói trong video</label><select id="reup-speakers"><option value="single">Dùng một giọng đọc</option><option value="manual">Tôi gán giọng khi duyệt phụ đề</option><option value="auto">Tự nhận diện nhiều người nói</option></select></div><div class="field"><label for="reup-voice0">Giọng đọc chính</label><select id="reup-voice0"><option value="vi-VN-NamMinhNeural">Nam · Nam Minh</option><option value="vi-VN-HoaiMyNeural">Nữ · Hoài My</option></select></div><div class="field hidden" id="reup-voice1-field"><label for="reup-voice1">Giọng người thứ hai</label><select id="reup-voice1"><option value="vi-VN-HoaiMyNeural">Nữ · Hoài My</option><option value="vi-VN-NamMinhNeural">Nam · Nam Minh</option></select></div></div>
+          <div id="reup-speaker-readiness" class="reup-readiness hidden" role="status" aria-live="polite"></div>
+          <label class="reup-toggle"><input type="checkbox" id="reup-short"><span><strong>Tạo thêm video ngắn từ các tình tiết chính</strong><small>Dùng model phân tích đã cài để chọn các cảnh trong video.</small></span></label>
+          <div id="reup-short-options" class="reup-grid two hidden"><div class="field" id="reup-short-duration-field"><label for="reup-short-seconds">Thời lượng video ngắn (giây)</label><input type="number" id="reup-short-seconds" value="60" min="10" max="180"></div></div>
+        </div></details>
+        <details class="reup-options" id="reup-advanced-options"><summary><strong>Tùy chọn nâng cao</strong><span>AI, lịch quét và múi giờ</span></summary><div class="reup-options-body">
+          <div class="reup-grid two"><div class="field"><label for="reup-metadata">Viết tiêu đề và mô tả</label><select id="reup-metadata"><option value="none">Tạo từ nội dung video</option><option value="ollama">Dùng AI chạy trên máy</option></select></div><div class="field"><label for="reup-model">Model AI đã cài · tùy chọn</label><input id="reup-model" placeholder="Tên model Ollama"><small id="reup-model-help">Để trống để dùng model hệ thống. Agent tự chuẩn bị từ khóa theo ngôn ngữ từng nguồn; model riêng cũng dùng được cho video ngắn.</small></div><div class="field"><label for="reup-interval">Tìm nguồn mới mỗi (phút)</label><input type="number" id="reup-interval" value="60" min="15" max="1440"></div><div class="field"><label for="reup-timezone">Múi giờ đăng</label><input id="reup-timezone" value="Asia/Bangkok"></div><div class="field"><label for="reup-exclude">Nội dung muốn bỏ qua · tùy chọn</label><textarea id="reup-exclude" rows="2" placeholder="Mỗi dòng một từ khóa loại trừ"></textarea></div></div>
+        </div></details>
+        <div class="reup-page-footer"><button class="btn secondary" type="button" data-reup-back="2">← Chọn lại nội dung</button><div class="reup-footer-actions"><button class="btn secondary" id="reup-save" type="button">Lưu cài đặt</button><button class="btn gradient" id="reup-scan" type="button">Tìm và xử lý video →</button></div></div>
+      </section>
+
+      <section class="reup-page hidden" id="reup-step-4" data-reup-panel="4" aria-labelledby="reup-runs-heading">
+        <div class="reup-page-heading reup-activity-heading"><div><span class="reup-eyebrow">BƯỚC 4 / 4</span><h3 id="reup-runs-heading" tabindex="-1">Video của bạn đang ở bước nào?</h3><p id="reup-activity-help">Xem tiến độ xử lý và duyệt những video đã sẵn sàng.</p></div><div class="reup-actions"><button class="btn secondary small" id="reup-search-again" type="button" disabled>Tìm video lại</button><button class="btn secondary small" type="button" data-reup-back="1">+ Chuẩn bị lượt mới</button></div></div>
+        <div id="reup-source-status" class="reup-source-status hidden" aria-live="polite"></div>
+        <div id="reup-run-scopes" class="reup-run-filters hidden" role="group" aria-label="Phạm vi video"><button type="button" data-reup-scope="latest" class="is-active" aria-pressed="true">Lượt tìm mới nhất</button><button type="button" data-reup-scope="history" aria-pressed="false" id="reup-history-count">Toàn bộ lịch sử</button></div>
+        <div class="reup-counters"><div><strong id="reup-stat-active">0</strong><span>Đang xử lý</span></div><div><strong id="reup-stat-review">0</strong><span>Chờ bạn duyệt</span></div><div><strong id="reup-stat-done">0</strong><span>Đã đăng / lên lịch</span></div><div><strong id="reup-stat-error">0</strong><span>Cần kiểm tra</span></div></div>
+        <div class="reup-activity-toolbar"><div class="reup-run-filters" role="group" aria-label="Lọc video"><button class="is-active" type="button" data-reup-filter="all" aria-pressed="true">Tất cả</button><button type="button" data-reup-filter="review" aria-pressed="false">Chờ duyệt</button><button type="button" data-reup-filter="active" aria-pressed="false">Đang xử lý</button><button type="button" data-reup-filter="error" aria-pressed="false">Cần kiểm tra</button></div><span id="reup-run-count" class="reup-count">0 video</span></div>
+        <div id="reup-runs" class="reup-runs" aria-live="polite"></div><div id="reup-package-preview" class="reup-package-preview"></div>
+        <div class="reup-actions"><button class="btn secondary hidden" id="reup-view-settings" type="button">Xem / sửa cài đặt lượt chạy</button></div>
+      </section>
+      <details class="reup-section reup-short-builder hidden" id="reup-short-builder"><summary>Tạo short thủ công từ video dài đã xử lý</summary><p class="reup-help">Nhập mã job trong lịch sử. Không có model local thì timeline chỉ là gợi ý highlight; hãy chọn lại cảnh trước khi dựng.</p><div class="reup-actions"><input id="short-job-id" placeholder="Mã job đã hoàn thành" aria-label="Mã job đã hoàn thành"><button class="btn secondary" id="short-plan-btn" type="button">Lập timeline</button></div><video id="short-source-preview" controls preload="none"></video><div id="short-cuts-table"></div><div class="reup-actions"><button class="btn secondary small" id="short-add-cut" type="button">Thêm cảnh</button><button class="btn gradient" id="short-render-btn" type="button">Dựng short</button></div><div id="short-result"></div></details>
+    </div>
+  </div>
+
+  <!-- Original AI Channel Agent creator -->
   <div class="feature-panel" data-feature="channel-agent">
     <div class="card">
       <div class="template-library-heading">
@@ -1864,7 +1998,10 @@
     <h3 class="section-title">Video đang xem</h3>
     <video id="latest-result-video" controls preload="metadata"></video>
     <div class="latest-result-title" id="latest-result-title"></div>
-    <button class="btn gradient small" id="latest-improve-btn" type="button" style="margin-top:10px">Improve this video</button>
+    <div class="social-result-actions">
+      <button class="btn secondary small" id="latest-improve-btn" type="button">Improve this video</button>
+      <button class="btn gradient small" id="latest-publish-btn" type="button">Đăng lên mạng xã hội</button>
+    </div>
   </div>
 
   <div class="card">
@@ -2065,12 +2202,14 @@
     <button class="modal-close" id="publish-close">×</button>
     <h3>Đăng lên mạng xã hội</h3>
 
-    <div id="connect-cards"></div>
+    <p id="publish-video-title" class="muted-help"></p>
+    <div id="connect-cards" data-social-connections aria-live="polite"></div>
 
-    <div class="chip-row">
-      <div class="chip" data-platform="tiktok">TikTok</div>
-      <div class="chip" data-platform="facebook">Facebook</div>
-      <div class="chip" data-platform="youtube">YouTube</div>
+    <p class="muted-help">Chọn nền tảng đã kết nối để đăng video. YouTube tải lên riêng tư; công khai trong YouTube Studio.</p>
+    <div class="chip-row" aria-label="Nền tảng đăng video">
+      <button type="button" class="chip" data-platform="tiktok" aria-pressed="false">TikTok</button>
+      <button type="button" class="chip" data-platform="facebook" aria-pressed="false">Facebook Page</button>
+      <button type="button" class="chip" data-platform="youtube" aria-pressed="false">YouTube</button>
     </div>
     <div class="field"><label>Tiêu đề</label><input id="publish-title"></div>
     <div class="field"><label>Mô tả</label><textarea id="publish-desc" rows="3"></textarea></div>
@@ -2086,6 +2225,15 @@
     </div>
     <div id="scheduled-posts" style="margin-top:12px"></div>
     <div id="publish-results"></div>
+  </div>
+</div>
+
+<div id="social-connect-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="social-connect-title">
+  <div class="modal">
+    <button class="modal-close" id="social-connect-close" type="button" aria-label="Đóng kết nối">×</button>
+    <h3 id="social-connect-title">Kết nối tài khoản social</h3>
+    <div id="social-connect-content" aria-live="polite"></div>
+    <button class="btn secondary small" id="social-connect-refresh" type="button">Kiểm tra kết nối</button>
   </div>
 </div>
 
@@ -2145,6 +2293,7 @@
 <script src="/assets/content_brain_ui.js?v=20260821-channel-agent-cp42-reliability1" defer></script>
 <script src="/assets/content_opportunity_ui.js?v=20260821-channel-agent-cp5-opportunities1" defer></script>
 <script src="/assets/content_production_ui.js?v=20260904-channel-agent-cp7a-production1" defer></script>
-<script src="/assets/app.js?v=20260909-voice-history2" defer></script>
+<script src="/assets/app.js?v=20261027-channel-first" defer></script>
+<script src="/assets/reup_agent_ui.js?v=20261028-source-recheck" defer></script>
 </body>
 </html>

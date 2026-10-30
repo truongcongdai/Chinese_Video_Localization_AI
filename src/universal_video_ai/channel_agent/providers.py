@@ -212,6 +212,8 @@ class OllamaProvider:
                 "POST", f"{self.base_url}/api/chat", request_payload, self.timeout_seconds
             )
         except OllamaThinkUnsupportedError:
+            from .coordination import reserve_provider_call
+            reserve_provider_call("llm_calls")
             # Older Ollama releases may reject a field they do not recognize.
             # Retry exactly once without it; structured JSON and all bounds stay intact.
             compatible_payload = dict(request_payload)

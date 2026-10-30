@@ -99,6 +99,19 @@ class ConnectResult:
 
 class PlatformOAuth:
     platform = "base"
+    CLIENT_ID_ENV = ""
+    CLIENT_SECRET_ENV = ""
+
+    def __init__(self, credentials: Optional[dict[str, str]] = None) -> None:
+        self._credentials = credentials or {}
+
+    @property
+    def client_id(self) -> str:
+        return self._credentials.get("client_id", os.environ.get(self.CLIENT_ID_ENV, ""))
+
+    @property
+    def client_secret(self) -> str:
+        return self._credentials.get("client_secret", os.environ.get(self.CLIENT_SECRET_ENV, ""))
 
     def is_configured(self) -> bool:
         raise NotImplementedError
@@ -116,6 +129,8 @@ class PlatformOAuth:
 
 class GoogleOAuth(PlatformOAuth):
     platform = "youtube"
+    CLIENT_ID_ENV = "GOOGLE_CLIENT_ID"
+    CLIENT_SECRET_ENV = "GOOGLE_CLIENT_SECRET"
     AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
     TOKEN_URL = "https://oauth2.googleapis.com/token"
     # Keep the existing upload permission so reconnecting does not break the
@@ -128,18 +143,14 @@ class GoogleOAuth(PlatformOAuth):
     )
 
     def is_configured(self) -> bool:
-        return bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))
+        return bool(self.client_id and self.client_secret)
 
     def not_configured_message(self) -> str:
-        return (
-            "Admin cần tạo OAuth Client (loại Web application) tại Google Cloud Console, "
-            "bật 'YouTube Data API v3', rồi set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET trong .env. "
-            "Xem README_WEB.md."
-        )
+        return "Quản trị viên cần thiết lập ứng dụng YouTube trong Tài khoản social → Thiết lập kết nối. Sau đó bạn chỉ cần bấm Đăng nhập YouTube."
 
     def authorize_url(self, redirect_uri: str, state: str) -> str:
         params = {
-            "client_id": os.environ["GOOGLE_CLIENT_ID"],
+            "client_id": self.client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": self.SCOPE,
@@ -152,8 +163,8 @@ class GoogleOAuth(PlatformOAuth):
     @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         resp = requests.post(self.TOKEN_URL, data={
-            "client_id": os.environ["GOOGLE_CLIENT_ID"],
-            "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
             "code": code,
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
@@ -194,8 +205,8 @@ class GoogleOAuth(PlatformOAuth):
     @_safe_oauth_errors
     def refresh_access_token_details(self, refresh_token: str) -> dict:
         resp = requests.post(self.TOKEN_URL, data={
-            "client_id": os.environ["GOOGLE_CLIENT_ID"],
-            "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
             "refresh_token": refresh_token,
             "grant_type": "refresh_token",
         }, timeout=30)
@@ -208,25 +219,21 @@ class GoogleOAuth(PlatformOAuth):
 
 class FacebookOAuth(PlatformOAuth):
     platform = "facebook"
+    CLIENT_ID_ENV = "FACEBOOK_APP_ID"
+    CLIENT_SECRET_ENV = "FACEBOOK_APP_SECRET"
     AUTH_URL = "https://www.facebook.com/v19.0/dialog/oauth"
     TOKEN_URL = "https://graph.facebook.com/v19.0/oauth/access_token"
     SCOPE = "pages_show_list,pages_manage_posts,pages_read_engagement"
 
     def is_configured(self) -> bool:
-        return bool(os.environ.get("FACEBOOK_APP_ID") and os.environ.get("FACEBOOK_APP_SECRET"))
+        return bool(self.client_id and self.client_secret)
 
     def not_configured_message(self) -> str:
-        return (
-            "Admin cần tạo app tại developers.facebook.com (loại 'Business'), thêm sản phẩm "
-            "'Facebook Login', rồi set FACEBOOK_APP_ID / FACEBOOK_APP_SECRET trong .env. Lưu ý: "
-            "đăng video lên Page thật (ngoài tài khoản test) cần Meta App Review duyệt quyền "
-            "pages_manage_posts trước — nếu bạn chưa có Meta Business, hãy tạo miễn phí tại "
-            "business.facebook.com trước khi làm bước này. Xem README_WEB.md."
-        )
+        return "Quản trị viên cần thiết lập ứng dụng Facebook trong Tài khoản social → Thiết lập kết nối. Sau đó bạn đăng nhập Facebook và cấp quyền cho Page muốn đăng."
 
     def authorize_url(self, redirect_uri: str, state: str) -> str:
         params = {
-            "client_id": os.environ["FACEBOOK_APP_ID"],
+            "client_id": self.client_id,
             "redirect_uri": redirect_uri,
             "state": state,
             "scope": self.SCOPE,
@@ -237,8 +244,8 @@ class FacebookOAuth(PlatformOAuth):
     @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         resp = requests.get(self.TOKEN_URL, params={
-            "client_id": os.environ["FACEBOOK_APP_ID"],
-            "client_secret": os.environ["FACEBOOK_APP_SECRET"],
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
             "redirect_uri": redirect_uri,
             "code": code,
         }, timeout=30)
@@ -276,24 +283,21 @@ class FacebookOAuth(PlatformOAuth):
 
 class TikTokOAuth(PlatformOAuth):
     platform = "tiktok"
+    CLIENT_ID_ENV = "TIKTOK_CLIENT_KEY"
+    CLIENT_SECRET_ENV = "TIKTOK_CLIENT_SECRET"
     AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
     TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
     SCOPE = "user.info.basic,video.publish"
 
     def is_configured(self) -> bool:
-        return bool(os.environ.get("TIKTOK_CLIENT_KEY") and os.environ.get("TIKTOK_CLIENT_SECRET"))
+        return bool(self.client_id and self.client_secret)
 
     def not_configured_message(self) -> str:
-        return (
-            "Admin cần đăng ký app tại TikTok for Developers, bật sản phẩm 'Login Kit' + "
-            "'Content Posting API', rồi set TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET trong .env. "
-            "App chưa được TikTok audit chỉ đăng được vào draft/inbox riêng tư của tài khoản test. "
-            "Xem README_WEB.md."
-        )
+        return "Quản trị viên cần thiết lập ứng dụng TikTok trong Tài khoản social → Thiết lập kết nối. Sau đó bạn chỉ cần bấm Đăng nhập TikTok."
 
     def authorize_url(self, redirect_uri: str, state: str) -> str:
         params = {
-            "client_key": os.environ["TIKTOK_CLIENT_KEY"],
+            "client_key": self.client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": self.SCOPE,
@@ -304,8 +308,8 @@ class TikTokOAuth(PlatformOAuth):
     @_safe_oauth_errors
     def exchange_code(self, code: str, redirect_uri: str) -> ConnectResult:
         resp = requests.post(self.TOKEN_URL, data={
-            "client_key": os.environ["TIKTOK_CLIENT_KEY"],
-            "client_secret": os.environ["TIKTOK_CLIENT_SECRET"],
+            "client_key": self.client_id,
+            "client_secret": self.client_secret,
             "code": code,
             "grant_type": "authorization_code",
             "redirect_uri": redirect_uri,
@@ -339,8 +343,8 @@ class TikTokOAuth(PlatformOAuth):
 _CLIENTS = {"youtube": GoogleOAuth, "facebook": FacebookOAuth, "tiktok": TikTokOAuth}
 
 
-def get_oauth_client(platform: str) -> PlatformOAuth:
+def get_oauth_client(platform: str, credentials: Optional[dict[str, str]] = None) -> PlatformOAuth:
     key = platform.strip().lower()
     if key not in _CLIENTS:
         raise ValueError(f"Unknown platform: {platform!r}")
-    return _CLIENTS[key]()
+    return _CLIENTS[key](credentials=credentials)

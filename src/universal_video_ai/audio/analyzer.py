@@ -8,11 +8,17 @@ for intelligent music selection.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections import OrderedDict
 from pathlib import Path
+import threading
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+_FEATURE_CACHE: OrderedDict[tuple, AudioFeatures] = OrderedDict()
+_FEATURE_LOCK = threading.Lock()
+_MAX_FEATURE_ENTRIES = 256
+_EXCERPT_SECONDS = 30.0
 
 
 @dataclass
@@ -56,16 +62,30 @@ class AudioAnalyzer:
             logger.error(f"Audio file not found: {audio_path}")
             return None
 
-        if self._librosa_available:
-            return self._analyze_with_librosa(audio_path)
-        else:
-            return self._analyze_fallback(audio_path)
+        stat = audio_path.stat()
+        key = (str(audio_path.resolve()), stat.st_size, stat.st_mtime_ns, self._librosa_available)
+        with _FEATURE_LOCK:
+            cached = _FEATURE_CACHE.get(key)
+            if cached is not None:
+                _FEATURE_CACHE.move_to_end(key)
+                return replace(cached)
+        result = (self._analyze_with_librosa(audio_path) if self._librosa_available
+                  else self._analyze_fallback(audio_path))
+        if result is not None:
+            with _FEATURE_LOCK:
+                _FEATURE_CACHE[key] = replace(result)
+                _FEATURE_CACHE.move_to_end(key)
+                while len(_FEATURE_CACHE) > _MAX_FEATURE_ENTRIES:
+                    _FEATURE_CACHE.popitem(last=False)
+        return result
 
     def _analyze_with_librosa(self, audio_path: Path) -> Optional[AudioFeatures]:
         """Full feature extraction using librosa."""
         try:
             # Load audio
-            y, sr = self.librosa.load(audio_path, sr=None)
+            y, sr = self.librosa.load(
+                audio_path, sr=22050, mono=True, duration=_EXCERPT_SECONDS,
+            )
 
             # Extract tempo
             tempo, _ = self.librosa.beat.beat_track(y=y, sr=sr)
@@ -89,7 +109,8 @@ class AudioAnalyzer:
             valence = float(self.np.mean(spectral_centroid) / self.np.mean(spectral_rolloff + 1e-6))
             valence = max(0.0, min(1.0, valence))  # Clamp to [0, 1]
 
-            duration = float(self.librosa.get_duration(y=y, sr=sr))
+            from .duration import media_duration
+            duration = media_duration(audio_path) or float(self.librosa.get_duration(y=y, sr=sr))
 
             return AudioFeatures(
                 tempo=float(tempo),

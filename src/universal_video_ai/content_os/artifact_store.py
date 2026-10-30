@@ -205,6 +205,17 @@ class ArtifactStore:
             return content
         except Exception as e:
             raise ArtifactValidationError(f"Failed to read artifact: {e}") from e
+
+    def describe(
+        self, user_id: int, project_id: int, run_id: int,
+        artifact_type: ArtifactType, version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Identify the exact bytes reviewed at an approval checkpoint."""
+        content = self.read(user_id, project_id, run_id, artifact_type, version)
+        version = content["version"]
+        path = self._get_artifact_path(user_id, project_id, run_id, artifact_type, version)
+        return {"artifact_type": artifact_type.value, "version": version,
+                "checksum": self._calculate_checksum(path.read_bytes()), "path": str(path)}
     
     def list_artifacts(
         self,

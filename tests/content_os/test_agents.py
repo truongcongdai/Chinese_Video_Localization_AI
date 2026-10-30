@@ -91,7 +91,7 @@ class TestLLMRouter:
         monkeypatch.setattr(requests, "post", fake_post)
 
         router = LLMRouter(provider="gemini", model="gemini-test")
-        result = router.invoke("Return JSON", output_schema=object)
+        result = router._invoke_gemini("Return JSON", output_schema=object)
 
         assert result["ok"] is True
         assert "gemini-test:generateContent" in captured["url"]

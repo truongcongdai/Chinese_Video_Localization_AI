@@ -15,12 +15,14 @@ from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from universal_video_ai.channel_agent.automation import (
+    AutomationBusy,
     AutomationError,
     AutomationOrchestrator,
     _contains_secret,
 )
 from universal_video_ai.provider_runtime import ProviderMode, get_cost_report
 from universal_video_ai.web.store import Store
+from universal_video_ai.channel_agent.coordination import ExecutionBusy, ExecutionLease, connection
 
 
 AUTONOMOUS_SCHEMA = """
@@ -313,18 +315,18 @@ class AutonomousChannelOperator:
             ).fetchall()
         return [self._cycle_row(row) for row in rows]
 
-    def _limit_ok(self, user_id: int, config: dict[str, Any]) -> None:
+    def _limit_ok(self, user_id: int, config: dict[str, Any],
+                  conn: Any) -> None:
         cfg, now = config["configuration"], self.now()
-        with self.store._connect() as conn:
-            active = conn.execute(
+        active = conn.execute(
                 "SELECT COUNT(*) c FROM autonomous_channel_cycles WHERE user_id=? AND status IN ('queued','running','waiting_approval')",
                 (user_id,),
             ).fetchone()["c"]
-            daily = conn.execute(
+        daily = conn.execute(
                 "SELECT COUNT(*) c FROM autonomous_channel_cycles WHERE user_id=? AND created_at>=?",
                 (user_id, now - 86400),
             ).fetchone()["c"]
-            weekly = conn.execute(
+        weekly = conn.execute(
                 "SELECT COUNT(*) c FROM autonomous_channel_cycles WHERE user_id=? AND created_at>=?",
                 (user_id, now - 7 * 86400),
             ).fetchone()["c"]
@@ -346,46 +348,62 @@ class AutonomousChannelOperator:
         key = idempotency_key or hashlib.sha256(
             f"{user_id}:{config_id}:{trigger}:{now:.6f}".encode("utf-8")
         ).hexdigest()
-        with self.store._connect() as conn:
+        with connection(self.store.db_path, immediate=True) as conn:
             existing = conn.execute(
                 "SELECT * FROM autonomous_channel_cycles WHERE user_id=? AND idempotency_key=?", (user_id, key),
             ).fetchone()
-            if existing:
-                return self._cycle_row(existing), False
-        self._limit_ok(user_id, config)
-        with self.store._connect() as conn:
-            cur = conn.execute(
+            created = existing is None
+            if existing is not None:
+                cycle_id = int(existing["id"])
+            else:
+                self._limit_ok(user_id, config, conn)
+                cur = conn.execute(
                 "INSERT INTO autonomous_channel_cycles "
                 "(user_id,config_id,status,trigger,idempotency_key,config_snapshot_json,cost_baseline_json,cost_report_json,created_at,updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (user_id, config_id, "queued", trigger, key, _json(config),
                  _json(get_cost_report().to_dict()), _json({}), now, now),
             )
-            cycle_id = int(cur.lastrowid)
-            conn.executemany(
+                cycle_id = int(cur.lastrowid)
+                conn.executemany(
                 "INSERT INTO autonomous_cycle_steps (user_id,cycle_id,stage,order_index,updated_at) VALUES (?,?,?,?,?)",
                 [(user_id, cycle_id, stage, index, now)
                  for index, stage in enumerate(AUTONOMOUS_STAGES)],
             )
-        run_config = dict(config["configuration"])
-        run_config["provider_mode"] = config["provider_mode"]
-        run, _ = self.orchestrator.start(
-            user_id, mode="FULL_AUTONOMOUS", configuration=run_config,
-            trigger=trigger, run_type="autonomous_channel_cycle", channel_id=config["channel_key"],
-            idempotency_key=f"cp11-cycle-{cycle_id}",
-        )
-        with self.store._connect() as conn:
-            conn.execute(
-                "UPDATE autonomous_channel_cycles SET automation_run_id=?,started_at=?,status='running',updated_at=? WHERE user_id=? AND id=?",
-                (run["id"], now, now, user_id, cycle_id),
-            )
-        cycle = self.get_cycle(user_id, cycle_id)
-        return (self.advance_cycle(user_id, cycle_id) if advance else cycle), True
+        cycle = self._ensure_run_link(user_id, cycle_id)
+        return (self.advance_cycle(user_id, cycle_id) if advance else cycle), created
+
+    def _ensure_run_link(self, user_id: int, cycle_id: int) -> dict[str, Any]:
+        """Repair either crash window using the deterministic automation key."""
+        try:
+            with ExecutionLease(self.store.db_path, user_id, f"cycle-link:{cycle_id}"):
+                cycle = self.get_cycle(user_id, cycle_id)
+                if cycle.get("automation_run_id"):
+                    return cycle
+                config = cycle["config_snapshot"]
+                run_config = dict(config["configuration"])
+                run_config["provider_mode"] = config["provider_mode"]
+                run, _ = self.orchestrator.start(
+                    user_id, mode="FULL_AUTONOMOUS", configuration=run_config,
+                    trigger=cycle["trigger"], run_type="autonomous_channel_cycle",
+                    channel_id=config["channel_key"], idempotency_key=f"cp11-cycle-{cycle_id}",
+                )
+                with connection(self.store.db_path, immediate=True) as conn:
+                    conn.execute(
+                        "UPDATE autonomous_channel_cycles SET automation_run_id=?,started_at=?,status='running',updated_at=? "
+                        "WHERE user_id=? AND id=? AND automation_run_id IS NULL",
+                        (run["id"], self.now(), self.now(), user_id, cycle_id),
+                    )
+                return self.get_cycle(user_id, cycle_id)
+        except ExecutionBusy as exc:
+            raise AutonomousOperatorError(str(exc)) from exc
 
     def advance_cycle(self, user_id: int, cycle_id: int) -> dict[str, Any]:
         cycle = self.get_cycle(user_id, cycle_id)
         if cycle["status"] in {"completed", "cancelled"}:
             return cycle
+        if not cycle.get("automation_run_id"):
+            cycle = self._ensure_run_link(user_id, cycle_id)
         try:
             run = self.orchestrator.advance(user_id, int(cycle["automation_run_id"]))
             mapping = {
@@ -394,6 +412,8 @@ class AutonomousChannelOperator:
             }
             status = mapping.get(run["status"], "running")
             error = run.get("error")
+        except AutomationBusy:
+            return self.get_cycle(user_id, cycle_id)
         except AutomationError as exc:
             run, status, error = {}, "failed", str(exc)
         now = self.now()
@@ -466,26 +486,46 @@ class AutonomousChannelOperator:
             rows = conn.execute(sql, params).fetchall()
         output: list[dict[str, Any]] = []
         for row in rows:
-            config = self._config_row(row)
-            missed = now - float(config["next_run_at"] or now) > 60
-            policy = config["missed_run_policy"]
-            should_run = not missed or policy == "run_once"
-            next_at = self.next_run(config["cadence"], config["local_time"], config["timezone_name"], now)
-            with self.store._connect() as conn:
-                conn.execute(
-                    "UPDATE autonomous_channel_configs SET next_run_at=?,updated_at=? WHERE id=? AND user_id=?",
-                    (next_at, now, config["id"], config["user_id"]),
-                )
-            if should_run:
-                key = f"scheduled-{config['id']}-{int(config['next_run_at'])}"
-                try:
-                    cycle, _ = self.start_cycle(
-                        int(config["user_id"]), int(config["id"]), trigger="scheduled",
-                        idempotency_key=key, advance=True,
-                    )
-                    output.append(cycle)
-                except AutonomousOperatorError:
-                    # A concurrency/budget window is a persisted next-tick concern,
-                    # never a reason to burst-create missed cycles.
-                    continue
+            try:
+                with ExecutionLease(self.store.db_path, int(row["user_id"]), f"scheduler:{row['id']}") as lease:
+                    cycle = self._schedule_occurrence(int(row["user_id"]), int(row["id"]), now, lease)
+                if cycle:
+                    output.append(self.advance_cycle(int(row["user_id"]), int(cycle["id"])))
+            except (ExecutionBusy, AutonomousOperatorError):
+                # Admission failures retain the due occurrence for a later tick.
+                continue
         return output
+
+    def _schedule_occurrence(self, user_id: int, config_id: int, now: float,
+                             lease: ExecutionLease) -> Optional[dict[str, Any]]:
+        with connection(self.store.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM autonomous_channel_configs WHERE id=? AND user_id=? "
+                "AND enabled=1 AND stop_after_current=0 AND next_run_at<=?",
+                (config_id, user_id, now),
+            ).fetchone()
+        if not row:
+            return None
+        config = self._config_row(row)
+        key = f"scheduled-{config_id}-{int(config['next_run_at'])}"
+        with connection(self.store.db_path) as conn:
+            occurrence = conn.execute(
+                "SELECT id FROM autonomous_channel_cycles WHERE user_id=? AND idempotency_key=?",
+                (user_id, key),
+            ).fetchone()
+        missed = now - float(config["next_run_at"]) > 60
+        cycle = None
+        if occurrence or not missed or config["missed_run_policy"] == "run_once":
+            # Persist and link before moving the schedule. A crash on either
+            # side of this boundary reuses the same occurrence and run key.
+            cycle, _ = self.start_cycle(user_id, config_id, trigger="scheduled",
+                                         idempotency_key=key, advance=False)
+        next_at = self.next_run(config["cadence"], config["local_time"], config["timezone_name"], now)
+        with connection(self.store.db_path, immediate=True) as conn:
+            lease.check(conn)
+            conn.execute(
+                "UPDATE autonomous_channel_configs SET next_run_at=?,updated_at=? "
+                "WHERE id=? AND user_id=? AND next_run_at=?",
+                (next_at, now, config_id, user_id, config["next_run_at"]),
+            )
+        return cycle

@@ -85,7 +85,7 @@ class JobService:
             progress=progress if progress is not None else job.progress,
             message=message or job.message,
             result_path=result_path or job.result_path,
-            error=error or job.error,
+            error=None if status == JobStatus.COMPLETED else (error or job.error),
             created_at=job.created_at,
             started_at=job.started_at or (datetime.now(timezone.utc) if status == JobStatus.RUNNING else None),
             completed_at=job.completed_at or (
@@ -119,11 +119,19 @@ class JobService:
         if self.use_queue and self.queue:
             self.logger.info("JobService: enqueuing job %s with priority %s", job_id, priority.name)
             
+            attempts = 0
+
             def _queue_callback(jid: str) -> None:
                 """Callback wrapper for queue processing."""
+                nonlocal attempts
+                if self.get_job(jid).status == JobStatus.CANCELLED:
+                    return
+                attempts += 1
                 try:
                     self.update_job(jid, status=JobStatus.RUNNING)
                     result = callback(jid)
+                    if self.get_job(jid).status == JobStatus.CANCELLED:
+                        return
                     self.update_job(
                         jid,
                         status=JobStatus.COMPLETED,
@@ -133,9 +141,16 @@ class JobService:
                     )
                 except Exception as exc:
                     self.logger.exception("JobService: job %s failed: %s", jid, exc)
-                    self.update_job(jid, status=JobStatus.FAILED, error=str(exc))
+                    if self.get_job(jid).status == JobStatus.CANCELLED:
+                        return
+                    final = attempts > self.queue.max_retries
+                    self.update_job(jid, status=JobStatus.FAILED if final else JobStatus.PENDING,
+                                    error=str(exc))
+                    raise
             
-            self.queue.enqueue(job_id, _queue_callback, priority)
+            if not self.queue.enqueue(job_id, _queue_callback, priority):
+                self.update_job(job_id, status=JobStatus.FAILED, error="Job queue is not running")
+                raise RuntimeError("Job queue rejected the job")
             return None
 
         # Use simple thread if queue not enabled

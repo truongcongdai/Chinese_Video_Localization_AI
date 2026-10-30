@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 def _cookiefile_for_platform(platform: Platform) -> str | None:
+    from universal_video_ai.reup.source_sessions import source_cookie_file
+    owned = source_cookie_file(platform.name)
+    if owned:
+        return owned
     candidate = (
         os.environ.get(f"{platform.name.upper()}_COOKIES_FILE")
         or os.environ.get("YTDLP_COOKIES_FILE")

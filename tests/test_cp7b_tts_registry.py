@@ -62,7 +62,12 @@ def test_runtime_voice_verification_is_real_and_cached():
     assert provider.synthesis_calls == 3
 
 
-def test_edge_catalog_contains_only_two_native_vietnamese_speakers():
+def test_edge_catalog_contains_only_two_native_vietnamese_speakers(monkeypatch):
+    from types import SimpleNamespace
+    from universal_video_ai.tts.registry import EdgeVoiceProvider
+    monkeypatch.setattr(EdgeVoiceProvider, "health_check", lambda self: ProviderHealth("edge", True, "fake CLI"))
+    monkeypatch.setattr("universal_video_ai.tts.registry.subprocess.run", lambda *a, **kw: SimpleNamespace(
+        returncode=0, stdout="vi-VN-HoaiMyNeural Female\nvi-VN-NamMinhNeural Male\n"))
     registry = TTSVoiceRegistry()
     voices = registry.list_voices("vi", provider="edge")
     identities = {voice.speaker_identity for voice in voices}

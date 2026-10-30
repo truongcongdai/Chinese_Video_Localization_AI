@@ -9,6 +9,7 @@ import logging
 import sqlite3
 import threading
 import time
+import math
 from typing import Any, Dict, List, Optional, Callable
 
 from universal_video_ai.config import TEMP_DIR
@@ -601,7 +602,7 @@ class DatabaseManager:
                 created = self._now()
                 cur.execute(
                     """
-                    INSERT INTO users (user_id, credits, total_used, created_at, updated_at)
+                    INSERT OR IGNORE INTO users (user_id, credits, total_used, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
                     (user_id, 3.0, 0.0, created, created),
@@ -612,61 +613,54 @@ class DatabaseManager:
 
             return self._row_to_user_credit(row)
 
-    def deduct_credits(self, user_id: int, amount: float) -> bool:
-        """Deduct credits; returns True if successful, False if insufficient."""
+    def _change_credits(self, user_id: int, amount: float, action: str,
+                        reason: Optional[str] = None, admin_id: Optional[int] = None) -> Optional[float]:
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError("Credit amounts must be finite and nonnegative")
         with self._lock:
-            uc = self.get_user_credits(user_id)
-            if uc.credits < amount:
-                self.logger.warning("Insufficient credits: user=%s has %s, need %s", user_id, uc.credits, amount)
-                return False
-            new_balance = uc.credits - amount
-            updatedAt = self._now()
-            cur = self._conn.cursor()
-            cur.execute(
-                "UPDATE users SET credits = ?, updated_at = ?, total_used = total_used + ? WHERE user_id = ?",
-                (new_balance, updatedAt, amount, user_id),
-            )
-            self._conn.commit()
-            self.logger.info("Deducted %.2f credits from user=%s, new_balance=%.2f", amount, user_id, new_balance)
-            # NEW: Audit log
-            self.log_audit(user_id, "deduct", old_value=uc.credits, new_value=new_balance, reason="Localization job")
-            return True
+            # Creation is idempotent across connections, outside the write transaction.
+            self.get_user_credits(user_id)
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                old = float(self._conn.execute(
+                    "SELECT credits FROM users WHERE user_id=?", (user_id,)
+                ).fetchone()[0])
+                now = self._now()
+                if action == "deduct":
+                    cursor = self._conn.execute(
+                        "UPDATE users SET credits=credits-?, total_used=total_used+?, updated_at=? "
+                        "WHERE user_id=? AND credits>=?", (amount, amount, now, user_id, amount)
+                    )
+                    if cursor.rowcount != 1:
+                        return None
+                elif action == "add":
+                    self._conn.execute("UPDATE users SET credits=credits+?, updated_at=? WHERE user_id=?",
+                                       (amount, now, user_id))
+                else:
+                    self._conn.execute("UPDATE users SET credits=?, updated_at=? WHERE user_id=?",
+                                       (amount, now, user_id))
+                balance = float(self._conn.execute(
+                    "SELECT credits FROM users WHERE user_id=?", (user_id,)
+                ).fetchone()[0])
+                self._conn.execute(
+                    "INSERT INTO audit_log(user_id,action,old_value,new_value,reason,admin_id,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)", (user_id, action, old, balance, reason, admin_id, now)
+                )
+            self.logger.info("Credit transaction: user=%s action=%s balance=%.2f", user_id, action, balance)
+            return balance
+
+    def deduct_credits(self, user_id: int, amount: float) -> bool:
+        """Atomically reserve credits and audit; False means insufficient balance."""
+        return self._change_credits(user_id, amount, "deduct", "Localization job") is not None
 
     def add_credits(self, user_id: int, amount: float) -> float:
-        """Add credits to user account; returns new balance."""
-        with self._lock:
-            uc = self.get_user_credits(user_id)
-            new_balance = uc.credits + amount
-            updatedAt = self._now()
-            cur = self._conn.cursor()
-            cur.execute(
-                "UPDATE users SET credits = ?, updated_at = ? WHERE user_id = ?",
-                (new_balance, updatedAt, user_id),
-            )
-            self._conn.commit()
-            self.logger.info("Added %.2f credits to user=%s, new_balance=%.2f", amount, user_id, new_balance)
-            # NEW: Audit log
-            self.log_audit(user_id, "add", old_value=uc.credits, new_value=new_balance)
-            return new_balance
+        """Add credits relative to the current balance in one audited transaction."""
+        return self._change_credits(user_id, amount, "add")
 
     def set_user_credits(self, user_id: int, new_balance: float, reason: Optional[str] = None,
                          admin_id: Optional[int] = None) -> float:
-        """Set user balance to exact amount (admin operation)."""
-        with self._lock:
-            uc = self.get_user_credits(user_id)
-            old_balance = uc.credits
-            updatedAt = self._now()
-            cur = self._conn.cursor()
-            cur.execute(
-                "UPDATE users SET credits = ?, updated_at = ? WHERE user_id = ?",
-                (new_balance, updatedAt, user_id),
-            )
-            self._conn.commit()
-            self.logger.info("Set user=%s balance from %.2f to %.2f", user_id, old_balance, new_balance)
-            # NEW: Audit log with admin tracking
-            self.log_audit(user_id, "set", old_value=old_balance, new_value=new_balance,
-                          reason=reason or "Admin adjustment", admin_id=admin_id)
-            return new_balance
+        """Set the balance and record its old/new values in the same transaction."""
+        return self._change_credits(user_id, new_balance, "set", reason or "Admin adjustment", admin_id)
 
     def set_subscription_tier(self, user_id: int, tier: str) -> None:
         """Set user subscription tier (free, pro, enterprise)."""

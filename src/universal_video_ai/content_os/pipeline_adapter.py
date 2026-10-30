@@ -5,6 +5,7 @@ Bridges the Content OS workflow with the existing video localization pipeline
 by creating jobs in the web store that the orchestrator can process.
 """
 import inspect
+import json
 import logging
 import time
 import uuid
@@ -12,6 +13,8 @@ from typing import Dict, Any, Optional, List
 
 from .repository import ContentOSRepository
 from .artifact_store import ArtifactStore
+from .approvals import ArtifactApprovals
+from .enums import ApprovalType
 from .enums import WorkflowStage
 from .exceptions import WorkflowError
 
@@ -86,18 +89,23 @@ class PipelineAdapter:
             )
         
         # Get the script artifact
-        script_artifact = self._get_latest_artifact(
-            user_id=user_id,
-            project_id=run.project_id,
-            run_id=run_id,
-            artifact_type="script",
-        )
+        script_artifact = ArtifactApprovals(self.repository, self.artifact_store).read(
+            run_id, user_id, ApprovalType.SCRIPT)["data"]
         
         if not script_artifact:
             raise WorkflowError(f"No script artifact found for run {run_id}")
         
         # script_artifact is already the data dict (extracted by _get_latest_artifact)
         script_data = script_artifact
+
+        # Resume the same production job after a manual gate, rather than
+        # creating a second job and replaying the approved storyboard.
+        from ..web.store import Store
+        linked_id = json.loads(run.warning_json or "{}").get("localization_job_id")
+        if linked_id:
+            linked = Store(self.web_store_db_path).get_job(linked_id)
+            if linked and linked.user_id == user_id:
+                return linked_id
         
         # Get the content plan for context
         plan_artifact = self._get_latest_artifact(
@@ -130,11 +138,10 @@ class PipelineAdapter:
         )
         
         # Update run to track the created job
-        import json
         self.repository.update_run(
             run_id=run_id,
             user_id=user_id,
-            warning_json=json.dumps({"localization_job_id": actual_job_id}),
+            warning_json=json.dumps({**json.loads(run.warning_json or "{}"), "localization_job_id": actual_job_id}),
         )
         
         self.logger.info(f"Created localization job {actual_job_id} from Content OS run {run_id}")

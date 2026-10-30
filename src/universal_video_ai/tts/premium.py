@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from universal_video_ai.network import post_with_retry
 
 from .backend import TTSBackend
 from .exceptions import SynthesisError
+
+__all__ = ["OpenAITTSBackend", "ElevenLabsTTSBackend", "OPENAI_BUILTIN_VOICES"]
 
 _logger = logging.getLogger(__name__)
 
@@ -77,6 +80,8 @@ class OpenAITTSBackend(TTSBackend):
         cleaned = " ".join(text.split()).strip()
         if not cleaned:
             raise ValueError("text must be a non-empty string")
+        if len(cleaned) > 4096:
+            raise SynthesisError("OpenAI TTS input exceeds 4096 characters; split the text before synthesis")
         output_path = output_path.resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         effective_voice = _normalize_voice(voice) or self.default_voice
@@ -84,20 +89,25 @@ class OpenAITTSBackend(TTSBackend):
         payload = {
             "model": self.model,
             "voice": voice_payload,
-            "input": cleaned[:4096],
+            "input": cleaned,
             "response_format": "wav",
         }
         if self.model not in {"tts-1", "tts-1-hd"} and self.style:
             payload["instructions"] = _style_instructions(self.style, language)
-        response = requests.post(
-            "https://api.openai.com/v1/audio/speech",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=120,
-        )
-        if response.status_code >= 400:
-            raise SynthesisError(f"OpenAI TTS failed: {response.status_code} {response.text[:300]}")
-        output_path.write_bytes(response.content)
+        try:
+            response = post_with_retry(
+                "https://api.openai.com/v1/audio/speech",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json=payload, retry_category="tts_requests",
+            )
+        except requests.RequestException as exc:
+            raise SynthesisError("OpenAI TTS network request failed", cause=exc) from exc
+        try:
+            if response.status_code >= 400:
+                raise SynthesisError(f"OpenAI TTS failed: HTTP {response.status_code}")
+            output_path.write_bytes(response.content)
+        finally:
+            response.close()
         if not output_path.exists() or output_path.stat().st_size <= 0:
             raise SynthesisError("OpenAI TTS returned an empty audio file")
         return output_path
@@ -133,15 +143,22 @@ class ElevenLabsTTSBackend(TTSBackend):
             "model_id": self.model,
             "voice_settings": _elevenlabs_voice_settings(self.style),
         }
-        response = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-            headers={"xi-api-key": self.api_key, "Content-Type": "application/json"},
-            json=payload,
-            timeout=120,
-        )
-        if response.status_code >= 400:
-            raise SynthesisError(f"ElevenLabs TTS failed: {response.status_code} {response.text[:300]}")
-        temp_mp3.write_bytes(response.content)
+        try:
+            response = post_with_retry(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                headers={"xi-api-key": self.api_key, "Content-Type": "application/json"},
+                json=payload, retry_category="tts_requests",
+            )
+        except requests.RequestException as exc:
+            raise SynthesisError("ElevenLabs TTS network request failed", cause=exc) from exc
+        try:
+            if response.status_code >= 400:
+                raise SynthesisError(f"ElevenLabs TTS failed: HTTP {response.status_code}")
+            if not response.content:
+                raise SynthesisError("ElevenLabs TTS returned empty audio")
+            temp_mp3.write_bytes(response.content)
+        finally:
+            response.close()
         return _convert_to_wav(temp_mp3, output_path)
 
 

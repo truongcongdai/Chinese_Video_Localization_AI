@@ -5,6 +5,7 @@ Coordinates the entire content creation workflow, managing state transitions,
 agent execution, artifact storage, and approval gates.
 """
 import hashlib
+import json
 import logging
 import os
 import time
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 
 from .repository import ContentOSRepository
 from .artifact_store import ArtifactStore
+from .approvals import ArtifactApprovals
 from .state_machine import StateMachine
 from .enums import WorkflowStage, RunStatus, StepStatus, ArtifactType, ApprovalType
 from .asset_resolver import AssetType as AssetResolverAssetType, AssetSource
@@ -62,6 +64,7 @@ class ContentOSWorkflow:
         self.repository = repository
         self.artifact_store = artifact_store
         self.config = config or WorkflowConfig()
+        self.approvals = ArtifactApprovals(repository, artifact_store)
 
         # Initialize agents
         self.agents = {
@@ -74,7 +77,7 @@ class ContentOSWorkflow:
         }
 
         # Initialize production components
-        self.storyboard_manager = StoryboardManager(repository)
+        self.storyboard_manager = StoryboardManager(repository, artifact_store)
         self.asset_resolver = AssetResolver(repository)
         self.renderer = Renderer(repository)
         self.mp4_validator = MP4Validator()
@@ -142,15 +145,6 @@ class ContentOSWorkflow:
         # Execute workflow stages
         try:
             result = self._execute_workflow(run_id, user_id)
-
-            # Mark as completed
-            self.repository.update_run(
-                run_id=run_id,
-                user_id=user_id,
-                status="completed",
-                completed_at=time.time(),
-                progress_percent=100,
-            )
 
             return result
 
@@ -255,8 +249,7 @@ class ContentOSWorkflow:
                 )
 
                 if revision_count >= self.config.max_revision_attempts:
-                    # Max revisions reached, force approval
-                    break
+                    raise WorkflowError("Script still needs fixes after the revision limit")
 
                 # Execute revision
                 self._advance_stage(run_id, user_id, WorkflowStage.SCRIPT_REVISION)
@@ -268,6 +261,10 @@ class ContentOSWorkflow:
                 # BLOCKED or FAIL - stop workflow
                 self._advance_stage(run_id, user_id, WorkflowStage.BLOCKED)
                 raise WorkflowError(f"Script audit failed: {audit_result['decision']}")
+
+        if context["script"] is not script_result:
+            self._store_agent_artifact(run_id, user_id, ArtifactType.SCRIPT,
+                                       context["script"], "script_reviser", WorkflowStage.SCRIPT_REVISION)
 
         # Stage 7: Await Approval
         self._advance_stage(run_id, user_id, WorkflowStage.AWAITING_APPROVAL)
@@ -289,6 +286,7 @@ class ContentOSWorkflow:
         else:
             # Wait for manual approval
             self.logger.info(f"Run {run_id} awaiting manual approval")
+            self.repository.update_run(run_id, user_id, status="awaiting_approval", completed_at=None)
             return {"status": "awaiting_approval", "run_id": run_id}
 
         # Stage 8: Ready for Localization
@@ -306,6 +304,16 @@ class ContentOSWorkflow:
         }
 
     def _execute_production_stages(self, run_id: int, user_id: int, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute/resume production and always persist its terminal outcome."""
+        try:
+            self.repository.update_run(run_id, user_id, status="running", error_json=None, completed_at=None)
+            return self._produce(run_id, user_id, context)
+        except Exception as exc:
+            self.repository.update_run(run_id, user_id, status="failed", completed_at=time.time(),
+                                       error_json=json.dumps({"error": str(exc), "type": type(exc).__name__}))
+            raise
+
+    def _produce(self, run_id: int, user_id: int, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute production stages: storyboard → assets → voice → subtitles → timeline → render → validate.
 
@@ -320,14 +328,17 @@ class ContentOSWorkflow:
         run = self.repository.get_run(run_id, user_id)
         project = self.repository.get_project(run.project_id, user_id)
 
-        # Stage 9: Storyboarding
-        self._advance_stage(run_id, user_id, WorkflowStage.STORYBOARDING)
-        storyboard = self._generate_storyboard(run_id, user_id, context)
-        context["storyboard"] = storyboard
-
-        # Stage 10: Storyboard Approval (auto-approve in this mode)
-        self._advance_stage(run_id, user_id, WorkflowStage.AWAITING_STORYBOARD_APPROVAL)
-        self._record_approval(run_id, user_id, ApprovalType.STORYBOARD, "approved", "Auto-approved")
+        if run.current_stage != WorkflowStage.AWAITING_STORYBOARD_APPROVAL.value:
+            self._advance_stage(run_id, user_id, WorkflowStage.STORYBOARDING)
+            context["storyboard"] = self._generate_storyboard(run_id, user_id, context)
+            self._advance_stage(run_id, user_id, WorkflowStage.AWAITING_STORYBOARD_APPROVAL)
+            if self.config.auto_approve:
+                self._record_approval(run_id, user_id, ApprovalType.STORYBOARD, "approved", "Auto-approved")
+        approval = self.repository.get_latest_approval(run_id, ApprovalType.STORYBOARD.value)
+        if approval is None or approval.decision != "approved":
+            self.repository.update_run(run_id, user_id, status="awaiting_approval", completed_at=None)
+            return {"status": "awaiting_approval", "stage": "awaiting_storyboard_approval", "run_id": run_id}
+        context["storyboard"] = self.approvals.read(run_id, user_id, ApprovalType.STORYBOARD)["data"]
         self._advance_stage(run_id, user_id, WorkflowStage.ASSET_PLANNING, has_approval=True)
 
         # Stage 11: Asset Planning
@@ -366,9 +377,13 @@ class ContentOSWorkflow:
         self._advance_stage(run_id, user_id, WorkflowStage.OUTPUT_VALIDATION)
         validation_result = self._validate_output(run_id, user_id, context)
         context["validation_result"] = validation_result
+        if validation_result.get("valid") is not True:
+            raise WorkflowError("Output validation failed: " + json.dumps(validation_result, ensure_ascii=False))
 
         # Stage 19: Completed
         self._advance_stage(run_id, user_id, WorkflowStage.COMPLETED)
+        self.repository.update_run(run_id, user_id, status="completed", progress_percent=100,
+                                   completed_at=time.time(), error_json=None)
 
         return {
             "status": "completed",
@@ -410,19 +425,10 @@ class ContentOSWorkflow:
             ],
             "status": storyboard.status.value if hasattr(storyboard.status, 'value') else str(storyboard.status),
             "version": storyboard.version,
+            "total_duration": storyboard.total_duration,
             "created_at": storyboard.created_at,
             "updated_at": storyboard.updated_at,
         }
-
-        # Store as artifact
-        self.artifact_store.write(
-            user_id=user_id,
-            project_id=run.project_id,
-            run_id=run_id,
-            artifact_type=ArtifactType.STORYBOARD,
-            data=storyboard_data,
-            created_by_agent="StoryboardManager",
-        )
 
         return storyboard_data
 
@@ -952,8 +958,9 @@ class ContentOSWorkflow:
         current_stage = WorkflowStage(run.current_stage)
         if not has_approval and current_stage in StateMachine._APPROVAL_REQUIRED:
             # Check if approval exists for this stage
-            approvals = self.repository.list_approvals(run_id)
-            has_approval = len(approvals) > 0
+            kind = ApprovalType.STORYBOARD if current_stage == WorkflowStage.AWAITING_STORYBOARD_APPROVAL else ApprovalType.SCRIPT
+            self.approvals.read(run_id, user_id, kind)
+            has_approval = True
 
         # Validate transition
         StateMachine.validate_transition(
@@ -1044,27 +1051,7 @@ class ContentOSWorkflow:
 
             # Store as artifact
             artifact_type = self._get_artifact_type_for_stage(stage)
-            artifact = self.repository.create_artifact(
-                run_id=run_id,
-                user_id=user_id,
-                artifact_type=artifact_type.value,
-                version=1,
-                schema_version="1.0",
-                path=f"/artifacts/{run_id}/{artifact_type.value}.v1.json",
-                checksum="mock_checksum",
-                metadata={"stage": stage.value, "agent": agent_name},
-                created_by_agent=agent_name,
-            )
-
-            # Also store in artifact store
-            self.artifact_store.write(
-                user_id=user_id,
-                project_id=run.project_id,
-                run_id=run_id,
-                artifact_type=artifact_type,
-                data=output,
-                created_by_agent=agent_name,
-            )
+            artifact = self._store_agent_artifact(run_id, user_id, artifact_type, output, agent_name, stage)
 
             # Update step
             self.repository.update_step(
@@ -1086,6 +1073,14 @@ class ContentOSWorkflow:
                 completed_at=time.time(),
             )
             raise
+
+    def _store_agent_artifact(self, run_id: int, user_id: int, kind: ArtifactType,
+                              data: dict, agent: str, stage: WorkflowStage):
+        run = self.repository.get_run(run_id, user_id)
+        info = self.artifact_store.write(user_id, run.project_id, run_id, kind, data, agent)
+        return self.repository.create_artifact(run_id, user_id, kind.value, info["version"],
+            info["schema_version"], info["path"], info["checksum"],
+            {"stage": stage.value, "agent": agent}, agent)
 
     def _get_artifact_type_for_stage(self, stage: WorkflowStage) -> ArtifactType:
         """Map workflow stage to artifact type."""
@@ -1122,13 +1117,16 @@ class ContentOSWorkflow:
         note: str = "",
     ) -> None:
         """Record an approval decision."""
-        self.repository.create_approval(
-            run_id=run_id,
-            user_id=user_id,
-            approval_type=approval_type.value,
-            decision=decision,
-            note=note,
-        )
+        self.approvals.record(run_id, user_id, approval_type, decision, note)
+
+    def production_context(self, run_id: int, user_id: int) -> dict:
+        """Load the approved script and saved plan without replaying research."""
+        run = self.repository.get_run(run_id, user_id)
+        if not run:
+            raise WorkflowError("Run not found")
+        script = self.approvals.read(run_id, user_id, ApprovalType.SCRIPT)["data"]
+        plan = self.artifact_store.read(user_id, run.project_id, run_id, ArtifactType.CONTENT_PLAN)["data"]
+        return {"script": script, "content_plan": plan}
 
     def resume_run(self, run_id: int, user_id: int) -> Dict[str, Any]:
         """
@@ -1145,13 +1143,16 @@ class ContentOSWorkflow:
         if not run:
             raise WorkflowError(f"Run {run_id} not found")
 
-        if run.status not in ["paused", "awaiting_approval"]:
+        if run.status not in ["paused", "awaiting_approval", "approved"]:
             raise WorkflowError(f"Run {run_id} is not in a resumable state")
 
         self.logger.info(f"Resuming workflow run {run_id}")
 
-        # Continue from current stage
-        return self._execute_workflow(run_id, user_id)
+        if run.current_stage in {"awaiting_approval", "awaiting_script_approval"}:
+            return {"status": "awaiting_approval", "run_id": run_id}
+        if run.current_stage in {"ready_for_localization", "awaiting_storyboard_approval"}:
+            return self._execute_production_stages(run_id, user_id, self.production_context(run_id, user_id))
+        raise WorkflowError(f"Cannot resume stage {run.current_stage}; retry the failed run instead")
 
     def cancel_run(self, run_id: int, user_id: int) -> None:
         """
@@ -1205,11 +1206,19 @@ class ContentOSWorkflow:
         if not run:
             raise WorkflowError(f"Run {run_id} not found")
 
+        if decision not in {"approved", "rejected"}:
+            raise WorkflowError("Decision must be approved or rejected")
+        expected = ApprovalType.STORYBOARD if run.current_stage == "awaiting_storyboard_approval" else ApprovalType.SCRIPT
+        if run.current_stage not in {"awaiting_approval", "awaiting_script_approval", "awaiting_storyboard_approval"} or approval_type != expected:
+            raise WorkflowError("Approval does not match the current checkpoint")
         # Record approval
         self._record_approval(run_id, user_id, approval_type, decision, note)
 
         # Advance based on decision
         if decision == "approved":
+            if approval_type == ApprovalType.STORYBOARD:
+                self.repository.update_run(run_id, user_id, status="approved", completed_at=None)
+                return {"status": "approved", "stage": "awaiting_storyboard_approval", "run_id": run_id}
             StateMachine.validate_transition(
                 from_stage=WorkflowStage(run.current_stage),
                 to_stage=WorkflowStage.APPROVED,
@@ -1219,6 +1228,8 @@ class ContentOSWorkflow:
                 run_id=run_id,
                 user_id=user_id,
                 current_stage="approved",
+                status="approved",
+                completed_at=None,
             )
 
             # Continue workflow from READY_FOR_LOCALIZATION

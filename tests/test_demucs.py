@@ -8,6 +8,13 @@ import pytest
 from universal_video_ai.audio.demucs import DemucsProcessor, DemucsOutput, DemucsConfig
 
 
+@pytest.fixture(autouse=True)
+def fake_audio_duration(monkeypatch):
+    # Command-construction tests intentionally use opaque dummy stem bytes.
+    # Real WAV validation/cache corruption is covered in test_media_review_fixes.
+    monkeypatch.setattr("universal_video_ai.audio.demucs.media_duration", lambda path: 1.0)
+
+
 def test_demucs_config_defaults():
     config = DemucsConfig()
     assert config.model == "htdemucs"
@@ -84,22 +91,24 @@ def test_separate_success(tmp_path: Path, monkeypatch):
     assert output.vocals.name == "vocals.wav"
 
 
-def test_separate_reuses_completed_stems(tmp_path: Path, monkeypatch):
+def test_separate_reuses_only_manifest_verified_stems(tmp_path: Path, monkeypatch):
     audio_file = tmp_path / "audio.wav"
     audio_file.write_bytes(b"dummy audio")
-    stems_dir = tmp_path / "demucs_output" / "htdemucs" / "audio"
-    stems_dir.mkdir(parents=True)
-    for stem in ("vocals", "drums", "bass", "other"):
-        (stems_dir / f"{stem}.wav").write_bytes(b"completed stem")
-
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("Demucs should not run when all completed stems exist")
-
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-    output = DemucsProcessor().separate(audio_file)
-
-    assert output.vocals == stems_dir / "vocals.wav"
-    assert output.other.stat().st_size > 0
+    processor = DemucsProcessor()
+    calls = []
+    def separate(source, output_dir):
+        calls.append(source)
+        output_dir.mkdir(parents=True)
+        paths = {}
+        for stem in ("vocals", "drums", "bass", "other"):
+            paths[stem] = output_dir / (stem + ".wav")
+            paths[stem].write_bytes(b"completed stem")
+        return DemucsOutput(**paths)
+    monkeypatch.setattr(processor, "_separate_uncached", separate)
+    first = processor.separate(audio_file)
+    second = processor.separate(audio_file)
+    assert first == second and len(calls) == 1
+    assert first.other.stat().st_size > 0
 
 
 def test_separate_uses_short_alias_when_demucs_output_path_is_too_long(tmp_path: Path, monkeypatch):

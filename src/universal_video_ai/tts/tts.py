@@ -1,5 +1,6 @@
 # src/universal_video_ai/tts/tts.py
 from __future__ import annotations
+from universal_video_ai.file_hash import sha256_file
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -272,7 +273,7 @@ class EdgeTTS:
             try:
                 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                 if (receipt.get("fingerprint") == fingerprint and output_path.is_file()
-                        and receipt.get("sha256") == hashlib.sha256(output_path.read_bytes()).hexdigest()):
+                        and receipt.get("sha256") == sha256_file(output_path)):
                     _validate_audio_file(output_path, self.logger)
                     self.logger.info("EdgeTTS reusing verified voice: %s", output_path.name)
                     return output_path
@@ -330,7 +331,7 @@ class EdgeTTS:
                             receipt_tmp = receipt_path.with_suffix(".json.part")
                             receipt_tmp.write_text(json.dumps({
                                 "fingerprint": fingerprint,
-                                "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                                "sha256": sha256_file(output_path),
                             }), encoding="utf-8")
                             receipt_tmp.replace(receipt_path)
                         except OSError:

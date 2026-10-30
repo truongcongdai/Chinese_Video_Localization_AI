@@ -1,4 +1,16 @@
 /* Quiet surfaces and clear hierarchy for the working dashboard. */
+.social-publishing-section { padding: 16px; margin: 18px 0; border: 1px solid var(--border); border-radius: 10px; }
+.social-publishing-section h3 { margin-top: 0; }
+.social-section-heading, .social-result-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.social-section-heading { justify-content: space-between; margin-bottom: 16px; }
+.social-section-heading > div { flex: 1; min-width: 200px; }
+.social-result-actions { margin-top: 10px; }
+[data-social-connections] .connect-head { flex-wrap: wrap; }
+[data-social-connections] .connect-sub, [data-social-connections] .connect-note { overflow-wrap: anywhere; }
+#social-connect-modal .connect-qr-box { flex-wrap: wrap; }
+#social-connect-content { margin-bottom: 16px; overflow-wrap: anywhere; }
+#publish-modal .chip { font: inherit; color: var(--text); }
+#app-view .feature-tabs { flex-wrap: wrap; }
 #app-view { --radius: 12px; --shadow: 0 2px 8px rgb(0 0 0 / 12%); }
 #app-view .card { background: #151a23; border-color: #2b3341; box-shadow: var(--shadow); }
 #app-view header { background: #121720; box-shadow: none; }

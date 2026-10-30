@@ -18,7 +18,7 @@ cp build_exe.spec "$OUTPUT_DIR/"
 cp build_exe.bat "$OUTPUT_DIR/"
 cp build_nuitka.bat "$OUTPUT_DIR/"
 cp BUILD_EXE_GUIDE.md "$OUTPUT_DIR/"
-cp .env "$OUTPUT_DIR/" 2>/dev/null || cp .env.example "$OUTPUT_DIR/.env"
+cp .env.example "$OUTPUT_DIR/.env.example"
 cp -r scripts "$OUTPUT_DIR/"
 
 # Copy config if exists

@@ -156,18 +156,10 @@ class VoiceCloner:
 
         # Simple matching based on language and gender
         # This is a basic implementation - can be enhanced with ML
-        from universal_video_ai.tts.tts import DEFAULT_VOICES_BY_LANGUAGE
+        from universal_video_ai.tts.tts import voice_for_language
 
-        voices = DEFAULT_VOICES_BY_LANGUAGE.get(target_language, [])
-
-        # Try to match gender
-        if profile.gender and profile.gender != "unknown":
-            gender_voices = [v for v in voices if profile.gender in v.lower()]
-            if gender_voices:
-                return gender_voices[0]
-
-        # Fallback to first available voice
-        return voices[0] if voices else None
+        # Defaults are complete voice strings, not a catalog with gender data.
+        return voice_for_language(target_language)
 
     def get_profile_features(self, profile_id: str) -> Optional[Dict[str, Any]]:
         """

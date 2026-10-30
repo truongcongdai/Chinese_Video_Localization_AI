@@ -6,6 +6,7 @@ from typing import Optional
 import logging
 import hashlib
 from dataclasses import dataclass
+from universal_video_ai.file_hash import sha256_file
 
 from .tts import TTS  # type: ignore
 from .exceptions import TTSBackendUnavailable, SynthesisError  # type: ignore
@@ -57,7 +58,7 @@ class TTSService:
             if isinstance(cached, dict):
                 try:
                     path = Path(cached["path"])
-                    if path.stat().st_size > 0 and hashlib.sha256(path.read_bytes()).hexdigest() == cached["sha256"]:
+                    if path.stat().st_size > 0 and sha256_file(path) == cached["sha256"]:
                         self.logger.debug("TTS cache HIT for %s voice=%s", language, voice)
                         return path
                 except (OSError, KeyError, TypeError):
@@ -79,7 +80,7 @@ class TTSService:
                 path = Path(result)
                 self.cache.set(cache_key, {
                     "path": str(path),
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "sha256": sha256_file(path),
                 }, ttl_seconds=86400 * 7)
 
             return result

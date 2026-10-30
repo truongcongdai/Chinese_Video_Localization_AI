@@ -7,6 +7,8 @@ import importlib.util
 import re
 from typing import Any, Protocol
 
+from universal_video_ai.async_runtime import run_blocking_bounded
+
 from .schemas import ResearchVideo
 
 
@@ -65,20 +67,19 @@ class YtDlpYouTubeResearchCollector:
         if not self.is_available():
             raise YouTubeCollectorUnavailableError("yt-dlp is not installed")
 
-        async with self._semaphore:
-            try:
-                raw = await asyncio.wait_for(
-                    asyncio.to_thread(self._extract_sync, clean_query, requested),
-                    timeout=self.timeout_seconds,
-                )
-            except asyncio.TimeoutError as exc:
-                raise YouTubeCollectorTimeoutError(
-                    f"YouTube collection exceeded {self.timeout_seconds} seconds"
-                ) from exc
-            except YouTubeCollectorError:
-                raise
-            except Exception as exc:
-                raise YouTubeCollectorError("YouTube metadata collection failed") from exc
+        try:
+            raw = await asyncio.wait_for(
+                run_blocking_bounded(self._semaphore, self._extract_sync, clean_query, requested),
+                timeout=self.timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise YouTubeCollectorTimeoutError(
+                f"YouTube collection exceeded {self.timeout_seconds} seconds"
+            ) from exc
+        except YouTubeCollectorError:
+            raise
+        except Exception as exc:
+            raise YouTubeCollectorError("YouTube metadata collection failed") from exc
         return self.normalize_search_result(raw, clean_query, requested)
 
     def _extract_sync(self, query: str, max_results: int) -> Mapping[str, Any]:

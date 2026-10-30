@@ -66,8 +66,9 @@ class StoryboardManager:
     - Version tracking
     """
     
-    def __init__(self, repository):
+    def __init__(self, repository, artifact_store=None):
         self.repository = repository
+        self.artifact_store = artifact_store
     
     def create_from_script(
         self,
@@ -172,6 +173,7 @@ class StoryboardManager:
         
         storyboard.updated_at = time.time()
         storyboard.version += 1
+        storyboard.status = StoryboardStatus.DRAFT
         
         self._store_storyboard(storyboard)
         
@@ -219,6 +221,7 @@ class StoryboardManager:
         
         storyboard.updated_at = time.time()
         storyboard.version += 1
+        storyboard.status = StoryboardStatus.DRAFT
         
         self._store_storyboard(storyboard)
         
@@ -253,6 +256,7 @@ class StoryboardManager:
         
         storyboard.updated_at = time.time()
         storyboard.version += 1
+        storyboard.status = StoryboardStatus.DRAFT
         
         self._store_storyboard(storyboard)
         
@@ -293,6 +297,7 @@ class StoryboardManager:
         storyboard.scenes = new_scenes
         storyboard.updated_at = time.time()
         storyboard.version += 1
+        storyboard.status = StoryboardStatus.DRAFT
         
         self._store_storyboard(storyboard)
         
@@ -393,7 +398,10 @@ class StoryboardManager:
     ) -> Optional[Storyboard]:
         """Get storyboard for a run."""
         # Try to get from artifacts
-        artifacts = self.repository.list_artifacts(run_id)
+        if self.repository.get_run(run_id, user_id) is None:
+            return None
+        artifacts = sorted(self.repository.list_artifacts(run_id),
+                           key=lambda item: (item.version, item.id), reverse=True)
         
         for artifact in artifacts:
             if artifact.artifact_type == "storyboard":
@@ -449,14 +457,20 @@ class StoryboardManager:
         }
         
         # Store as artifact
+        info = None
+        if self.artifact_store is not None:
+            from .enums import ArtifactType
+            run = self.repository.get_run(storyboard.run_id, storyboard.user_id)
+            info = self.artifact_store.write(storyboard.user_id, run.project_id, storyboard.run_id,
+                                             ArtifactType.STORYBOARD, data, "StoryboardManager")
         self.repository.create_artifact(
             run_id=storyboard.run_id,
             user_id=storyboard.user_id,
             artifact_type="storyboard",
             version=storyboard.version,
             schema_version="1.0",
-            path=f"/storyboards/{storyboard.run_id}_v{storyboard.version}.json",
-            checksum="",
+            path=info["path"] if info else f"/storyboards/{storyboard.run_id}_v{storyboard.version}.json",
+            checksum=info["checksum"] if info else "",
             metadata=data,
             created_by_agent="StoryboardManager",
         )

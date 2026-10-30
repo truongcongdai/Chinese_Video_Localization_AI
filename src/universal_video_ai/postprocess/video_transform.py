@@ -1,5 +1,7 @@
 """Video transformation module for flip, border, and split-screen effects."""
 import logging
+import json
+import math
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -71,14 +73,17 @@ class VideoTransformer:
         # Build FFmpeg filter chain
         filters = self._build_filter_chain()
         
-        if not filters:
+        if not filters and not self.config.enable_split_screen:
             # No transformations needed, just copy
             self.logger.info("No transformations configured, copying video directly")
-            self._copy_video(input_path, output_path)
+            if not self._copy_video(input_path, output_path):
+                raise RuntimeError("Requested video copy failed")
             return True
         
         # Apply transformations
-        return self._apply_ffmpeg_filters(input_path, output_path, filters)
+        if not self._apply_ffmpeg_filters(input_path, output_path, filters):
+            raise RuntimeError("Requested video transformations failed")
+        return True
     
     def _build_filter_chain(self) -> str:
         """Build FFmpeg filter chain from config."""
@@ -103,12 +108,6 @@ class VideoTransformer:
             if border_filter:
                 filters.append(border_filter)
         
-        # Split-screen
-        if self.config.enable_split_screen and self.config.overlay_image_path:
-            split_filter = self._build_split_screen_filter()
-            if split_filter:
-                filters.append(split_filter)
-        
         # Randomization
         if self.config.enable_randomization:
             random_filters = self._build_randomization_filters()
@@ -126,27 +125,6 @@ class VideoTransformer:
             return f"pad=width=iw+{self.config.border_px * 2}:height=ih:x={self.config.border_px}:y=0:color={self.config.border_color}"
         return ""
     
-    def _build_split_screen_filter(self) -> str:
-        """Build FFmpeg filter_complex for split-screen overlay."""
-        if not self.config.overlay_image_path or not self.config.overlay_image_path.exists():
-            self.logger.warning(f"Overlay image not found: {self.config.overlay_image_path}")
-            return ""
-        
-        if self.config.split_mode == "vertical":
-            # Top/bottom split
-            return (
-                f"[1:v]scale=iw:ih/2[top];"
-                f"[0:v]scale=iw:ih/2[bottom];"
-                f"[top][bottom]vstack=inputs=2"
-            )
-        else:
-            # Left/right split
-            return (
-                f"[1:v]scale=iw/2:ih[left];"
-                f"[0:v]scale=iw/2:ih[right];"
-                f"[left][right]hstack=inputs=2"
-            )
-    
     def _build_randomization_filters(self) -> list:
         """Build filters for randomization effects."""
         filters = []
@@ -160,6 +138,8 @@ class VideoTransformer:
             filters.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
         
         # Speed (setpts)
+        if not math.isfinite(self.config.speed_factor) or self.config.speed_factor <= 0:
+            raise ValueError("speed_factor must be finite and positive")
         if self.config.speed_factor != 1.0:
             filters.append(f"setpts={1.0/self.config.speed_factor}*PTS")
         
@@ -175,29 +155,51 @@ class VideoTransformer:
     
     def _apply_ffmpeg_filters(self, input_path: Path, output_path: Path, filters: str) -> bool:
         """Apply FFmpeg filters to video."""
-        cmd = [
-            "ffmpeg",
-            "-i", str(input_path),
-            "-vf", filters,
-            "-c:a", "copy",  # Copy audio without re-encoding
-            "-y",  # Overwrite output file
-            str(output_path),
-        ]
-        
-        # Add overlay image input if split-screen is enabled
-        if self.config.enable_split_screen and self.config.overlay_image_path:
-            cmd.insert(2, "-i")
-            cmd.insert(3, str(self.config.overlay_image_path))
-            cmd.insert(4, "-filter_complex")
-            cmd.insert(5, filters)
-            cmd.insert(6, "-map")
-            cmd.insert(7, "[out]")
-            cmd.insert(8, "-map")
-            cmd.insert(9, "0:a")
-            # Remove -vf since we're using -filter_complex
-            cmd.remove("-vf")
-            cmd.remove(filters)
-        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(input_path)]
+        if self.config.enable_split_screen:
+            image = self.config.overlay_image_path
+            if image is None or not image.is_file():
+                raise ValueError("Split-screen requires an existing overlay image")
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "json", str(input_path)],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+            dimensions = json.loads(probe.stdout)["streams"][0]
+            width = max(2, int(self.config.target_width or dimensions["width"]) // 2 * 2)
+            height = max(2, int(self.config.target_height or dimensions["height"]) // 2 * 2)
+            vertical = self.config.split_mode == "vertical"
+            if self.config.split_mode not in {"vertical", "horizontal"}:
+                raise ValueError("split_mode must be vertical or horizontal")
+            pane_w = width if vertical else max(2, width // 4 * 2)
+            pane_h = max(2, height // 4 * 2) if vertical else height
+            fit = (f"scale={pane_w}:{pane_h}:force_original_aspect_ratio=decrease,"
+                   f"pad={pane_w}:{pane_h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+            graph = (f"[0:v]{filters or 'null'},{fit}[source];"
+                     f"[1:v]{fit}[image];[image][source]"
+                     f"{'vstack' if vertical else 'hstack'}=inputs=2:shortest=1[out]")
+            cmd.extend(["-loop", "1", "-i", str(image), "-filter_complex_threads", "2",
+                        "-filter_complex", graph, "-map", "[out]", "-map", "0:a:0?"])
+        else:
+            cmd.extend(["-map", "0:v:0", "-map", "0:a:0?", "-vf", filters])
+        speed = self.config.speed_factor if self.config.enable_randomization else 1.0
+        if speed != 1.0:
+            if not math.isfinite(speed) or speed <= 0:
+                raise ValueError("speed_factor must be finite and positive")
+            parts = []
+            while speed > 2.0:
+                parts.append("atempo=2.0")
+                speed /= 2.0
+            while speed < 0.5:
+                parts.append("atempo=0.5")
+                speed /= 0.5
+            parts.append(f"atempo={speed:.9f}")
+            cmd.extend(["-af", ",".join(parts), "-c:a", "aac"])
+        else:
+            cmd.extend(["-c:a", "copy"])
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-shortest", str(output_path)])
+
         self.logger.info(f"Applying FFmpeg filters: {filters}")
         self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
         

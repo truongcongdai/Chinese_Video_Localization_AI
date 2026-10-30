@@ -4,23 +4,23 @@ services:
     build: .
     container_name: video-ai-app
     restart: always
-    command: python scripts/run_bot.py --db /app/database.sqlite3 --admin 7164535840
+    command: python scripts/run_bot.py --db /app/data/database.sqlite3 --admin 7164535840
     env_file:
       - .env
     environment:
-      - DATABASE_PATH=/app/database.sqlite3
+      - DATABASE_PATH=/app/data/database.sqlite3
       - TEMP_DIR=/app/temp
       - OUTPUT_DIR=/app/output
       - LOGS_DIR=/app/logs
       - ENVIRONMENT=production
       - LOG_LEVEL=INFO
-      - REDIS_URL=redis://localhost:6379/0
+      - REDIS_URL=redis://localhost:6380/0
     network_mode: host
     volumes:
       - db-data:/app/data
       - ./temp:/app/temp
       - ./output:/app/output
-      - ./logs:/app/log
+      - ./logs:/app/logs
     depends_on:
       redis:
         condition: service_healthy
@@ -52,13 +52,13 @@ services:
       - LOGS_DIR=/app/logs
       - ENVIRONMENT=production
       - LOG_LEVEL=INFO
-      - REDIS_URL=redis://localhost:6379/0
+      - REDIS_URL=redis://localhost:6380/0
       - WEB_PORT=8080
     network_mode: host
     volumes:
       - ./temp:/app/temp
       - ./output:/app/output
-      - ./logs:/app/log
+      - ./logs:/app/logs
     depends_on:
       redis:
         condition: service_healthy

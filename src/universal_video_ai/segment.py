@@ -38,6 +38,22 @@ class TranscriptSegment:
     start: float
     end: float
     text: str
+    speaker_id: str | None = None
+    speaker_review: bool = False
+
+    def to_dict(self) -> dict:
+        """Keep legacy payloads unchanged when no speaker is known."""
+        result = {"start": self.start, "end": self.end, "text": self.text}
+        if self.speaker_id is not None:
+            result["speaker_id"] = self.speaker_id
+        if self.speaker_review:
+            result["speaker_review"] = True
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TranscriptSegment:
+        return cls(start=float(data["start"]), end=float(data["end"]), text=data["text"],
+                   speaker_id=data.get("speaker_id"), speaker_review=bool(data.get("speaker_review", False)))
 
     @property
     def has_timing(self) -> bool:

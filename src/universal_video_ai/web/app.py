@@ -8,12 +8,15 @@ your own platform credentials) publish straight to TikTok/Facebook/YouTube.
 Run with: python scripts/run_web.py
 """
 from __future__ import annotations
+from typing import Literal
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -43,7 +46,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from universal_video_ai.orchestrator.factory import create_localization_service
 from universal_video_ai.orchestrator.service import (
@@ -109,10 +112,10 @@ from universal_video_ai.channel_agent.channel_sources import (
     ChannelSourceRegistry,
 )
 
-from .store import Job, Store
+from .store import Job, Store, InsufficientCreditsError, ExecutionLeaseLost
 from .auth import (
     COOKIE_NAME, hash_password, verify_password,
-    create_session_cookie_value, get_current_user_id,
+    create_session_cookie_value, get_current_user_id, set_session_cookie, remember_existing_session,
 )
 from . import oauth as oauth_module
 from . import identity_oauth
@@ -177,14 +180,19 @@ _VIDEO_AI_LOCK = threading.Lock()
 # Same default DB as the Telegram bot (scripts/run_bot.py's --db), but the
 # web app gets its own table set (users/jobs/publish_log) inside it via
 # Store's schema, so both can safely share one sqlite file if you want.
-_DB_PATH = Path(os.environ.get("WEB_DB_PATH", TEMP_DIR / "database.sqlite3"))
-_OUTPUT_BASE_DIR = TEMP_DIR / "output"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_DB_PATH = Path(os.environ.get("WEB_DB_PATH", TEMP_DIR / "database.sqlite3")).expanduser()
+if not _DB_PATH.is_absolute():
+    _DB_PATH = _REPO_ROOT / _DB_PATH
+_OUTPUT_BASE_DIR = TEMP_DIR / "output"
 
 # Credits consumed per submitted job. Purely a usage-limiting knob (there's
 # no billing/payment wired up) — an admin tops up a user's balance from the
 # admin dashboard. Set to 0 to disable the whole credits gate.
 JOB_COST_CREDITS = int(os.environ.get("JOB_COST_CREDITS", "1"))
+_WEB_WORKER_ID = uuid.uuid4().hex
+_WEB_LEASE_SECONDS = 300
+_IDENTITY_NONCE_COOKIE = "vai_identity_state"
 WEB_RENDER_PRESET = os.environ.get("WEB_RENDER_PRESET", "fast")
 WEB_RENDER_CRF = max(16, min(28, int(os.environ.get("WEB_RENDER_CRF", "20"))))
 WEB_RENDER_TIMEOUT_SECONDS = int(os.environ.get("WEB_RENDER_TIMEOUT_SECONDS", "1800"))
@@ -279,7 +287,12 @@ def _store_create_job(
     if supports_publishing:
         kwargs["publishing_config"] = normalized_publishing
 
-    job = create_method(*args, **kwargs)
+    kwargs.update(charge_credits=max(0, JOB_COST_CREDITS), lease_owner=_WEB_WORKER_ID,
+                  lease_seconds=_WEB_LEASE_SECONDS)
+    try:
+        job = create_method(*args, **kwargs)
+    except InsufficientCreditsError as exc:
+        raise HTTPException(402, str(exc)) from None
 
     if normalized_branding is not None and not supports_branding:
         setter = getattr(store, "set_job_branding_config", None)
@@ -351,7 +364,7 @@ async def install_windows_disconnect_handler() -> None:
 @app.on_event("startup")
 def recover_jobs_interrupted_by_restart() -> None:
     """Background jobs cannot survive a process restart; expose that state."""
-    recovered = store.fail_interrupted_jobs(JOB_COST_CREDITS)
+    recovered = store.fail_interrupted_jobs(JOB_COST_CREDITS, lease_seconds=_WEB_LEASE_SECONDS)
     if recovered:
         logger.warning("Recovered %s interrupted jobs", recovered)
 
@@ -487,6 +500,21 @@ class RegisterBody(BaseModel):
     referral_code: Optional[str] = None  # whoever invited this person, if anyone
 
 
+class SpeakerConfigBody(BaseModel):
+    mode: Literal["single", "manual", "auto"] = "single"
+    voices: Dict[str, str] = Field(default_factory=dict, max_length=16)
+    max_speakers: int = Field(default=2, ge=1, le=8)
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> "SpeakerConfigBody":
+        if any(not key.strip() or len(key) > 64 or not voice.strip() or len(voice) > 256
+               for key, voice in self.voices.items()):
+            raise ValueError("Speaker IDs and voice IDs must be nonempty and bounded.")
+        if self.mode == "auto" and any(f"speaker_{i}" not in self.voices for i in range(self.max_speakers)):
+            raise ValueError("Assign a voice for each possible detected speaker.")
+        return self
+
+
 class NewJobBody(BaseModel):
     url: str
     target_language: str = "vi"
@@ -505,6 +533,7 @@ class NewJobBody(BaseModel):
     publishing_config: Optional[Dict[str, Any]] = None
     # Explicit Edge-TTS voice id from GET /api/voices, e.g.
     # "vi-VN-NamMinhNeural" — None uses the target language's default voice.
+    speaker_config: Optional[SpeakerConfigBody] = None
     tts_voice: Optional[str] = None
     tts_provider: str = "edge"
     tts_style: str = "natural"
@@ -664,6 +693,8 @@ class SegmentBody(BaseModel):
     start: float
     end: float
     text: str
+    speaker_id: Optional[str] = Field(default=None, max_length=64)
+    speaker_review: bool = False
 
 
 class UpdateSegmentsBody(BaseModel):
@@ -887,7 +918,7 @@ def _unique_username_from(base: str) -> str:
 
 def _login_response(user_id: int) -> JSONResponse:
     resp = JSONResponse({"ok": True, "user_id": user_id})
-    resp.set_cookie(COOKIE_NAME, create_session_cookie_value(user_id), httponly=True, samesite="lax")
+    set_session_cookie(resp, user_id)
     return resp
 
 
@@ -990,10 +1021,11 @@ def logout():
 
 
 @app.get("/api/me")
-def me(user_id: int = Depends(get_current_user_id)):
+def me(request: Request, response: Response, user_id: int = Depends(get_current_user_id)):
     user = store.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    remember_existing_session(request, response)
     referral_code = user["referral_code"] or store.ensure_referral_code(user_id)
     return {
         "id": user["id"], "username": user["username"],
@@ -1068,7 +1100,10 @@ def identity_login(provider: str, request: Request):
     state = identity_oauth.new_state()
     store.create_identity_oauth_state(state, provider)
     url = client.authorize_url(_identity_redirect_uri(request, provider), state)
-    return {"authorize_url": url}
+    response = JSONResponse({"authorize_url": url})
+    response.set_cookie(_IDENTITY_NONCE_COOKIE, state, max_age=600, httponly=True,
+                        secure=request.url.scheme == "https", samesite="lax", path="/api/identity/callback")
+    return response
 
 
 @app.get("/api/identity/callback/{provider}")
@@ -1084,6 +1119,9 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
     if error:
         return RedirectResponse(url=f"/?login_error={urllib.parse.quote(error)}")
 
+    browser_state = request.cookies.get(_IDENTITY_NONCE_COOKIE, "")
+    if not state or not browser_state or not secrets.compare_digest(state, browser_state):
+        return RedirectResponse(url="/?login_error=state_invalid")
     state_row = store.consume_identity_oauth_state(state)
     if not state_row or state_row["provider"] != provider:
         return RedirectResponse(url="/?login_error=state_invalid")
@@ -1092,29 +1130,33 @@ def identity_callback(provider: str, request: Request, code: str = "", state: st
         client = identity_oauth.get_identity_oauth_client(provider)
         result = client.exchange_code(code, _identity_redirect_uri(request, provider))
     except Exception:
-        logger.exception("Identity OAuth callback failed for provider=%s", provider)
+        # Provider request URLs/exception chains may contain app secrets and codes.
+        logger.warning("Identity OAuth callback failed for provider=%s", provider)
         return RedirectResponse(url="/?login_error=exchange_failed")
 
     user = store.get_user_by_oauth(provider, result.provider_user_id)
-    if user is None and result.email:
-        # Someone who already has a password account with this email signs
-        # in with Google/etc. for the first time — link it to the same
-        # account rather than creating a confusing duplicate.
-        user = store.get_user_by_email(result.email)
+    verified_email = result.email if result.email_verified else None
+    if user is None and verified_email and store.get_user_by_email(verified_email):
+        # Local sign-up does not prove email ownership. Never merge credentials
+        # on an email match; the account must be accessed with its existing login.
+        return RedirectResponse(url="/?login_error=account_link_required")
     if user is None:
         is_first_user = not store.any_users_exist()
+        if not is_first_user and not OPEN_REGISTRATION:
+            return RedirectResponse(url="/?login_error=registration_closed")
         username_base = result.display_name or result.email or f"{provider}_{result.provider_user_id[:8]}"
         username = _unique_username_from(username_base)
         user_id = store.create_user_oauth(
             username, provider, result.provider_user_id,
-            email=result.email, is_admin=is_first_user,
+            email=verified_email, is_admin=is_first_user,
             credits=10_000 if is_first_user else 10,
         )
     else:
         user_id = user["id"]
 
     resp = RedirectResponse(url="/")
-    resp.set_cookie(COOKIE_NAME, create_session_cookie_value(user_id), httponly=True, samesite="lax")
+    set_session_cookie(resp, user_id)
+    resp.delete_cookie(_IDENTITY_NONCE_COOKIE, path="/api/identity/callback")
     return resp
 
 
@@ -1366,6 +1408,7 @@ def _build_service_for_job(job):
         target_language=job.target_language,
         run_tts=True,
         tts_voice=job.tts_voice,
+        speaker_config=getattr(job, "speaker_config", None),
         tts_provider=tts_provider,
         tts_provider_api_key=provider_settings.get("api_key") if provider_settings else None,
         tts_provider_model=getattr(job, "tts_model", None)
@@ -1414,6 +1457,8 @@ def _is_content_os_job(job) -> bool:
 
 
 def _is_non_retryable_job_error(exc: Exception) -> bool:
+    from universal_video_ai.downloader.bilibili import BilibiliMetadataError
+    from universal_video_ai.downloader.douyin import DouyinSourceError
     # Translation/provider failures are wrapped by the service and backend.
     # Inspect their cause chain so a confirmed quota block is not mistaken for
     # a fresh transient error and followed by another full download/OCR pass.
@@ -1421,6 +1466,8 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
     seen: set[int] = set()
     current: Optional[BaseException] = exc
     while current is not None and id(current) not in seen:
+        if isinstance(current, (BilibiliMetadataError, DouyinSourceError)):
+            return True
         seen.add(id(current))
         messages.append(str(current).lower())
         current = current.__cause__ or current.__context__
@@ -1454,6 +1501,9 @@ def _is_non_retryable_job_error(exc: Exception) -> bool:
             # The translator already honored Retry-After/backoff. Repeating
             # minutes of preprocessing cannot change a provider/IP quota.
             "translation rate limited",
+            "Dub exceeds source video",
+            "Dub exceeds requested mix duration",
+            "input exceeds 4096 characters",
         )
     )
 
@@ -1462,12 +1512,47 @@ MAX_JOB_RETRIES = 2
 RETRY_DELAY_SECONDS = 30
 
 
+async def _renew_execution_lease(kind: str, resource_id: str, owner: str) -> None:
+    while True:
+        await asyncio.sleep(_WEB_LEASE_SECONDS / 3)
+        if not await asyncio.to_thread(store.renew_execution_lease, kind, resource_id, owner, _WEB_LEASE_SECONDS):
+            return
+
+
+@asynccontextmanager
+async def _execution_lease_scope(kind: str, resource_id: str, owner: str):
+    heartbeat = asyncio.create_task(_renew_execution_lease(kind, resource_id, owner))
+    try:
+        with store.execution_scope(kind, resource_id, owner):
+            yield
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        store.release_execution_lease(kind, resource_id, owner)
+
+
 async def _run_job(job_id: str) -> None:
+    owner = f"{_WEB_WORKER_ID}:{uuid.uuid4().hex}"
+    if not store.claim_job_execution(job_id, owner, reserved_owner=_WEB_WORKER_ID,
+                                     lease_seconds=_WEB_LEASE_SECONDS):
+        _running_tasks.pop(job_id, None)
+        return
+    async with _execution_lease_scope("job", job_id, owner):
+        try:
+            await _run_job_with_slot(job_id)
+        except ExecutionLeaseLost:
+            logger.warning("Stopped superseded execution for job %s", job_id)
+
+
+async def _run_job_with_slot(job_id: str) -> None:
     slot_acquired = False
     try:
         await _acquire_job_run_slot()
         slot_acquired = True
-        await _run_job_unlocked(job_id)
+        job = store.get_job(job_id)
+        if job:
+            with reup_runtime.source_sessions.download_scope(job.user_id):
+                await _run_job_unlocked(job_id)
     finally:
         current = store.get_job(job_id)
         if current and current.source_logical_id and current.status in {"done", "error"}:
@@ -1512,7 +1597,7 @@ async def _run_job_unlocked(job_id: str) -> None:
             service = _build_service_for_job(job)
             job_output_dir = _OUTPUT_BASE_DIR / "web_jobs" / job_id
 
-            if job.review_mode:
+            if job.review_mode or (getattr(job, "speaker_config", None) or {}).get("mode") == "auto":
                 # Stop after translation and wait for the person to review/edit
                 # the translated sentences via PUT .../segments, then
                 # POST .../render (-> _run_render_from_review) to continue.
@@ -1520,15 +1605,19 @@ async def _run_job_unlocked(job_id: str) -> None:
                 prepared = await service.prepare_for_review(
                     job.source_url, job_output_dir, target_language=job.target_language
                 )
+                if not job.review_mode and not any(s.speaker_review for s in prepared.source_segments):
+                    result = await service.finalize_from_review(prepared)
+                    await asyncio.to_thread(_finish_job_from_result, job_id, job, result)
+                    return
                 segments = prepared.translated_segments or [
                     {"start": 0.0, "end": 0.0, "text": prepared.translated_text or ""}
                 ]
                 segments_payload = (
-                    [{"start": s.start, "end": s.end, "text": s.text} for s in prepared.translated_segments]
+                    [s.to_dict() for s in prepared.translated_segments]
                     if prepared.translated_segments else segments
                 )
                 source_segments_payload = [
-                    {"start": s.start, "end": s.end, "text": s.text} for s in prepared.source_segments
+                    s.to_dict() for s in prepared.source_segments
                 ]
                 store.set_job_source_segments(job_id, source_segments_payload)
                 store.set_job_segments(job_id, segments_payload)
@@ -1551,6 +1640,12 @@ async def _run_job_unlocked(job_id: str) -> None:
                 logger.info("Job %s cancelled; stopping without retry", job_id)
                 return
             last_error = exc
+            from universal_video_ai.downloader.douyin import DouyinSourceError
+            if isinstance(exc, DouyinSourceError):
+                logger.warning("Job %s needs source access: %s", job_id, exc)
+                store.update_job(job_id, status="error", error=str(exc))
+                _refund_job_credits(job)
+                return
             logger.exception("Job %s failed (attempt %d/%d)", job_id, retry_count + 1, MAX_JOB_RETRIES + 1)
 
             if _is_non_retryable_job_error(exc):
@@ -1632,7 +1727,9 @@ def _publishing_llm_client_for_job(job, config: PublishingPackConfig) -> Publish
     elif selected == "ollama":
         llm_config = PublishingLLMConfig(
             provider="ollama",
-            model=_env_first("PUBLISHING_OLLAMA_MODEL", "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL,
+            model=config.local_model or _env_first("PUBLISHING_OLLAMA_MODEL", "OLLAMA_MODEL") or DEFAULT_OLLAMA_TRANSLATION_MODEL,
+            ollama_keep_alive=0 if config.local_model else None,
+            ollama_num_gpu=0 if config.local_model else None,
             base_url=_env_first("OLLAMA_BASE_URL") or "http://127.0.0.1:11434",
             timeout_seconds=_env_int("PUBLISHING_LLM_TIMEOUT", 180, minimum=10, maximum=1800),
         )
@@ -1666,11 +1763,11 @@ def _generate_publishing_pack_for_result(job_id: str, job, result):
             "raw_metadata": getattr(download, "raw_metadata", {}) or {},
         }
         translated_segments = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            s.to_dict()
             for s in (getattr(result, "translated_segments", None) or [])
         ]
         source_segments = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            s.to_dict()
             for s in (getattr(result, "source_segments", None) or [])
         ]
         service = PublishingPackService(
@@ -1722,18 +1819,18 @@ def _finish_job_from_result(job_id: str, job, result) -> None:
         source_segments = []
         if getattr(result, "source_segments", None):
             source_segments = [
-                {"start": s.start, "end": s.end, "text": s.text}
+                s.to_dict()
                 for s in result.source_segments
                 if getattr(s, "has_timing", False)
             ]
         elif result.audio_pipeline_result and result.audio_pipeline_result.segments:
             source_segments = [
-                {"start": s.start, "end": s.end, "text": s.text}
+                s.to_dict()
                 for s in result.audio_pipeline_result.segments
                 if getattr(s, "has_timing", False)
             ]
         translated_segments = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            s.to_dict()
             for s in (result.translated_segments or [])
             if getattr(s, "has_timing", False)
         ]
@@ -1786,6 +1883,18 @@ def _write_job_srt_artifacts(
 
 
 async def _run_render_from_review(job_id: str) -> None:
+    owner = f"{_WEB_WORKER_ID}:{uuid.uuid4().hex}"
+    if not store.claim_job_execution(job_id, owner, reserved_owner=_WEB_WORKER_ID,
+                                     expected_status="review", lease_seconds=_WEB_LEASE_SECONDS):
+        return
+    async with _execution_lease_scope("job", job_id, owner):
+        try:
+            await _render_from_review_unlocked(job_id)
+        except ExecutionLeaseLost:
+            logger.warning("Stopped superseded render for job %s", job_id)
+
+
+async def _render_from_review_unlocked(job_id: str) -> None:
     """Resume a job sitting at status='review': re-hydrate what
     prepare_for_review() produced, and render using whatever's currently in
     segments_json (the person's edits, if they made any — otherwise still
@@ -1802,7 +1911,7 @@ async def _run_render_from_review(job_id: str) -> None:
 
         segments_data = json.loads(job.segments_json) if job.segments_json else []
         edited_segments = [
-                              TranscriptSegment(start=s["start"], end=s["end"], text=s["text"]) for s in segments_data
+                              TranscriptSegment.from_dict(s) for s in segments_data
                           ] or None
 
         result = await service.finalize_from_review(prepared, edited_segments)
@@ -1819,7 +1928,7 @@ def _refund_job_credits(job) -> None:
     """A job that errors out shouldn't cost the user credit — refund it."""
     if JOB_COST_CREDITS > 0:
         try:
-            store.adjust_credits(job.user_id, JOB_COST_CREDITS)
+            store.refund_job_credits(job.id, job.credit_reservation_id)
         except Exception:
             logger.exception("Failed to refund credits for job %s", job.id)
 
@@ -4080,6 +4189,24 @@ def _add_creator_voice_and_subtitles(
         write_branding_manifest(output_path, branding_config, source_path=video_path, logger=logger)
 
 
+async def _run_creator_job_leased(job_id: str, body: CreatorJobBody) -> None:
+    owner = f"{_WEB_WORKER_ID}:{uuid.uuid4().hex}"
+    if not store.claim_job_execution(job_id, owner, reserved_owner=_WEB_WORKER_ID,
+                                     lease_seconds=_WEB_LEASE_SECONDS):
+        return
+    async with _execution_lease_scope("job", job_id, owner):
+        operation = asyncio.create_task(asyncio.to_thread(_run_creator_job, job_id, body))
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Cancellation cannot kill an already-running thread. Keep renewing
+            # its lease until it exits, so recovery cannot steal live work.
+            await operation
+            raise
+        except ExecutionLeaseLost:
+            logger.warning("Stopped superseded creator job %s", job_id)
+
+
 def _run_creator_job(job_id: str, body: CreatorJobBody) -> None:
     job = store.get_job(job_id)
     if job is None:
@@ -4522,6 +4649,18 @@ async def remix_plan(body: RemixPlanBody, user_id: int = Depends(get_current_use
 
 @app.post("/api/jobs")
 async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_id)):
+    return await _submit_localization(body, user_id)
+
+
+async def _submit_localization(body: NewJobBody, user_id: int, job_id: Optional[str] = None):
+    if job_id:
+        existing = store.get_job(job_id)
+        if existing:
+            if existing.user_id != user_id:
+                raise HTTPException(404, "Job not found")
+            if existing.status == "queued" and job_id not in _running_tasks:
+                _running_tasks[job_id] = asyncio.create_task(_run_job(job_id))
+            return existing.to_dict()
     normalized_url = _extract_first_video_url(body.url)
     classification = await asyncio.to_thread(_video_url_classifier.classify, normalized_url)
     if classification.platform.value in {"youtube", "tiktok", "douyin"}:
@@ -4623,8 +4762,10 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         logo_size_px=body.logo_size_px or 120,
         branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
         publishing_config=PublishingPackConfig.from_dict(body.publishing_config).to_dict() if body.publishing_config else None,
+        job_id=job_id,
         tts_voice=body.tts_voice or None,
-        review_mode=body.review_before_render,
+        speaker_config=body.speaker_config.model_dump() if body.speaker_config else None,
+        review_mode=body.review_before_render or bool(body.speaker_config and body.speaker_config.mode == "manual"),
         animated_subtitle_config=body.animated_subtitle_config,
         video_template_config=body.video_template_config,
         transform_config=body.transform_config,
@@ -4645,8 +4786,6 @@ async def create_job(body: NewJobBody, user_id: int = Depends(get_current_user_i
         keep_original_audio=body.keep_original_audio,
         background_music_strategy=body.background_music_strategy,
     )
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
     await _configure_job_run_limit(body.max_concurrent)
     task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
@@ -4919,11 +5058,9 @@ async def process_channel_download(
                 old_job = store.get_job(job_id)
                 if not old_job or old_job.user_id != user_id or old_job.status != "error":
                     raise RuntimeError("Retryable source no longer has an owner-scoped failed job.")
-                retried_job = store.retry_job(job_id, user_id)
+                retried_job = store.retry_job(job_id, user_id, charge_credits=max(0, JOB_COST_CREDITS), lease_owner=_WEB_WORKER_ID, lease_seconds=_WEB_LEASE_SECONDS)
                 if retried_job is None:
                     raise RuntimeError("Failed job changed state before retry could start.")
-                if JOB_COST_CREDITS > 0:
-                    store.adjust_credits(user_id, -JOB_COST_CREDITS)
                 _delete_job_artifacts(job_id)
                 channel_source_registry.begin_attempt(
                     user_id, int(source_row["id"]), mode="AUTO_RETRY_FAILED", job_id=job_id,
@@ -5017,6 +5154,7 @@ async def upload_video(
         logo_size_px: int = Form(120),
         branding_config: Optional[str] = Form(None),
         publishing_config: Optional[str] = Form(None),
+        speaker_config: Optional[str] = Form(None),
         tts_voice: Optional[str] = Form(None),
         review_before_render: bool = Form(False),
         animated_subtitle_config: Optional[str] = Form(None),
@@ -5062,7 +5200,8 @@ async def upload_video(
         template_config = json.loads(video_template_config) if video_template_config else None
         branding_data = BrandingConfig.from_dict(json.loads(branding_config)).to_dict() if branding_config else None
         publishing_data = PublishingPackConfig.from_dict(json.loads(publishing_config)).to_dict() if publishing_config else None
-    except json.JSONDecodeError:
+        speaker_data = SpeakerConfigBody(**json.loads(speaker_config)).model_dump() if speaker_config else None
+    except (json.JSONDecodeError, ValueError, TypeError):
         raise HTTPException(400, "Định dạng JSON không hợp lệ cho cấu hình")
 
     # Create job with file:// URL
@@ -5077,8 +5216,9 @@ async def upload_video(
         logo_size_px=logo_size_px,
         branding_config=branding_data,
         publishing_config=publishing_data,
+        speaker_config=speaker_data,
         tts_voice=tts_voice,
-        review_mode=review_before_render,
+        review_mode=review_before_render or bool(speaker_data and speaker_data["mode"] == "manual"),
         animated_subtitle_config=animated_config,
         video_template_config=template_config,
         keep_original_audio=keep_original_audio,
@@ -5086,8 +5226,6 @@ async def upload_video(
     )
 
     # Deduct credits if needed
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
 
     # Start job processing
     task = asyncio.create_task(_run_job(job.id))
@@ -5098,6 +5236,18 @@ async def upload_video(
 
 def _job_preflight_report(user_id: int, body: NewJobBody, *, url_count: int) -> Dict[str, Any]:
     issues: List[Dict[str, str]] = []
+    if body.speaker_config and body.speaker_config.mode == "auto":
+        from universal_video_ai.speech.diarization import diarization_readiness
+        readiness = diarization_readiness()
+        if not readiness["installed"]:
+            issues.append({"severity": "error", "code": "diarization_unavailable",
+                           "message": "Cài requirements-diarization.txt trước khi bật nhận diện người nói tự động."})
+        elif not readiness["audio_decoder_ready"]:
+            issues.append({"severity": "error", "code": "diarization_decoder_unavailable",
+                           "message": "TorchCodec chưa giải mã được âm thanh. Kiểm tra bản CPU phù hợp trong hướng dẫn Reup Agent."})
+        if not readiness["model_ready"]:
+            issues.append({"severity": "error", "code": "diarization_model_missing",
+                           "message": "Cấu hình DIARIZATION_MODEL_PATH đến thư mục model pyannote có config.yaml, hoặc chọn gán người nói thủ công."})
     raw_url = (body.url or "").strip()
     url = _extract_first_video_url(raw_url)
     if not url:
@@ -5286,6 +5436,12 @@ def preflight_job(body: JobPreflightBody, user_id: int = Depends(get_current_use
     return _job_preflight_report(user_id, body, url_count=body.url_count)
 
 
+@app.get("/api/speakers/readiness")
+def speaker_readiness(user_id: int = Depends(get_current_user_id)):
+    from universal_video_ai.speech.diarization import diarization_readiness
+    return diarization_readiness()
+
+
 @app.post("/api/creator/jobs")
 async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_current_user_id)):
     if not body.topic.strip():
@@ -5319,9 +5475,7 @@ async def create_creator_job(body: CreatorJobBody, user_id: int = Depends(get_cu
         source_language=f"creator:{'ai' if body.image_provider == 'cpu_ai' else body.image_provider}",
         branding_config=BrandingConfig.from_dict(body.branding_config).to_dict() if body.branding_config else None,
     )
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
-    task = asyncio.create_task(asyncio.to_thread(_run_creator_job, job.id, body))
+    task = asyncio.create_task(_run_creator_job_leased(job.id, body))
     _running_tasks[job.id] = task
     return job.to_dict()
 
@@ -6641,10 +6795,10 @@ def bulk_download_jobs(body: BulkDeleteBody, user_id: int = Depends(get_current_
                 archive.writestr(f"{Path(name).stem}.vi.srt", _segments_to_srt_text(segments))
             if source_segments:
                 archive.writestr(f"{Path(name).stem}.source.srt", _segments_to_srt_text(source_segments))
-            pack_dir = Path(job.publishing_pack_path or "")
-            if pack_dir.is_dir():
+            pack_dir = _safe_publishing_pack_directory(job)
+            if pack_dir is not None:
                 for asset in pack_dir.rglob("*"):
-                    if asset.is_file():
+                    if asset.is_file() and asset.resolve().is_relative_to(pack_dir):
                         archive.write(
                             asset,
                             arcname=f"{Path(name).stem}.publishing_pack/{asset.relative_to(pack_dir)}",
@@ -6679,6 +6833,21 @@ def _get_owned_job(job_id: str, user_id: int):
     if job is None or job.user_id != user_id:
         raise HTTPException(404, "Không tìm thấy job")
     return job
+
+
+def _safe_publishing_pack_directory(job) -> Optional[Path]:
+    """Resolve only the dedicated pack directory of this job, never cwd."""
+    raw = job.publishing_pack_path
+    if not raw or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job.id):
+        return None
+    root = (_OUTPUT_BASE_DIR / "web_jobs").resolve()
+    job_dir = (root / job.id).resolve()
+    expected = (job_dir / "publishing_pack").resolve()
+    candidate = Path(raw).resolve()
+    if (job_dir.parent != root or expected.parent != job_dir or candidate != expected
+            or not candidate.is_dir()):
+        return None
+    return candidate
 
 
 @app.get("/api/jobs/{job_id}")
@@ -6728,15 +6897,15 @@ def get_job_source_video(job_id: str, user_id: int = Depends(get_current_user_id
 @app.get("/api/jobs/{job_id}/publishing-pack")
 def get_publishing_pack(job_id: str, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
-    pack_dir = Path(job.publishing_pack_path or "")
-    if not pack_dir.is_dir():
+    pack_dir = _safe_publishing_pack_directory(job)
+    if pack_dir is None:
         if job.publishing_pack_status == "error":
             raise HTTPException(422, job.publishing_pack_error or "AI Publishing Pack tạo thất bại")
         raise HTTPException(404, "Job này chưa có AI Publishing Pack")
 
     def read_json(name: str) -> Dict[str, Any]:
-        path = pack_dir / name
-        if not path.is_file():
+        path = (pack_dir / name).resolve()
+        if path.parent != pack_dir or not path.is_file():
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -6938,8 +7107,8 @@ def retry_publishing_pack_component(
 @app.get("/api/jobs/{job_id}/publishing-assets/{asset_name}")
 def get_publishing_asset(asset_name: str, job_id: str, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
-    pack_dir = Path(job.publishing_pack_path or "").resolve()
-    if not pack_dir.is_dir():
+    pack_dir = _safe_publishing_pack_directory(job)
+    if pack_dir is None:
         raise HTTPException(404, "Publishing Pack chưa sẵn sàng")
     safe_name = Path(asset_name).name
     asset = (pack_dir / safe_name).resolve()
@@ -6952,8 +7121,8 @@ def get_publishing_asset(asset_name: str, job_id: str, user_id: int = Depends(ge
 @app.get("/api/jobs/{job_id}/publishing-pack.zip")
 def download_publishing_pack(job_id: str, user_id: int = Depends(get_current_user_id)):
     job = _get_owned_job(job_id, user_id)
-    pack_dir = Path(job.publishing_pack_path or "")
-    if not pack_dir.is_dir():
+    pack_dir = _safe_publishing_pack_directory(job)
+    if pack_dir is None:
         raise HTTPException(404, "Publishing Pack chưa sẵn sàng")
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
     temp = tempfile.NamedTemporaryFile(prefix=f"publishing_pack_{job_id}_", suffix=".zip", delete=False, dir=str(TEMP_DIR))
@@ -6961,7 +7130,7 @@ def download_publishing_pack(job_id: str, user_id: int = Depends(get_current_use
     temp.close()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for asset in pack_dir.rglob("*"):
-            if asset.is_file():
+            if asset.is_file() and asset.resolve().is_relative_to(pack_dir):
                 archive.write(asset, arcname=f"publishing_pack/{asset.relative_to(pack_dir)}")
     return FileResponse(
         zip_path,
@@ -7027,7 +7196,7 @@ def _schedule_job_rerun(job: Job) -> asyncio.Task:
             target_language=job.target_language,
             image_provider=job.source_language.partition(":")[2] or "stock",
         )
-        task = asyncio.create_task(asyncio.to_thread(_run_creator_job, job.id, body))
+        task = asyncio.create_task(_run_creator_job_leased(job.id, body))
     else:
         task = asyncio.create_task(_run_job(job.id))
     _running_tasks[job.id] = task
@@ -7068,6 +7237,11 @@ async def rerun_selected_jobs(
             errors.append({"job_id": job.id, "reason": str(exc.detail), "status_code": exc.status_code})
         else:
             queued.append(job.id)
+    # Start queued workers before returning, without waiting for their work.
+    # Python 3.14's wait_for can await this coroutine inline, so callers no
+    # longer necessarily provide an intervening event-loop turn.
+    if queued:
+        await asyncio.sleep(0)
     return {"queued": queued, "skipped": skipped, "errors": errors}
 
 
@@ -7089,7 +7263,7 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     if JOB_COST_CREDITS > 0 and user["credits"] < JOB_COST_CREDITS:
         raise HTTPException(402, f"Không đủ credit (còn {user['credits']}, cần {JOB_COST_CREDITS})")
 
-    retried_job = store.retry_job(job_id, user_id)
+    retried_job = store.retry_job(job_id, user_id, charge_credits=max(0, JOB_COST_CREDITS), lease_owner=_WEB_WORKER_ID, lease_seconds=_WEB_LEASE_SECONDS)
     if retried_job is not None:
         channel_source_registry.create_job_attempt(
             user_id, job_id, mode="RETRY_FROM_FAILED_STAGE", reset_stages=[],
@@ -7102,8 +7276,6 @@ async def retry_job(job_id: str, user_id: int = Depends(get_current_user_id)):
             )
     if retried_job is None:
         raise HTTPException(409, "Job đã được chạy lại hoặc trạng thái đã thay đổi")
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
     # A failed attempt can leave partial media behind. It must not be mixed
     # into the next attempt even though retry deliberately reuses job_id.
     # Reset state atomically first; no second request can delete artifacts
@@ -7163,8 +7335,6 @@ async def rerun_full_pipeline(
         channel_source_registry.begin_attempt(
             user_id, int(job.source_logical_id), mode=mode, job_id=job_id,
         )
-    if JOB_COST_CREDITS > 0:
-        store.adjust_credits(user_id, -JOB_COST_CREDITS)
 
     fields: dict[str, Any] = {
         "status": "queued", "progress_note": "Full pipeline rerun queued", "error": None,
@@ -7183,6 +7353,13 @@ async def rerun_full_pipeline(
                 "pending" if (job.publishing_config or {}).get("enabled") else "disabled"
             ),
         })
+    try:
+        admitted = store.queue_job_rerun(job_id, user_id, charge_credits=max(0, JOB_COST_CREDITS),
+                                        lease_owner=_WEB_WORKER_ID, lease_seconds=_WEB_LEASE_SECONDS)
+    except InsufficientCreditsError as exc:
+        raise HTTPException(402, str(exc)) from None
+    if admitted is None:
+        raise HTTPException(409, "Another worker already owns this execution attempt.")
     store.update_job(job_id, **fields)
     _schedule_job_rerun(_get_owned_job(job_id, user_id))
     return {
@@ -7275,7 +7452,17 @@ def update_job_segments(job_id: str, body: UpdateSegmentsBody, user_id: int = De
     job = _get_owned_job(job_id, user_id)
     if job.status != "review":
         raise HTTPException(400, "Job này không ở trạng thái chờ chỉnh sửa phụ đề")
-    store.set_job_segments(job_id, [s.model_dump() for s in body.segments])
+    existing = json.loads(job.segments_json or "[]")
+    updated = []
+    for i, segment in enumerate(body.segments):
+        payload = segment.model_dump()
+        if "speaker_id" not in segment.model_fields_set and i < len(existing):
+            old = existing[i]
+            if old.get("start") == segment.start and old.get("end") == segment.end:
+                payload["speaker_id"] = old.get("speaker_id")
+                payload["speaker_review"] = old.get("speaker_review", False)
+        updated.append(payload)
+    store.set_job_segments(job_id, updated)
     return {"ok": True}
 
 
@@ -7411,7 +7598,11 @@ def cancel_scheduled_post(post_id: int, user_id: int = Depends(get_current_user_
     return {"ok": True}
 
 
-def _run_scheduled_post(row) -> None:
+def _run_scheduled_post(row, owner: Optional[str] = None) -> None:
+    if owner:
+        with store.background_execution("scheduled_post", str(row["id"]), owner, _WEB_LEASE_SECONDS):
+            _run_scheduled_post(row)
+        return
     job = store.get_job(row["job_id"])
     results = []
     try:
@@ -7438,8 +7629,20 @@ def _run_scheduled_post(row) -> None:
 
 async def _scheduled_publish_loop() -> None:
     while True:
-        for row in store.claim_due_scheduled_posts(time.time()):
-            await asyncio.to_thread(_run_scheduled_post, row)
+        try:
+            # A newly started worker may precede the old worker's lease expiry.
+            # Continue recovery after startup so abandoned work cannot stay stuck.
+            await asyncio.to_thread(store.fail_interrupted_jobs, JOB_COST_CREDITS,
+                                    lease_seconds=_WEB_LEASE_SECONDS)
+            await asyncio.to_thread(store.recover_processing_scheduled_posts,
+                                    lease_seconds=_WEB_LEASE_SECONDS)
+            owner = f"{_WEB_WORKER_ID}:post:{uuid.uuid4().hex}"
+            rows = await asyncio.to_thread(store.claim_due_scheduled_posts, time.time(),
+                                           owner=owner, lease_seconds=_WEB_LEASE_SECONDS, limit=1)
+            for row in rows:
+                await asyncio.to_thread(_run_scheduled_post, row, owner)
+        except Exception:
+            logger.exception("Scheduled worker operation failed; retrying after polling interval")
         await asyncio.sleep(15)
 
 
@@ -7547,13 +7750,18 @@ def _resolve_publish_credentials(user_id: int, platform: str) -> tuple[Optional[
         # YouTube access tokens are short-lived (~1h); always mint a fresh
         # one at publish time rather than trusting whatever was cached.
         try:
-            access_token = oauth_module.GoogleOAuth().refresh_access_token(row["refresh_token"])
+            access_token = oauth_module.GoogleOAuth(store.get_social_app_credentials("youtube")).refresh_access_token(row["refresh_token"])
         except Exception:
             logger.warning("Failed to refresh YouTube token for user %s", user_id)
     return access_token, row["account_ref"]
 
 
 # ------------------------------------------------------- social connect --
+
+def _social_oauth_client(platform: str) -> oauth_module.PlatformOAuth:
+    credentials = store.get_social_app_credentials(platform)
+    return (oauth_module.get_oauth_client(platform, credentials=credentials)
+            if credentials else oauth_module.get_oauth_client(platform))
 
 def _redirect_uri(request: Request, platform: str) -> str:
     return str(request.base_url).rstrip("/") + f"/api/social/callback/{platform}"
@@ -7569,12 +7777,14 @@ def list_social_connections(user_id: int = Depends(get_current_user_id)):
     rows = {r["platform"]: r for r in store.list_social_accounts(user_id)}
     out = {}
     for platform in ("tiktok", "facebook", "youtube"):
-        client = oauth_module.get_oauth_client(platform)
+        client = _social_oauth_client(platform)
         row = rows.get(platform)
         out[platform] = {
             "configured": client.is_configured(),
             "connected": row is not None,
             "account_name": row["account_name"] if row else None,
+            "account_ref": row["account_ref"] if row else None,
+            "updated_at": row["updated_at"] if row else None,
             "not_configured_message": None if client.is_configured() else client.not_configured_message(),
         }
     return out
@@ -7583,7 +7793,7 @@ def list_social_connections(user_id: int = Depends(get_current_user_id)):
 @app.get("/api/social/connect/{platform}")
 def connect_social(platform: str, request: Request, user_id: int = Depends(get_current_user_id)):
     try:
-        client = oauth_module.get_oauth_client(platform)
+        client = _social_oauth_client(platform)
     except ValueError:
         raise HTTPException(404, "Nền tảng không hỗ trợ")
     if not client.is_configured():
@@ -7594,10 +7804,28 @@ def connect_social(platform: str, request: Request, user_id: int = Depends(get_c
     store.create_oauth_state(state, user_id, platform)
     redirect_uri = _redirect_uri(request, platform)
     authorize_url = client.authorize_url(redirect_uri, state)
+    handoff = str(request.base_url).rstrip("/") + f"/api/social/authorize/{platform}/{state}"
     return {
-        "authorize_url": authorize_url,
-        "qr_code_url": oauth_module.qr_code_url(authorize_url),
+        "authorize_url": handoff,
+        "qr_code_url": oauth_module.qr_code_url(handoff),
+        "confirmation_token": state,
     }
+
+
+@app.get("/api/social/authorize/{platform}/{state}")
+def authorize_owned_social_connection(platform: str, state: str, request: Request):
+    """A QR device must sign into the same application owner before consent."""
+    try:
+        owner = get_current_user_id(request)
+    except HTTPException:
+        return RedirectResponse("/?social_authorize=" + urllib.parse.quote(state, safe="")
+                                + "&social_platform=" + urllib.parse.quote(platform, safe=""))
+    with store._connect() as conn:
+        pending = conn.execute("SELECT * FROM oauth_states WHERE state=? AND user_id=? AND platform=? AND created_at>?",
+                               (state, owner, platform, time.time() - 600)).fetchone()
+    if pending is None:
+        raise HTTPException(403, "Sign into the account that initiated this connection and scan a fresh QR.")
+    return RedirectResponse(_social_oauth_client(platform).authorize_url(_redirect_uri(request, platform), state))
 
 
 @app.get("/api/social/callback/{platform}")
@@ -7620,28 +7848,31 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
     if error:
         return HTMLResponse(close_html.format(message="OAuth connection was cancelled or denied."))
 
+    try:
+        browser_owner = get_current_user_id(request)
+    except HTTPException:
+        return HTMLResponse(close_html.format(message="Sign into the initiating account and start the connection again."), status_code=401)
     state_row = store.consume_oauth_state(state)
-    if not state_row or state_row["platform"] != platform:
+    if not state_row or state_row["platform"] != platform or state_row["user_id"] != browser_owner:
         return HTMLResponse(
             close_html.format(message="Liên kết đăng nhập không hợp lệ hoặc đã hết hạn."),
             status_code=400)
 
     user_id = state_row["user_id"]
     try:
-        client = oauth_module.get_oauth_client(platform)
+        client = _social_oauth_client(platform)
         redirect_uri = _redirect_uri(request, platform)
         store.token_cipher.require_key()
         result = client.exchange_code(code, redirect_uri)
-        store.upsert_social_account(
-            user_id, platform,
-            access_token=result.access_token, refresh_token=result.refresh_token,
-            expires_at=result.expires_at, account_name=result.account_name,
-            account_ref=result.account_ref,
-            scopes=result.scopes,
-        )
-        label = result.account_name or "tài khoản của bạn"
-        return HTMLResponse(
-            close_html.format(message=f"✓ Đã kết nối {platform} ({label}). Có thể đóng cửa sổ này."))
+        store.create_pending_social_connection(state, user_id, platform, {
+            "access_token": result.access_token, "refresh_token": result.refresh_token,
+            "expires_at": result.expires_at, "account_name": result.account_name,
+            "account_ref": result.account_ref, "scopes": result.scopes,
+        })
+        # The initiating desktop can poll the same token after a QR approval on
+        # another device. Provider consent alone never activates credentials.
+        link = "/?social_confirmation=" + urllib.parse.quote(state, safe="")
+        return RedirectResponse(url=link)
     except SecretCipherError as exc:
         return HTMLResponse(close_html.format(message=str(exc)), status_code=503)
     except Exception:
@@ -7652,6 +7883,21 @@ def social_callback(platform: str, request: Request, code: str = "", state: str 
             ),
             status_code=400,
         )
+
+
+@app.get("/api/social/confirm/{token}")
+def pending_social_connection(token: str, user_id: int = Depends(get_current_user_id)):
+    pending = store.get_pending_social_connection(token, user_id)
+    if not pending:
+        raise HTTPException(404, "Không có kết nối đang chờ xác nhận cho tài khoản này")
+    return pending
+
+
+@app.post("/api/social/confirm/{token}")
+def confirm_social_connection(token: str, user_id: int = Depends(get_current_user_id)):
+    if not store.confirm_social_connection(token, user_id):
+        raise HTTPException(404, "Kết nối đã hết hạn hoặc không thuộc tài khoản này")
+    return {"ok": True}
 
 
 @app.delete("/api/social/connections/{platform}")
@@ -7898,3 +8144,18 @@ app.state.youtube_research_submit_localization = _submit_research_localization
 app.include_router(youtube_research_router)
 app.include_router(content_os_router)
 app.include_router(channel_agent_router)
+
+# Additive source-based automation. Legacy Creator and Channel Agent routes
+# keep their existing behavior; reup uses the same validated job submission.
+from universal_video_ai.web.reup_router import install_reup_routes
+
+
+async def _submit_reup_localization(payload: dict, user_id: int, job_id: str) -> dict:
+    return await _submit_localization(NewJobBody(**payload), user_id, job_id)
+
+
+reup_runtime = install_reup_routes(app, store, _submit_reup_localization, Path(TEMP_DIR) / "reup_shorts", retry_localization=retry_job)
+
+
+from universal_video_ai.web.social_settings import install_social_settings_routes
+install_social_settings_routes(app, store)

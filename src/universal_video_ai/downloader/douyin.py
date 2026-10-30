@@ -24,6 +24,55 @@ _DOWNLOAD_MAX_ATTEMPTS = 6
 _DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 
 
+class DouyinSourceError(RuntimeError):
+    """A confirmed source-access block that needs the user's source window."""
+
+
+def douyin_media_items(payload: object) -> list[dict]:
+    """Read exact video identities and playback URLs from normal page responses."""
+    pending, found = [payload], {}
+    for _ in range(8000):
+        if not pending:
+            break
+        row = pending.pop()
+        if isinstance(row, list):
+            pending.extend(row[:100])
+            continue
+        if not isinstance(row, dict):
+            continue
+        pending.extend(value for value in row.values() if isinstance(value, (dict, list)))
+        identity = str(row.get("aweme_id") or row.get("awemeId") or "")
+        video = row.get("video")
+        if not identity.isdigit() or len(identity) > 24 or not isinstance(video, dict) or row.get("images"):
+            continue
+        urls = []
+        for field in ("play_addr", "play_addr_h264", "playAddr", "playAddrH264"):
+            address = video.get(field)
+            values = address.get("url_list", address.get("urlList", [])) if isinstance(address, dict) else address if isinstance(address, list) else []
+            for value in values:
+                url = value.get("src") if isinstance(value, dict) else value
+                parsed = urlparse(str(url or ""))
+                host = parsed.hostname or ""
+                if parsed.scheme in {"http", "https"} and any(host == domain or host.endswith("." + domain) for domain in (
+                    "douyinvod.com", "douyin.com", "iesdouyin.com", "amemv.com", "snssdk.com", "bytecdn.cn", "bytecdn.com", "pstatp.com"
+                )) and DouyinDownloader._is_plausible_video_url(str(url)):
+                    if url not in urls:
+                        urls.append(url)
+            if urls:
+                break  # Backup URLs must describe the same encoding.
+        if not urls:
+            continue
+        author = row.get("author") or {}
+        cover = video.get("cover") or {}
+        cover_urls = cover.get("url_list", cover.get("urlList", [])) if isinstance(cover, dict) else []
+        found[identity] = {"id": identity, "title": str(row.get("desc") or f"douyin_{identity}")[:500],
+                           "uploader": str(author.get("nickname") or "") if isinstance(author, dict) else "",
+                           "urls": urls[:8], "thumbnail_url": str(cover_urls[0]) if cover_urls else "",
+                           "duration": video.get("duration") or 0, "width": video.get("width") or 0,
+                           "height": video.get("height") or 0}
+    return list(found.values())
+
+
 def _safe_video_filename(title: str, video_id: str, max_bytes: int = 200) -> str:
     """Return a portable, byte-bounded filename for a Douyin video."""
     cleaned = re.sub(r'[\\/\x00-\x1f\x7f]+', "_", title).strip(" .")
@@ -130,6 +179,7 @@ class DouyinDownloader(BaseDownloader):
         video_url: str,
         output_path: Path,
         headers: dict[str, str],
+        *, cookies=None,
     ) -> Optional[int]:
         """Download a large CDN object while preserving a resumable ``.part`` file."""
         part_path = output_path.with_suffix(f"{output_path.suffix}.part")
@@ -155,6 +205,7 @@ class DouyinDownloader(BaseDownloader):
                     video_url,
                     headers=request_headers,
                     stream=True,
+                    cookies=cookies,
                     timeout=(30, 120),
                 ) as video_response:
                     if video_response.status_code == 416 and offset:
@@ -211,6 +262,101 @@ class DouyinDownloader(BaseDownloader):
                 time.sleep(delay)
 
         return None
+
+    def _download_media_item(self, item: dict, output_dir: Path, original_url: str, *, user_agent: str = "") -> Optional[DownloadResult]:
+        headers = {"User-Agent": user_agent or item.get("user_agent") or "Mozilla/5.0", "Referer": original_url}
+        cookies = None
+        cookiefile = _cookiefile_for(Platform.DOUYIN)
+        if cookiefile:
+            cookies = MozillaCookieJar(cookiefile)
+            cookies.load(ignore_discard=True, ignore_expires=False)
+        output_path = output_dir / _safe_video_filename(item["title"], item["id"])
+        for url in item["urls"][:3]:
+            size = self._download_stream_with_resume(url, output_path, headers, cookies=cookies)
+            if size is None:
+                continue
+            valid, reason = validate_video_file(output_path)
+            if not valid:
+                output_path.unlink(missing_ok=True)
+                logger.warning("Douyin playback response is not valid media: %s", reason)
+                continue
+            return DownloadResult(success=True, platform=self.platform, original_url=original_url, final_url=original_url,
+                                  video_path=output_path, title=item["title"], uploader=item.get("uploader", ""),
+                                  duration=float(item.get("duration") or 0) / 1000, width=int(item.get("width") or 0),
+                                  height=int(item.get("height") or 0), filesize=size, extension="mp4", description=item["title"],
+                                  thumbnail_url=item.get("thumbnail_url", ""), raw_metadata={"aweme_id": item["id"]})
+        return None
+
+    def _download_with_source_session(self, video_id: str, output_dir: Path, original_url: str) -> Optional[DownloadResult]:
+        from universal_video_ai.reup.source_sessions import source_download_context
+        binding = source_download_context()
+        if not binding:
+            return None
+        sessions, owner, directories = binding
+        directory = directories["douyin"]
+        if sessions.directory(owner, "douyin") != directory:
+            raise DouyinSourceError("Tài khoản nguồn Douyin vừa thay đổi. Bấm Thử lại để dùng phiên tài khoản hiện tại.")
+        cached = sessions.read_media(owner, video_id)
+        if cached:
+            result = self._download_media_item(cached, output_dir, original_url)
+            if result:
+                return result
+        blocked = sessions.download_issue(owner)
+        if blocked:
+            raise DouyinSourceError(blocked)
+        from playwright.sync_api import sync_playwright, Error as BrowserError
+        from universal_video_ai.reup.discovery import SourceDiscovery
+        item = None
+        user_agent = ""
+        failures = []
+        try:
+            with sync_playwright() as driver:
+                with sessions.browser_context(driver, owner, "douyin", headless=True) as context:
+                    signature = sessions.signature(owner, "douyin")
+                    page = context.new_page()
+                    def response_metadata(response):
+                        parsed = urlparse(response.url)
+                        if parsed.hostname not in {"www.douyin.com", "www.iesdouyin.com"} or "/aweme/" not in parsed.path:
+                            return
+                        if "/aweme/detail/" in parsed.path and response.status in {401, 403, 412, 429}:
+                            failures.append(response.status)
+                        try:
+                            payload = response.json()
+                            if any(row["id"] == video_id for row in douyin_media_items(payload)) and not SourceDiscovery.verification_visible(page):
+                                sessions.save_media(owner, payload, directory=directory, user_agent=user_agent)
+                        except (BrowserError, ValueError):
+                            pass
+                    page.on("response", response_metadata)
+                    page.goto(original_url, wait_until="domcontentloaded", timeout=25000)
+                    user_agent = page.evaluate("() => navigator.userAgent")
+                    for attempt in range(10):
+                        if SourceDiscovery.verification_visible(page):
+                            raise DouyinSourceError("Douyin yêu cầu xác minh video trong phiên đã lưu. Bấm Kiểm tra video nguồn trên thẻ video và hoàn tất yêu cầu trong cửa sổ đó; không cần xuất cookie.")
+                        if self._extract_video_id(page.url) == video_id:
+                            payload = page.evaluate("() => [window._ROUTER_DATA, window.__INITIAL_STATE__, window.RENDER_DATA].filter(x => x && typeof x === 'object')")
+                            sessions.save_media(owner, payload, directory=directory, user_agent=user_agent)
+                        item = sessions.read_media(owner, video_id)
+                        if item or (failures and attempt >= 2):
+                            break
+                        page.wait_for_timeout(800)
+                    previous = sessions.state_path(owner, "douyin")
+                    origins = json.loads(previous.read_text()).get("origins", []) if previous.is_file() else []
+                    sessions.save(owner, "douyin", {"cookies": context.cookies(), "origins": origins}, expected_signature=signature)
+        except DouyinSourceError as error:
+            sessions.download_issue(owner, str(error))
+            raise
+        except ValueError as error:
+            raise DouyinSourceError("Cửa sổ Douyin đang bận hoặc chưa mở được. Đóng cửa sổ nguồn rồi bấm Thử lại; phiên đã lưu được giữ.") from error
+        if sessions.directory(owner, "douyin") != directory:
+            raise DouyinSourceError("Tài khoản nguồn Douyin vừa thay đổi. Chưa dùng dữ liệu từ phiên cũ; bấm Thử lại.")
+        if item:
+            result = self._download_media_item(item, output_dir, original_url, user_agent=user_agent)
+            if result:
+                return result
+        reason = f" (HTTP {failures[0]})" if failures else ""
+        message = f"Douyin chưa cho tải video trong phiên hiện tại{reason}. Bấm Kiểm tra video nguồn để xem video có phát được và hoàn tất xác minh nếu được yêu cầu; không cần xuất cookie hoặc đăng nhập lại khi phiên còn hiệu lực."
+        sessions.download_issue(owner, message)
+        raise DouyinSourceError(message)
 
     def _download_douyin_scraping(self, video_id: str, output_dir: Path) -> Optional[DownloadResult]:
         """Download Douyin by scraping HTML from iesdouyin.com"""
@@ -402,6 +548,11 @@ class DouyinDownloader(BaseDownloader):
         )
 
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        if requested_video_id:
+            result = self._download_with_source_session(requested_video_id, output_dir, f"https://www.douyin.com/video/{requested_video_id}")
+            if result:
+                return result
 
         # Strategy 1: HTML scraping (no login required)
         resolved_url = self._resolve_short_url(url)

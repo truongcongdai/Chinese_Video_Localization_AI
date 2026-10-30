@@ -11,14 +11,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from universal_video_ai.downloader.service import DownloadService
+from universal_video_ai.async_runtime import run_blocking_bounded
 from universal_video_ai.downloader.download_result import DownloadResult
 from universal_video_ai.downloader.platform import Platform
 from universal_video_ai.downloader.rate_limiter import get_rate_limiter
 from universal_video_ai.audio.factory import create_audio_pipeline
+from universal_video_ai.audio.duration import media_duration
 from universal_video_ai.audio.pipeline import AudioPipelineResult
 from universal_video_ai.audio.audio_result import AudioResult
 from universal_video_ai.audio.background_music import BackgroundMusicLibrary
 from universal_video_ai.segment import TranscriptSegment
+from universal_video_ai.speech.diarization import Diarizer
 from universal_video_ai.translate.service import TranslateService
 from universal_video_ai.translate.adapt import SegmentAdapter
 from universal_video_ai.translate.speech_fit import SpeechFitConfig, fit_translated_segments
@@ -56,6 +59,8 @@ _TRANSCRIPTION_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TRANSCRIPTION_CON
 _OCR_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("OCR_CONCURRENCY", "1"))))
 _RENDER_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("RENDER_CONCURRENCY", "2"))))
 _TTS_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("TTS_CONCURRENCY", "8"))))
+_AUDIO_MIX_SLOTS = asyncio.Semaphore(max(1, int(os.getenv("AUDIO_MIX_CONCURRENCY", "2"))))
+_TTS_WORKERS = max(1, int(os.getenv("TTS_CONCURRENCY", "8")))
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,8 @@ class LocalizationConfig:
     # tts.voice_for_language()'s default for target_language, unchanged
     # from before this option existed.
     tts_voice: Optional[str] = None
+    speaker_mode: str = "single"
+    speaker_voices: Optional[Dict[str, str]] = None
     # Fit each generated WAV to its real timeline slot instead of letting the
     # mixer truncate words at the nominal subtitle end.  The clip duration is
     # measured after synthesis; modest atempo compression is preferred, then
@@ -276,13 +283,13 @@ def prepared_localization_to_dict(prepared: PreparedLocalization) -> Dict[str, A
         "target_language": prepared.target_language,
         "output_dir": str(prepared.output_dir),
         "source_segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in prepared.source_segments
+            s.to_dict() for s in prepared.source_segments
         ],
         "translated_segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.translated_segments or [])
+            s.to_dict() for s in (prepared.translated_segments or [])
         ],
         "tts_segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in (prepared.tts_segments or [])
+            s.to_dict() for s in (prepared.tts_segments or [])
         ],
         "translated_text": prepared.translated_text,
     }
@@ -309,15 +316,15 @@ def prepared_localization_from_dict(data: Dict[str, Any]) -> PreparedLocalizatio
         detected_language=data.get("detected_language"),
     )
     source_segments = [
-        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        TranscriptSegment.from_dict(s)
         for s in data.get("source_segments", [])
     ]
     translated_segments = [
-        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        TranscriptSegment.from_dict(s)
         for s in data.get("translated_segments", [])
     ] or None
     tts_segments = [
-        TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+        TranscriptSegment.from_dict(s)
         for s in data.get("tts_segments", [])
     ] or None
     return PreparedLocalization(
@@ -380,6 +387,7 @@ class LocalizationService:
             cancellation_checker: Optional[Callable[[], bool]] = None,
             user_id: Optional[int] = None,
             use_download_cache: bool = True,
+            diarizer: Optional[Diarizer] = None,
     ) -> None:
         self.downloader = downloader or DownloadService(user_id=user_id, use_cache=use_download_cache)
         self.translate_service = translate_service
@@ -395,6 +403,7 @@ class LocalizationService:
         self.progress_callback = progress_callback
         self.cancellation_checker = cancellation_checker
         self.user_id = user_id
+        self.diarizer = diarizer
         self._last_subtitle_alignment_estimate = None
         self._used_source_subtitle_timing = False
 
@@ -537,11 +546,10 @@ class LocalizationService:
             rate_limiter = get_rate_limiter()
             await rate_limiter.acquire(self.user_id)
 
-            try:
-                async with _DOWNLOAD_SLOTS:
-                    download_result = await asyncio.to_thread(self.downloader.download, url, output_dir)
-            finally:
-                rate_limiter.release()
+            download_result = await run_blocking_bounded(
+                _DOWNLOAD_SLOTS, self.downloader.download, url, output_dir,
+                on_complete=rate_limiter.release,
+            )
 
             if not download_result.success:
                 raise ValueError(f"Download failed for {url}")
@@ -567,10 +575,9 @@ class LocalizationService:
         )
 
         # Run audio processing (this is the CPU-heavy bottleneck)
-        async with _TRANSCRIPTION_SLOTS:
-            audio_result = await asyncio.to_thread(
-                pipeline.process, download_result, output_dir=output_dir / "audio"
-            )
+        audio_result = await run_blocking_bounded(_TRANSCRIPTION_SLOTS,
+            pipeline.process, download_result, output_dir=output_dir / "audio"
+        )
         self.logger.info("LocalizationService: audio processing complete")
         self._progress(40, "Đã nhận diện lời nói ✓")
 
@@ -585,13 +592,12 @@ class LocalizationService:
             and self.config.enable_text_cover
             and download_result.video_path
         ):
-            async with _OCR_SLOTS:
-                opening_ocr_segments = await asyncio.to_thread(
-                    self._scan_opening_ocr_segments,
-                    download_result.video_path,
-                    audio_result.audio_result.duration,
-                    audio_result.detected_language,
-                )
+            opening_ocr_segments = await run_blocking_bounded(_OCR_SLOTS,
+                self._scan_opening_ocr_segments,
+                download_result.video_path,
+                audio_result.audio_result.duration,
+                audio_result.detected_language,
+            )
         source_evidence = reconcile_source_evidence(
             audio_source_segments, opening_ocr_segments
         )
@@ -601,6 +607,15 @@ class LocalizationService:
                 sum(1 for item in source_evidence if item.detector == "ocr"),
             )
         audio_source_segments = [item.as_segment() for item in source_evidence]
+        if self.config.speaker_mode == "auto":
+            if self.diarizer is None:
+                raise RuntimeError("Automatic speaker detection is not configured.")
+            from universal_video_ai.speech.diarization import assign_speakers
+            self._progress(40, "Đang nhận diện người nói...")
+            turns = await run_blocking_bounded(_TRANSCRIPTION_SLOTS, self.diarizer.diarize, audio_result.audio_result.audio_path)
+            audio_source_segments = assign_speakers(audio_source_segments, turns)
+            if not turns:
+                raise RuntimeError("Speaker detection found no speech; use manual review or single voice.")
         self._source_evidence = source_evidence
 
         self._last_subtitle_alignment_estimate = None
@@ -609,14 +624,13 @@ class LocalizationService:
         # on the event-loop thread made every API request look frozen until the
         # scan ended. Run it in a worker so history/progress/cancel stay alive.
         self._progress(40, "Đang chờ lượt nhận diện phụ đề gốc...")
-        async with _OCR_SLOTS:
-            visual_source_segments = await asyncio.to_thread(
-                self._align_source_segments_to_burned_subtitles,
-                video_path=download_result.video_path,
-                source_segments=audio_source_segments,
-                detected_language=audio_result.detected_language,
-                audio_duration=audio_result.audio_result.duration,
-            )
+        visual_source_segments = await run_blocking_bounded(_OCR_SLOTS,
+            self._align_source_segments_to_burned_subtitles,
+            video_path=download_result.video_path,
+            source_segments=audio_source_segments,
+            detected_language=audio_result.detected_language,
+            audio_duration=audio_result.audio_result.duration,
+        )
 
         translated_text: Optional[str] = None
         translated_segments: Optional[List[TranscriptSegment]] = None
@@ -856,7 +870,7 @@ class LocalizationService:
         if not text_segments or not timing_segments or len(text_segments) != len(timing_segments):
             return text_segments
         return [
-            TranscriptSegment(start=timing.start, end=timing.end, text=text.text)
+            TranscriptSegment(start=timing.start, end=timing.end, text=text.text, speaker_id=text.speaker_id, speaker_review=text.speaker_review)
             for text, timing in zip(text_segments, timing_segments)
         ]
 
@@ -874,7 +888,7 @@ class LocalizationService:
                 start=max(0.0, s.start - padding),
                 end=min(audio_duration, s.end + padding),
                 text=s.text,
-            )
+                speaker_id=s.speaker_id, speaker_review=s.speaker_review)
             for s in sorted(segments, key=lambda item: item.start)
         ]
 
@@ -888,12 +902,12 @@ class LocalizationService:
                 start=previous.start,
                 end=max(previous.start, boundary),
                 text=previous.text,
-            )
+                speaker_id=previous.speaker_id, speaker_review=previous.speaker_review)
             padded[idx] = TranscriptSegment(
                 start=min(current.end, boundary),
                 end=current.end,
                 text=current.text,
-            )
+                speaker_id=current.speaker_id, speaker_review=current.speaker_review)
         return padded
 
     def _maybe_apply_audio_sync_offset(
@@ -921,7 +935,7 @@ class LocalizationService:
                 start=max(0.0, min(audio_duration, s.start + offset)),
                 end=max(0.0, min(audio_duration, s.end + offset)),
                 text=s.text,
-            )
+                speaker_id=s.speaker_id, speaker_review=s.speaker_review)
             for s in segments
         ]
 
@@ -957,7 +971,7 @@ class LocalizationService:
                     start=max(0.0, min(audio_duration, s.start + offset)),
                     end=max(0.0, min(audio_duration, s.end + offset)),
                     text=s.text,
-                )
+                 speaker_id=s.speaker_id, speaker_review=s.speaker_review)
                 for s in source_segments
             ]
 
@@ -1085,7 +1099,7 @@ class LocalizationService:
                                 start=window.start if window is not None else s.start,
                                 end=window.end if window is not None else s.end,
                                 text=s.text,
-                            )
+                             speaker_id=s.speaker_id, speaker_review=s.speaker_review)
                             for s, window in zip(source_segments, windows)
                         ]
                     self.logger.info(
@@ -1131,7 +1145,7 @@ class LocalizationService:
                 start=max(0.0, min(audio_duration, s.start + self._segment_alignment_offset(s, estimate))),
                 end=max(0.0, min(audio_duration, s.end + self._segment_alignment_offset(s, estimate))),
                 text=s.text,
-            )
+                speaker_id=s.speaker_id, speaker_review=s.speaker_review)
             for s in source_segments
         ]
 
@@ -1208,14 +1222,21 @@ class LocalizationService:
                     else:
                         self.logger.info("LocalizationService: synthesizing TTS (whole-text fallback)")
                         tts_audio_path = output_dir / "tts_audio.wav"
-                        await asyncio.to_thread(
-                            self.tts_service.synthesize,
+                        tts_audio_path = await run_blocking_bounded(
+                            _TTS_SLOTS, self.tts_service.synthesize,
                             translated_text,
                             output_path=tts_audio_path,
                             language=effective_target_language,
                             voice=self.config.tts_voice,
                         )
                     self.logger.info("LocalizationService: TTS complete: %s", tts_audio_path)
+                    measured_duration = await run_blocking_bounded(
+                        _AUDIO_MIX_SLOTS, self._wav_duration, Path(tts_audio_path),
+                    )
+                    self._reject_dub_overflow(
+                        [TimedAudioClip(0.0, measured_duration, Path(tts_audio_path))],
+                        audio_result.audio_result.duration,
+                    )
                     self._progress(72, "Đã tạo giọng đọc ✓")
                 except Exception as exc:
                     self.logger.error("TTS synthesis failed: %s", exc)
@@ -1321,14 +1342,13 @@ class LocalizationService:
             and download_result.video_path
         ):
             self._progress(80, "Đang nhận diện vùng chữ gốc...")
-            async with _OCR_SLOTS:
-                text_overlays = await asyncio.to_thread(
-                    self._build_text_overlays,
-                    video_path=download_result.video_path,
-                    source_segments=visual_source_segments,
-                    translated_segments=visual_translated_segments,
-                    detected_language=audio_result.detected_language,
-                )
+            text_overlays = await run_blocking_bounded(_OCR_SLOTS,
+                self._build_text_overlays,
+                video_path=download_result.video_path,
+                source_segments=visual_source_segments,
+                translated_segments=visual_translated_segments,
+                detected_language=audio_result.detected_language,
+            )
             if text_overlays and subtitles_path and subtitle_segments:
                 common_font_size = text_overlays[0].font_size or 48
                 positions = None
@@ -1373,7 +1393,8 @@ class LocalizationService:
             self.logger.info("LocalizationService: mixing audio streams")
             if self.config.replace_source_audio:
                 replacement_track = (
-                    self.background_music_library.select_like(
+                    await run_blocking_bounded(
+                        _AUDIO_MIX_SLOTS, self.background_music_library.select_like,
                         audio_result.audio_result.audio_path,
                         selection_key=str(download_result.video_path),
                     )
@@ -1382,7 +1403,7 @@ class LocalizationService:
                 source_effects_bed: Optional[Path] = None
                 if audio_result.demucs_output is not None:
                     source_effects_bed = output_dir / "source_effects_bed.wav"
-                    self.mixer.build_source_effects_bed(
+                    await run_blocking_bounded(_AUDIO_MIX_SLOTS, self.mixer.build_source_effects_bed,
                         [
                             audio_result.demucs_output.drums,
                             audio_result.demucs_output.bass,
@@ -1400,7 +1421,7 @@ class LocalizationService:
 
                 mixed_audio_path = output_dir / "audio_safe_mix.wav"
                 if source_effects_bed is not None:
-                    self.mixer.mix_dub_with_source_and_background(
+                    await run_blocking_bounded(_AUDIO_MIX_SLOTS, self.mixer.mix_dub_with_source_and_background,
                         DubbedSourceBackgroundMix(
                             voice_audio=tts_audio_path,
                             source_audio=source_effects_bed,
@@ -1412,7 +1433,7 @@ class LocalizationService:
                         mixed_audio_path,
                     )
                 elif replacement_track is not None:
-                    self.mixer.mix_dub_with_background(
+                    await run_blocking_bounded(_AUDIO_MIX_SLOTS, self.mixer.mix_dub_with_background,
                         DubbedBackgroundMix(
                             voice_audio=tts_audio_path,
                             background_audio=replacement_track,
@@ -1425,7 +1446,7 @@ class LocalizationService:
                     mixed_audio_path = tts_audio_path
             else:
                 mixed_audio_path = output_dir / "audio_mixed.wav"
-                self.mixer.mix(
+                await run_blocking_bounded(_AUDIO_MIX_SLOTS, self.mixer.mix,
                     AudioMix(
                         primary_audio=audio_result.audio_result.audio_path,
                         secondary_audio=tts_audio_path,
@@ -1447,13 +1468,12 @@ class LocalizationService:
                 try:
                     # Use mixed audio if available, otherwise use TTS audio, otherwise use original audio
                     audio_for_render = mixed_audio_path or tts_audio_path or audio_result.audio_result.audio_path
-                    async with _OCR_SLOTS:
-                        static_text_boxes = await asyncio.to_thread(
-                            self._detect_static_text_watermark_boxes,
-                            video_path=download_result.video_path,
-                            detected_language=audio_result.detected_language,
-                            duration=audio_result.audio_result.duration,
-                        )
+                    static_text_boxes = await run_blocking_bounded(_OCR_SLOTS,
+                        self._detect_static_text_watermark_boxes,
+                        video_path=download_result.video_path,
+                        detected_language=audio_result.detected_language,
+                        duration=audio_result.audio_result.duration,
+                    )
                     if static_text_boxes:
                         existing_boxes = tuple(self.renderer.config.watermark_boxes_fractional or ())
                         self.renderer.config = replace(
@@ -1557,21 +1577,20 @@ class LocalizationService:
                             "burn-in and text-cover boxes, not static drawtext subtitles"
                         )
 
-                    async with _RENDER_SLOTS:
-                        await asyncio.to_thread(
-                            self.renderer.render,
-                            video_path=download_result.video_path,
-                            audio_path=audio_for_render,
-                            subtitles=subtitles_for_render,
-                            output_path=final_video_path,
-                            text_overlays=text_overlays,
-                            subtitle_segments=subtitle_segments_for_render,
-                        )
+                    await run_blocking_bounded(_RENDER_SLOTS,
+                        self.renderer.render,
+                        video_path=download_result.video_path,
+                        audio_path=audio_for_render,
+                        subtitles=subtitles_for_render,
+                        output_path=final_video_path,
+                        text_overlays=text_overlays,
+                        subtitle_segments=subtitle_segments_for_render,
+                    )
                     self._progress(98, "Đã render ✓")
                     self.logger.info("LocalizationService: render complete: %s", final_video_path)
                 except Exception as exc:
                     self.logger.error("Rendering failed: %s", exc)
-                    final_video_path = None
+                    raise RuntimeError(f"Rendering failed: {exc}") from exc
 
         return LocalizationResult(
             download_result=download_result,
@@ -1667,33 +1686,10 @@ class LocalizationService:
         """Return real media duration even when a provider writes MP3/AAC bytes
         to a file named ``.wav``.
 
-        Several TTS backends do exactly that.  ``wave.open`` then returns 0,
-        causing the mixer to trust the nominal subtitle window and trim the
-        final syllables.  Probe with ffprobe first and keep the stdlib WAV
-        reader as a dependency-free fallback.
+        Try the cheap WAV header first; fall back to ffprobe for mislabeled
+        MP3/AAC files. This avoids a subprocess for every PCM sentence.
         """
-        try:
-            result = subprocess.run(
-                [
-                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            duration = float((result.stdout or "").strip())
-            if duration > 0.0:
-                return duration
-        except Exception:
-            pass
-        try:
-            with wave.open(str(path), "rb") as wav_file:
-                rate = wav_file.getframerate()
-                frames = wav_file.getnframes()
-                return (frames / rate) if rate else 0.0
-        except Exception:
-            return 0.0
+        return media_duration(path)
 
     @staticmethod
     def _atempo_chain(speed: float) -> str:
@@ -1745,7 +1741,7 @@ class LocalizationService:
         # Critical invariant: never advertise an end earlier than the actual
         # audio. Mixer implementations commonly atrim to TimedAudioClip.end;
         # using the measured duration prevents final syllables being lost.
-        real_end = min(total_duration, start + actual_duration)
+        real_end = start + actual_duration
         if real_end > available_end + 0.01:
             self.logger.warning(
                 "TTS clip %s exceeds its free slot by %.3fs after %.3fx fit; preserving the full clip instead of truncating it",
@@ -1792,20 +1788,25 @@ class LocalizationService:
         gap = max(0.0, float(self.config.tts_neighbor_gap_seconds))
         max_speed = max(1.0, float(self.config.tts_max_speed_ratio))
 
+        suffix_duration = [0.0] * (len(items) + 1)
+        next_anchor_start: List[Optional[float]] = [None] * len(items)
+        upcoming_anchor: Optional[float] = None
+        for pos in range(len(items) - 1, -1, -1):
+            suffix_duration[pos] = suffix_duration[pos + 1] + items[pos][3]
+            next_anchor_start[pos] = upcoming_anchor
+            if items[pos][1].has_timing:
+                upcoming_anchor = items[pos][1].start
+
         for pos, (idx, seg, clip_path, raw_duration) in enumerate(items):
             anchor_start = seg.start if seg.has_timing else previous_end
             start = max(anchor_start, previous_end + (gap if clips else 0.0))
 
-            remaining_raw = sum(item[3] for item in items[pos:])
+            remaining_raw = suffix_duration[pos]
             remaining_gaps = gap * max(0, len(items) - pos - 1)
             remaining_time = max(0.10, total_duration - start - remaining_gaps)
             global_required_speed = remaining_raw / remaining_time
 
-            next_anchor = None
-            for _later_idx, later_seg, _later_path, _later_duration in items[pos + 1:]:
-                if later_seg.has_timing:
-                    next_anchor = later_seg.start
-                    break
+            next_anchor = next_anchor_start[pos]
             if next_anchor is not None:
                 local_available = max(0.10, next_anchor - start - gap)
                 local_required_speed = raw_duration / local_available
@@ -1845,10 +1846,20 @@ class LocalizationService:
                     idx,
                 )
             clips.append(TimedAudioClip(start=start, end=end, audio_path=fitted_path))
-            playback.append(TranscriptSegment(start=start, end=end, text=seg.text))
+            playback.append(TranscriptSegment(start=start, end=end, text=seg.text, speaker_id=seg.speaker_id, speaker_review=seg.speaker_review))
             previous_end = end
 
         return clips, playback
+
+    def _voice_for_segment(self, segment: TranscriptSegment, fallback: Optional[str]) -> Optional[str]:
+        if self.config.speaker_mode == "single":
+            return fallback
+        mapping = self.config.speaker_voices or {}
+        if segment.speaker_id and segment.speaker_id in mapping:
+            return mapping[segment.speaker_id]
+        if segment.speaker_id:
+            raise RuntimeError(f"No voice assigned to {segment.speaker_id}; assign it in speaker settings.")
+        return fallback
 
     def _synthesize_timed_track(
         self,
@@ -1883,7 +1894,7 @@ class LocalizationService:
                     seg.text,
                     output_path=clip_path,
                     language=target_language,
-                    voice=voice,
+                    voice=self._voice_for_segment(seg, voice),
                 ))
             except Exception as exc:
                 raise RuntimeError(
@@ -1903,8 +1914,18 @@ class LocalizationService:
                 ))
 
         tts_audio_path = output_dir / "tts_audio.wav"
+        self._reject_dub_overflow(clips, total_duration)
         self.mixer.build_dubbed_track(clips, total_duration=total_duration, output_path=tts_audio_path)
         return tts_audio_path
+
+    @staticmethod
+    def _reject_dub_overflow(clips: List[TimedAudioClip], total_duration: float) -> None:
+        end = max((clip.end for clip in clips), default=0.0)
+        if end > total_duration + 0.05:
+            raise RuntimeError(
+                f"Dub exceeds source video by {end - total_duration:.3f}s; "
+                "shorten the translation or provide a longer source video before rendering."
+            )
 
     async def _synthesize_timed_track_async(
         self,
@@ -1930,17 +1951,14 @@ class LocalizationService:
                 return None
             clip_path = segments_dir / f"segment_{idx:04d}.wav"
             try:
-                async with _TTS_SLOTS:
-                    generated_path = await asyncio.to_thread(
-                        self.tts_service.synthesize,
-                        seg.text,
-                        output_path=clip_path,
-                        language=target_language,
-                        voice=voice,
-                    )
-                    clip_path = Path(generated_path)
-                    if not clip_path.is_file() or clip_path.stat().st_size == 0:
-                        raise RuntimeError("TTS provider returned missing or empty audio")
+                generated_path = await run_blocking_bounded(
+                    _TTS_SLOTS, self.tts_service.synthesize, seg.text,
+                    output_path=clip_path, language=target_language,
+                    voice=self._voice_for_segment(seg, voice),
+                )
+                clip_path = Path(generated_path)
+                if not clip_path.is_file() or clip_path.stat().st_size == 0:
+                    raise RuntimeError("TTS provider returned missing or empty audio")
             except Exception as exc:
                 self.logger.warning(
                     "TTS segment %d needs recovery after synthesis failed: %s",
@@ -1952,14 +1970,22 @@ class LocalizationService:
             self._raise_if_cancelled()
             return idx, seg, clip_path
 
-        # Run TTS synthesis in parallel with concurrency control
-        tasks = [
-            synthesize_segment(idx, seg)
-            for idx, seg in enumerate(translated_segments)
-        ]
-        results = await asyncio.gather(*tasks)
+        # A fixed number of workers keeps pending coroutines bounded for long
+        # transcripts while preserving the per-sentence recovery behavior.
+        pending = iter(enumerate(translated_segments))
 
-        completed = [item for item in results if item is not None]
+        async def synthesize_worker() -> List[Tuple[int, TranscriptSegment, Path]]:
+            output: List[Tuple[int, TranscriptSegment, Path]] = []
+            for idx, seg in pending:
+                item = await synthesize_segment(idx, seg)
+                if item is not None:
+                    output.append(item)
+            return output
+
+        groups = await asyncio.gather(*(
+            synthesize_worker() for _ in range(min(_TTS_WORKERS, len(translated_segments)))
+        ))
+        completed = [item for group in groups for item in group]
         expected = {idx for idx, seg in enumerate(translated_segments) if seg.text.strip()}
         missing = expected - {item[0] for item in completed}
         # A later recovery pass gives the remote provider time to recover and
@@ -1980,10 +2006,11 @@ class LocalizationService:
                 "Rendering stopped; retry to recover missing voice."
             )
         completed.sort(key=lambda item: item[0])
-        clips, playback_segments = self._schedule_tts_clips(
+        clips, playback_segments = await run_blocking_bounded(_AUDIO_MIX_SLOTS, self._schedule_tts_clips,
             completed,
             total_duration=total_duration,
         )
+        self._reject_dub_overflow(clips, total_duration)
         self._last_tts_playback_segments = playback_segments
         if len(playback_segments) != len(expected):
             raise RuntimeError("TTS incomplete: invalid audio clips; rendering stopped.")
@@ -2003,7 +2030,10 @@ class LocalizationService:
 
         tts_audio_path = output_dir / "tts_audio.wav"
         mix_duration = max(total_duration, clips[-1].end if clips else total_duration)
-        self.mixer.build_dubbed_track(clips, total_duration=mix_duration, output_path=tts_audio_path)
+        await run_blocking_bounded(
+            _AUDIO_MIX_SLOTS, self.mixer.build_dubbed_track,
+            clips, total_duration=mix_duration, output_path=tts_audio_path,
+        )
         return tts_audio_path
 
     @staticmethod
@@ -2021,6 +2051,8 @@ class LocalizationService:
             seg_duration = max(1e-6, seg.end_time - seg.start_time)
             covered = False
             for overlay in text_overlays:
+                if not overlay.text.strip():
+                    continue
                 overlap = min(seg.end_time, overlay.end) - max(seg.start_time, overlay.start)
                 if overlap > 0 and (overlap / seg_duration) >= min_overlap_ratio:
                     covered = True

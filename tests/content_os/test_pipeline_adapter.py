@@ -93,9 +93,9 @@ class TestPipelineAdapter:
         return run
     
     @pytest.fixture
-    def script_artifact(self, artifact_store, run, project):
+    def script_artifact(self, artifact_store, run, project, repo):
         """Create a script artifact."""
-        return artifact_store.write(
+        info = artifact_store.write(
             user_id=1,
             project_id=project.id,
             run_id=run.id,
@@ -111,6 +111,11 @@ class TestPipelineAdapter:
             },
             created_by_agent="script_writer",
         )
+        from universal_video_ai.content_os.approvals import ArtifactApprovals
+        from universal_video_ai.content_os.enums import ApprovalType
+        ArtifactApprovals(repo, artifact_store).record(run.id, 1, ApprovalType.SCRIPT, "approved")
+        return info
+
     
     @pytest.fixture
     def content_plan_artifact(self, artifact_store, run, project):

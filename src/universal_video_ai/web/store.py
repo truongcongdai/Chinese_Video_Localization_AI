@@ -9,10 +9,14 @@ small tables and doesn't need one.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import sqlite3
 import statistics
 import time
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +71,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     publishing_pack_status TEXT DEFAULT 'disabled',
     publishing_pack_error TEXT,
     tts_voice TEXT,
+    speaker_config TEXT,
     review_mode INTEGER NOT NULL DEFAULT 0,
     review_state_json TEXT,
     segments_json TEXT,
@@ -112,6 +117,14 @@ CREATE TABLE IF NOT EXISTS social_accounts (
     UNIQUE(user_id, platform)
 );
 
+CREATE TABLE IF NOT EXISTS social_oauth_apps (
+    platform TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    client_secret TEXT NOT NULL,
+    updated_by INTEGER NOT NULL REFERENCES users(id),
+    updated_at REAL NOT NULL
+);
+
 -- Short-lived CSRF state for the OAuth redirect dance (state -> which
 -- app user + which platform initiated it). Rows are deleted once consumed
 -- by the callback, and stale ones (>1h) are swept on write.
@@ -130,6 +143,22 @@ CREATE TABLE IF NOT EXISTS identity_oauth_states (
     state TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS web_execution_leases (
+    kind TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    PRIMARY KEY (kind, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS pending_social_connections (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    encrypted_payload TEXT NOT NULL,
+    expires_at REAL NOT NULL
 );
 
 -- Feedback / bug reports sent in from the app's "Góp ý / Báo lỗi" button.
@@ -1085,6 +1114,9 @@ CREATE INDEX IF NOT EXISTS idx_content_os_memories_active ON content_os_memories
 """
 
 _MIGRATIONS = [
+    ("jobs", "charged_credits", "ALTER TABLE jobs ADD COLUMN charged_credits INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "credits_refunded", "ALTER TABLE jobs ADD COLUMN credits_refunded INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "credit_reservation_id", "ALTER TABLE jobs ADD COLUMN credit_reservation_id TEXT"),
     ("users", "credits", "ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 10"),
     ("users", "is_admin", "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"),
     # Alternative sign-up/sign-in identifiers alongside the original
@@ -1297,6 +1329,7 @@ _MIGRATIONS = [
     ("jobs", "publishing_pack_error", "ALTER TABLE jobs ADD COLUMN publishing_pack_error TEXT"),
     # TTS voice override (None = pick the language's default voice, see
     # tts.voices.VOICE_OPTIONS).
+    ("jobs", "speaker_config", "ALTER TABLE jobs ADD COLUMN speaker_config TEXT"),
     ("jobs", "tts_voice", "ALTER TABLE jobs ADD COLUMN tts_voice TEXT"),
     # "Chỉnh sửa phụ đề trước khi render" opt-in: when set, the job stops
     # at status='review' after translation instead of rendering straight
@@ -1449,6 +1482,7 @@ class Job:
     publish_ready_video_path: Optional[str] = None
     publishing_pack_status: str = "disabled"
     publishing_pack_error: Optional[str] = None
+    speaker_config: Optional[Dict[str, Any]] = None
     tts_voice: Optional[str] = None
     review_mode: int = 0
     review_state_json: Optional[str] = None
@@ -1479,9 +1513,14 @@ class Job:
     source_logical_id: Optional[int] = None
     history_archived: int = 0
     execution_attempt: int = 1
+    charged_credits: int = 0
+    credits_refunded: int = 0
+    credit_reservation_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
+        for internal in ("charged_credits", "credits_refunded", "credit_reservation_id"):
+            d.pop(internal, None)
         d["is_content_os"] = (
                 str(self.source_url or "").startswith("content_os://")
                 or str(self.source_language or "").startswith("content_os")
@@ -1510,15 +1549,26 @@ class Job:
         return d
 
 
+from universal_video_ai.sqlite_runtime import ClosingConnection
+
+class InsufficientCreditsError(ValueError):
+    """The requested execution could not reserve sufficient credits."""
+
+
+class ExecutionLeaseLost(RuntimeError):
+    """A superseded worker must stop writing results."""
+
+
 class Store:
     def __init__(self, db_path: Path, *, token_cipher: Optional[TokenCipher] = None):
         self.db_path = Path(db_path)
         self.token_cipher = token_cipher or TokenCipher()
+        self._execution_context = ContextVar("web_execution_owner", default=None)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), factory=ClosingConnection, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA secure_delete=ON")
         return conn
@@ -1735,6 +1785,126 @@ class Store:
         with self._connect() as conn:
             conn.execute("UPDATE users SET credits = ? WHERE id = ?", (value, user_id))
 
+    def _charge_credits(self, conn: sqlite3.Connection, user_id: int, amount: int) -> None:
+        if amount < 0:
+            raise ValueError("Credit charge cannot be negative")
+        if amount and conn.execute(
+            "UPDATE users SET credits=credits-? WHERE id=? AND credits>=?",
+            (amount, user_id, amount),
+        ).rowcount != 1:
+            raise InsufficientCreditsError("Không đủ credit để thực hiện công việc")
+
+    def refund_job_credits(self, job_id: str, reservation_id: Optional[str]) -> bool:
+        """Refund exactly the reservation belonging to this execution attempt."""
+        if not reservation_id:
+            return False
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id, charged_credits FROM jobs WHERE id=? AND credit_reservation_id=? "
+                "AND credits_refunded=0", (job_id, reservation_id),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute("UPDATE jobs SET credits_refunded=1 WHERE id=?", (job_id,))
+            conn.execute("UPDATE users SET credits=credits+? WHERE id=?", (row["charged_credits"], row["user_id"]))
+            return True
+
+    def queue_job_rerun(self, job_id: str, user_id: int, *, charge_credits: int,
+                        lease_owner: str, lease_seconds: float = 300) -> Optional[Job]:
+        """Admit a stopped execution and its charge in one write transaction."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id=? AND user_id=? AND status IN ('error','cancelled','review','done')",
+                (job_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            live = conn.execute(
+                "SELECT 1 FROM web_execution_leases WHERE kind='job' AND resource_id=? AND expires_at>?",
+                (job_id, time.time()),
+            ).fetchone()
+            if live:
+                return None
+            self._charge_credits(conn, user_id, charge_credits)
+            conn.execute(
+                "UPDATE jobs SET status='queued', charged_credits=?, credits_refunded=0, "
+                "credit_reservation_id=?, updated_at=? WHERE id=?",
+                (charge_credits, uuid.uuid4().hex, time.time(), job_id),
+            )
+            self._write_lease(conn, "job", job_id, lease_owner, time.time() + lease_seconds)
+            return self._row_to_job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+
+    def _write_lease(self, conn: sqlite3.Connection, kind: str, resource_id: str,
+                     owner: str, expires_at: float) -> None:
+        conn.execute(
+            "INSERT INTO web_execution_leases(kind,resource_id,owner,expires_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(kind,resource_id) DO UPDATE SET owner=excluded.owner, expires_at=excluded.expires_at",
+            (kind, str(resource_id), owner, expires_at),
+        )
+
+    def claim_job_execution(self, job_id: str, owner: str, *, reserved_owner: str,
+                            expected_status: str = "queued", lease_seconds: float = 300) -> bool:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM jobs WHERE id=? AND status=?", (job_id, expected_status)).fetchone():
+                return False
+            lease = conn.execute(
+                "SELECT * FROM web_execution_leases WHERE kind='job' AND resource_id=?", (job_id,),
+            ).fetchone()
+            if lease and lease["expires_at"] > time.time() and lease["owner"] != reserved_owner:
+                return False
+            self._write_lease(conn, "job", job_id, owner, time.time() + lease_seconds)
+            return True
+
+    def renew_execution_lease(self, kind: str, resource_id: str, owner: str, lease_seconds: float = 300) -> bool:
+        with self._connect() as conn:
+            return conn.execute(
+                "UPDATE web_execution_leases SET expires_at=? WHERE kind=? AND resource_id=? "
+                "AND owner=? AND expires_at>?",
+                (time.time() + lease_seconds, kind, str(resource_id), owner, time.time()),
+            ).rowcount == 1
+
+    def release_execution_lease(self, kind: str, resource_id: str, owner: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM web_execution_leases WHERE kind=? AND resource_id=? AND owner=?",
+                         (kind, str(resource_id), owner))
+
+    @contextmanager
+    def background_execution(self, kind: str, resource_id: str, owner: str,
+                             lease_seconds: float = 300):
+        """Keep thread-owned work leased until the actual operation returns."""
+        if not self.renew_execution_lease(kind, resource_id, owner, lease_seconds):
+            raise ExecutionLeaseLost("Execution claim expired before work started")
+        finished = threading.Event()
+
+        def renew() -> None:
+            while not finished.wait(max(0.01, lease_seconds / 3)):
+                try:
+                    if not self.renew_execution_lease(kind, resource_id, owner, lease_seconds):
+                        return
+                except sqlite3.Error:
+                    return
+
+        heartbeat = threading.Thread(target=renew, name="web-execution-lease", daemon=True)
+        heartbeat.start()
+        try:
+            with self.execution_scope(kind, resource_id, owner):
+                yield
+        finally:
+            finished.set()
+            heartbeat.join(timeout=1)
+            self.release_execution_lease(kind, resource_id, owner)
+
+    @contextmanager
+    def execution_scope(self, kind: str, resource_id: str, owner: str):
+        token = self._execution_context.set((kind, str(resource_id), owner))
+        try:
+            yield
+        finally:
+            self._execution_context.reset(token)
+
     def set_admin(self, user_id: int, is_admin: bool) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (int(is_admin), user_id))
@@ -1769,8 +1939,13 @@ class Store:
             subtitle_offset_seconds: float = 0.0,
             keep_original_audio: int = 0,
             background_music_strategy: str = "deterministic",
+            speaker_config: Optional[Dict[str, Any]] = None,
+            job_id: Optional[str] = None,
+            charge_credits: int = 0,
+            lease_owner: Optional[str] = None,
+            lease_seconds: float = 300,
     ) -> Job:
-        job_id = uuid.uuid4().hex[:12]
+        job_id = job_id or uuid.uuid4().hex[:12]
         now = time.time()
         job = Job(
             id=job_id, user_id=user_id, source_url=source_url,
@@ -1782,7 +1957,7 @@ class Store:
             branding_config=branding_config,
             publishing_config=publishing_config,
             publishing_pack_status=("pending" if (publishing_config or {}).get("enabled") else "disabled"),
-            tts_voice=tts_voice, review_mode=int(review_mode),
+            tts_voice=tts_voice, review_mode=int(review_mode), speaker_config=speaker_config,
             animated_subtitle_config=animated_subtitle_config,
             video_template_config=video_template_config,
             transform_config=transform_config,
@@ -1808,7 +1983,7 @@ class Store:
             "progress_note", "error", "title", "final_video_path", "logo_path", "logo_corner",
             "logo_size_px", "branding_config", "publishing_config", "publishing_pack_path",
             "publish_ready_video_path", "publishing_pack_status", "publishing_pack_error",
-            "tts_voice", "review_mode", "review_state_json", "segments_json",
+            "speaker_config", "tts_voice", "review_mode", "review_state_json", "segments_json",
             "qc_warnings_json", "created_at", "updated_at", "animated_subtitle_config",
             "video_template_config", "transform_config", "source_video_path", "source_segments_json",
             "processing_mode", "tts_provider", "tts_style", "translation_mode", "translation_tone",
@@ -1823,7 +1998,7 @@ class Store:
             json.dumps(job.branding_config, ensure_ascii=False) if job.branding_config else None,
             json.dumps(job.publishing_config, ensure_ascii=False) if job.publishing_config else None,
             job.publishing_pack_path, job.publish_ready_video_path, job.publishing_pack_status,
-            job.publishing_pack_error, job.tts_voice, job.review_mode, job.review_state_json,
+            job.publishing_pack_error, json.dumps(job.speaker_config) if job.speaker_config else None, job.tts_voice, job.review_mode, job.review_state_json,
             job.segments_json, job.qc_warnings_json,
             job.created_at, job.updated_at,
             json.dumps(job.animated_subtitle_config) if job.animated_subtitle_config else None,
@@ -1838,13 +2013,23 @@ class Store:
         )
         placeholders = ",".join("?" for _ in values)
         with self._connect() as conn:
+            self._charge_credits(conn, user_id, charge_credits)
             conn.execute(
                 f"INSERT INTO jobs ({','.join(columns)}) VALUES ({placeholders})",
                 values,
             )
+            job.credit_reservation_id = uuid.uuid4().hex
+            job.charged_credits = charge_credits
+            conn.execute(
+                "UPDATE jobs SET charged_credits=?, credit_reservation_id=? WHERE id=?",
+                (charge_credits, job.credit_reservation_id, job.id),
+            )
+            if lease_owner:
+                self._write_lease(conn, "job", job.id, lease_owner, time.time() + lease_seconds)
         return job
 
-    def retry_job(self, job_id: str, user_id: int) -> Optional[Job]:
+    def retry_job(self, job_id: str, user_id: int, *, charge_credits: int = 0,
+                  lease_owner: Optional[str] = None, lease_seconds: float = 300) -> Optional[Job]:
         """Reset a failed job in place and return the same history entry.
 
         Command settings and source metadata are preserved. Attempt-specific
@@ -1853,6 +2038,7 @@ class Store:
         """
         now = time.time()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 "UPDATE jobs SET "
                 "status = 'queued', progress_note = ?, error = NULL, title = NULL, "
@@ -1868,6 +2054,13 @@ class Store:
             )
             if cursor.rowcount != 1:
                 return None
+            self._charge_credits(conn, user_id, charge_credits)
+            conn.execute(
+                "UPDATE jobs SET charged_credits=?, credits_refunded=0, credit_reservation_id=? WHERE id=?",
+                (charge_credits, uuid.uuid4().hex, job_id),
+            )
+            if lease_owner:
+                self._write_lease(conn, "job", job_id, lease_owner, now + lease_seconds)
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row) if row else None
 
@@ -1982,6 +2175,27 @@ class Store:
             return data if isinstance(data, dict) else None
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    # ---- deployment-wide social OAuth applications ----
+    def get_social_app_credentials(self, platform: str) -> Dict[str, str]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM social_oauth_apps WHERE platform=?", (platform,)).fetchone()
+        if not row:
+            return {}
+        return {"client_id": row["client_id"],
+                "client_secret": self.token_cipher.decrypt_secret(row["client_secret"]) or ""}
+
+    def save_social_app_credentials(self, platform: str, client_id: str, client_secret: str, admin_id: int) -> None:
+        encrypted = self.token_cipher.encrypt_secret(client_secret)
+        with self._connect() as conn:
+            conn.execute("""INSERT INTO social_oauth_apps(platform,client_id,client_secret,updated_by,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(platform) DO UPDATE SET client_id=excluded.client_id,
+                client_secret=excluded.client_secret,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+                         (platform, client_id, encrypted, admin_id, time.time()))
+
+    def delete_social_app_credentials(self, platform: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM social_oauth_apps WHERE platform=?", (platform,))
 
     # ---- provider settings ----
     def upsert_provider_settings(
@@ -2190,6 +2404,7 @@ class Store:
 
     def approve_top_up_request(self, request_id: int, admin_note: Optional[str] = None) -> Optional[sqlite3.Row]:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
             if not row or row["status"] != "pending":
                 return None
@@ -2202,6 +2417,7 @@ class Store:
 
     def reject_top_up_request(self, request_id: int, admin_note: Optional[str] = None) -> Optional[sqlite3.Row]:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM top_up_requests WHERE id = ?", (request_id,)).fetchone()
             if not row or row["status"] != "pending":
                 return None
@@ -2247,14 +2463,28 @@ class Store:
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [job_id]
         with self._connect() as conn:
-            conn.execute(f"UPDATE jobs SET {set_clause} WHERE id = ?", values)
+            scope = self._execution_context.get()
+            if scope and scope[:2] == ("job", job_id):
+                cursor = conn.execute(
+                    f"UPDATE jobs SET {set_clause} WHERE id = ? AND EXISTS "
+                    "(SELECT 1 FROM web_execution_leases WHERE kind='job' AND resource_id=? AND owner=? AND expires_at>?)",
+                    [*values, job_id, scope[2], time.time()],
+                )
+                if cursor.rowcount != 1:
+                    raise ExecutionLeaseLost("Job execution ownership expired")
+            else:
+                conn.execute(f"UPDATE jobs SET {set_clause} WHERE id = ?", values)
 
-    def fail_interrupted_jobs(self, refund_credits: int = 0) -> int:
-        """Resolve in-process jobs orphaned by a server restart."""
+    def fail_interrupted_jobs(self, refund_credits: int = 0, *, lease_seconds: float = 300) -> int:
+        """Recover expired owners, allowing a grace period for legacy jobs."""
         now = time.time()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT id, user_id FROM jobs WHERE status IN ('queued', 'running')"
+                "SELECT j.* FROM jobs j LEFT JOIN web_execution_leases l "
+                "ON l.kind='job' AND l.resource_id=j.id WHERE j.status IN ('queued','running') "
+                "AND ((l.owner IS NOT NULL AND l.expires_at<=?) OR (l.owner IS NULL AND j.updated_at<=?))",
+                (now, now - lease_seconds),
             ).fetchall()
             for row in rows:
                 cursor = conn.execute(
@@ -2266,11 +2496,14 @@ class Store:
                         now, row["id"],
                     ),
                 )
-                if cursor.rowcount and refund_credits > 0:
+                amount = row["charged_credits"] if row["credit_reservation_id"] else refund_credits
+                if cursor.rowcount and not row["credits_refunded"] and amount > 0:
                     conn.execute(
                         "UPDATE users SET credits = credits + ? WHERE id = ?",
-                        (refund_credits, row["user_id"]),
+                        (amount, row["user_id"]),
                     )
+                    conn.execute("UPDATE jobs SET credits_refunded=1 WHERE id=?", (row["id"],))
+                conn.execute("DELETE FROM web_execution_leases WHERE kind='job' AND resource_id=?", (row["id"],))
             return len(rows)
 
     _JOB_FIELDS = {f.name for f in dataclasses.fields(Job)}
@@ -2293,6 +2526,8 @@ class Store:
         if unknown:
             for key in unknown:
                 row_dict.pop(key, None)
+        if row_dict.get("speaker_config"):
+            row_dict["speaker_config"] = json.loads(row_dict["speaker_config"])
         # Deserialize JSON fields
         if row_dict.get("animated_subtitle_config"):
             row_dict["animated_subtitle_config"] = json.loads(row_dict["animated_subtitle_config"])
@@ -2677,11 +2912,13 @@ class Store:
                 (user_id,),
             ).fetchall()
 
-    def claim_due_scheduled_posts(self, now: float) -> List[sqlite3.Row]:
+    def claim_due_scheduled_posts(self, now: float, *, owner: Optional[str] = None,
+                                  lease_seconds: float = 300, limit: int = 1) -> List[sqlite3.Row]:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT 20",
-                (now,),
+                "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT ?",
+                (now, max(1, min(20, limit))),
             ).fetchall()
             claimed = []
             for row in rows:
@@ -2690,19 +2927,33 @@ class Store:
                     (now, row["id"]),
                 )
                 if cur.rowcount:
+                    self._write_lease(conn, "scheduled_post", str(row["id"]), owner or uuid.uuid4().hex, now + lease_seconds)
                     claimed.append(row)
             return claimed
 
-    def recover_processing_scheduled_posts(self) -> None:
+    def recover_processing_scheduled_posts(self, *, lease_seconds: float = 300) -> None:
         with self._connect() as conn:
+            now = time.time()
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "UPDATE scheduled_posts SET status='error', result_json=?, updated_at=? WHERE status='processing'",
+                "UPDATE scheduled_posts SET status='error', result_json=?, updated_at=? WHERE status='processing' "
+                "AND (EXISTS (SELECT 1 FROM web_execution_leases l WHERE l.kind='scheduled_post' "
+                "AND l.resource_id=CAST(scheduled_posts.id AS TEXT) AND l.expires_at<=?) OR "
+                "(updated_at<=? AND NOT EXISTS (SELECT 1 FROM web_execution_leases l WHERE l.kind='scheduled_post' "
+                "AND l.resource_id=CAST(scheduled_posts.id AS TEXT))))",
                 (json.dumps({"message": "Server khởi động lại khi đang đăng; không tự thử lại để tránh đăng trùng."},
-                            ensure_ascii=False), time.time()),
+                            ensure_ascii=False), now, now, now - lease_seconds),
             )
 
     def finish_scheduled_post(self, post_id: int, status: str, result: Any) -> None:
         with self._connect() as conn:
+            scope = self._execution_context.get()
+            if scope and scope[:2] == ("scheduled_post", str(post_id)):
+                if not conn.execute(
+                    "SELECT 1 FROM web_execution_leases WHERE kind=? AND resource_id=? AND owner=? AND expires_at>?",
+                    (*scope, time.time()),
+                ).fetchone():
+                    raise ExecutionLeaseLost("Scheduled post ownership expired")
             conn.execute(
                 "UPDATE scheduled_posts SET status=?, result_json=?, updated_at=? WHERE id=?",
                 (status, json.dumps(result, ensure_ascii=False), time.time(), post_id),
@@ -4792,10 +5043,57 @@ class Store:
     def consume_oauth_state(self, state: str) -> Optional[sqlite3.Row]:
         """Look up and delete a state token in one call (single-use)."""
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM oauth_states WHERE state = ?", (state,)).fetchone()
             if row:
                 conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
-            return row
+            return row if row and row["created_at"] >= time.time() - 600 else None
+
+    def create_pending_social_connection(self, token: str, user_id: int, platform: str, payload: Dict[str, Any]) -> None:
+        encrypted = self.token_cipher.encrypt_secret(json.dumps(payload))
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_social_connections WHERE expires_at<=?", (time.time(),))
+            conn.execute(
+                "INSERT INTO pending_social_connections(token_hash,user_id,platform,encrypted_payload,expires_at) VALUES (?,?,?,?,?)",
+                (hashlib.sha256(token.encode()).hexdigest(), user_id, platform, encrypted, time.time() + 600),
+            )
+
+    def get_pending_social_connection(self, token: str, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_social_connections WHERE token_hash=? AND user_id=? AND expires_at>?",
+                (hashlib.sha256(token.encode()).hexdigest(), user_id, time.time()),
+            ).fetchone()
+            if not row:
+                return None
+            payload = json.loads(self.token_cipher.decrypt_secret(row["encrypted_payload"]))
+            return {"platform": row["platform"], "account_name": payload.get("account_name") or ""}
+
+    def confirm_social_connection(self, token: str, user_id: int) -> bool:
+        """Activate pending credentials only after the authenticated owner confirms."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            row = conn.execute(
+                "SELECT * FROM pending_social_connections WHERE token_hash=? AND user_id=? AND expires_at>?",
+                (digest, user_id, time.time()),
+            ).fetchone()
+            if not row:
+                return False
+            payload = json.loads(self.token_cipher.decrypt_secret(row["encrypted_payload"]))
+            now = time.time()
+            # Do not carry a refresh token from a different account when switching.
+            conn.execute(
+                "INSERT INTO social_accounts(user_id,platform,access_token,refresh_token,expires_at,account_name,account_ref,scopes,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,platform) DO UPDATE SET "
+                "access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, "
+                "account_name=excluded.account_name, account_ref=excluded.account_ref, scopes=excluded.scopes, updated_at=excluded.updated_at",
+                (user_id, row["platform"], self.token_cipher.encrypt_secret(payload.get("access_token")),
+                 self.token_cipher.encrypt_secret(payload.get("refresh_token")), payload.get("expires_at"),
+                 payload.get("account_name"), payload.get("account_ref"), payload.get("scopes"), now, now),
+            )
+            conn.execute("DELETE FROM pending_social_connections WHERE token_hash=?", (digest,))
+            return True
 
     # ---- identity oauth state (CSRF protection for "Sign in with ..." login/register) ----
     def create_identity_oauth_state(self, state: str, provider: str) -> None:
@@ -4809,12 +5107,13 @@ class Store:
 
     def consume_identity_oauth_state(self, state: str) -> Optional[sqlite3.Row]:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM identity_oauth_states WHERE state = ?", (state,)
             ).fetchone()
             if row:
                 conn.execute("DELETE FROM identity_oauth_states WHERE state = ?", (state,))
-            return row
+            return row if row and row["created_at"] >= time.time() - 600 else None
 
     # ---- video presets ----
     def create_video_preset(

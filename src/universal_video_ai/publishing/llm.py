@@ -7,6 +7,7 @@ import logging
 import re
 
 import requests
+from universal_video_ai.network import NetworkRetryPolicy, post_with_retry
 
 _logger = logging.getLogger(__name__)
 
@@ -18,6 +19,10 @@ class PublishingLLMConfig:
     model: Optional[str] = None
     base_url: Optional[str] = None
     timeout_seconds: int = 180
+    ollama_keep_alive: Optional[int] = None
+    ollama_num_gpu: Optional[int] = None
+    ollama_think: Optional[bool] = None
+    ollama_num_predict: Optional[int] = None
 
 
 class PublishingLLMClient:
@@ -55,7 +60,7 @@ class PublishingLLMClient:
     def _gemini(self, prompt: str) -> str:
         model = self.config.model or "gemini-2.5-flash"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        response = requests.post(
+        response = post_with_retry(
             url,
             params={"key": self.config.api_key},
             json={
@@ -65,7 +70,7 @@ class PublishingLLMClient:
                     "responseMimeType": "application/json",
                 },
             },
-            timeout=self.config.timeout_seconds,
+            policy=NetworkRetryPolicy(read_timeout=self.config.timeout_seconds),
         )
         response.raise_for_status()
         data = response.json()
@@ -73,7 +78,7 @@ class PublishingLLMClient:
 
     def _openai(self, prompt: str) -> str:
         base = (self.config.base_url or "https://api.openai.com/v1").rstrip("/")
-        response = requests.post(
+        response = post_with_retry(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {self.config.api_key}"},
             json={
@@ -85,14 +90,22 @@ class PublishingLLMClient:
                 "temperature": 0.35,
                 "response_format": {"type": "json_object"},
             },
-            timeout=self.config.timeout_seconds,
+            policy=NetworkRetryPolicy(read_timeout=self.config.timeout_seconds),
         )
         response.raise_for_status()
         return str(response.json()["choices"][0]["message"]["content"])
 
     def _ollama(self, prompt: str) -> str:
         base = (self.config.base_url or "http://127.0.0.1:11434").rstrip("/")
-        response = requests.post(
+        options = {"temperature": 0.35}
+        if self.config.ollama_num_gpu is not None:
+            options["num_gpu"] = self.config.ollama_num_gpu
+        if self.config.ollama_num_predict is not None:
+            options["num_predict"] = self.config.ollama_num_predict
+        extra = {"keep_alive": self.config.ollama_keep_alive} if self.config.ollama_keep_alive is not None else {}
+        if self.config.ollama_think is not None:
+            extra["think"] = self.config.ollama_think
+        response = post_with_retry(
             f"{base}/api/chat",
             json={
                 "model": self.config.model or "qwen2.5:7b",
@@ -102,9 +115,10 @@ class PublishingLLMClient:
                 ],
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.35},
+                "options": options,
+                **extra,
             },
-            timeout=self.config.timeout_seconds,
+            policy=NetworkRetryPolicy(read_timeout=self.config.timeout_seconds),
         )
         response.raise_for_status()
         return str(response.json().get("message", {}).get("content") or "")

@@ -210,6 +210,7 @@ def test_oauth_echoed_exception_and_error_parameter_do_not_leak(tmp_path, monkey
     owner = store.create_user("owner", "x")
     store.create_oauth_state("test-state", owner, "facebook")
     monkeypatch.setattr(web_app, "store", store)
+    monkeypatch.setattr(web_app, "get_current_user_id", lambda request: owner)
 
     class OAuth:
         def exchange_code(self, *args):

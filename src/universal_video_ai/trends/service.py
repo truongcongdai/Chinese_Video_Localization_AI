@@ -89,10 +89,15 @@ class TrendScanner:
 
         # Calculate and normalize trend scores
         if all_candidates:
+            maxima = {
+                "max_views": max((item.view_count or 0 for item in all_candidates), default=0),
+                "max_likes": max((item.like_count or 0 for item in all_candidates), default=0),
+                "max_comments": max((item.comment_count or 0 for item in all_candidates), default=0),
+            }
             # Calculate scores based on engagement metrics
             for item in all_candidates:
                 if item.trend_score == 0:
-                    item.trend_score = calculate_trend_score(item)
+                    item.trend_score = calculate_trend_score(item, **maxima)
 
             # Normalize scores to 0-1 range
             all_candidates = normalize_scores(all_candidates)

@@ -1,7 +1,6 @@
 # src/universal_video_ai/speech/service.py
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import List, Optional
 import logging
@@ -10,6 +9,7 @@ from dataclasses import dataclass, field
 from .backend import SpeechBackend  # type: ignore
 from .exceptions import SpeechBackendUnavailable, TranscriptionError  # type: ignore
 from universal_video_ai.segment import TranscriptSegment, UNKNOWN_TIMING
+from universal_video_ai.file_hash import sha256_file
 
 __all__ = ["SpeechService"]
 
@@ -36,20 +36,13 @@ class SpeechService:
             self.logger = _logger
         self.logger.debug("SpeechService initialized backend=%s", type(self.backend).__name__ if self.backend is not None else None)
 
-    def _cache_key(self, prefix: str, audio_path: Path, language: Optional[str]) -> str:
+    def _cache_key(self, prefix: str, audio_path: Path, language: Optional[str]) -> Optional[str]:
         """Build a stable key across job directories for the same audio."""
         try:
-            file_size = audio_path.stat().st_size
-            digest = hashlib.sha256()
-            digest.update(str(file_size).encode("ascii"))
-            with audio_path.open("rb") as stream:
-                digest.update(stream.read(1024 * 1024))
-                if file_size > 1024 * 1024:
-                    stream.seek(max(0, file_size - 1024 * 1024))
-                    digest.update(stream.read(1024 * 1024))
-            audio_identity = digest.hexdigest()
+            audio_identity = sha256_file(audio_path)
         except OSError:
-            audio_identity = audio_path.name
+            self.logger.warning("Cannot fingerprint speech input; bypassing cache")
+            return None
 
         transcriber = getattr(self.backend, "_transcriber", None)
         backend_config = getattr(transcriber, "config", None)
@@ -74,8 +67,8 @@ class SpeechService:
             raise SpeechBackendUnavailable("No SpeechBackend configured in SpeechService")
 
         # Check cache first
-        if self.cache:
-            cache_key = self._cache_key("transcribe-v2", audio_path, language)
+        cache_key = self._cache_key("transcribe-v3", audio_path, language) if self.cache else None
+        if cache_key:
             cached_result = self.cache.get(cache_key)
             if cached_result is not None:
                 self.logger.debug("SpeechService transcribe cache HIT: audio=%s", audio_path)
@@ -86,8 +79,7 @@ class SpeechService:
             result = self.backend.transcribe(audio_path, language=language)
 
             # Cache result
-            if self.cache:
-                cache_key = self._cache_key("transcribe-v2", audio_path, language)
+            if self.cache and cache_key:
                 self.cache.set(cache_key, result, ttl_seconds=86400 * 30)
 
             return result
@@ -120,8 +112,8 @@ class SpeechService:
 
         cache_key = None
         if self.cache:
-            cache_key = self._cache_key("transcribe-segments-v2", audio_path, language)
-            cached_result = self.cache.get(cache_key)
+            cache_key = self._cache_key("transcribe-segments-v3", audio_path, language)
+            cached_result = self.cache.get(cache_key) if cache_key else None
             if cached_result is not None:
                 self.logger.debug("SpeechService transcribe_segments cache HIT: audio=%s", audio_path)
                 # New entries retain Whisper's detected language so OCR can

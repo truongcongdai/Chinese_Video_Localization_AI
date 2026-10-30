@@ -1,6 +1,8 @@
 # src/universal_video_ai/orchestrator/factory.py
 from __future__ import annotations
 
+import os
+
 import logging
 from pathlib import Path
 from typing import Callable, Optional
@@ -65,6 +67,7 @@ def create_localization_service(
         cancellation_checker: Optional[Callable[[], bool]] = None,
         user_id: Optional[int] = None,
         use_download_cache: bool = True,
+        speaker_config: Optional[dict] = None,
 ) -> LocalizationService:
     """Convenience factory for LocalizationService with auto-detected backends.
 
@@ -213,6 +216,15 @@ def create_localization_service(
             "once the spoken audio language is detected."
         )
 
+    diarizer = None
+    if (speaker_config or {}).get("mode") == "auto":
+        from universal_video_ai.speech.diarization import PyannoteDiarizer
+        diarizer = PyannoteDiarizer(
+            os.getenv("DIARIZATION_MODEL_PATH", ""),
+            device=os.getenv("DIARIZATION_DEVICE", "cpu"),
+            max_speakers=int((speaker_config or {}).get("max_speakers", 2)),
+        )
+
     # Build config
     config = LocalizationConfig(
         run_demucs=run_demucs,
@@ -224,6 +236,8 @@ def create_localization_service(
         target_language=target_language or "en",
         run_tts=run_tts,
         tts_voice=tts_voice,
+        speaker_mode=(speaker_config or {}).get("mode", "single"),
+        speaker_voices=(speaker_config or {}).get("voices", {}),
         generate_subtitles=generate_subtitles,
         mix_audio=mix_audio,
         replace_source_audio=replace_source_audio,
@@ -239,6 +253,7 @@ def create_localization_service(
     )
 
     return LocalizationService(
+        diarizer=diarizer,
         downloader=downloader,
         translate_service=translate_service,
         segment_adapter=segment_adapter,

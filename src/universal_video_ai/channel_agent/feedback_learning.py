@@ -530,6 +530,8 @@ class FeedbackLearningService:
             + json.dumps({"allowed_evidence_ids": sorted(evidence_ids),
                           "evidence": evidence}, ensure_ascii=False, sort_keys=True))
         try:
+            from universal_video_ai.channel_agent.coordination import reserve_provider_call
+            reserve_provider_call("llm_calls")
             raw = self.llm.generate_structured(
                 system_prompt="Produce cautious, grounded channel learning. JSON only.",
                 user_prompt=prompt, temperature=.1, top_p=.8, num_predict=1800)

@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from .base import BaseAgent
 from ..schemas import AuditResult, AuditIssue
 from ..enums import AuditDecision, RiskLevel
+from ..exceptions import LLMOutputError
+from universal_video_ai.provider_runtime import ProviderMode, default_provider_mode
 
 logger = logging.getLogger(__name__)
 
@@ -98,30 +100,17 @@ Format your response as JSON:
     
     def validate_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
         """Validate audit output."""
-        # If output only contains raw_content (from LLM router fallback), use agent's mock
+        # A deterministic synthetic audit is only valid in explicit mock mode.
         if set(output.keys()) == {"raw_content"}:
-            logger.warning("LLM returned raw_content only, using agent mock output")
-            return self._mock_output()
+            if default_provider_mode() is ProviderMode.MOCK:
+                return self._mock_output()
+            raise LLMOutputError("Audit provider returned unstructured output")
         
         try:
             result = self.output_schema(**output)
             return result.model_dump()
-        except Exception as e:
-            logger.warning(f"Output validation failed, returning default: {e}")
-            return AuditResult(
-                decision=AuditDecision.PASS,
-                overall_score=0.7,
-                hook_strength=0.7,
-                originality_score=0.7,
-                clarity_score=0.7,
-                retention_score=0.7,
-                source_dependency=RiskLevel.MEDIUM,
-                copyright_risk=RiskLevel.MEDIUM,
-                factual_risk=RiskLevel.LOW,
-                timing_valid=True,
-                issues=[],
-                warnings=["Audit validation failed, using default pass"],
-            ).model_dump()
+        except Exception as exc:
+            raise LLMOutputError("Audit output failed schema validation") from exc
     
     def _mock_output(self) -> Dict[str, Any]:
         """Return mock output for testing."""

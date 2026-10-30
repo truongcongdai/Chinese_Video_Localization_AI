@@ -13,6 +13,9 @@ from pydantic import BaseModel
 
 from ..config import CONTENT_OS_LLM_PROVIDER, CONTENT_OS_LLM_MODEL, CONTENT_OS_LLM_BASE_URL, CONTENT_OS_LLM_API_KEY
 from ..exceptions import LLMOutputError, ProviderUnavailableError
+from ..config import CONTENT_OS_PROVIDER_TIMEOUT_SECONDS
+from universal_video_ai.network import NetworkRetryPolicy, post_with_retry
+from universal_video_ai.provider_runtime import execute_provider_call
 
 logger = logging.getLogger(__name__)
 
@@ -97,14 +100,21 @@ class LLMRouter:
         provider = self._effective_provider()
         self.logger.debug(f"Invoking LLM: provider={provider}, model={self.model}")
         
-        if provider == "openai":
-            return self._invoke_openai(prompt, output_schema, temperature, max_tokens)
-        elif provider == "ollama":
-            return self._invoke_ollama(prompt, output_schema, temperature, max_tokens)
-        elif provider == "gemini":
-            return self._invoke_gemini(prompt, output_schema, temperature, max_tokens)
-        else:
+        handlers = {
+            "openai": self._invoke_openai,
+            "ollama": self._invoke_ollama,
+            "gemini": self._invoke_gemini,
+        }
+        if provider not in handlers:
             raise ProviderUnavailableError(f"Unsupported LLM provider: {self.provider}")
+        return execute_provider_call(
+            provider, "content_os_generation",
+            {"prompt": prompt, "schema": getattr(output_schema, "__name__", None)},
+            live=lambda: handlers[provider](prompt, output_schema, temperature, max_tokens),
+            mock=self._mock_output,
+            category="llm",
+            settings={"model": self.model, "temperature": temperature, "max_tokens": max_tokens},
+        )
     
     def _invoke_openai(
         self,
@@ -122,45 +132,30 @@ class LLMRouter:
         - Other OpenAI-compatible endpoints
         """
         try:
-            # Try to import openai
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ProviderUnavailableError("openai package is not installed") from exc
+        client = OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key or "dummy-key",
+            max_retries=2,
+            timeout=CONTENT_OS_PROVIDER_TIMEOUT_SECONDS,
+        )
+        messages = [{"role": "user", "content": prompt}]
+        response = client.chat.completions.create(
+            model=self.model or "gpt-3.5-turbo",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=CONTENT_OS_PROVIDER_TIMEOUT_SECONDS,
+        )
+        content = response.choices[0].message.content
+        if output_schema:
             try:
-                from openai import OpenAI
-            except ImportError:
-                self.logger.warning("openai package not installed, using mock output")
-                return self._mock_output()
-            
-            client = OpenAI(
-                base_url=self.base_url,
-                api_key=self.api_key or "dummy-key",  # Ollama doesn't require API key
-            )
-            
-            # Build messages
-            messages = [{"role": "user", "content": prompt}]
-            
-            # Call the API
-            response = client.chat.completions.create(
-                model=self.model or "gpt-3.5-turbo",
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=300,  # Increased timeout
-            )
-            
-            # Extract content
-            content = response.choices[0].message.content
-            
-            if output_schema:
-                try:
-                    return _parse_json_content(content)
-                except json.JSONDecodeError as e:
-                    self.logger.warning(f"Failed to parse LLM output as JSON: {e}")
-                    return {"raw_content": content}
-            
-            return {"raw_content": content}
-            
-        except Exception as e:
-            self.logger.warning(f"OpenAI API call failed: {e}, using mock output")
-            return self._mock_output()
+                return _parse_json_content(content)
+            except json.JSONDecodeError as exc:
+                raise LLMOutputError("OpenAI returned invalid structured output") from exc
+        return {"raw_content": content}
     
     def _invoke_ollama(
         self,
@@ -172,53 +167,37 @@ class LLMRouter:
         """
         Invoke Ollama API directly.
         """
-        try:
-            import requests
-            
-            base_url = self.base_url.rstrip("/")
-            if base_url.endswith("/v1"):
-                base_url = base_url[:-3]
-            url = f"{base_url}/api/generate"
-            effective_prompt = prompt
-            if output_schema:
-                effective_prompt = (
-                    f"{prompt}\n\n"
-                    "Return only one valid JSON object. Do not wrap it in Markdown. "
-                    "Do not include commentary before or after JSON."
-                )
-            payload = {
-                "model": self.model or "llama2",
-                "prompt": effective_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                    "num_predict": max_tokens,
-                },
-            }
-            if output_schema:
-                payload["format"] = "json"
-            
-            response = requests.post(url, json=payload, timeout=300)
-            response.raise_for_status()
-            
-            data = response.json()
-            content = data.get("response", "")
-            
-            if output_schema:
-                try:
-                    return _parse_json_content(content)
-                except json.JSONDecodeError as e:
-                    self.logger.warning(f"Failed to parse Ollama output as JSON: {e}")
-                    return {"raw_content": content}
-            
-            return {"raw_content": content}
-            
-        except ImportError:
-            self.logger.warning("requests package not installed, using mock output")
-            return self._mock_output()
-        except Exception as e:
-            self.logger.warning(f"Ollama API call failed: {e}, using mock output")
-            return self._mock_output()
+        base_url = self.base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        url = f"{base_url}/api/generate"
+        effective_prompt = prompt
+        if output_schema:
+            effective_prompt = (
+                f"{prompt}\n\n"
+                "Return only one valid JSON object. Do not wrap it in Markdown. "
+                "Do not include commentary before or after JSON."
+            )
+        payload = {
+            "model": self.model or "llama2",
+            "prompt": effective_prompt,
+            "stream": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        if output_schema:
+            payload["format"] = "json"
+        response = post_with_retry(
+            url, json=payload,
+            policy=NetworkRetryPolicy(read_timeout=CONTENT_OS_PROVIDER_TIMEOUT_SECONDS),
+        )
+        response.raise_for_status()
+        content = response.json().get("response", "")
+        if output_schema:
+            try:
+                return _parse_json_content(content)
+            except json.JSONDecodeError as exc:
+                raise LLMOutputError("Ollama returned invalid structured output") from exc
+        return {"raw_content": content}
 
     def _invoke_gemini(
         self,
@@ -230,63 +209,51 @@ class LLMRouter:
         """Invoke Gemini generateContent API."""
         api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_AI_API_KEY")
         if not api_key:
-            self.logger.warning("GEMINI_API_KEY/GOOGLE_AI_API_KEY not configured, using mock output")
-            return self._mock_output()
+            raise ProviderUnavailableError("Gemini API key is not configured")
 
-        try:
-            import requests
+        model = self.model or os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+        effective_prompt = prompt
+        generation_config: Dict[str, Any] = {
+            "temperature": temperature, "maxOutputTokens": max_tokens,
+        }
+        if output_schema:
+            effective_prompt = (
+                f"{prompt}\n\n"
+                "Return only one valid JSON object. Do not wrap it in Markdown. "
+                "Do not include commentary before or after JSON."
+            )
+            generation_config["responseMimeType"] = "application/json"
 
-            model = self.model or os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite"
-            effective_prompt = prompt
-            generation_config: Dict[str, Any] = {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-            }
-            if output_schema:
-                effective_prompt = (
-                    f"{prompt}\n\n"
-                    "Return only one valid JSON object. Do not wrap it in Markdown. "
-                    "Do not include commentary before or after JSON."
-                )
-                generation_config["responseMimeType"] = "application/json"
-
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": effective_prompt}]}],
-                "generationConfig": generation_config,
-            }
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            response = requests.post(
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": effective_prompt}]}],
+            "generationConfig": generation_config,
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        response = post_with_retry(
+            url,
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+            policy=NetworkRetryPolicy(read_timeout=CONTENT_OS_PROVIDER_TIMEOUT_SECONDS),
+        )
+        if response.status_code == 400 and "responseMimeType" in response.text:
+            payload["generationConfig"].pop("responseMimeType", None)
+            response.close()
+            response = post_with_retry(
                 url,
                 headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                 json=payload,
-                timeout=300,
+                policy=NetworkRetryPolicy(read_timeout=CONTENT_OS_PROVIDER_TIMEOUT_SECONDS),
             )
-            if response.status_code == 400 and "responseMimeType" in response.text:
-                payload["generationConfig"].pop("responseMimeType", None)
-                response = requests.post(
-                    url,
-                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=300,
-                )
-            response.raise_for_status()
-            data = response.json()
-            parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            content = "".join(str(part.get("text") or "") for part in parts).strip()
-
-            if output_schema:
-                try:
-                    return _parse_json_content(content)
-                except json.JSONDecodeError as e:
-                    self.logger.warning(f"Failed to parse Gemini output as JSON: {e}")
-                    return {"raw_content": content}
-            return {"raw_content": content}
-        except ImportError:
-            self.logger.warning("requests package not installed, using mock output")
-            return self._mock_output()
-        except Exception as e:
-            self.logger.warning(f"Gemini API call failed: {e}, using mock output")
-            return self._mock_output()
+        response.raise_for_status()
+        data = response.json()
+        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        content = "".join(str(part.get("text") or "") for part in parts).strip()
+        if output_schema:
+            try:
+                return _parse_json_content(content)
+            except json.JSONDecodeError as exc:
+                raise LLMOutputError("Gemini returned invalid structured output") from exc
+        return {"raw_content": content}
     
     def _mock_output(self) -> Dict[str, Any]:
         """Return mock output for testing."""

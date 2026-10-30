@@ -361,7 +361,8 @@ def test_all_asset_publish_gates_render_reuse_and_partial_destination_result(tmp
     assert third["refs"]["render_job_id"] == render_id and calls["render"] == 0
     service.approve(owner, run["id"], "publish")
     finished = service.advance(owner, run["id"])
-    assert calls["publish"] == 1 and finished["status"] == "completed"
+    assert calls["publish"] == 1 and finished["status"] == "failed"
+    assert finished["current_stage"] == "publish"
     assert finished["refs"]["partial_success"] is True
     assert finished["refs"]["publishing_jobs"]["youtube"]["status"] == "published"
     assert finished["refs"]["publishing_jobs"]["facebook"]["status"] == "failed"

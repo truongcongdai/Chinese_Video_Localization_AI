@@ -102,7 +102,13 @@ def test_localization_service_with_translation_and_tts(tmp_path: Path):
     translate_service.translate.return_value = "Xin chào thế giới"
 
     # Mock TTS
-    tts_service.synthesize.return_value = None
+    def synthesize(text, output_path, **kwargs):
+        import wave
+        with wave.open(str(output_path), "wb") as stream:
+            stream.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            stream.writeframes(b"\x00\x00" * 8000)
+        return output_path
+    tts_service.synthesize.side_effect = synthesize
 
     # Mock mixer
     mixer.mix.return_value = None

@@ -1,14 +1,21 @@
 # src/universal_video_ai/audio/demucs.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+import hashlib
+import json
+import os
 from pathlib import Path
 import logging
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Optional
 import uuid
+from universal_video_ai.file_hash import sha256_file
+from .duration import media_duration
 
 __all__ = ["DemucsProcessor", "DemucsOutput", "DemucsConfig", "DEMUCS_AVAILABLE"]
 
@@ -304,7 +311,90 @@ class DemucsProcessor:
         self.logger.info("Chunked audio separation successful: %s", final_stems_dir)
         return result
 
+    @contextmanager
+    def _cache_lock(self, path: Path):
+        """Serialize publication of one content key across local processes."""
+        with path.open("a+b") as handle:
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _validated_cache(self, directory: Path, identity: dict) -> Optional[DemucsOutput]:
+        try:
+            manifest = json.loads((directory / "complete.json").read_text(encoding="utf-8"))
+            if manifest["identity"] != identity:
+                return None
+            paths = {}
+            for name in ("vocals", "drums", "bass", "other"):
+                entry = manifest["stems"][name]
+                path = directory / entry["path"]
+                if directory.resolve() not in path.resolve().parents:
+                    return None
+                if path.stat().st_size != entry["size"] or sha256_file(path) != entry["sha256"]:
+                    return None
+                paths[name] = path
+            return DemucsOutput(**paths)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
     def separate(self, audio_path: Path, output_dir: Optional[Path] = None) -> DemucsOutput:
+        """Reuse only validated, atomically completed source-content cache entries."""
+        audio_path = Path(audio_path).resolve()
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        identity = {"version": 2, "source_sha256": sha256_file(audio_path), "options": asdict(self.config)}
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+        base = self.get_output_dir(audio_path, output_dir) / "content-v2"
+        base.mkdir(parents=True, exist_ok=True)
+        destination = base / key
+        with self._cache_lock(base / f"{key}.lock"):
+            cached = self._validated_cache(destination, identity)
+            if cached is not None:
+                return cached
+            with tempfile.TemporaryDirectory(prefix=".demucs-", dir=base) as temp_name:
+                stage = Path(temp_name)
+                result = self._separate_uncached(audio_path, output_dir=stage / "work")
+                source_duration = media_duration(audio_path)
+                stems = {}
+                for name in ("vocals", "drums", "bass", "other"):
+                    path = getattr(result, name)
+                    duration = media_duration(path)
+                    if duration <= 0 or (source_duration > 0 and abs(duration - source_duration) > max(0.25, source_duration * 0.01)):
+                        raise RuntimeError(f"Demucs {name} stem is invalid or incomplete")
+                    stems[name] = {"path": str(path.relative_to(stage)), "size": path.stat().st_size,
+                                   "sha256": sha256_file(path), "duration": duration}
+                if sha256_file(audio_path) != identity["source_sha256"]:
+                    raise RuntimeError("Demucs source changed during separation; cache was not published")
+                with (stage / "complete.json").open("w", encoding="utf-8") as stream:
+                    json.dump({"identity": identity, "stems": stems}, stream, sort_keys=True)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if destination.exists():
+                    shutil.rmtree(destination)
+                stage.replace(destination)
+                return DemucsOutput(**{name: destination / row["path"] for name, row in stems.items()})
+
+    def _separate_uncached(self, audio_path: Path, output_dir: Optional[Path] = None) -> DemucsOutput:
         """
         Separate audio into stems (vocals, drums, bass, other) using Demucs.
 
@@ -341,7 +431,7 @@ class DemucsProcessor:
                 alias_path,
             )
             try:
-                return self.separate(alias_path, output_dir=output_dir)
+                return self._separate_uncached(alias_path, output_dir=output_dir)
             finally:
                 alias_path.unlink(missing_ok=True)
 

@@ -5,6 +5,7 @@ Provides REST API endpoints for Content OS workflow management.
 Integrates with the existing web app authentication and user isolation.
 """
 import logging
+import json
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -25,6 +26,8 @@ from universal_video_ai.content_os.workflow import ContentOSWorkflow, WorkflowCo
 from universal_video_ai.content_os.pipeline_adapter import PipelineAdapter
 from universal_video_ai.content_os.enums import ApprovalType, ArtifactType, WorkflowStage
 from universal_video_ai.content_os.exceptions import FeatureDisabledError
+from universal_video_ai.content_os.exceptions import WorkflowError
+from universal_video_ai.content_os.production import execute_production_job
 from universal_video_ai.content_os.storyboard import StoryboardManager
 from universal_video_ai.content_os.asset_resolver import AssetResolver
 from universal_video_ai.content_os.renderer import Renderer, MP4Validator
@@ -35,6 +38,31 @@ from .auth import get_current_user_id
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/content-os", tags=["content-os"])
+
+
+def _start_production(workflow, adapter, run_id: int, user_id: int, job_id: str) -> bool:
+    """Continue only approved bytes; a persisted claim prevents duplicate threads."""
+    workflow.production_context(run_id, user_id)
+    run = workflow.repository.get_run(run_id, user_id)
+    if run.current_stage == "awaiting_storyboard_approval":
+        workflow.approvals.read(run_id, user_id, ApprovalType.STORYBOARD)
+    if not workflow.repository.claim_production(run_id, user_id):
+        return False
+    import threading
+
+    def work():
+        try:
+            execute_production_job(workflow, Store(adapter.web_store_db_path), run_id, user_id, job_id)
+        except Exception:
+            logger.exception("Content OS production failed for run %s", run_id)
+
+    try:
+        threading.Thread(target=work, daemon=True).start()
+    except Exception as exc:
+        workflow.repository.update_run(run_id, user_id, status="failed", error_json=json.dumps({"error": str(exc)}))
+        Store(adapter.web_store_db_path).update_job(job_id, status="error", error=str(exc))
+        raise
+    return True
 
 # Pydantic models for request/response
 class CreateChannelRequest(BaseModel):
@@ -698,78 +726,32 @@ async def create_localization_job(
             source_url=request.source_url,
         )
         
-        # Trigger production pipeline to generate actual video
-        # Get the script and content plan artifacts
-        script_artifact = workflow.artifact_store.read(
-            user_id=user_id,
-            project_id=workflow.repository.get_run(run_id, user_id).project_id,
-            run_id=run_id,
-            artifact_type=ArtifactType.SCRIPT,
-        )
-        plan_artifact = workflow.artifact_store.read(
-            user_id=user_id,
-            project_id=workflow.repository.get_run(run_id, user_id).project_id,
-            run_id=run_id,
-            artifact_type=ArtifactType.CONTENT_PLAN,
-        )
-        
-        if script_artifact:
-            context = {
-                "script": script_artifact.get("data", script_artifact),
-                "content_plan": plan_artifact.get("data", plan_artifact) if plan_artifact else {},
-            }
-            
-            # Execute production stages in background
-            import threading
-            def run_production():
-                job_store = Store(adapter.web_store_db_path)
-                try:
-                    job_store.update_job(
-                        job_id,
-                        status="running",
-                        progress_note="Content OS đang dựng video...",
-                    )
-                    workflow.repository.update_run(
-                        run_id=run_id,
-                        user_id=user_id,
-                        status="running",
-                        current_stage="ready_for_localization",
-                        progress_percent=workflow._calculate_progress(WorkflowStage.READY_FOR_LOCALIZATION),
-                        error_json=None,
-                        completed_at=None,
-                    )
-                    result = workflow._execute_production_stages(run_id, user_id, context)
-                    output_path = result.get("output_path")
-                    if not output_path or not Path(output_path).exists():
-                        raise RuntimeError(f"Render finished without output file: {output_path}")
-                    job_store.update_job(
-                        job_id,
-                        final_video_path=output_path,
-                        status="done",
-                        progress_note="Hoàn tất",
-                    )
-                    logger.info(f"Updated job {job_id} with video path: {output_path}")
-                except Exception as e:
-                    logger.error(f"Production pipeline failed for run {run_id}: {e}")
-                    job_store.update_job(
-                        job_id,
-                        status="error",
-                        error=str(e),
-                        progress_note="Content OS render lỗi",
-                    )
-            
-            # Start production in background thread
-            thread = threading.Thread(target=run_production, daemon=True)
-            thread.start()
-            logger.info(f"Started production pipeline for run {run_id} in background")
-        
-        return {"job_id": job_id, "run_id": run_id, "status": "production_started"}
+        started = _start_production(workflow, adapter, run_id, user_id, job_id)
+        return {"job_id": job_id, "run_id": run_id, "status": "production_started" if started else "already_started"}
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as e:
         logger.error(f"Failed to create job from run {run_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== Storyboard ====================
+
+@router.post("/runs/{run_id}/resume")
+async def resume_production(run_id: int, user_id: int = Depends(get_current_user_id)):
+    """Continue a linked production job from its approved checkpoint."""
+    repo, _, workflow, adapter = get_content_os_components(user_id)
+    run = repo.get_run(run_id, user_id)
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    job_id = json.loads(run.warning_json or "{}").get("localization_job_id")
+    if not job_id:
+        raise HTTPException(409, "Create a production job first")
+    try:
+        started = _start_production(workflow, adapter, run_id, user_id, job_id)
+        return {"run_id": run_id, "job_id": job_id, "status": "production_started" if started else "already_started"}
+    except WorkflowError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 @router.get("/runs/{run_id}/storyboard")
 async def get_storyboard(
@@ -780,8 +762,8 @@ async def get_storyboard(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, _, _ = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     storyboard = storyboard_manager._get_storyboard(run_id, user_id)
     if not storyboard:
@@ -826,8 +808,8 @@ async def update_storyboard_scene(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, _, _ = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     storyboard = storyboard_manager.update_scene(
         run_id=run_id,
@@ -850,8 +832,8 @@ async def add_storyboard_scene(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, _, _ = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     from universal_video_ai.content_os.storyboard import StoryboardScene
     scene = StoryboardScene(
@@ -888,8 +870,8 @@ async def delete_storyboard_scene(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, _, _ = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     storyboard = storyboard_manager.delete_scene(
         run_id=run_id,
@@ -909,8 +891,8 @@ async def submit_storyboard_for_review(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, _, _ = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     storyboard = storyboard_manager.submit_for_review(
         run_id=run_id,
@@ -930,15 +912,20 @@ async def approve_storyboard(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, workflow, adapter = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     storyboard = storyboard_manager.approve_storyboard(
         run_id=run_id,
         user_id=user_id,
-        approver_id=request.approver_id,
+        approver_id=user_id,
         notes=request.notes,
     )
+    workflow.submit_approval(run_id, user_id, ApprovalType.STORYBOARD, "approved", request.notes)
+    run = repo.get_run(run_id, user_id)
+    linked = json.loads(run.warning_json or "{}").get("localization_job_id")
+    if linked:
+        _start_production(workflow, adapter, run_id, user_id, linked)
     
     return {"message": "Storyboard approved", "status": storyboard.status.value}
 
@@ -953,15 +940,20 @@ async def reject_storyboard(
     if not CONTENT_OS_ENABLED:
         raise FeatureDisabledError("Content OS is disabled")
     
-    repo, _, _, _ = get_content_os_components(user_id)
-    storyboard_manager = StoryboardManager(repo)
+    repo, artifacts, workflow, adapter = get_content_os_components(user_id)
+    storyboard_manager = StoryboardManager(repo, artifacts)
     
     storyboard = storyboard_manager.reject_storyboard(
         run_id=run_id,
         user_id=user_id,
-        approver_id=request.approver_id,
+        approver_id=user_id,
         reason=request.reason,
     )
+    workflow.submit_approval(run_id, user_id, ApprovalType.STORYBOARD, "rejected", request.reason)
+    run = repo.get_run(run_id, user_id)
+    linked = json.loads(run.warning_json or "{}").get("localization_job_id")
+    if linked:
+        Store(adapter.web_store_db_path).update_job(linked, status="cancelled", progress_note="Storyboard bị từ chối")
     
     return {"message": "Storyboard rejected", "status": storyboard.status.value}
 

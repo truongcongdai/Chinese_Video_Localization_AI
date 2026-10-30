@@ -4,11 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional, List
 import subprocess
 import shutil
 import tempfile
+from universal_video_ai.audio.duration import media_duration
 
 __all__ = [
     "MixerService", "MixerConfig", "AudioMix", "TimedAudioClip",
@@ -16,6 +18,7 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+_FILTER_THREADS = max(1, min(8, int(os.getenv("FFMPEG_AUDIO_FILTER_THREADS", "2"))))
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,7 @@ class MixerService:
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "error",
+            "-filter_complex_threads", str(_FILTER_THREADS),
             "-i", str(mix_spec.primary_audio),
             "-i", str(mix_spec.secondary_audio),
             "-filter_complex",
@@ -162,7 +166,7 @@ class MixerService:
             # by the input count again and quietly halve overall loudness,
             # on top of the balance we already applied).
             f"[0:a]volume={mix_spec.mix_level}[a0];[1:a]volume={1 - mix_spec.mix_level}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:normalize=0[out]",
+            f"[a0][a1]amix=inputs=2:duration=longest:normalize=0[out]",
             "-map", "[out]",
             "-ar", str(self.config.sample_rate),
             "-y",
@@ -193,6 +197,9 @@ class MixerService:
 
         output_path = Path(output_path).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        voice_duration = self._probe_duration(spec.voice_audio)
+        if voice_duration > spec.total_duration + 0.05:
+            raise ValueError("Dub exceeds requested mix duration; extend the timeline or shorten the speech")
         duration = max(0.01, spec.total_duration)
         fade = max(0.0, min(spec.fade_seconds, duration / 2.0))
         fade_out_start = max(0.0, duration - fade)
@@ -245,6 +252,9 @@ class MixerService:
 
         output_path = Path(output_path).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        voice_duration = self._probe_duration(spec.voice_audio)
+        if voice_duration > spec.total_duration + 0.05:
+            raise ValueError("Dub exceeds requested mix duration; extend the timeline or shorten the speech")
         duration = max(0.01, spec.total_duration)
 
         inputs = [
@@ -346,26 +356,8 @@ class MixerService:
         return output_path
 
     def _probe_duration(self, audio_path: Path) -> float:
-        """Return duration in seconds of `audio_path` via ffprobe, or 0.0 if unknown."""
-        if shutil.which("ffprobe") is None:
-            self.logger.warning("ffprobe not available; cannot measure clip duration for %s", audio_path)
-            return 0.0
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            str(audio_path),
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
-            if result.returncode != 0:
-                self.logger.warning("ffprobe failed for %s: %s", audio_path, result.stderr)
-                return 0.0
-            data = json.loads(result.stdout or "{}")
-            return float(data.get("format", {}).get("duration", 0.0))
-        except Exception as exc:
-            self.logger.warning("ffprobe duration probe failed for %s: %s", audio_path, exc)
-            return 0.0
+        """Measure duration using the shared validated WAV/probe path."""
+        return media_duration(audio_path)
 
     @staticmethod
     def _atempo_chain(factor: float) -> List[str]:
@@ -636,6 +628,8 @@ class MixerService:
 
     def _run_ffmpeg(self, cmd: List[str], op_name: str) -> None:
         try:
+            if "-filter_complex" in cmd and "-filter_complex_threads" not in cmd:
+                cmd = [cmd[0], "-filter_complex_threads", str(_FILTER_THREADS), *cmd[1:]]
             result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=1800)
             if result.returncode != 0:
                 stderr = result.stderr or result.stdout or "unknown error"

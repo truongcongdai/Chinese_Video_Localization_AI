@@ -3,6 +3,7 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, ch => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
 }[ch]));
 let currentJobId = null;
+let publishJobId = null;
 let selectedPlatforms = new Set();
 let pollTimer = null;
 let pollTimer2 = null;
@@ -41,6 +42,7 @@ function showHistoryVideo(job) {
   $("#latest-result-card").classList.remove("hidden");
   $("#latest-result-title").textContent = job.title || job.source_url;
   $("#latest-improve-btn").dataset.jobId = job.id;
+  $("#latest-publish-btn").dataset.jobId = job.id;
   if (latestResultJobId !== job.id) {
     latestResultJobId = job.id;
     $("#latest-result-video").src = `/api/jobs/${job.id}/video`;
@@ -62,7 +64,9 @@ async function api(path, opts = {}) {
     const body = await resp.json().catch(() => ({}));
     const detail = body.detail;
     const message = detail && typeof detail === "object" ? detail.message : detail;
-    throw new Error(message || ("HTTP " + resp.status));
+    const error = new Error(message || ("HTTP " + resp.status));
+    error.status = resp.status;
+    throw error;
   }
   return resp.status === 204 ? null : resp.json();
 }
@@ -113,6 +117,10 @@ async function initAuth() {
 
   // Surface an error from a failed "Sign in with ..." redirect, if any.
   const params = new URLSearchParams(location.search);
+  if ((params.has("social_confirmation") || params.has("social_authorize")) && currentUserId === null) {
+    showAuthTab("login");
+    showAuth();
+  }
   if (params.get("login_error")) {
     $("#auth-error").textContent = "Đăng nhập thất bại: " + params.get("login_error");
     showAuth();
@@ -205,6 +213,11 @@ async function startIdentityLogin(provider) {
 }
 
 function showApp(me) {
+  const socialParams = new URLSearchParams(location.search);
+  if (socialParams.has("social_authorize") && socialParams.has("social_platform")) {
+    location.href = `/api/social/authorize/${encodeURIComponent(socialParams.get("social_platform"))}/${encodeURIComponent(socialParams.get("social_authorize"))}`;
+    return;
+  }
   currentUserId = me.id;
   $("#landing-view").classList.add("hidden");
   $("#auth-view").classList.add("hidden");
@@ -212,6 +225,8 @@ function showApp(me) {
   $("#userbar-name").textContent = me.username;
   $("#userbar-credits").textContent = `💳 ${me.credits}`;
   $("#admin-btn").classList.toggle("hidden", !me.is_admin);
+  $("#social-app-settings").classList.toggle("hidden", !me.is_admin);
+  if (me.is_admin) loadSocialAppSettings();
   $("#feedback-fab").classList.remove("hidden");
   $("#feedback-header-btn").classList.remove("hidden");
 
@@ -223,6 +238,8 @@ function showApp(me) {
   });
   loadProviderSettings();
   loadPublishingProfiles();
+  loadConnections();
+  handleSocialConfirmation();
   loadPersonalStats();
   refreshJobQueueStatus();
   requestNotificationPermission();
@@ -304,8 +321,14 @@ async function refreshMe() {
 }
 
 window.addEventListener("message", (ev) => {
-  if (ev.data === "social-connected") {
-    loadConnections();
+  if (ev.origin === location.origin && ev.data?.type === "social-confirmed" &&
+      socialConfirmationPollToken && ev.data.token === socialConfirmationPollToken) {
+    socialConfirmationPollToken = null;
+    checkSocialConnection();
+    return;
+  }
+  if (ev.origin === location.origin && ev.data === "social-connected") {
+    checkSocialConnection();
     if (bootstrapConfig.features?.ai_channel_agent) initChannelAgent();
   }
 });
@@ -2007,7 +2030,7 @@ $("#submit-btn").onclick = async () => {
     $("#submit-error").textContent = "Chọn ảnh logo trước (hoặc bỏ tick 'Chèn logo')";
     return;
   }
-  const reviewMode = $("#review-mode-checkbox").checked;
+  const reviewMode = $("#review-mode-checkbox").checked || $("#speaker-mode-select").value === "manual";
   if (channelModeEnabled() && reviewMode) {
     $("#submit-error").textContent = "Xử lý toàn bộ kênh không hỗ trợ dừng từng video để sửa phụ đề thủ công.";
     return;
@@ -2021,6 +2044,11 @@ $("#submit-btn").onclick = async () => {
     target_language: $("#lang-select").value,
     source_language: $("#source-lang-select").value,
     tts_voice: $("#voice-select").value || null,
+    speaker_config: {
+      mode: $("#speaker-mode-select").value,
+      voices: {speaker_0: $("#speaker-voice-0").value.trim(), speaker_1: $("#speaker-voice-1").value.trim()},
+      max_speakers: 2,
+    },
     tts_provider: $("#tts-provider-select").value,
     tts_style: $("#tts-style-select").value,
     tts_model: $("#tts-model-select").value || null,
@@ -2781,7 +2809,7 @@ async function refreshJobs() {
           <div class="job-info">
             ${job.execution_attempt > 1 ? `<div class="job-meta">Attempts: ${job.execution_attempt}</div>` : ""}
             ${job.source_external_video_id ? `<div class="job-meta">Source video ID: ${_escapeHtml(job.source_external_video_id)}</div>` : ""}
-            <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${job.title || job.source_url}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
+            <div class="job-url ${job.has_video ? "playable" : ""}" ${job.has_video ? `data-play-video="${job.id}" title="Bấm để xem video này"` : ""}>${_escapeHtml(job.title || job.source_url)}${job.qc_warnings && job.qc_warnings.length ? ` <span title="${_escapeHtml(job.qc_warnings.join(' | '))}" style="color:var(--warn);cursor:help">⚠ Cần kiểm tra</span>` : ""}</div>
             <div class="job-meta">${created} · ${job.target_language.toUpperCase()} · ${jobProgressNote(job)}${job.publishing_pack_status && job.publishing_pack_status !== "disabled" ? ` · Publishing: ${_escapeHtml(job.publishing_pack_status)}` : ""}</div>
             ${job.source_channel_url || job.source_channel_title || job.source_uploader ? `<div class="job-meta" style="margin-top:4px">Kênh nguồn: <b>${_escapeHtml(job.source_channel_title || job.source_uploader || "Không rõ")}</b>${job.source_channel_url ? ` · <a href="${_escapeHtml(job.source_channel_url)}" target="_blank" rel="noopener">Mở kênh</a>` : ""}</div>` : ""}
             ${job.source_url && /^https?:\/\//i.test(job.source_url) ? `<div class="job-meta" style="margin-top:3px">Video gốc: <a href="${_escapeHtml(job.source_url)}" target="_blank" rel="noopener">${_escapeHtml(job.source_url)}</a></div>` : ""}
@@ -3110,12 +3138,15 @@ async function openReview(jobId) {
   $("#review-segments-list").innerHTML = segments.map((s, i) => `
     <div class="review-segment" data-segment-row="${i}" data-start="${s.start}" data-end="${s.end}">
       <div class="seg-time">${_fmtTime(s.start)} → ${_fmtTime(s.end)}</div>
+      <label>Người nói ${s.speaker_review ? " · cần kiểm tra" : ""}
+        <input class="review-speaker" maxlength="64" value="${_escapeHtml(s.speaker_id || '')}" placeholder="speaker_0 / speaker_1 (để trống: giọng mặc định)">
+      </label>
       <textarea data-idx="${i}" data-start="${s.start}" data-end="${s.end}">${_escapeHtml(s.text)}</textarea>
     </div>
   `).join("");
   $("#review-segments-list").querySelectorAll("[data-segment-row]").forEach(row => {
     row.onclick = ev => {
-      if (ev.target.tagName === "TEXTAREA") return;
+      if (["TEXTAREA", "INPUT", "SELECT"].includes(ev.target.tagName)) return;
       sourceVideo.currentTime = Number(row.dataset.start);
       sourceVideo.play().catch(() => {});
     };
@@ -3140,6 +3171,8 @@ function _fmtTime(seconds) {
 function _collectReviewSegments() {
   return Array.from($("#review-segments-list").querySelectorAll("textarea")).map(ta => ({
     start: parseFloat(ta.dataset.start), end: parseFloat(ta.dataset.end), text: ta.value,
+    speaker_id: ta.closest(".review-segment").querySelector(".review-speaker").value.trim() || null,
+    speaker_review: false,
   }));
 }
 
@@ -3519,6 +3552,7 @@ $("#quality-modal").addEventListener("click", ev => {
 });
 $("#preview-improve-btn").onclick = () => openQualityReview($("#preview-improve-btn").dataset.jobId);
 $("#latest-improve-btn").onclick = () => openQualityReview($("#latest-improve-btn").dataset.jobId);
+$("#latest-publish-btn").onclick = () => openPublish($("#latest-publish-btn").dataset.jobId);
 
 $("#preview-publish-btn").onclick = () => {
   closePreview();
@@ -3526,7 +3560,21 @@ $("#preview-publish-btn").onclick = () => {
 };
 
 function openPublish(jobId) {
-  currentJobId = jobId;
+  if (!jobId) return;
+  publishJobId = jobId;
+  selectedPlatforms.clear();
+  document.querySelectorAll("#publish-modal [data-platform]").forEach(chip => {
+    chip.classList.remove("active");
+    chip.setAttribute("aria-pressed", "false");
+  });
+  const job = (window._jobsById || {})[jobId];
+  const title = job?.title || (jobId === latestResultJobId ? $("#latest-result-title").textContent : "") || jobId;
+  $("#publish-video-title").textContent = `Video: ${title}`;
+  $("#publish-title").value = job?.title || (jobId === latestResultJobId ? title : "");
+  $("#publish-desc").value = "";
+  $("#publish-hashtags").value = "";
+  $("#publish-scheduled-at").value = "";
+  $("#publish-hashtag-suggestions").innerHTML = "";
   $("#publish-results").innerHTML = "";
   $("#publish-modal").classList.remove("hidden");
   loadConnections();
@@ -3567,6 +3615,7 @@ async function _prefillPublishSuggestions(jobId) {
   if (job.has_publishing_pack) {
     try {
       const pack = await api(`/api/jobs/${jobId}/publishing-pack`);
+      if (publishJobId !== jobId) return;
       window._publishingPackByJob = window._publishingPackByJob || {};
       window._publishingPackByJob[jobId] = pack;
       const yt = pack.youtube || {};
@@ -3579,6 +3628,7 @@ async function _prefillPublishSuggestions(jobId) {
       console.warn("Could not prefill Publishing Pack", e);
     }
   }
+  if (publishJobId !== jobId) return;
   if (!$("#publish-title").value) $("#publish-title").value = baseText;
   if (!suggestedHashtags.length) suggestedHashtags = _suggestHashtags(baseText);
   const box = $("#publish-hashtag-suggestions");
@@ -3601,6 +3651,13 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".feature-tab").forEach(tab => {
     tab.onclick = () => {
       const feature = tab.dataset.feature;
+      $("#app-view").classList.toggle("reup-focused", feature === "reup-agent");
+      document.body.classList.toggle("reup-focused", feature === "reup-agent");
+      const languagePicker = $(".ui-language-picker");
+      if (languagePicker) {
+        if (feature === "reup-agent") $(".reup-header-actions").append(languagePicker);
+        else document.body.insertBefore(languagePicker, $("#landing-view"));
+      }
 
       console.log("Tab clicked:", feature);
 
@@ -3624,6 +3681,9 @@ document.addEventListener("DOMContentLoaded", () => {
           }
           if (feature === "channel-agent") {
             initChannelAgent();
+          }
+          if (feature === "social-accounts") {
+            loadConnections();
           }
         }
       });
@@ -5945,13 +6005,13 @@ $("#content-os-create-run-btn").onclick = async () => {
 
 let contentOSPollingInterval = null;
 
-$("#content-os-start-run-btn").onclick = async () => {
-  if (!selectedRunId) return;
+async function startContentOSRun(runId) {
+  if (!runId) return;
 
   try {
-    await api(`/api/content-os/runs/${selectedRunId}/start`, { method: "POST" });
+    await api(`/api/content-os/runs/${runId}/start`, { method: "POST" });
     await loadContentOSRuns(selectedProjectId);
-    selectContentOSRun(selectedRunId);
+    selectContentOSRun(runId);
 
     // Start polling for updates
     startContentOSPolling();
@@ -5959,7 +6019,8 @@ $("#content-os-start-run-btn").onclick = async () => {
     console.error("Failed to start run:", e);
     alert(`Lỗi chạy run: ${e.message}`);
   }
-};
+}
+$("#content-os-start-run-btn").onclick = () => startContentOSRun(selectedRunId);
 
 function startContentOSPolling() {
   if (contentOSPollingInterval) {
@@ -5990,26 +6051,27 @@ function stopContentOSPolling() {
   }
 }
 
-$("#content-os-cancel-run-btn").onclick = async () => {
-  if (!selectedRunId) return;
+async function cancelContentOSRun(runId) {
+  if (!runId) return;
 
   if (!confirm("Bạn có chắc muốn hủy run này?")) return;
 
   try {
-    await api(`/api/content-os/runs/${selectedRunId}/cancel`, { method: "POST" });
+    await api(`/api/content-os/runs/${runId}/cancel`, { method: "POST" });
     await loadContentOSRuns(selectedProjectId);
-    selectContentOSRun(selectedRunId);
+    selectContentOSRun(runId);
   } catch (e) {
     console.error("Failed to cancel run:", e);
     alert(`Lỗi hủy run: ${e.message}`);
   }
-};
+}
+$("#content-os-cancel-run-btn").onclick = () => cancelContentOSRun(selectedRunId);
 
-$("#content-os-approve-run-btn").onclick = async () => {
-  if (!selectedRunId) return;
+async function approveContentOSRun(runId) {
+  if (!runId) return;
 
   try {
-    await api(`/api/content-os/runs/${selectedRunId}/approve`, {
+    await api(`/api/content-os/runs/${runId}/approve`, {
       method: "POST",
       body: JSON.stringify({
         approval_type: "script",
@@ -6018,18 +6080,19 @@ $("#content-os-approve-run-btn").onclick = async () => {
       }),
     });
     await loadContentOSRuns(selectedProjectId);
-    selectContentOSRun(selectedRunId);
+    selectContentOSRun(runId);
   } catch (e) {
     console.error("Failed to approve run:", e);
     alert(`Lỗi phê duyệt: ${e.message}`);
   }
-};
+}
+$("#content-os-approve-run-btn").onclick = () => approveContentOSRun(selectedRunId);
 
-$("#content-os-create-job-btn").onclick = async () => {
-  if (!selectedRunId) return;
+async function createContentOSJob(runId) {
+  if (!runId) return;
 
   try {
-    const result = await api(`/api/content-os/runs/${selectedRunId}/create-job`, {
+    const result = await api(`/api/content-os/runs/${runId}/create-job`, {
       method: "POST",
       body: JSON.stringify({ source_url: null }),
     });
@@ -6041,69 +6104,287 @@ $("#content-os-create-job-btn").onclick = async () => {
     console.error("Failed to create job:", e);
     alert(`Lỗi tạo job: ${e.message}`);
   }
-};
+}
+$("#content-os-create-job-btn").onclick = () => createContentOSJob(selectedRunId);
 
-document.querySelectorAll(".chip").forEach(chip => {
+document.querySelectorAll("#publish-modal [data-platform]").forEach(chip => {
   chip.onclick = () => {
-    const p = chip.dataset.platform;
-    if (selectedPlatforms.has(p)) { selectedPlatforms.delete(p); chip.classList.remove("active"); }
-    else { selectedPlatforms.add(p); chip.classList.add("active"); }
+    const platform = chip.dataset.platform;
+    if (selectedPlatforms.has(platform)) selectedPlatforms.delete(platform);
+    else selectedPlatforms.add(platform);
+    chip.classList.toggle("active", selectedPlatforms.has(platform));
+    chip.setAttribute("aria-pressed", String(selectedPlatforms.has(platform)));
   };
 });
 
 const PLATFORM_LABEL = { tiktok: "TikTok", facebook: "Facebook Page", youtube: "YouTube" };
+let socialAppSettings = {};
+
+function showSocialAppSettings() {
+  const meta = socialAppSettings[$("#social-app-platform").value];
+  if (!meta) return;
+  $("#social-app-id-label").textContent = meta.id_label;
+  $("#social-app-id").value = meta.client_id || "";
+  $("#social-app-secret").value = "";
+  $("#social-app-redirect").value = meta.redirect_uri;
+  $("#social-app-dashboard").href = meta.dashboard_url;
+  $("#social-app-status").textContent = meta.configured
+    ? "Đã có cấu hình ứng dụng. Bạn có thể đăng nhập tài khoản ở phía trên."
+    : "Chưa thiết lập ứng dụng. Nhập mã và khóa từ trang quản lý ứng dụng của nền tảng.";
+}
+
+async function loadSocialAppSettings() {
+  try {
+    const data = await api("/api/admin/social-apps");
+    socialAppSettings = Object.fromEntries(data.apps.map(meta => [meta.platform, meta]));
+    showSocialAppSettings();
+  } catch (e) { $("#social-app-status").textContent = e.message; }
+}
+
+$("#social-app-platform").onchange = showSocialAppSettings;
+$("#social-app-form").onsubmit = async event => {
+  event.preventDefault();
+  const button = $("#social-app-save");
+  button.disabled = true;
+  const platform = $("#social-app-platform").value;
+  try {
+    const saved = await api(`/api/admin/social-apps/${platform}`, {method: "PUT", body: JSON.stringify({
+      client_id: $("#social-app-id").value.trim(), client_secret: $("#social-app-secret").value.trim() || null,
+    })});
+    socialAppSettings[platform] = saved;
+    showSocialAppSettings();
+    $("#social-app-status").textContent = "Đã lưu thiết lập. Bấm Đăng nhập ở phía trên để kết nối tài khoản.";
+    await loadConnections();
+  } catch (e) { $("#social-app-status").textContent = e.message; }
+  finally { button.disabled = false; }
+};
+let socialConnectionRequest = 0;
+let socialConnectTimer = null;
+let socialConnectAttempt = 0;
+let activeSocialConnectPlatform = null;
+let socialConnectionsSnapshot = {};
+let socialConnectBaseline = null;
+let pendingSocialConfirmation = null;
+let socialConfirmationPollToken = null;
 
 async function loadConnections() {
-  const box = $("#connect-cards");
-  box.innerHTML = `<div style="color:var(--text-dim);font-size:13px">Đang tải trạng thái kết nối…</div>`;
+  const boxes = [...document.querySelectorAll("[data-social-connections]")];
+  const requestId = ++socialConnectionRequest;
+  boxes.forEach(box => {
+    if (!box.innerHTML) box.textContent = "Đang tải trạng thái kết nối…";
+  });
   let conns;
   try { conns = await api("/api/social/connections"); }
-  catch (e) { box.innerHTML = ""; return; }
+  catch (e) {
+    if (requestId === socialConnectionRequest) boxes.forEach(box => {
+      box.innerHTML = `<p role="alert" class="connect-note">Không tải được kết nối: ${escapeHtml(e.message)}</p><button class="btn secondary small" type="button" data-retry-connections>Thử lại</button>`;
+      box.querySelector("[data-retry-connections]").onclick = loadConnections;
+    });
+    return null;
+  }
+  if (requestId !== socialConnectionRequest) return null;
+  socialConnectionsSnapshot = conns;
+  const reupChannel = $("#reup-channel");
+  if (reupChannel) reupChannel.value = conns.youtube?.account_ref || "";
+  document.dispatchEvent(new CustomEvent("social-connections-updated", { detail: conns }));
 
-  box.innerHTML = Object.entries(conns).map(([platform, info]) => `
+  const cards = Object.entries(PLATFORM_LABEL).map(([platform, label]) => {
+    const info = conns[platform] || {};
+    return `
     <div class="connect-card" data-card="${platform}">
       <div class="connect-head">
         <div>
-          <span class="connect-name">${PLATFORM_LABEL[platform]}</span>
+          <span class="connect-name">${label}</span>
           <span class="pill ${info.connected ? "on" : "off"}">${info.connected ? "Đã kết nối" : "Chưa kết nối"}</span>
         </div>
         ${info.connected
-          ? `<button class="btn secondary small" data-disconnect="${platform}">Ngắt kết nối</button>`
-          : `<button class="btn secondary small" data-connect="${platform}" ${info.configured ? "" : "disabled"}>Kết nối</button>`}
+          ? `<div class="social-result-actions"><button class="btn secondary small" type="button" data-connect="${platform}">Đổi tài khoản</button><button class="btn secondary small" type="button" data-disconnect="${platform}">Ngắt kết nối</button></div>`
+          : `<button class="btn secondary small" type="button" data-connect="${platform}" ${info.configured ? "" : "disabled"}>Đăng nhập ${label}</button>`}
       </div>
-      ${info.connected ? `<div class="connect-sub">Đăng dưới tên: ${info.account_name || "(không rõ tên)"}</div>` : ""}
-      ${!info.configured ? `<div class="connect-note">${info.not_configured_message}</div>` : ""}
-      <div class="connect-qr-box hidden" id="qr-${platform}"></div>
-    </div>
-  `).join("");
+      ${info.connected ? `<div class="connect-sub">Đăng dưới tên: ${escapeHtml(info.account_name || "(không rõ tên)")}</div>` : ""}
+      ${!info.configured ? `<div class="connect-note">${escapeHtml(info.not_configured_message || "Quản trị viên cần cấu hình ứng dụng OAuth cho nền tảng này.")}</div>` : ""}
+    </div>`;
+  }).join("");
 
-  box.querySelectorAll("[data-connect]").forEach(btn => {
-    btn.onclick = () => startConnect(btn.dataset.connect);
+  boxes.forEach(box => {
+    box.innerHTML = cards;
+    box.querySelectorAll("[data-connect]").forEach(btn => {
+      btn.onclick = () => startConnect(btn.dataset.connect);
+    });
+    box.querySelectorAll("[data-disconnect]").forEach(btn => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await api(`/api/social/connections/${btn.dataset.disconnect}`, { method: "DELETE" });
+          selectedPlatforms.delete(btn.dataset.disconnect);
+          const chip = $(`#publish-modal [data-platform="${btn.dataset.disconnect}"]`);
+          chip?.classList.remove("active");
+          chip?.setAttribute("aria-pressed", "false");
+          await loadConnections();
+        } catch (e) {
+          alert(e.message);
+          btn.disabled = false;
+        }
+      };
+    });
   });
-  box.querySelectorAll("[data-disconnect]").forEach(btn => {
-    btn.onclick = async () => {
-      await fetch(`/api/social/connections/${btn.dataset.disconnect}`, { method: "DELETE" });
-      loadConnections();
-    };
-  });
+  return conns;
 }
 
+function closeSocialConnect() {
+  clearInterval(socialConnectTimer);
+  socialConnectTimer = null;
+  activeSocialConnectPlatform = null;
+  socialConnectAttempt++;
+  socialConfirmationPollToken = null;
+  if (pendingSocialConfirmation) {
+    clearSocialConfirmationQuery(pendingSocialConfirmation);
+    pendingSocialConfirmation = null;
+  }
+  $("#social-connect-refresh").classList.remove("hidden");
+  $("#social-connect-modal").classList.add("hidden");
+}
+
+function clearSocialConfirmationQuery(token) {
+  const url = new URL(location.href);
+  if (url.searchParams.get("social_confirmation") !== token) return;
+  url.searchParams.delete("social_confirmation");
+  history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+}
+
+async function handleSocialConfirmation() {
+  const token = new URLSearchParams(location.search).get("social_confirmation");
+  if (!token || currentUserId === null || pendingSocialConfirmation === token) return;
+  closeSocialConnect();
+  pendingSocialConfirmation = token;
+  const attempt = socialConnectAttempt;
+  const content = $("#social-connect-content");
+  $("#social-connect-title").textContent = "Xác nhận kết nối tài khoản";
+  $("#social-connect-refresh").classList.add("hidden");
+  content.textContent = "Đang kiểm tra tài khoản cần kết nối…";
+  $("#social-connect-modal").classList.remove("hidden");
+  const endpoint = `/api/social/confirm/${encodeURIComponent(token)}`;
+  try {
+    const account = await api(endpoint);
+    if (attempt !== socialConnectAttempt) return;
+    presentSocialConfirmation(account, token, attempt);
+  } catch {
+    if (attempt !== socialConnectAttempt) return;
+    content.textContent = "Không thể xác nhận kết nối. Hãy đăng nhập bằng tài khoản đã bắt đầu kết nối và thử lại.";
+    clearSocialConfirmationQuery(token);
+    pendingSocialConfirmation = null;
+  }
+}
+
+function presentSocialConfirmation(account, token, attempt) {
+  if (!Object.prototype.hasOwnProperty.call(PLATFORM_LABEL, account?.platform)) {
+    throw new Error("Unsupported confirmation platform");
+  }
+  clearInterval(socialConnectTimer);
+  socialConnectTimer = null;
+  socialConfirmationPollToken = null;
+  activeSocialConnectPlatform = null;
+  pendingSocialConfirmation = token;
+  $("#social-connect-title").textContent = "Xác nhận kết nối tài khoản";
+  $("#social-connect-refresh").classList.add("hidden");
+  $("#social-connect-content").innerHTML = `
+      <p>Kết nối tài khoản <strong>${escapeHtml(account.account_name || "(không rõ tên)")}</strong>
+      trên <strong>${escapeHtml(PLATFORM_LABEL[account.platform])}</strong> với tài khoản ứng dụng đang đăng nhập?</p>
+      <p class="muted-help">Chỉ xác nhận nếu đây là tài khoản của bạn và bạn vừa yêu cầu kết nối.</p>
+      <p id="social-confirm-error" role="alert"></p>
+      <button class="btn gradient" id="social-confirm-submit" type="button">Xác nhận kết nối tài khoản này</button>`;
+  const button = $("#social-confirm-submit");
+  button.onclick = async () => {
+    if (button.disabled || attempt !== socialConnectAttempt) return;
+    button.disabled = true;
+    $("#social-confirm-error").textContent = "";
+    try {
+      await api(`/api/social/confirm/${encodeURIComponent(token)}`, {method: "POST"});
+      if (attempt !== socialConnectAttempt) return;
+      closeSocialConnect();
+      await loadConnections();
+      window.opener?.postMessage({type: "social-confirmed", token}, location.origin);
+    } catch {
+      if (attempt !== socialConnectAttempt) return;
+      $("#social-confirm-error").textContent = "Chưa thể xác nhận kết nối. Vui lòng thử lại hoặc bắt đầu kết nối mới.";
+      button.disabled = false;
+    }
+  };
+}
+
+async function pollSocialConfirmation(token, attempt) {
+  try {
+    const account = await api(`/api/social/confirm/${encodeURIComponent(token)}`);
+    if (attempt !== socialConnectAttempt || token !== socialConfirmationPollToken || pendingSocialConfirmation) return;
+    presentSocialConfirmation(account, token, attempt);
+  } catch (error) {
+    if (attempt !== socialConnectAttempt || token !== socialConfirmationPollToken || error.status === 404) return;
+    $("#social-connect-content").textContent = "Chưa thể kiểm tra kết nối. Vui lòng thử lại hoặc bắt đầu kết nối mới.";
+  }
+}
+
+async function checkSocialConnection() {
+  if (socialConfirmationPollToken) {
+    await pollSocialConfirmation(socialConfirmationPollToken, socialConnectAttempt);
+    return;
+  }
+  const platform = activeSocialConnectPlatform;
+  const attempt = socialConnectAttempt;
+  const conns = await loadConnections();
+  if (attempt === socialConnectAttempt && platform && conns?.[platform]?.connected) {
+    if (socialConnectBaseline != null && conns[platform].updated_at === socialConnectBaseline) return;
+    closeSocialConnect();
+  }
+}
+
+$("#social-refresh-btn").onclick = loadConnections;
+$("#social-connect-refresh").onclick = checkSocialConnection;
+$("#social-connect-close").onclick = closeSocialConnect;
+$("#social-connect-modal").addEventListener("click", ev => {
+  if (ev.target === $("#social-connect-modal")) closeSocialConnect();
+});
+document.addEventListener("keydown", ev => {
+  if (ev.key === "Escape") closeSocialConnect();
+});
+
 async function startConnect(platform) {
+  closeSocialConnect();
+  activeSocialConnectPlatform = platform;
+  socialConnectBaseline = socialConnectionsSnapshot[platform]?.connected
+    ? socialConnectionsSnapshot[platform].updated_at ?? null : null;
+  const attempt = socialConnectAttempt;
+  $("#social-connect-title").textContent = `Kết nối ${PLATFORM_LABEL[platform] || platform}`;
+  $("#social-connect-content").textContent = "Đang chuẩn bị đăng nhập…";
+  $("#social-connect-modal").classList.remove("hidden");
+  // Open during the click, before awaiting HTTP, so browsers allow the popup.
+  const popup = window.open("about:blank", "connect_" + platform, "width=520,height=680");
   let data;
   try { data = await api(`/api/social/connect/${platform}`); }
-  catch (e) { alert(e.message); return; }
-
-  window.open(data.authorize_url, "connect_" + platform, "width=520,height=680");
-
-  const qrBox = $(`#qr-${platform}`);
-  qrBox.classList.remove("hidden");
-  qrBox.innerHTML = `
-    <img src="${data.qr_code_url}" width="140" height="140" alt="QR đăng nhập ${platform}">
-    <div style="font-size:12px;color:var(--text-dim);max-width:260px">
-      Cửa sổ đăng nhập ${PLATFORM_LABEL[platform]} đã mở. Nếu bạn đang dùng máy tính nhưng đã
-      đăng nhập ${PLATFORM_LABEL[platform]} trên điện thoại, quét mã QR này bằng điện thoại để
-      xác nhận nhanh hơn — không cần gõ lại mật khẩu trên máy tính.
-    </div>`;
+  catch (e) {
+    popup?.close();
+    if (attempt === socialConnectAttempt) $("#social-connect-content").textContent = e.message;
+    return;
+  }
+  if (attempt !== socialConnectAttempt) { popup?.close(); return; }
+  socialConfirmationPollToken = data.confirmation_token || null;
+  if (popup && !popup.closed) popup.location.href = data.authorize_url;
+  $("#social-connect-content").innerHTML = `
+    <p class="muted-help">Đăng nhập và cấp quyền trong cửa sổ vừa mở. Nếu trình duyệt chặn cửa sổ, bấm liên kết bên dưới. Bạn cũng có thể quét QR bằng điện thoại.</p>
+    <a class="btn secondary small" href="${escapeHtml(data.authorize_url)}" target="_blank" rel="noopener">Mở trang đăng nhập ${PLATFORM_LABEL[platform]}</a>
+    <div class="connect-qr-box"><img src="${escapeHtml(data.qr_code_url)}" width="140" height="140" alt="QR đăng nhập ${platform}"><span class="muted-help">Sau khi cấp quyền, xác nhận đúng tài khoản trong ứng dụng để hoàn tất kết nối. Nếu chưa thấy yêu cầu xác nhận, bấm “Kiểm tra kết nối”.</span></div>`;
+  let checks = 0;
+  const confirmationDeadline = Date.now() + 10 * 60 * 1000;
+  socialConnectTimer = setInterval(() => {
+    if (++checks >= 200 || Date.now() >= confirmationDeadline) {
+      clearInterval(socialConnectTimer);
+      socialConnectTimer = null;
+      socialConfirmationPollToken = null;
+      activeSocialConnectPlatform = null;
+      $("#social-connect-content").textContent = "Thời gian chờ kết nối đã hết. Vui lòng bắt đầu kết nối mới.";
+      return;
+    }
+    checkSocialConnection();
+  }, 3000);
 }
 
 $("#publish-submit").onclick = async () => {
@@ -6111,7 +6392,7 @@ $("#publish-submit").onclick = async () => {
   const hashtags = $("#publish-hashtags").value.split(/\s+/).filter(Boolean);
   $("#publish-results").innerHTML = "Đang đăng...";
   try {
-    const { results } = await api(`/api/jobs/${currentJobId}/publish`, {
+    const { results } = await api(`/api/jobs/${publishJobId}/publish`, {
       method: "POST", body: JSON.stringify({
         platforms: [...selectedPlatforms],
         title: $("#publish-title").value,
@@ -6120,10 +6401,10 @@ $("#publish-submit").onclick = async () => {
       }),
     });
     $("#publish-results").innerHTML = results.map(r =>
-      `<div class="publish-result ${r.success ? "ok" : "fail"}"><b>${r.platform}:</b> ${r.message}</div>`
+      `<div class="publish-result ${r.success ? "ok" : "fail"}"><b>${escapeHtml(r.platform)}:</b> ${escapeHtml(r.message)}</div>`
     ).join("");
   } catch (e) {
-    $("#publish-results").innerHTML = `<div class="publish-result fail">${e.message}</div>`;
+    $("#publish-results").innerHTML = `<div class="publish-result fail">${escapeHtml(e.message)}</div>`;
   }
 };
 
@@ -6149,7 +6430,7 @@ $("#publish-schedule").onclick = async () => {
   if (!localValue) { alert("Chọn ngày và giờ đăng"); return; }
   const scheduledAt = new Date(localValue).getTime() / 1000;
   try {
-    await api(`/api/jobs/${currentJobId}/schedule-publish`, {
+    await api(`/api/jobs/${publishJobId}/schedule-publish`, {
       method: "POST", body: JSON.stringify({
         platforms: [...selectedPlatforms], title: $("#publish-title").value,
         description: $("#publish-desc").value,
@@ -6190,7 +6471,7 @@ async function loadAdmin() {
   const body = $("#admin-users-body");
   body.innerHTML = users.map(u => `
     <tr>
-      <td>${u.username}</td>
+      <td>${_escapeHtml(u.username)}</td>
       <td>${u.is_admin ? "Admin" : "User"}</td>
       <td>${u.credits}</td>
       <td>
@@ -6215,7 +6496,7 @@ async function loadAdmin() {
   $("#admin-topups-empty").classList.toggle("hidden", topups.length > 0);
   $("#admin-topups-body").innerHTML = topups.map(r => `
     <tr>
-      <td>${r.username || ("#" + r.user_id)}</td>
+      <td>${_escapeHtml(r.username || ("#" + r.user_id))}</td>
       <td>${r.credits} token</td>
       <td>${_formatVnd(r.amount_vnd)}</td>
       <td style="max-width:260px;white-space:pre-wrap">${_escapeHtml(r.note || "")}</td>
@@ -6251,16 +6532,14 @@ async function loadAdmin() {
     <tr>
       <td><b>${_escapeHtml(f.username || "(ẩn danh)")}</b><br><span style="color:var(--text-dim);font-size:12px">${_escapeHtml(f.email || f.phone || "Không có liên hệ")}</span></td>
       <td style="max-width:400px;white-space:pre-wrap">${_escapeHtml(f.message)}</td>
-      <td>${f.page || ""}</td>
+      <td>${_escapeHtml(f.page || "")}</td>
       <td>${new Date(f.created_at * 1000).toLocaleString(uiLocale())}</td>
     </tr>
   `).join("");
 }
 
 function _escapeHtml(s) {
-  const div = document.createElement("div");
-  div.textContent = s;
-  return div.innerHTML;
+  return escapeHtml(s);
 }
 
 $("#new-user-submit").onclick = async () => {

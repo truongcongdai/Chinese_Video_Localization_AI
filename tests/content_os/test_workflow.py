@@ -186,14 +186,8 @@ class TestContentOSWorkflow:
             config=WorkflowConfig(auto_approve=False),
         )
         
-        # Manually set to awaiting_approval for testing
-        repo.update_run(
-            run_id=run.id,
-            user_id=1,
-            status="running",
-            current_stage="awaiting_approval",
-        )
-        
+        workflow_no_auto.start_run(run.id, user_id=1)
+
         result = workflow_no_auto.submit_approval(
             run_id=run.id,
             user_id=1,

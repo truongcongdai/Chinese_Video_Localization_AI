@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 #   DOUYIN_COOKIES_FILE=/path/to/douyin_cookies.txt
 #   YTDLP_COOKIES_FILE=/path/to/generic_cookies.txt   (fallback for any platform)
 def _cookiefile_for(platform: Platform) -> str | None:
+    from universal_video_ai.reup.source_sessions import source_cookie_file
+    owned = source_cookie_file(platform.name)
+    if owned:
+        return owned
     env_key = f"{platform.name.upper()}_COOKIES_FILE"
     candidate = os.environ.get(env_key) or os.environ.get("YTDLP_COOKIES_FILE")
     if candidate and Path(candidate).is_file():
@@ -105,6 +109,9 @@ class YTDLPDownloader(BaseDownloader):
 
     # ---------------------------------------------------------
 
+    def extract_info(self, ydl, url: str) -> dict:
+        return ydl.extract_info(url, download=True)
+
     def download(
         self,
         url: str,
@@ -170,14 +177,17 @@ class YTDLPDownloader(BaseDownloader):
 
         with yt_dlp.YoutubeDL(options) as ydl:
 
-            info = ydl.extract_info(
-                url,
-                download=True,
-            )
+            info = self.extract_info(ydl, url)
 
-            filepath = Path(
-                ydl.prepare_filename(info)
-            ).with_suffix(".mp4")
+            candidates = [info.get("filepath")]
+            candidates.extend(item.get("filepath") for item in (info.get("requested_downloads") or []))
+            prepared = Path(ydl.prepare_filename(info))
+            if info.get("ext"):
+                candidates.append(str(prepared.with_suffix("." + info["ext"])))
+            candidates.append(str(prepared))
+            filepath = next((Path(value) for value in candidates if value and Path(value).is_file()), None)
+            if filepath is None:
+                raise FileNotFoundError("yt-dlp completed without an existing media output path")
 
         return DownloadResult(
 
@@ -203,7 +213,7 @@ class YTDLPDownloader(BaseDownloader):
 
             filesize=info.get("filesize", 0),
 
-            extension="mp4",
+            extension=filepath.suffix.lstrip("."),
 
             description=info.get("description", "") or "",
 

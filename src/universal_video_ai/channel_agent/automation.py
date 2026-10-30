@@ -15,6 +15,13 @@ from universal_video_ai.provider_runtime import (
     ProviderMode,
     execute_provider_call,
 )
+from universal_video_ai.channel_agent.coordination import (
+    ExecutionBusy, ExecutionLease, ExecutionStopped, StageBudget, budget_scope,
+    check_run, connection, control_run, update_run,
+)
+from universal_video_ai.channel_agent.social_publishing import (
+    COMPLETED_PUBLISHING_STATES, matches_publish_request,
+)
 
 
 AUTOMATION_MODES = frozenset({
@@ -48,6 +55,10 @@ class AutomationError(RuntimeError):
 
 
 class AutomationNotFound(AutomationError):
+    pass
+
+
+class AutomationBusy(AutomationError):
     pass
 
 
@@ -164,8 +175,15 @@ class AutomationOrchestrator:
         if stage == "publish":
             requested = set(config.get("target_platforms") or [])
             rows = self.store.list_production_publishing_jobs(user_id, item_id)
-            matched = {row.get("platform"): row for row in rows
-                       if row.get("platform") in requested and row.get("status") != "cancelled"}
+            render_id = int(refs.get("render_job_id") or 0)
+            matched = {}
+            for row in rows:
+                platform = row.get("platform")
+                if (platform in requested and platform not in matched
+                        and row.get("status") in COMPLETED_PUBLISHING_STATES
+                        and row.get("external_video_id")
+                        and matches_publish_request(self.store, user_id, row, render_id, config)):
+                    matched[platform] = row
             if requested and requested.issubset(matched):
                 return {"publishing_jobs": {
                     platform: {"job_id": int(row["id"]), "status": row["status"]}
@@ -232,91 +250,77 @@ class AutomationOrchestrator:
             return {"production_item_id": int(item["id"]), "production_created": created}
         raise AutomationWaiting(f"{stage.title()} requires an explicit existing-service action.")
 
-    @staticmethod
-    def _consume_provider_budget(stage: str, config: dict[str, Any],
-                                 refs: dict[str, Any]) -> None:
-        categories = {
-            "research": "external_api_calls", "competitor": "external_api_calls",
-            "script": "llm_calls", "assets": "llm_calls", "render": "tts_requests",
-            "publish": "upload_attempts", "analytics": "external_api_calls",
-            "learning": "llm_calls",
-        }
-        category = categories.get(stage)
-        if not category:
-            return
-        limits = dict(config.get("budgets") or {})
-        limit_key = {
-            "external_api_calls": "max_external_api_calls",
-            "llm_calls": "max_llm_calls",
-            "upload_attempts": "max_upload_attempts",
-            "tts_requests": "max_tts_requests",
-        }[category]
-        usage = dict(refs.get("provider_usage") or {})
-        total = int(usage.get("provider_calls") or 0)
-        total_limit = limits.get("max_external_api_calls")
-        if total_limit is not None and total >= int(total_limit):
-            raise AutomationError(
-                f"Provider budget exceeded: max_external_api_calls={total_limit}."
-            )
-        current = int(usage.get(category) or 0)
-        limit = limits.get(limit_key)
-        if limit is not None and current >= int(limit):
-            raise AutomationError(f"Provider budget exceeded: {limit_key}={limit}.")
-        usage[category] = current + 1
-        usage["provider_calls"] = total + 1
-        refs["provider_usage"] = usage
-
-    def _enforce_stage_concurrency(self, user_id: int, run_id: int, stage: str,
-                                   config: dict[str, Any]) -> None:
+    def _claim_stage(self, user_id: int, run_id: int, step: dict[str, Any],
+                     config: dict[str, Any], refs: dict[str, Any], lease: ExecutionLease) -> None:
+        stage = step["stage"]
         limit_key = {
             "render": "max_concurrent_renders",
             "publish": "max_concurrent_publishes",
         }.get(stage)
-        if not limit_key:
-            return
-        limit = max(1, int(config.get(limit_key, 1)))
-        with self.store._connect() as conn:
-            running = int(conn.execute(
-                "SELECT COUNT(*) c FROM automation_steps WHERE user_id=? AND stage=? "
-                "AND status='running' AND run_id<>?",
-                (user_id, stage, run_id),
-            ).fetchone()["c"])
-        if running >= limit:
-            raise AutomationWaiting(f"Concurrency limit reached: {limit_key}={limit}.")
+        with connection(self.store.db_path, immediate=True) as conn:
+            check_run(conn, lease, run_id)
+            if limit_key:
+                limit = max(1, int(config.get(limit_key, 1)))
+                running = int(conn.execute(
+                    "SELECT COUNT(*) c FROM automation_steps s JOIN automation_runs r ON r.id=s.run_id AND r.user_id=s.user_id "
+                    "LEFT JOIN channel_execution_leases l ON l.user_id=r.user_id AND l.resource='automation:'||r.id "
+                    "WHERE s.user_id=? AND s.stage=? AND s.status='running' AND s.run_id<>? "
+                    "AND (r.status NOT IN ('cancelled','completed','failed','paused') OR l.expires_at>?)",
+                    (user_id, stage, run_id, time.time()),
+                ).fetchone()["c"])
+                if running >= limit:
+                    raise AutomationWaiting(f"Concurrency limit reached: {limit_key}={limit}.")
+            conn.execute(
+                "UPDATE automation_steps SET status='running',input_refs_json=?,started_at=?,error=NULL,updated_at=? "
+                "WHERE user_id=? AND run_id=? AND stage=?",
+                (json.dumps(refs, sort_keys=True), step.get("started_at") or self.now(),
+                 self.now(), user_id, run_id, stage),
+            )
 
     def _execute_stage(self, user_id: int, stage: str, config: dict[str, Any],
-                       refs: dict[str, Any], handler: Optional[StageHandler]) -> dict[str, Any]:
+                       refs: dict[str, Any], handler: Optional[StageHandler],
+                       *, lease: ExecutionLease, run_id: int) -> dict[str, Any]:
         def operation():
             from universal_video_ai.downloader.concurrency import download_scope
             with download_scope(self.store.db_path, user_id, config.get("max_concurrent_downloads", 20)):
                 return (handler(user_id, config, refs) if handler
                         else self._default_execute(user_id, stage, config, refs))
-        if "provider_mode" not in config or stage in {"opportunity", "production"}:
+        if stage in {"opportunity", "production"}:
             return operation()
-        self._consume_provider_budget(stage, config, refs)
+        categories = {
+            "research": "external_api_calls", "competitor": "external_api_calls",
+            "script": "llm_calls", "assets": "llm_calls", "render": "tts_requests",
+            "publish": "upload_attempts", "analytics": "external_api_calls", "learning": "llm_calls",
+        }
+        reservation = StageBudget(lease, run_id, categories[stage],
+                                  dict(config.get("budgets") or {}), refs)
         simulated = lambda: {
             "provider_mode": str(config["provider_mode"]).upper(),
             "simulated": True,
             "stage": stage,
         }
-        return execute_provider_call(
-            "channel_operator", stage,
-            {"stage": stage, "config": config, "refs": refs},
-            live=operation, mock=simulated,
-            mode=ProviderMode(str(config["provider_mode"]).upper()),
-            category=("llm" if stage in {"script", "assets", "learning"}
-                      else "tts" if stage == "render"
-                      else "upload" if stage == "publish" else "external"),
-            cacheable=stage in {"research", "competitor", "script", "assets", "learning"},
-        )
+        with budget_scope(reservation):
+            if "provider_mode" not in config:
+                return operation()
+            return execute_provider_call(
+                "channel_operator", stage,
+                {"stage": stage, "config": config, "refs": refs},
+                live=operation, mock=simulated,
+                mode=ProviderMode(str(config["provider_mode"]).upper()),
+                category=("llm" if stage in {"script", "assets", "learning"}
+                          else "tts" if stage == "render"
+                          else "upload" if stage == "publish" else "external"),
+                cacheable=stage in {"research", "competitor", "script", "assets", "learning"},
+            )
 
-    def _set_waiting(self, user_id: int, run_id: int, stage: str, reason: str) -> dict[str, Any]:
+    def _set_waiting(self, user_id: int, run_id: int, stage: str, reason: str,
+                     lease: ExecutionLease) -> dict[str, Any]:
         step = self.store.get_automation_step(user_id, run_id, stage)
         if step and step["status"] == "running":
             self.store.update_automation_step(user_id, run_id, stage, {
                 "status": "waiting", "error": None,
             })
-        self.store.update_automation_run(user_id, run_id, {
+        update_run(lease, run_id, {
             "status": "waiting_approval", "current_stage": stage,
             "current_step_id": step["id"] if step else None, "waiting_reason": reason,
             "error": None,
@@ -333,14 +337,24 @@ class AutomationOrchestrator:
         return True if not key else dict(config.get("approval_policy") or {}).get(key) is not False
 
     def advance(self, user_id: int, run_id: int) -> dict[str, Any]:
+        self.get(user_id, run_id)
+        try:
+            with ExecutionLease(self.store.db_path, user_id, f"automation:{run_id}") as lease:
+                try:
+                    return self._advance(user_id, run_id, lease)
+                except ExecutionStopped:
+                    return self.get(user_id, run_id)
+        except ExecutionBusy as exc:
+            raise AutomationBusy(str(exc)) from exc
+
+    def _advance(self, user_id: int, run_id: int, lease: ExecutionLease) -> dict[str, Any]:
         run = self.get(user_id, run_id)
         if run["status"] == "failed":
             raise AutomationError("Failed runs must use bounded step retry.")
         if run["status"] in {"paused", "cancelled", "completed"}:
             raise AutomationError(f"Cannot advance a {run['status']} automation run.")
         config, refs = run["configuration"], dict(run["refs"])
-        # A process may have died after marking a step running.  Re-evaluate
-        # persisted output first, then safely retry only that step.
+        # Only the persisted lease owner may recover an interrupted stage.
         for step in run["steps"]:
             if step["status"] == "running":
                 self.store.update_automation_step(user_id, run_id, step["stage"], {
@@ -348,19 +362,21 @@ class AutomationOrchestrator:
                 })
         run = self.get(user_id, run_id)
         completed_count = sum(step["status"] in {"completed", "skipped"} for step in run["steps"])
-        self.store.update_automation_run(user_id, run_id, {
+        update_run(lease, run_id, {
             "status": "running", "started_at": run.get("started_at") or self.now(),
             "waiting_reason": None, "error": None,
         })
         budget = 1 if run["mode"] in {"MANUAL_STEP", "ASSISTED"} else len(PIPELINE_STAGES)
         executed = 0
         for step in run["steps"]:
+            with connection(self.store.db_path) as conn:
+                check_run(conn, lease, run_id)
             stage = str(step["stage"])
             if step["status"] in {"completed", "skipped"}:
                 gate = GATE_AFTER_STAGE.get(stage)
                 if gate and self._gate_required(config, gate) and not self._gate_satisfied(user_id, run_id, gate):
                     return self._set_waiting(
-                        user_id, run_id, stage, f"Human {gate} approval is required."
+                        user_id, run_id, stage, f"Human {gate} approval is required.", lease
                     )
                 continue
             if executed >= budget:
@@ -378,42 +394,52 @@ class AutomationOrchestrator:
                     "status": "completed", "output_refs": existing,
                     "completed_at": self.now(), "error": None,
                 })
-                self.store.update_automation_run(user_id, run_id, {"refs": refs})
+                update_run(lease, run_id, {"refs": refs})
                 completed_count += 1
             else:
                 try:
-                    self._enforce_stage_concurrency(user_id, run_id, stage, config)
+                    self._claim_stage(user_id, run_id, step, config, refs, lease)
                 except AutomationWaiting as exc:
-                    return self._set_waiting(user_id, run_id, stage, str(exc))
-                self.store.update_automation_step(user_id, run_id, stage, {
-                    "status": "running", "input_refs": refs,
-                    "started_at": step.get("started_at") or self.now(), "error": None,
-                })
-                self.store.update_automation_run(user_id, run_id, {
+                    return self._set_waiting(user_id, run_id, stage, str(exc), lease)
+                update_run(lease, run_id, {
                     "current_stage": stage, "current_step_id": step["id"],
                     "progress": round(completed_count / len(PIPELINE_STAGES) * 100, 1),
                 })
                 try:
                     handler = self.handlers.get(stage)
-                    output = self._execute_stage(user_id, stage, config, refs, handler)
+                    output = self._execute_stage(user_id, stage, config, refs, handler,
+                                                 lease=lease, run_id=run_id)
                     if not isinstance(output, dict):
                         raise AutomationError("Automation stage output must be a mapping.")
                     if _contains_secret(output):
                         raise AutomationError("Automation output cannot contain credentials or tokens.")
                     refs.update(output)
+                    update_run(lease, run_id, {"refs": refs})
+                    self.store.update_automation_step(user_id, run_id, stage, {"output_refs": output})
+                    if stage == "publish" and not (output.get("simulated") or output.get("dry_run")):
+                        jobs = output.get("publishing_jobs") or {}
+                        incomplete = [platform for platform in config.get("target_platforms", [])
+                                      if jobs.get(platform, {}).get("status") not in COMPLETED_PUBLISHING_STATES]
+                        if incomplete:
+                            states = [jobs.get(platform, {}).get("status", "missing") for platform in incomplete]
+                            if any(state in {"failed", "outcome_unknown", "missing"} for state in states):
+                                raise AutomationError("Publishing incomplete for: " + ", ".join(incomplete))
+                            raise AutomationWaiting("Remote publishing is still processing: " + ", ".join(incomplete))
                     self.store.update_automation_step(user_id, run_id, stage, {
                         "status": "completed", "output_refs": output,
                         "completed_at": self.now(), "error": None,
                     })
-                    self.store.update_automation_run(user_id, run_id, {"refs": refs})
+                    update_run(lease, run_id, {"refs": refs})
                     completed_count += 1
                 except AutomationWaiting as exc:
-                    return self._set_waiting(user_id, run_id, stage, str(exc))
+                    return self._set_waiting(user_id, run_id, stage, str(exc), lease)
+                except ExecutionStopped:
+                    raise
                 except Exception as exc:
                     self.store.update_automation_step(user_id, run_id, stage, {
                         "status": "failed", "error": str(exc),
                     })
-                    self.store.update_automation_run(user_id, run_id, {
+                    update_run(lease, run_id, {
                         "status": "failed", "current_stage": stage,
                         "current_step_id": step["id"], "error": str(exc),
                     })
@@ -422,19 +448,19 @@ class AutomationOrchestrator:
             gate = GATE_AFTER_STAGE.get(stage)
             if gate and self._gate_required(config, gate) and not self._gate_satisfied(user_id, run_id, gate):
                 return self._set_waiting(
-                    user_id, run_id, stage, f"Human {gate} approval is required."
+                    user_id, run_id, stage, f"Human {gate} approval is required.", lease
                 )
         refreshed = self.get(user_id, run_id)
         remaining = [step for step in refreshed["steps"]
                      if step["status"] not in {"completed", "skipped"}]
         if not remaining:
-            self.store.update_automation_run(user_id, run_id, {
+            update_run(lease, run_id, {
                 "status": "completed", "current_stage": None, "current_step_id": None,
                 "progress": 100, "completed_at": self.now(), "waiting_reason": None,
             })
         else:
             next_step = remaining[0]
-            self.store.update_automation_run(user_id, run_id, {
+            update_run(lease, run_id, {
                 "status": (
                     "running" if run["mode"] in {"AUTOMATION_WITH_GATES", "FULL_AUTONOMOUS"}
                     else "queued"
@@ -449,6 +475,8 @@ class AutomationOrchestrator:
         if stage not in {"opportunity", "script", "assets", "publish"}:
             raise AutomationError("Unknown approval gate.")
         run = self.get(user_id, run_id)
+        if run["status"] not in {"queued", "waiting_approval"}:
+            raise AutomationError("Only queued or waiting runs can accept approvals.")
         if _contains_secret(refs or {}):
             raise AutomationError("Automation references cannot contain credentials or tokens.")
         merged = dict(run["refs"])
@@ -481,16 +509,16 @@ class AutomationOrchestrator:
         event = self.store.add_automation_approval(user_id, run_id, stage, "approved", note)
         if not event:
             raise AutomationNotFound("Automation run not found.")
-        self.store.update_automation_run(user_id, run_id, {
+        self._control(user_id, run_id, {
             "status": "queued", "waiting_reason": None, "error": None, "refs": merged,
-        })
+        }, {"queued", "waiting_approval"})
         return self.get(user_id, run_id)
 
     def pause(self, user_id: int, run_id: int) -> dict[str, Any]:
         run = self.get(user_id, run_id)
         if run["status"] in {"completed", "cancelled"}:
             raise AutomationError("Completed or cancelled runs cannot be paused.")
-        self.store.update_automation_run(user_id, run_id, {"status": "paused"})
+        self._control(user_id, run_id, {"status": "paused"}, set(RUN_STATUSES) - {"completed", "cancelled"})
         return self.get(user_id, run_id)
 
     def resume(self, user_id: int, run_id: int) -> dict[str, Any]:
@@ -501,34 +529,54 @@ class AutomationOrchestrator:
             return run
         if run["status"] == "failed":
             return self.retry(user_id, run_id)
-        self.store.update_automation_run(user_id, run_id, {"status": "queued", "error": None})
+        self._control(user_id, run_id, {"status": "queued", "error": None},
+                      {"queued", "paused", "waiting_approval", "running"})
         return self.advance(user_id, run_id)
 
     def retry(self, user_id: int, run_id: int) -> dict[str, Any]:
+        self.get(user_id, run_id)
+        try:
+            with ExecutionLease(self.store.db_path, user_id, f"automation:{run_id}") as lease:
+                return self._retry(user_id, run_id, lease)
+        except ExecutionBusy as exc:
+            raise AutomationBusy(str(exc)) from exc
+        except ExecutionStopped:
+            return self.get(user_id, run_id)
+
+    def _retry(self, user_id: int, run_id: int, lease: ExecutionLease) -> dict[str, Any]:
         run = self.get(user_id, run_id)
+        if run["status"] != "failed":
+            raise AutomationError("Only failed runs can retry a step.")
         step = next((item for item in run["steps"] if item["status"] == "failed"), None)
         if not step:
             raise AutomationError("No failed automation step is available to retry.")
         count = int(step["retry_count"] or 0)
         if count >= MAX_RETRIES:
             raise AutomationError("Automation step retry limit reached.")
-        self.store.update_automation_step(user_id, run_id, step["stage"], {
-            "status": "pending", "retry_count": count + 1, "error": None,
-        })
-        self.store.update_automation_run(user_id, run_id, {
-            "status": "queued", "error": None, "waiting_reason": None,
-        })
-        return self.advance(user_id, run_id)
+        with connection(self.store.db_path, immediate=True) as conn:
+            check_run(conn, lease, run_id)
+            conn.execute("UPDATE automation_steps SET status='pending',retry_count=?,error=NULL "
+                         "WHERE user_id=? AND run_id=? AND stage=?",
+                         (count + 1, user_id, run_id, step["stage"]))
+            conn.execute("UPDATE automation_runs SET status='queued',error=NULL,waiting_reason=NULL "
+                         "WHERE user_id=? AND id=?", (user_id, run_id))
+        return self._advance(user_id, run_id, lease)
 
     def cancel(self, user_id: int, run_id: int) -> dict[str, Any]:
         run = self.get(user_id, run_id)
         if run["status"] == "completed":
             raise AutomationError("Completed runs cannot be cancelled.")
-        self.store.update_automation_run(user_id, run_id, {
+        self._control(user_id, run_id, {
             "status": "cancelled", "completed_at": self.now(),
             "waiting_reason": None, "error": None,
-        })
+        }, set(RUN_STATUSES) - {"completed"})
         return self.get(user_id, run_id)
+
+    def _control(self, user_id: int, run_id: int, data: dict[str, Any], allowed: set[str]) -> None:
+        try:
+            control_run(self.store.db_path, user_id, run_id, data, allowed)
+        except ExecutionStopped as exc:
+            raise AutomationError(str(exc)) from exc
 
     # Scheduler-ready entry points only; CP10 deliberately has no recurring loop.
     def run_daily_research(self, user_id: int, configuration: dict[str, Any]) -> dict[str, Any]:

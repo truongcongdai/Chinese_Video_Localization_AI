@@ -25,6 +25,15 @@ def pytest_sessionstart(session):
         # disposable database before test modules are imported, so regression
         # can never migrate or write the configured runtime database.
         _TEST_RUNTIME_DIR = tempfile.TemporaryDirectory(prefix="uvai-pytest-")
+        import dotenv
+        dotenv.load_dotenv = lambda *args, **kwargs: False
+        runtime = Path(_TEST_RUNTIME_DIR.name)
+        for name, suffix in {
+            "TEMP_DIR": "temp", "LOGS_DIR": "logs", "COOKIE_DIR": "cookies",
+            "TRANSLATION_CACHE_PATH": "translation.sqlite3", "SPEECH_CACHE_PATH": "speech.sqlite3",
+            "DEMUCS_CACHE_DIR": "demucs",
+        }.items():
+            os.environ[name] = str(runtime / suffix)
         os.environ["WEB_DB_PATH"] = str(
             Path(_TEST_RUNTIME_DIR.name) / "regression.sqlite3"
         )

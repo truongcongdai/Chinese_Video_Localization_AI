@@ -11,6 +11,10 @@ from typing import Any, Optional
 
 import requests
 
+from universal_video_ai.channel_agent.coordination import (
+    ExecutionBusy, ExecutionLease, reserve_provider_call, set_upload_intent, upload_intent,
+)
+
 from universal_video_ai.channel_agent.production_assets import ProductionAssetService
 from universal_video_ai.channel_agent.social_publishing import (
     PublishingCapability,
@@ -139,6 +143,10 @@ class MetaGraphPublisher:
     def upload(self, user_id: int, job: dict[str, Any]) -> dict[str, Any]:
         account = self._account(user_id)
         package = job["package"]
+        expected = str(job.get("channel_id") or (package.get("target_page") or {}).get("id") or "")
+        if not expected or str(account["account_ref"]) != expected:
+            raise FacebookPublishingError("Connected Facebook Page changed; reconnect the saved destination before uploading.")
+        headers = {"Authorization": f"Bearer {account['access_token']}"}
         if package.get("destination_type") != "page_video":
             raise FacebookPublishingError("Facebook Reels capability is unavailable for this connection.")
         video = Path(str(package["video_path"]))
@@ -158,7 +166,7 @@ class MetaGraphPublisher:
         with video.open("rb") as stream:
             response = self.http.post(
                 f"{self.graph}/{account['account_ref']}/videos",
-                headers=self._headers(user_id), data=data,
+                headers=headers, data=data,
                 files={"source": (video.name, stream, "video/mp4")}, timeout=self.timeout,
             )
         payload = self._payload(response)
@@ -169,6 +177,7 @@ class MetaGraphPublisher:
         return _safe_provider_state(payload)
 
     def status(self, user_id: int, external_id: str) -> dict[str, Any]:
+        reserve_provider_call("external_api_calls")
         response = self.http.get(
             f"{self.graph}/{external_id}",
             params={"fields": "id,permalink_url,published,status"},
@@ -330,18 +339,42 @@ class FacebookPublishingService(SocialPublishingService):
             raise FacebookPublishingNotFound(str(exc)) from exc
 
     def run(self, user_id: int, item_id: int, job_id: int) -> dict[str, Any]:
+        self.job(user_id, item_id, job_id)
+        try:
+            with ExecutionLease(self.store.db_path, user_id, f"publish:{job_id}") as lease:
+                return self._run(user_id, item_id, job_id, lease)
+        except ExecutionBusy as exc:
+            raise FacebookPublishingError(str(exc)) from exc
+
+    def _run(self, user_id: int, item_id: int, job_id: int,
+             lease: ExecutionLease) -> dict[str, Any]:
         job = self.job(user_id, item_id, job_id, private=True)
         if job["dry_run"]:
             return self.get(user_id, item_id, job_id)
         if job["status"] == "cancelled":
             raise FacebookPublishingError("Cancelled publishing jobs cannot run.")
+        if not job.get("external_video_id") and (
+            job["status"] in {"outcome_unknown", "uploading"}
+            or upload_intent(self.store.db_path, user_id, job_id) in {"sending", "outcome_unknown"}
+        ):
+            self.store.update_production_publishing_job(user_id, item_id, job_id, {
+                "status": "outcome_unknown",
+                "error": "Previous upload outcome is unknown; reconcile the remote Page before retrying.",
+            })
+            raise FacebookPublishingError("Previous upload outcome is unknown; automatic retry is blocked.")
         try:
             if job.get("external_video_id"):
                 return self.refresh(user_id, item_id, job_id)
+            account = self.store.get_social_account(user_id, self.platform)
+            if not account or str(account["account_ref"]) != str(job["channel_id"]):
+                raise FacebookPublishingError("Connected Facebook Page changed; the saved destination is required.")
+            reserve_provider_call("upload_attempts")
+            set_upload_intent(lease, job_id, "sending")
             self.store.update_production_publishing_job(
                 user_id, item_id, job_id, {"status": "uploading", "progress": 5, "error": None}
             )
             remote = self.publisher.upload(user_id, job)
+            lease.assert_owned()
             external_id = str(remote["id"])
             external_url = str(remote.get("permalink_url") or f"https://www.facebook.com/{external_id}")
             self.store.update_production_publishing_job(user_id, item_id, job_id, {
@@ -349,18 +382,26 @@ class FacebookPublishingService(SocialPublishingService):
                 "external_url": external_url, "upload_offset": job["upload_size"],
                 "remote_status": remote,
             })
+            set_upload_intent(lease, job_id, "completed")
             self.persist_result(user_id, job_id, PublishingResult(
                 platform=self.platform, status="processing", external_id=external_id,
                 external_url=external_url, provider_state=remote,
             ))
             return self.refresh(user_id, item_id, job_id)
         except Exception as exc:
+            lease.assert_owned()
             message = str(exc)
+            stored = self.job(user_id, item_id, job_id, private=True)
+            unknown = (not stored.get("external_video_id")
+                       and upload_intent(self.store.db_path, user_id, job_id) == "sending")
+            state = "outcome_unknown" if unknown else "failed"
+            if unknown:
+                set_upload_intent(lease, job_id, state)
             self.store.update_production_publishing_job(
-                user_id, item_id, job_id, {"status": "failed", "error": message}
+                user_id, item_id, job_id, {"status": state, "error": message}
             )
             self.persist_result(user_id, job_id, PublishingResult(
-                platform=self.platform, status="failed", error=message
+                platform=self.platform, status=state, error=message
             ))
             raise
 

@@ -13,6 +13,9 @@ from typing import Optional, Callable, Any, Protocol, runtime_checkable
 from dataclasses import dataclass, field
 from enum import Enum
 import time
+import math
+import uuid
+import itertools
 
 from .models import JobStatus
 
@@ -46,6 +49,7 @@ class QueueEnvelope:
     priority: JobPriority = JobPriority.NORMAL
     attempts: int = 0
     enqueued_at: float = field(default_factory=time.time)
+    claim_token: str = ""
 
 
 @runtime_checkable
@@ -75,225 +79,308 @@ class JobQueueProtocol(Protocol):
 
 
 class RedisQueue:
-    """Redis-backed queue with priority ordering and in-memory fallback."""
+    """Atomic claims with renewable leases; fallback capacity is process-local.
 
-    def __init__(
-        self,
-        redis_url: str = "redis://127.0.0.1:6379/0",
-        namespace: str = "universal_video_ai:jobs",
-        client: Optional[Any] = None,
-        fallback: bool = True,
-        logger: Optional[logging.Logger] = None,
-    ) -> None:
+    Redis keys for one namespace must live on one Redis instance. A recovered
+    callback can run again, so side effects still require their own idempotency.
+    """
+
+    _ENQUEUE = """
+    if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+    redis.call('HSET', KEYS[1], unpack(ARGV, 4))
+    redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+    redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
+    return 1
+    """
+    _CLAIM = """
+    local now, expires, token = tonumber(ARGV[1]), tonumber(ARGV[2]), ARGV[3]
+    local prefix = ARGV[4]
+    local ranks = {LOW=1, NORMAL=2, HIGH=3, URGENT=4}
+    -- Reclaim a bounded batch. A live worker renews its deadline independently.
+    for _, id in ipairs(redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, 64)) do
+      local key = prefix .. ':job:' .. id
+      if redis.call('HGET', key, 'status') == 'running' then
+        local rank = ranks[redis.call('HGET', key, 'priority')] or 2
+        redis.call('HINCRBY', key, 'attempts', 1)
+        redis.call('HSET', key, 'status', 'pending', 'enqueued_at', now,
+                   'updated_at', now, 'claim_token', '')
+        redis.call('ZADD', KEYS[1], now, id)
+        redis.call('ZADD', KEYS[rank+2], now, id)
+      end
+      redis.call('ZREM', KEYS[2], id)
+    end
+    -- Index legacy pending entries once, without executing an unclaimed job.
+    for _, id in ipairs(redis.call('ZRANGE', KEYS[1], 0, 127)) do
+      local key = prefix .. ':job:' .. id
+      if redis.call('HGET', key, 'queue_version') ~= '2' then
+        local rank = ranks[redis.call('HGET', key, 'priority')] or 2
+        local at = tonumber(redis.call('HGET', key, 'enqueued_at')) or now
+        redis.call('HSET', key, 'queue_version', '2')
+        redis.call('ZADD', KEYS[rank+2], at, id)
+        redis.call('ZADD', KEYS[1], at, id)
+      end
+    end
+    for rank = 4, 1, -1 do
+      local ids = redis.call('ZRANGEBYSCORE', KEYS[rank+2], '-inf', now, 'LIMIT', 0, 1)
+      if #ids > 0 then
+        local id, key = ids[1], prefix .. ':job:' .. ids[1]
+        redis.call('ZREM', KEYS[rank+2], id)
+        redis.call('ZREM', KEYS[1], id)
+        if redis.call('HGET', key, 'status') == 'pending' then
+          redis.call('HSET', key, 'status', 'running', 'claim_token', token,
+                     'lease_expires_at', expires, 'updated_at', now)
+          redis.call('ZADD', KEYS[2], expires, id)
+          return redis.call('HGETALL', key)
+        end
+      end
+    end
+    return {}
+    """
+    _TRANSITION = """
+    local state = redis.call('HGET', KEYS[1], 'status')
+    if not state or state == 'cancelled' then return 0 end
+    if ARGV[1] ~= '' and redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[1] then return 0 end
+    if ARGV[1] ~= '' and (tonumber(redis.call('HGET', KEYS[1], 'lease_expires_at')) or 0) <= tonumber(ARGV[4]) then return 0 end
+    redis.call('HSET', KEYS[1], 'status', ARGV[2], 'updated_at', ARGV[4], 'error', ARGV[5])
+    if ARGV[6] ~= '' then redis.call('HSET', KEYS[1], 'attempts', ARGV[6]) end
+    if ARGV[2] == 'pending' then
+      redis.call('HSET', KEYS[1], 'enqueued_at', ARGV[7], 'claim_token', '')
+      redis.call('ZADD', KEYS[2], ARGV[7], ARGV[3])
+      redis.call('ZADD', KEYS[4], ARGV[7], ARGV[3])
+    end
+    if ARGV[2] ~= 'running' then redis.call('ZREM', KEYS[3], ARGV[3]) end
+    return 1
+    """
+    _RENEW = """
+    if redis.call('HGET', KEYS[1], 'status') ~= 'running' or
+       redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[1] or
+       (tonumber(redis.call('HGET', KEYS[1], 'lease_expires_at')) or 0) <= tonumber(ARGV[4]) then return 0 end
+    redis.call('HSET', KEYS[1], 'lease_expires_at', ARGV[2])
+    redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+    return 1
+    """
+    _CANCEL = """
+    if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+    redis.call('HSET', KEYS[1], 'status', 'cancelled', 'claim_token', '', 'updated_at', ARGV[2])
+    for i = 2, #KEYS do redis.call('ZREM', KEYS[i], ARGV[1]) end
+    return 1
+    """
+
+    def __init__(self, redis_url: str = "redis://127.0.0.1:6379/0",
+                 namespace: str = "universal_video_ai:jobs", client: Optional[Any] = None,
+                 fallback: bool = True, logger: Optional[logging.Logger] = None,
+                 lease_seconds: float = 60.0) -> None:
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
         self.namespace = namespace.rstrip(":")
         self.logger = logger or _logger
+        self.lease_seconds = float(lease_seconds)
         self._redis = client
-        self._fallback_enabled = fallback
+        self._memory_lock = threading.RLock()
         self._fallback_queue: list[QueueEnvelope] = []
         self._fallback_jobs: dict[str, dict[str, Any]] = {}
+        self._fallback_leases: dict[str, float] = {}
         self._using_fallback = client is None
-
         if client is None:
             try:
                 import redis
-
-                self._redis = redis.from_url(redis_url, decode_responses=True)
+                self._redis = redis.from_url(redis_url, decode_responses=True,
+                                             socket_connect_timeout=2, socket_timeout=2)
                 self._redis.ping()
                 self._using_fallback = False
             except Exception as exc:
                 if not fallback:
-                    raise RuntimeError(f"Redis queue unavailable: {exc}") from exc
-                self.logger.warning("Redis queue unavailable, using in-memory fallback: %s", exc)
+                    raise RuntimeError("Redis queue unavailable") from exc
+                self.logger.warning("Redis queue unavailable; using process-local queue")
 
     @property
     def pending_key(self) -> str:
-        """Redis sorted set key for pending jobs."""
+        """Sorted set of pending job identifiers."""
         return f"{self.namespace}:pending"
 
+    @property
+    def inflight_key(self) -> str:
+        """Sorted set of claim expiry timestamps."""
+        return f"{self.namespace}:inflight"
+
     def job_key(self, job_id: str) -> str:
-        """Redis hash key for a job."""
+        """Hash containing the job and its current claim token."""
         return f"{self.namespace}:job:{job_id}"
 
-    def enqueue(
-        self,
-        job_id: str,
-        payload: Optional[dict[str, Any]] = None,
-        priority: JobPriority = JobPriority.NORMAL,
-    ) -> bool:
-        """Add a job to the queue."""
-        envelope = QueueEnvelope(job_id=job_id, payload=payload or {}, priority=priority)
+    def _priority_key(self, priority: JobPriority) -> str:
+        return f"{self.namespace}:priority:{priority.value}"
+
+    def _claim_keys(self) -> list[str]:
+        return [self.pending_key, self.inflight_key, *(self._priority_key(p) for p in JobPriority)]
+
+    def enqueue(self, job_id: str, payload: Optional[dict[str, Any]] = None,
+                priority: JobPriority = JobPriority.NORMAL) -> bool:
+        """Insert once; never switch storage after an ambiguous Redis failure."""
+        envelope = QueueEnvelope(job_id, payload or {}, priority, enqueued_at=time.time())
+        data = self._serialize_job(envelope, JobStatus.PENDING)
         if self._using_fallback:
-            self._fallback_jobs[job_id] = self._serialize_job(envelope, JobStatus.PENDING)
-            self._fallback_queue.append(envelope)
-            self._fallback_queue.sort(key=lambda item: (-item.priority.value, item.enqueued_at))
-            return True
-
+            with self._memory_lock:
+                if job_id in self._fallback_jobs:
+                    return False
+                self._fallback_jobs[job_id] = data
+                self._fallback_queue.append(envelope)
+                return True
         try:
-            assert self._redis is not None
-            self._redis.hset(self.job_key(job_id), mapping=self._serialize_job(envelope, JobStatus.PENDING))
-            self._redis.zadd(self.pending_key, {job_id: self._queue_score(envelope.enqueued_at, priority)})
-            return True
-        except Exception as exc:
-            self.logger.exception("Failed to enqueue job %s: %s", job_id, exc)
-            if not self._fallback_enabled:
-                return False
-            self._using_fallback = True
-            return self.enqueue(job_id, payload, priority)
-
-    def dequeue(self, timeout_seconds: float = 0.0) -> Optional[QueueEnvelope]:
-        """Return the highest-priority pending job."""
-        deadline = time.monotonic() + max(timeout_seconds, 0.0)
-        while True:
-            envelope = self._dequeue_once()
-            if envelope is not None:
-                return envelope
-            if timeout_seconds <= 0 or time.monotonic() >= deadline:
-                return None
-            time.sleep(min(0.1, deadline - time.monotonic()))
-
-    def get_status(self, job_id: str) -> Optional[JobStatus]:
-        """Return the stored job status."""
-        data = self._get_job_data(job_id)
-        if not data:
-            return None
-        try:
-            return JobStatus(data["status"])
-        except (KeyError, ValueError):
-            return None
-
-    def cancel(self, job_id: str) -> bool:
-        """Cancel a queued or running job."""
-        if self._using_fallback:
-            if job_id not in self._fallback_jobs:
-                return False
-            self._fallback_queue = [item for item in self._fallback_queue if item.job_id != job_id]
-            self._fallback_jobs[job_id]["status"] = JobStatus.CANCELLED.value
-            return True
-
-        try:
-            assert self._redis is not None
-            if not self._redis.exists(self.job_key(job_id)):
-                return False
-            self._redis.zrem(self.pending_key, job_id)
-            self._redis.hset(self.job_key(job_id), mapping={"status": JobStatus.CANCELLED.value, "updated_at": time.time()})
-            return True
-        except Exception as exc:
-            self.logger.exception("Failed to cancel job %s: %s", job_id, exc)
+            flat = [value for pair in data.items() for value in pair]
+            return bool(self._redis.eval(self._ENQUEUE, 3, self.job_key(job_id), self.pending_key,
+                        self._priority_key(priority), job_id, envelope.enqueued_at, '', *flat))
+        except Exception:
+            self.logger.exception("Redis enqueue failed for job %s", job_id)
             return False
 
-    def mark_status(
-        self,
-        job_id: str,
-        status: JobStatus,
-        *,
-        error: Optional[str] = None,
-        attempts: Optional[int] = None,
-    ) -> None:
-        """Persist a job status update."""
-        update: dict[str, Any] = {"status": status.value, "updated_at": time.time()}
-        if error is not None:
-            update["error"] = error
-        if attempts is not None:
-            update["attempts"] = attempts
-
-        if self._using_fallback:
-            self._fallback_jobs.setdefault(job_id, {}).update(update)
-            return
-
-        assert self._redis is not None
-        self._redis.hset(self.job_key(job_id), mapping=update)
-
-    def requeue(self, envelope: QueueEnvelope, delay_seconds: float = 0.0) -> None:
-        """Place a failed job back on the pending queue."""
-        next_envelope = QueueEnvelope(
-            job_id=envelope.job_id,
-            payload=envelope.payload,
-            priority=envelope.priority,
-            attempts=envelope.attempts + 1,
-            enqueued_at=time.time() + max(delay_seconds, 0.0),
-        )
-        self.mark_status(envelope.job_id, JobStatus.PENDING, attempts=next_envelope.attempts)
-        if self._using_fallback:
-            self._fallback_queue.append(next_envelope)
-            self._fallback_queue.sort(key=lambda item: (-item.priority.value, item.enqueued_at))
-            return
-        assert self._redis is not None
-        self._redis.zadd(
-            self.pending_key,
-            {next_envelope.job_id: self._queue_score(next_envelope.enqueued_at, next_envelope.priority)},
-        )
+    def dequeue(self, timeout_seconds: float = 0.0) -> Optional[QueueEnvelope]:
+        """Atomically claim a due job, urgent first and FIFO within priority."""
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            result = self._dequeue_once()
+            if result is not None:
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.1, remaining))
 
     def _dequeue_once(self) -> Optional[QueueEnvelope]:
+        now = time.time()
+        token = uuid.uuid4().hex
         if self._using_fallback:
-            now = time.time()
-            for index, envelope in enumerate(self._fallback_queue):
-                if envelope.enqueued_at <= now:
+            with self._memory_lock:
+                for job_id, expiry in list(self._fallback_leases.items()):
+                    data = self._fallback_jobs[job_id]
+                    if expiry <= now:
+                        self._fallback_leases.pop(job_id, None)
+                        data.update(status='pending', enqueued_at=now, claim_token='',
+                                    attempts=int(data.get('attempts', 0)) + 1)
+                        self._fallback_queue.append(self._deserialize_job(data))
+                self._fallback_queue.sort(key=lambda e: (-e.priority.value, e.enqueued_at))
+                for index, envelope in enumerate(self._fallback_queue):
+                    if envelope.enqueued_at > now:
+                        continue
+                    data = self._fallback_jobs[envelope.job_id]
+                    if data['status'] != 'pending':
+                        continue
                     self._fallback_queue.pop(index)
-                    if self.get_status(envelope.job_id) == JobStatus.CANCELLED:
-                        return None
-                    self.mark_status(envelope.job_id, JobStatus.RUNNING)
-                    return envelope
-            return None
-
+                    data.update(status='running', claim_token=token, lease_expires_at=now+self.lease_seconds)
+                    self._fallback_leases[envelope.job_id] = now + self.lease_seconds
+                    return self._deserialize_job(data)
+                return None
         try:
-            assert self._redis is not None
-            rows = self._redis.zrange(self.pending_key, 0, 0, withscores=True)
+            rows = self._redis.eval(self._CLAIM, 6, *self._claim_keys(),
+                                    now, now+self.lease_seconds, token, self.namespace)
             if not rows:
                 return None
-            job_id, score = rows[0]
-            if float(score) > self._queue_score(time.time(), JobPriority.LOW):
-                return None
-            self._redis.zrem(self.pending_key, job_id)
-            if self.get_status(job_id) == JobStatus.CANCELLED:
-                return None
-            data = self._get_job_data(job_id)
-            if not data:
-                return None
-            self.mark_status(job_id, JobStatus.RUNNING)
+            data = dict(zip(rows[::2], rows[1::2]))
             return self._deserialize_job(data)
-        except Exception as exc:
-            self.logger.exception("Failed to dequeue job: %s", exc)
+        except Exception:
+            self.logger.exception("Redis dequeue failed")
             return None
+
+    def get_status(self, job_id: str) -> Optional[JobStatus]:
+        """Read the persisted current state."""
+        data = self._get_job_data(job_id)
+        return JobStatus(data['status']) if data else None
+
+    def cancel(self, job_id: str) -> bool:
+        """Invalidate the claim and remove pending/inflight entries atomically."""
+        if self._using_fallback:
+            with self._memory_lock:
+                data = self._fallback_jobs.get(job_id)
+                if not data:
+                    return False
+                data.update(status='cancelled', claim_token='')
+                self._fallback_leases.pop(job_id, None)
+                self._fallback_queue = [e for e in self._fallback_queue if e.job_id != job_id]
+                return True
+        return bool(self._redis.eval(self._CANCEL, 7, self.job_key(job_id), *self._claim_keys(),
+                                     job_id, time.time()))
+
+    def mark_status(self, job_id: str, status: JobStatus, *, error: Optional[str] = None,
+                    attempts: Optional[int] = None, claim_token: str = '') -> bool:
+        """Transition only a current claim; cancellation is terminal."""
+        now = time.time()
+        if self._using_fallback:
+            with self._memory_lock:
+                data = self._fallback_jobs.get(job_id)
+                if not data or data['status'] == 'cancelled':
+                    return False
+                if claim_token and (data.get('claim_token') != claim_token or
+                                    float(data.get('lease_expires_at', 0)) <= now):
+                    return False
+                data.update(status=status.value, updated_at=now, error=error or '')
+                if status != JobStatus.RUNNING:
+                    self._fallback_leases.pop(job_id, None)
+                if attempts is not None:
+                    data['attempts'] = attempts
+                return True
+        return bool(self._redis.eval(self._TRANSITION, 4, self.job_key(job_id), self.pending_key,
+                    self.inflight_key, self._priority_key(JobPriority.NORMAL), claim_token,
+                    status.value, job_id, now, error or '', '' if attempts is None else attempts, now))
+
+    def renew(self, envelope: QueueEnvelope) -> bool:
+        """Extend a live claim; stale workers cannot renew a replacement claim."""
+        now = time.time()
+        if self._using_fallback:
+            with self._memory_lock:
+                data = self._fallback_jobs.get(envelope.job_id, {})
+                if (data.get('status') != 'running' or data.get('claim_token') != envelope.claim_token
+                        or float(data.get('lease_expires_at', 0)) <= now):
+                    return False
+                data['lease_expires_at'] = now + self.lease_seconds
+                self._fallback_leases[envelope.job_id] = now + self.lease_seconds
+                return True
+        return bool(self._redis.eval(self._RENEW, 2, self.job_key(envelope.job_id), self.inflight_key,
+                                     envelope.claim_token, now+self.lease_seconds, envelope.job_id, now))
+
+    def requeue(self, envelope: QueueEnvelope, delay_seconds: float = 0.0) -> bool:
+        """Retry a current claim only, preserving cancellation and due time."""
+        now = time.time()
+        available = now + max(0.0, delay_seconds)
+        if self._using_fallback:
+            with self._memory_lock:
+                if not self.mark_status(envelope.job_id, JobStatus.PENDING,
+                                        attempts=envelope.attempts+1, claim_token=envelope.claim_token):
+                    return False
+                data = self._fallback_jobs[envelope.job_id]
+                data.update(enqueued_at=available, claim_token='')
+                self._fallback_queue.append(self._deserialize_job(data))
+                return True
+        return bool(self._redis.eval(self._TRANSITION, 4, self.job_key(envelope.job_id),
+                    self.pending_key, self.inflight_key, self._priority_key(envelope.priority),
+                    envelope.claim_token, 'pending', envelope.job_id, now, '', envelope.attempts+1, available))
 
     def _get_job_data(self, job_id: str) -> dict[str, Any]:
         if self._using_fallback:
-            return dict(self._fallback_jobs.get(job_id, {}))
-        assert self._redis is not None
+            with self._memory_lock:
+                return dict(self._fallback_jobs.get(job_id, {}))
         return dict(self._redis.hgetall(self.job_key(job_id)))
 
     @staticmethod
     def _serialize_job(envelope: QueueEnvelope, status: JobStatus) -> dict[str, Any]:
-        return {
-            "job_id": envelope.job_id,
-            "payload": json.dumps(envelope.payload),
-            "priority": envelope.priority.name,
-            "attempts": envelope.attempts,
-            "status": status.value,
-            "enqueued_at": envelope.enqueued_at,
-            "updated_at": time.time(),
-        }
+        return dict(job_id=envelope.job_id, payload=json.dumps(envelope.payload),
+                    priority=envelope.priority.name, attempts=envelope.attempts,
+                    status=status.value, enqueued_at=envelope.enqueued_at,
+                    updated_at=time.time(), queue_version=2, claim_token='')
 
     @staticmethod
     def _deserialize_job(data: dict[str, Any]) -> QueueEnvelope:
-        return QueueEnvelope(
-            job_id=str(data["job_id"]),
-            payload=json.loads(data.get("payload") or "{}"),
-            priority=JobPriority[str(data.get("priority", JobPriority.NORMAL.name))],
-            attempts=int(data.get("attempts", 0)),
-            enqueued_at=float(data.get("enqueued_at", time.time())),
-        )
-
-    @staticmethod
-    def _queue_score(available_at: float, priority: JobPriority) -> float:
-        return (available_at * _QUEUE_SCORE_SCALE) - priority.value
+        return QueueEnvelope(job_id=str(data['job_id']), payload=json.loads(data.get('payload') or '{}'),
+                             priority=JobPriority[str(data.get('priority', 'NORMAL'))],
+                             attempts=int(data.get('attempts', 0)), enqueued_at=float(data['enqueued_at']),
+                             claim_token=str(data.get('claim_token', '')))
 
 
 @dataclass(order=True)
 class QueuedJob:
     """Job with priority for queue ordering."""
     priority: int
-    job_id: str
+    job_id: str = field(compare=False)
     callback: Callable[[str], Any] = field(compare=False)
+    sequence: int = field(default=0)
     created_at: float = field(default_factory=time.time, compare=False)
 
 
@@ -322,6 +409,7 @@ class JobQueue:
         self._workers: list[threading.Thread] = []
         self._running = False
         self._job_retries: dict[str, int] = {}
+        self._sequence = itertools.count()
         
         self.logger.debug("JobQueue initialized max_workers=%d max_retries=%d", max_workers, max_retries)
 
@@ -373,9 +461,10 @@ class JobQueue:
             return False
         
         queued_job = QueuedJob(
-            priority=priority.value,
+            priority=-priority.value,
             job_id=job_id,
             callback=callback,
+            sequence=next(self._sequence),
         )
         
         self._queue.put(queued_job)
@@ -411,8 +500,9 @@ class JobQueue:
                         self._job_retries[queued_job.job_id] = retry_count + 1
                         self.logger.warning("JobQueue: retrying job %s (attempt %d/%d)", 
                                           queued_job.job_id, retry_count + 1, self.max_retries)
-                        # Re-queue with same priority (don't call task_done yet)
+                        # Each get has its own unfinished-task count.
                         self._queue.put(queued_job)
+                        self._queue.task_done()
                     else:
                         self.logger.error("JobQueue: job %s failed after %d retries", 
                                          queued_job.job_id, self.max_retries)

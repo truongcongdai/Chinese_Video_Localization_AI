@@ -76,11 +76,26 @@ class RedisWorker:
             self.logger.info("Skipping cancelled job %s", envelope.job_id)
             return
 
-        self.queue.mark_status(envelope.job_id, JobStatus.RUNNING, attempts=envelope.attempts)
+        if not self.queue.renew(envelope):
+            return
+        finished = threading.Event()
+
+        def heartbeat() -> None:
+            while not finished.wait(max(0.01, self.queue.lease_seconds / 3)):
+                try:
+                    if not self.queue.renew(envelope):
+                        return
+                except Exception:
+                    self.logger.exception("Could not renew job lease %s", envelope.job_id)
+                    return
+
+        renewal = threading.Thread(target=heartbeat, name="JobLeaseHeartbeat", daemon=True)
+        renewal.start()
         try:
             self.callback(envelope)
             if self.queue.get_status(envelope.job_id) != JobStatus.CANCELLED:
-                self.queue.mark_status(envelope.job_id, JobStatus.COMPLETED)
+                self.queue.mark_status(envelope.job_id, JobStatus.COMPLETED,
+                                       claim_token=envelope.claim_token)
         except Exception as exc:
             next_attempt = envelope.attempts + 1
             if next_attempt <= self.max_retries:
@@ -101,16 +116,24 @@ class RedisWorker:
                 JobStatus.FAILED,
                 error=str(exc),
                 attempts=next_attempt,
+                claim_token=envelope.claim_token,
             )
+        finally:
+            finished.set()
+            renewal.join(timeout=2)
 
     def _run(self) -> None:
         while self._running:
-            envelope = self.queue.dequeue(timeout_seconds=self.poll_interval_seconds)
-            if envelope is None:
-                continue
-            self.process_job(envelope)
+            try:
+                envelope = self.queue.dequeue(timeout_seconds=self.poll_interval_seconds)
+                if envelope is not None:
+                    self.process_job(envelope)
+            except Exception:
+                # A Redis interruption must not silently kill the polling thread.
+                self.logger.exception("Worker queue operation failed; retrying poll")
+                time.sleep(max(0.1, self.poll_interval_seconds))
 
     def _retry_delay(self, attempt: int) -> float:
         if self.backoff_multiplier <= 0:
             return 0.0
-        return max(0.0, self.backoff_multiplier ** max(attempt - 1, 0))
+        return min(60.0, self.backoff_multiplier ** min(max(attempt - 1, 0), 20))

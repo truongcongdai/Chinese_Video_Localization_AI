@@ -10,9 +10,10 @@ server"; if you need SSO/multi-tenant auth later, swap this module out.
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
-from fastapi import Request, HTTPException, status
+from fastapi import Request, Response, HTTPException, status
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from passlib.context import CryptContext
 
@@ -46,6 +47,24 @@ def verify_password(password: str, password_hash: str) -> bool:
 def create_session_cookie_value(user_id: int) -> str:
     serializer = URLSafeTimedSerializer(_get_secret_key())
     return serializer.dumps({"user_id": user_id})
+
+
+def set_session_cookie(response: Response, user_id: int) -> None:
+    response.set_cookie(COOKIE_NAME, create_session_cookie_value(user_id),
+                        max_age=SESSION_MAX_AGE_SECONDS, httponly=True, samesite="lax")
+
+
+def remember_existing_session(request: Request, response: Response) -> None:
+    """Persist a valid existing login without extending its signed lifetime."""
+    value = request.cookies.get(COOKIE_NAME)
+    if not value:
+        return
+    try:
+        _, issued = URLSafeTimedSerializer(_get_secret_key()).loads(value, max_age=SESSION_MAX_AGE_SECONDS, return_timestamp=True)
+    except (BadSignature, SignatureExpired):
+        return
+    remaining = max(0, int(SESSION_MAX_AGE_SECONDS - (time.time() - issued.timestamp())))
+    response.set_cookie(COOKIE_NAME, value, max_age=remaining, httponly=True, samesite="lax")
 
 
 def read_session_cookie_value(value: str) -> Optional[int]:

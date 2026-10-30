@@ -6,10 +6,12 @@ from supported platforms. It is disabled by default and requires explicit config
 """
 
 import logging
+import json
 import os
 import shutil
 import subprocess
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 from universal_video_ai.trends.providers.base import BaseTrendProvider
 from universal_video_ai.trends.models import TrendItemCandidate
 
@@ -123,25 +125,53 @@ class AgentReachProvider(BaseTrendProvider):
             )
             return []
 
-        # Parse output - this will need to be adapted to actual Agent-Reach output format
+        # Structured output only; CLI compatibility depends on installed version.
         return self._parse_agent_reach_output(result["stdout"], channel)
 
     def _parse_agent_reach_output(
         self, output: str, platform: str
     ) -> List[TrendItemCandidate]:
-        """
-        Parse Agent-Reach command output into TrendItemCandidate objects.
-
-        This is a placeholder implementation. The actual parsing logic will
-        need to be adapted based on the real Agent-Reach output format.
-        """
-        # TODO: Implement actual parsing based on Agent-Reach output format
-        # For now, return empty list as this is a placeholder
-        return []
+        """Accept structured JSON/JSONL; never infer videos from prose output."""
+        try:
+            payload = json.loads(output)
+        except (TypeError, ValueError):
+            payload = []
+            for line in str(output or "").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    payload.append(row)
+        if isinstance(payload, dict):
+            payload = payload.get("items", payload.get("results", payload.get("entries", [payload])))
+        if not isinstance(payload, list):
+            return []
+        candidates = []
+        for row in payload[:self._max_results]:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("source_url") or row.get("webpage_url") or row.get("url") or "")
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                continue
+            def numeric(key):
+                value = row.get(key)
+                try:
+                    return max(0, int(value)) if value is not None else None
+                except (ValueError, TypeError, OverflowError):
+                    return None
+            candidates.append(TrendItemCandidate(
+                platform=platform, source_url=url, title=str(row.get("title") or "")[:500],
+                author=str(row.get("author") or row.get("uploader") or "")[:200],
+                duration_seconds=numeric("duration"), view_count=numeric("view_count"),
+                like_count=numeric("like_count"), comment_count=numeric("comment_count"),
+            ))
+        return candidates
 
     def _run_agent_reach_command(
         self, args: List[str], timeout: int
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         Safely run an Agent-Reach command.
 

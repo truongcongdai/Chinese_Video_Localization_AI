@@ -292,7 +292,7 @@ class WhisperTranscriber:
                         or "nan" in lower_message
                         or "expected scalar type" in lower_message
                     )
-                    if use_fp16 and is_numeric_cuda_failure:
+                    if resolved_device.startswith("cuda") and use_fp16 and is_numeric_cuda_failure:
                         self.logger.warning(
                             "Whisper fp16 decoding failed on %s with %s; "
                             "retrying once with fp16=False",
@@ -314,7 +314,7 @@ class WhisperTranscriber:
                                 result = retry_cpu_fp32()
                             else:
                                 raise
-                    elif is_numeric_cuda_failure:
+                    elif resolved_device.startswith("cuda") and is_numeric_cuda_failure:
                         result = retry_cpu_fp32()
                     else:
                         raise
